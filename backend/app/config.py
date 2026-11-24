@@ -16,6 +16,7 @@ SENSITIVE_RUNTIME_FIELDS = frozenset(
         "ph_password",
         "ph_cookie",
         "serverchan_send_key",
+        "yescaptcha_client_key",
     }
 )
 
@@ -164,6 +165,13 @@ class RuntimeSettings(BaseModel):
     ph_password: str = ""
     ph_logged_in_username: str = ""
     ph_cookie: str = ""
+
+    # YesCaptcha (reCAPTCHA solver used by auto-login)
+    yescaptcha_enabled: bool = False
+    yescaptcha_client_key: str = ""
+    yescaptcha_api_base: str = "https://api.yescaptcha.com"
+    yescaptcha_task_type: str = "RecaptchaV2EnterpriseTaskProxyless"
+    yescaptcha_timeout_seconds: float = Field(default=180.0, ge=30.0, le=600.0)
 
     # Network & Retry
     proxy_url: str = ""

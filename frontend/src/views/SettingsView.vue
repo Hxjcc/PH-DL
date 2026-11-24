@@ -14,6 +14,7 @@ import {
   Settings,
   Code2,
   RotateCcw,
+  ShieldCheck,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
@@ -24,6 +25,7 @@ import Input from '../components/ui/Input.vue'
 import Textarea from '../components/ui/Textarea.vue'
 import Switch from '../components/ui/Switch.vue'
 import Tabs from '../components/ui/Tabs.vue'
+import Select from '../components/ui/Select.vue'
 
 const DEFAULT_SELECTORS = Object.freeze({
   list_page_main_containers:
@@ -65,6 +67,17 @@ const SELECTOR_FIELDS = [
   { key: 'subs_page_main_container', label: '订阅页列表主容器' },
   { key: 'subs_page_user_link_in_container', label: '订阅页用户链接' },
   { key: 'pornstar_page_video_container_check', label: 'Pornstar 上传容器校验' },
+]
+
+const YESCAPTCHA_ENDPOINTS = [
+  { label: '国际节点 api.yescaptcha.com', value: 'https://api.yescaptcha.com' },
+  { label: '国内节点 cn.yescaptcha.com', value: 'https://cn.yescaptcha.com' },
+]
+
+const YESCAPTCHA_TASK_TYPES = [
+  { label: 'reCAPTCHA v2 企业版（推荐，PornHub 使用 enterprise.js）', value: 'RecaptchaV2EnterpriseTaskProxyless' },
+  { label: 'reCAPTCHA v2 普通版（15 点/次，低价）', value: 'NoCaptchaTaskProxyless' },
+  { label: 'reCAPTCHA v2 备用线路（20 点/次）', value: 'RecaptchaV2TaskProxyless' },
 ]
 
 function cloneSettings(src) {
@@ -196,6 +209,23 @@ async function handleRefreshCookie() {
   }
 }
 
+async function handleTestYescaptcha() {
+  busyTool.value = 'yescaptcha'
+  try {
+    const saved = await api.saveSettings(form.value)
+    if (saved?.settings) {
+      form.value = cloneSettings(saved.settings)
+      store.setSettingsCache(saved.settings)
+    }
+    const res = await api.testYescaptcha()
+    store.notify(res.message, res.ok ? 'success' : 'error')
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    busyTool.value = ''
+  }
+}
+
 async function handleTestRclone() {
   busyTool.value = 'rclone'
   try {
@@ -286,7 +316,7 @@ async function handleTestNotify() {
                 </Badge>
               </div>
               <p class="text-xs text-muted-foreground">
-                推荐在 VPS 上直接粘贴从浏览器复制的 Cookie 请求头，稳定且免验证码
+                推荐在 VPS 上直接粘贴从浏览器复制的 Cookie 请求头，稳定且免验证码；也可配置下方 YesCaptcha 自动处理 reCAPTCHA
               </p>
             </div>
             <div class="flex flex-wrap gap-2">
@@ -341,6 +371,63 @@ async function handleTestNotify() {
               <Input v-model="form.ph_logged_in_username" placeholder="拉取订阅列表用" />
             </div>
           </div>
+        </div>
+
+        <div class="p-6 space-y-4">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="flex items-center gap-3">
+              <div
+                class="w-9 h-9 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+              >
+                <ShieldCheck class="w-4 h-4" />
+              </div>
+              <div>
+                <div class="flex items-center gap-2">
+                  <h3 class="text-sm font-semibold text-foreground">YesCaptcha 自动过验证码</h3>
+                  <Switch v-model="form.yescaptcha_enabled" />
+                </div>
+                <p class="text-xs text-muted-foreground mt-0.5">
+                  自动登录遇到 reCAPTCHA 时调用 YesCaptcha 获取 token；仅在触发验证码时消耗点数
+                </p>
+              </div>
+            </div>
+            <Button
+              variant="outline"
+              size="xs"
+              :disabled="busyTool !== ''"
+              @click="handleTestYescaptcha"
+            >
+              <PlugZap class="w-3.5 h-3.5" />
+              测试 YesCaptcha
+            </Button>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+            <div class="space-y-1.5">
+              <label class="text-xs font-medium text-foreground">ClientKey（已脱敏）</label>
+              <Input
+                v-model="form.yescaptcha_client_key"
+                type="password"
+                placeholder="从 yescaptcha.com 后台复制"
+              />
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-xs font-medium text-foreground">API 节点</label>
+              <Select v-model="form.yescaptcha_api_base" :options="YESCAPTCHA_ENDPOINTS" />
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-xs font-medium text-foreground">识别任务类型</label>
+              <Select v-model="form.yescaptcha_task_type" :options="YESCAPTCHA_TASK_TYPES" />
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-xs font-medium text-foreground">解题超时（秒）</label>
+              <Input v-model="form.yescaptcha_timeout_seconds" type="number" :min="30" :max="600" />
+            </div>
+          </div>
+
+          <p class="text-xs text-muted-foreground">
+            国内服务器若无法访问国际节点，可切换到 cn.yescaptcha.com。若 token 提交后仍要求验证码，可尝试切换识别任务类型。
+          </p>
         </div>
       </Card>
 

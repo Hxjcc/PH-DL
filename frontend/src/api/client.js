@@ -109,6 +109,7 @@ export const api = {
   testCookie: () => request('/api/settings/cookie/test', { method: 'POST' }),
   importCookie: (cookie) => request('/api/settings/cookie/import', { method: 'POST', body: { cookie } }),
   refreshCookie: () => request('/api/settings/cookie/refresh', { method: 'POST' }),
+  testYescaptcha: () => request('/api/settings/yescaptcha/test', { method: 'POST' }),
   testRclone: () => request('/api/settings/rclone/test', { method: 'POST' }),
   testNotify: () => request('/api/settings/notify/test', { method: 'POST' }),
   getLogs: () => request('/api/settings/logs'),

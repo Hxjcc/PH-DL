@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..engine.scheduler import parse_hhmm
+from ..services.captcha import CaptchaError, get_yescaptcha_balance
 from ..services.cookie import check_cookie_valid, login_and_get_cookies
 from ..services.notifier import send_serverchan
 from ..services.uploader import test_rclone_connection
@@ -90,6 +91,12 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
         settings.ph_password,
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
+        yescaptcha_enabled=settings.yescaptcha_enabled,
+        yescaptcha_client_key=settings.yescaptcha_client_key,
+        yescaptcha_api_base=settings.yescaptcha_api_base,
+        yescaptcha_task_type=settings.yescaptcha_task_type,
+        yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
+        on_log=lambda level, message: container.events.emit_log(level, message),
     )
     if not res.success:
         container.tasks.set_cookie_status(False, res.message)
@@ -104,6 +111,27 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
         "success": True,
         "logged_in_username": res.logged_in_username,
         "message": res.message,
+    }
+
+
+@router.post("/yescaptcha/test")
+async def test_yescaptcha(container: AppContainer = Depends(require_auth)):
+    settings = await container.repo.get_settings()
+    if not (settings.yescaptcha_client_key or "").strip():
+        return {"ok": False, "message": "未配置 YesCaptcha ClientKey"}
+    try:
+        balance = await get_yescaptcha_balance(
+            settings.yescaptcha_client_key,
+            api_base=settings.yescaptcha_api_base,
+        )
+    except CaptchaError as err:
+        return {"ok": False, "message": str(err)}
+    except Exception as err:  # pragma: no cover - defensive
+        return {"ok": False, "message": f"YesCaptcha 连接异常: {err}"}
+    return {
+        "ok": True,
+        "balance": balance,
+        "message": f"YesCaptcha 连接成功，账户余额 {balance} 点",
     }
 
 

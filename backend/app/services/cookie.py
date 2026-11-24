@@ -5,11 +5,19 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from ..parsers.http_session import TaskHttpContext, parse_cookie_string
+from .captcha import CaptchaError, solve_recaptcha_v2
+
+PORNHUB_LOGIN_URL = "https://www.pornhub.com/login"
+# Stable reCAPTCHA sitekey of the PornHub login modal (fallback only).
+PORNHUB_DEFAULT_SITEKEY = "6LfyQRoUAAAAAApqS-inJxUwCOtvOHwKxJuZCsuv"
+
+LogCallback = Callable[[str, str], None]
 
 
 @dataclass(frozen=True)
@@ -149,6 +157,211 @@ def _is_auth_json_failure(data: dict) -> bool:
     return False
 
 
+def _is_auth_json_success(data: dict) -> bool:
+    if not isinstance(data, dict) or data.get("error"):
+        return False
+    if "success" not in data:
+        return False
+    val = data.get("success")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes")
+    return False
+
+
+def _is_captcha_required(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    val = data.get("requireCaptcha")
+    if isinstance(val, str):
+        if val.strip().lower() in ("1", "true", "yes"):
+            return True
+    elif val:
+        return True
+    message = str(data.get("message") or data.get("error") or "").lower()
+    return any(token in message for token in ("captcha", "recaptcha", "robot"))
+
+
+def _auth_message(data: dict) -> str:
+    return str(
+        data.get("message")
+        or data.get("error")
+        or data.get("errorDescription")
+        or ""
+    ).strip()
+
+
+def _friendly_auth_failure(message: str) -> str:
+    lower = (message or "").lower()
+    if "blocked" in lower:
+        return (
+            "PornHub 临时锁定了该账号（Your account has been blocked for one hour）。"
+            "请等待约 1 小时后再试，期间不要频繁点击自动登录。"
+        )
+    if "invalid credential" in lower:
+        return (
+            "账号或密码错误 (Invalid credentials)。"
+            "请检查设置中的 PornHub 账号密码，或手动粘贴浏览器 Cookie。"
+        )
+    if "captcha" in lower or "recaptcha" in lower:
+        return "PornHub 要求人机验证，请启用 YesCaptcha 后重试。"
+    return message
+
+
+@dataclass(frozen=True)
+class LoginPageConfig:
+    token: str = ""
+    redirect: str = ""
+    from_value: str = "pc_login_modal_:login"
+    sitekey: str = ""
+    login_url: str = "/front/authenticate"
+
+
+def _extract_connection_modal_configs(html: str) -> Dict[str, object]:
+    """Read the hydrated ``connectionModalData.configs`` object.
+
+    The static ``<template id="signinModal">`` contains placeholder redirect
+    values.  The browser actually submits the values from this JavaScript
+    config, so they must take precedence for auto-login to behave the same.
+    """
+
+    if not html:
+        return {}
+    marker = "connectionModalData"
+    idx = html.find(marker)
+    if idx < 0:
+        return {}
+    brace = html.find("{", idx)
+    if brace < 0:
+        return {}
+    try:
+        data, _ = json.JSONDecoder().raw_decode(html[brace:])
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    configs = data.get("configs")
+    return configs if isinstance(configs, dict) else {}
+
+
+def _extract_sitekey(html: str, configs: Dict[str, object]) -> str:
+    configured = str(configs.get("captchaKey") or "").strip()
+    if configured:
+        return configured
+    for pattern in (
+        r'data-sitekey=["\']([^"\']+)["\']',
+        r'recaptcha-key=["\']([^"\']+)["\']',
+        r'gRecaptchaPublicKey\s*=\s*["\']([^"\']+)["\']',
+    ):
+        match = re.search(pattern, html or "", re.I)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _extract_login_config(html: str) -> LoginPageConfig:
+    configs = _extract_connection_modal_configs(html)
+    token, redirect, from_val = _extract_login_form_fields(html)
+
+    return LoginPageConfig(
+        token=str(configs.get("token") or token or "").strip(),
+        redirect=str(configs.get("redirectFieldValue") or redirect or "").strip(),
+        from_value=str(configs.get("fromValue") or from_val or "pc_login_modal_:login").strip(),
+        sitekey=_extract_sitekey(html, configs),
+        login_url=str(configs.get("loginUrl") or "/front/authenticate").strip(),
+    )
+
+
+def _login_payload(
+    config: LoginPageConfig,
+    username: str,
+    password: str,
+    captcha_token: str = "",
+) -> Dict[str, str]:
+    payload: Dict[str, str] = {
+        "redirect": config.redirect or "",
+        "user_id": "",
+        "intended_action": "",
+        "token": config.token or "",
+        "from": config.from_value or "pc_login_modal_:login",
+        "email": username.strip(),
+        "password": password,
+    }
+    if captcha_token:
+        # reCAPTCHA v2 injects this hidden field inside the login form and the
+        # site posts it verbatim with the rest of the form data.
+        payload["g-recaptcha-response"] = captcha_token
+    return payload
+
+
+async def _submit_login(
+    ctx: TaskHttpContext,
+    config: LoginPageConfig,
+    username: str,
+    password: str,
+    *,
+    timeout: float,
+    captcha_token: str = "",
+    page_url: str = PORNHUB_LOGIN_URL,
+) -> Tuple[Optional[object], Optional[str], Optional[dict]]:
+    auth_url = config.login_url or "/front/authenticate"
+    if not re.match(r"^https?://", auth_url, re.I):
+        auth_url = urljoin(page_url, auth_url)
+
+    parsed_page = urlparse(page_url)
+    origin = f"{parsed_page.scheme or 'https'}://{parsed_page.netloc or 'www.pornhub.com'}"
+
+    resp, err = await ctx.fetch_with_pow(
+        auth_url,
+        method="POST",
+        data=_login_payload(config, username, password, captcha_token),
+        headers={
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": origin,
+            "Referer": page_url,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        },
+        timeout=timeout,
+        max_retries=1,
+        log_label="登录提交",
+    )
+    data: Optional[dict] = None
+    if resp is not None:
+        try:
+            parsed = json.loads(resp.text)
+            if isinstance(parsed, dict):
+                data = parsed
+        except (ValueError, TypeError):
+            data = None
+    return resp, err, data
+
+
+async def _finish_login(
+    ctx: TaskHttpContext,
+    proxy_url: Optional[str],
+    timeout: float,
+    logged_in_username: str,
+) -> CookieLoginResult:
+    cookie_str = ctx.cookie_string()
+    if not cookie_str:
+        return CookieLoginResult(success=False, message="登录未返回任何 Cookie")
+
+    verify = await check_cookie_valid(cookie_str, proxy_url=proxy_url, timeout=timeout)
+    if not verify.valid:
+        return CookieLoginResult(success=False, message=f"登录后验证失败: {verify.message}")
+
+    return CookieLoginResult(
+        success=True,
+        cookie_str=cookie_str,
+        logged_in_username=logged_in_username,
+        message="登录并更新 Cookie 成功",
+    )
+
+
 async def check_cookie_valid(
     cookie_str: str,
     proxy_url: Optional[str] = None,
@@ -196,17 +409,128 @@ async def check_cookie_valid(
         return CookieCheckResult(valid=False, message=f"Cookie 校验失败: {err}")
 
 
+async def _login_with_captcha(
+    ctx: TaskHttpContext,
+    config: LoginPageConfig,
+    username: str,
+    password: str,
+    *,
+    proxy_url: Optional[str],
+    timeout: float,
+    yescaptcha_client_key: str,
+    yescaptcha_api_base: str,
+    yescaptcha_task_type: str,
+    yescaptcha_timeout_seconds: float,
+    on_log: Optional[LogCallback],
+) -> CookieLoginResult:
+    """Refresh the login state, solve reCAPTCHA with YesCaptcha, then retry."""
+
+    def emit(level: str, message: str) -> None:
+        if on_log:
+            on_log(level, message)
+
+    # CSRF tokens and the captcha challenge can be rotated after a failed POST.
+    page_resp, page_err = await ctx.fetch_with_pow(
+        PORNHUB_LOGIN_URL,
+        timeout=timeout,
+        max_retries=1,
+        log_label="登录页",
+    )
+    if page_resp is None:
+        return CookieLoginResult(success=False, message=f"访问登录页失败: {page_err or '请求失败'}")
+    if page_resp.status_code >= 400:
+        return CookieLoginResult(success=False, message=f"访问登录页失败 (HTTP {page_resp.status_code})")
+
+    fresh_config = _extract_login_config(page_resp.text)
+    page_url = str(page_resp.final_url or PORNHUB_LOGIN_URL)
+    sitekey = fresh_config.sitekey or config.sitekey or PORNHUB_DEFAULT_SITEKEY
+    emit("INFO", "检测到 PornHub 要求 reCAPTCHA，正在调用 YesCaptcha 解题...")
+
+    try:
+        solution = await solve_recaptcha_v2(
+            yescaptcha_client_key,
+            page_url,
+            sitekey,
+            api_base=yescaptcha_api_base,
+            task_type=yescaptcha_task_type,
+            timeout=yescaptcha_timeout_seconds,
+            proxy=proxy_url,
+            cancel_event=ctx.cancel_event,
+            on_log=on_log,
+        )
+    except CaptchaError as err:
+        emit("WARNING", f"YesCaptcha 解题失败: {err}")
+        return CookieLoginResult(success=False, message=f"YesCaptcha 解题失败: {err}")
+    except Exception as err:  # pragma: no cover - defensive
+        emit("WARNING", f"YesCaptcha 调用异常: {type(err).__name__}: {err}")
+        return CookieLoginResult(success=False, message=f"YesCaptcha 调用异常: {err}")
+
+    emit("INFO", "YesCaptcha 已返回 token，正在重新提交登录...")
+    auth_resp, auth_err, data = await _submit_login(
+        ctx,
+        fresh_config,
+        username,
+        password,
+        timeout=timeout,
+        captcha_token=solution.token,
+        page_url=page_url,
+    )
+    if auth_resp is None:
+        return CookieLoginResult(success=False, message=f"验证码已通过，但重新登录失败: {auth_err or '请求失败'}")
+    if auth_resp.status_code >= 400:
+        return CookieLoginResult(
+            success=False,
+            message=f"验证码已通过，但登录请求返回 HTTP {auth_resp.status_code}",
+        )
+
+    if data is not None:
+        if _is_auth_json_success(data):
+            logged_in_user = str(data.get("username") or "").strip()
+            return await _finish_login(ctx, proxy_url, timeout, logged_in_user)
+        if _is_captcha_required(data):
+            return CookieLoginResult(
+                success=False,
+                message=(
+                    "YesCaptcha 已提交 token，但 PornHub 仍要求人机验证。"
+                    "可尝试在设置中切换 YesCaptcha 任务类型，或手动粘贴浏览器 Cookie。"
+                ),
+            )
+        msg = _auth_message(data) or "认证失败"
+        return CookieLoginResult(success=False, message=f"验证码已通过，但 {_friendly_auth_failure(msg)}")
+
+    if "login" in str(auth_resp.final_url).lower():
+        return CookieLoginResult(
+            success=False,
+            message=(
+                "YesCaptcha token 已提交，但 PornHub 仍跳回登录页。"
+                "请检查账号密码，或手动粘贴浏览器 Cookie。"
+            ),
+        )
+    return CookieLoginResult(
+        success=False,
+        message=f"验证码已通过，但登录响应异常: {auth_resp.text[:200]}",
+    )
+
+
 async def login_and_get_cookies(
     username: str,
     password: str,
     proxy_url: Optional[str] = None,
     timeout: float = 20.0,
+    *,
+    yescaptcha_enabled: bool = False,
+    yescaptcha_client_key: str = "",
+    yescaptcha_api_base: str = "https://api.yescaptcha.com",
+    yescaptcha_task_type: str = "RecaptchaV2EnterpriseTaskProxyless",
+    yescaptcha_timeout_seconds: float = 180.0,
+    on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     if not (username or "").strip() or not (password or "").strip():
         return CookieLoginResult(success=False, message="未配置 PornHub 账号或密码")
 
-    login_url = "https://www.pornhub.com/login"
-    auth_url = "https://www.pornhub.com/front/authenticate"
+    def emit(level: str, message: str) -> None:
+        if on_log:
+            on_log(level, message)
 
     try:
         ctx = TaskHttpContext(
@@ -217,10 +541,11 @@ async def login_and_get_cookies(
             max_retries=1,
             retry_delay_base=1.0,
             retry_delay_max=2.0,
+            on_log=on_log,
         )
         async with ctx:
             page_resp, page_err = await ctx.fetch_with_pow(
-                login_url,
+                PORNHUB_LOGIN_URL,
                 timeout=timeout,
                 max_retries=1,
                 log_label="登录页",
@@ -233,30 +558,20 @@ async def login_and_get_cookies(
             if page_resp.status_code >= 400:
                 return CookieLoginResult(success=False, message=f"访问登录页失败 (HTTP {page_resp.status_code})")
 
-            token, redirect, from_val = _extract_login_form_fields(page_resp.text)
-            payload = {
-                "redirect": redirect or "",
-                "user_id": "",
-                "intended_action": "",
-                "token": token or "",
-                "from": from_val or "pc_login_modal_:login",
-                "email": username.strip(),
-                "password": password,
-            }
-            auth_resp, auth_err = await ctx.fetch_with_pow(
-                auth_url,
-                method="POST",
-                data=payload,
-                headers={
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Origin": "https://www.pornhub.com",
-                    "Referer": login_url,
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                },
+            config = _extract_login_config(page_resp.text)
+            page_url = str(page_resp.final_url or PORNHUB_LOGIN_URL)
+            emit(
+                "INFO",
+                f"登录页已加载（reCAPTCHA sitekey: {'已获取' if config.sitekey else '未找到'}）",
+            )
+
+            auth_resp, auth_err, data = await _submit_login(
+                ctx,
+                config,
+                username,
+                password,
                 timeout=timeout,
-                max_retries=1,
-                log_label="登录提交",
+                page_url=page_url,
             )
             if auth_resp is None:
                 return CookieLoginResult(success=False, message=f"自动登录失败: {auth_err or '请求失败'}")
@@ -266,34 +581,75 @@ async def login_and_get_cookies(
                     message=f"登录请求返回 HTTP {auth_resp.status_code}",
                 )
 
-            logged_in_user = ""
-            try:
-                data = json.loads(auth_resp.text)
-                if isinstance(data, dict):
-                    if _is_auth_json_failure(data):
-                        err_msg = data.get("message") or data.get("error") or "认证失败"
-                        return CookieLoginResult(success=False, message=f"登录被拒绝: {err_msg}")
+            if data is not None:
+                if _is_auth_json_success(data):
                     logged_in_user = str(data.get("username") or "").strip()
-            except (ValueError, TypeError):
-                if "login" in str(auth_resp.final_url).lower():
-                    return CookieLoginResult(
-                        success=False,
-                        message="自动登录失败，可能触发了人机验证 (CAPTCHA)，请在设置中手动粘贴浏览器 Cookie",
+                    return await _finish_login(ctx, proxy_url, timeout, logged_in_user)
+
+                if _is_captcha_required(data):
+                    if not yescaptcha_enabled or not (yescaptcha_client_key or "").strip():
+                        return CookieLoginResult(
+                            success=False,
+                            message=(
+                                "登录需要人机验证（reCAPTCHA）。请在【系统设置 → Cookie 与账号】"
+                                "启用 YesCaptcha 并填写 ClientKey 后重试。"
+                            ),
+                        )
+                    return await _login_with_captcha(
+                        ctx,
+                        config,
+                        username,
+                        password,
+                        proxy_url=proxy_url,
+                        timeout=timeout,
+                        yescaptcha_client_key=yescaptcha_client_key,
+                        yescaptcha_api_base=yescaptcha_api_base,
+                        yescaptcha_task_type=yescaptcha_task_type,
+                        yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
+                        on_log=on_log,
                     )
 
-            cookie_str = ctx.cookie_string()
-            if not cookie_str:
-                return CookieLoginResult(success=False, message="登录未返回任何 Cookie")
+                msg = _auth_message(data) or "认证失败"
+                return CookieLoginResult(
+                    success=False,
+                    message=f"登录被拒绝: {_friendly_auth_failure(msg)}",
+                )
 
-            verify = await check_cookie_valid(cookie_str, proxy_url=proxy_url, timeout=timeout)
-            if not verify.valid:
-                return CookieLoginResult(success=False, message=f"登录后验证失败: {verify.message}")
+            body_lower = (auth_resp.text or "").lower()
+            if "captcha" in body_lower or "recaptcha" in body_lower:
+                if not yescaptcha_enabled or not (yescaptcha_client_key or "").strip():
+                    return CookieLoginResult(
+                        success=False,
+                        message=(
+                            "登录需要人机验证（reCAPTCHA）。请在【系统设置 → Cookie 与账号】"
+                            "启用 YesCaptcha 并填写 ClientKey 后重试。"
+                        ),
+                    )
+                return await _login_with_captcha(
+                    ctx,
+                    config,
+                    username,
+                    password,
+                    proxy_url=proxy_url,
+                    timeout=timeout,
+                    yescaptcha_client_key=yescaptcha_client_key,
+                    yescaptcha_api_base=yescaptcha_api_base,
+                    yescaptcha_task_type=yescaptcha_task_type,
+                    yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
+                    on_log=on_log,
+                )
 
+            if "login" in str(auth_resp.final_url).lower():
+                return CookieLoginResult(
+                    success=False,
+                    message=(
+                        "自动登录失败，登录页未返回可解析的结果。"
+                        "请在设置中手动粘贴浏览器 Cookie。"
+                    ),
+                )
             return CookieLoginResult(
-                success=True,
-                cookie_str=cookie_str,
-                logged_in_username=logged_in_user,
-                message="登录并更新 Cookie 成功",
+                success=False,
+                message=f"自动登录失败，响应异常: {(auth_resp.text or '')[:200]}",
             )
     except Exception as err:
         return CookieLoginResult(success=False, message=f"自动登录异常: {err}")
