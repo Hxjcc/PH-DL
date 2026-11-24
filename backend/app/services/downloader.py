@@ -1,0 +1,447 @@
+"""Streaming MP4 downloader with true HTTP Range resume and progress callbacks."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import json
+import os
+import re
+import shutil
+import tempfile
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable, Iterator, Optional, Set
+
+import aiohttp
+
+from ..cancel import StopRequested, until_stopped
+from ..config import SelectorSettings
+from ..parsers.http_session import TaskHttpContext
+from ..parsers.video import fetch_single_video_detail
+from .filename import is_valid_video_file, normalized_quality, video_filename_base
+
+DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",
+}
+
+ProgressCallback = Callable[[int, int, float], None]  # (downloaded_bytes, total_bytes, speed_bps)
+LogCallback = Callable[[str, str], None]
+
+
+@dataclass(frozen=True)
+class DownloadOutcome:
+    success: bool
+    cancelled: bool = False
+    local_path: Optional[Path] = None
+    temp_path: Optional[Path] = None
+    file_size: int = 0
+    quality: str = ""
+    download_url: str = ""
+    error: str = ""
+
+
+class _RangeMismatch(Exception):
+    pass
+
+
+class _DiskSpaceError(Exception):
+    pass
+
+
+class DownloadDiskBudget:
+    """Reserve known response sizes across downloads and enforce the floor on writes."""
+
+    def __init__(self, path: Path, keep_free_bytes: int):
+        self.path = path
+        self.keep_free_bytes = max(0, int(keep_free_bytes))
+        self._reserved = 0
+
+    @contextlib.contextmanager
+    def reserve(self, expected_bytes: int) -> Iterator[Callable[[int], None]]:
+        if not self.keep_free_bytes:
+            yield lambda _size: None
+            return
+
+        remaining = max(0, expected_bytes)
+        if shutil.disk_usage(self.path).free < self.keep_free_bytes + self._reserved + remaining:
+            raise _DiskSpaceError("磁盘余量不足，无法为此下载预留空间")
+        self._reserved += remaining
+        try:
+            def before_write(size: int) -> None:
+                others = self._reserved - remaining
+                if shutil.disk_usage(self.path).free < self.keep_free_bytes + others + size:
+                    raise _DiskSpaceError("写入会低于磁盘保留空间，已保留下载断点")
+
+            def consume(size: int) -> None:
+                nonlocal remaining
+                before_write(size)
+                used = min(size, remaining)
+                remaining -= used
+                self._reserved -= used
+
+            yield consume
+        finally:
+            self._reserved -= remaining
+
+
+@dataclass(frozen=True)
+class DownloadCheckpoint:
+    viewkey: str
+    quality: str
+    request_fingerprint: str
+    response_fingerprint: str
+    etag: str
+    total: int
+
+
+_SATISFIED_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+_UNSATISFIED_RANGE = re.compile(r"bytes \*/(\d+)")
+
+
+def _fingerprint(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def _strong_etag(value: str) -> str:
+    candidate = value.strip()
+    return candidate if re.fullmatch(r'"[^"\x00-\x20\x7f]*"', candidate) else ""
+
+
+def _checkpoint_path(path: Path) -> Path:
+    return path.with_name(path.name + ".json")
+
+
+def read_download_checkpoint(path: Path) -> Optional[DownloadCheckpoint]:
+    try:
+        data = json.loads(_checkpoint_path(path).read_text(encoding="utf-8"))
+        if data.pop("version") != 1:
+            return None
+        checkpoint = DownloadCheckpoint(**data)
+        if (
+            type(checkpoint.total) is int
+            and checkpoint.total >= 0
+            and all(isinstance(value, str) for name, value in data.items() if name != "total")
+        ):
+            return checkpoint
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return None
+
+
+def remove_download_checkpoint(path: Path) -> None:
+    _checkpoint_path(path).unlink(missing_ok=True)
+
+
+def _write_checkpoint(path: Path, checkpoint: DownloadCheckpoint) -> None:
+    sidecar = _checkpoint_path(path)
+    draft = sidecar.with_suffix(".json.new")
+    draft.write_text(json.dumps({"version": 1, **asdict(checkpoint)}), encoding="utf-8")
+    os.replace(draft, sidecar)
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+async def probe_download_size(
+    session: aiohttp.ClientSession,
+    download_url: str,
+    *,
+    referer_url: str,
+    cookie_str: str = "",
+    proxy_url: Optional[str] = None,
+    timeout: float = 20.0,
+) -> Optional[int]:
+    """Read total media size with a one-byte Range request without downloading the file."""
+    if not download_url:
+        return None
+    headers = dict(DOWNLOAD_HEADERS)
+    headers["Referer"] = referer_url or "https://www.pornhub.com/"
+    headers["Range"] = "bytes=0-0"
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+    try:
+        async with session.get(
+            download_url,
+            headers=headers,
+            allow_redirects=True,
+            proxy=proxy_url or None,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            if response.status == 206:
+                content_range = _SATISFIED_RANGE.fullmatch(response.headers.get("Content-Range", "").strip())
+                if content_range and content_range.group(1, 2) == ("0", "0"):
+                    return int(content_range.group(3)) or None
+                return None
+            if response.status == 200:
+                content_length = response.headers.get("Content-Length", "")
+                return (
+                    int(content_length)
+                    if content_length.isdigit() and int(content_length) > 0
+                    else None
+                )
+            return None
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+        return None
+
+
+async def download_mp4_with_resume(
+    *,
+    session: aiohttp.ClientSession,
+    parse_ctx: TaskHttpContext,
+    selectors: SelectorSettings,
+    viewkey: str,
+    title: str,
+    download_url: str,
+    page_url: str,
+    referer_url: str,
+    quality: str,
+    download_dir: Path,
+    temp_dir: Path,
+    partial_path: Optional[Path] = None,
+    replace_existing: bool = False,
+    disk_budget: Optional[DownloadDiskBudget] = None,
+    cookie_str: str = "",
+    proxy_url: Optional[str] = None,
+    preferred_qualities: Optional[Set[str]] = None,
+    max_attempts: int = 3,
+    retry_delay_base: float = 2.0,
+    retry_delay_max: float = 10.0,
+    request_timeout: Optional[float] = None,
+    min_file_size_bytes: int = 10240,
+    cancel_event: Optional[asyncio.Event] = None,
+    on_progress: Optional[ProgressCallback] = None,
+    on_log: Optional[LogCallback] = None,
+) -> DownloadOutcome:
+    """Only append ranges proven to belong to the previous HTTP representation."""
+    stop = cancel_event if cancel_event is not None else parse_ctx.cancel_event
+    if not re.fullmatch(r"[a-zA-Z0-9]+", viewkey or ""):
+        return DownloadOutcome(success=False, error="缺少或无效的 viewkey")
+
+    base_name = video_filename_base(title, viewkey)
+    default_part = temp_dir / f"{base_name}.mp4.tmp"
+    part = default_part
+    if partial_path is not None and partial_path.resolve().is_relative_to(temp_dir.resolve()):
+        if partial_path.name.endswith(".mp4.tmp") and partial_path.is_file():
+            part = partial_path
+
+    url = (download_url or "").strip()
+    referer = (referer_url or page_url or "https://www.pornhub.com/").strip()
+    current_quality = (quality or "").strip()
+    initial_checkpoint = read_download_checkpoint(part)
+    if not current_quality and initial_checkpoint and initial_checkpoint.viewkey == viewkey:
+        current_quality = initial_checkpoint.quality
+    disk = disk_budget or DownloadDiskBudget(temp_dir, 0)
+    owned_parts: Set[Path] = set()
+    force_fresh = False
+
+    def emit(level: str, message: str) -> None:
+        if on_log:
+            on_log(level, message)
+
+    def incomplete(error: str, *, cancelled: bool = False) -> DownloadOutcome:
+        try:
+            size = _size(part)
+        except OSError:
+            size = 0
+        return DownloadOutcome(
+            success=False,
+            cancelled=cancelled,
+            temp_path=part if size else None,
+            file_size=size,
+            quality=current_quality,
+            download_url=url,
+            error=error,
+        )
+
+    def new_part() -> Path:
+        # Never truncate an earlier download while restarting with a different/unknown source.
+        if not default_part.exists():
+            return default_part
+        # Keep the random suffix after the viewkey, so legacy file listings can still identify it.
+        fd, name = tempfile.mkstemp(prefix=f"{base_name}.", suffix=".mp4.tmp", dir=temp_dir)
+        os.close(fd)
+        return Path(name)
+
+    async def refresh_link() -> bool:
+        nonlocal url, referer, current_quality
+        target_page = page_url or referer
+        locked = normalized_quality(current_quality) if _size(part) else ""
+        filters = {locked} if locked else preferred_qualities
+        detail = await fetch_single_video_detail(parse_ctx, target_page, selectors,
+                                                preferred_qualities=filters, timeout=request_timeout)
+        if not detail.download_url and filters != preferred_qualities:
+            detail = await fetch_single_video_detail(parse_ctx, target_page, selectors,
+                                                    preferred_qualities=preferred_qualities, timeout=request_timeout)
+        if not detail.download_url:
+            return False
+        url = detail.download_url
+        referer = detail.referer_url or referer
+        current_quality = detail.quality or current_quality
+        return True
+
+    async def receive() -> int:
+        nonlocal part, force_fresh
+        offset = _size(part)
+        checkpoint = read_download_checkpoint(part) if offset else None
+        if not (
+            checkpoint and not force_fresh and checkpoint.viewkey == viewkey
+            and normalized_quality(checkpoint.quality) == normalized_quality(current_quality)
+            and checkpoint.request_fingerprint == _fingerprint(url)
+            and _strong_etag(checkpoint.etag) and 0 < offset <= checkpoint.total
+        ):
+            checkpoint = None
+
+        headers = {**DOWNLOAD_HEADERS, "Referer": referer}
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if checkpoint:
+            headers["Range"] = f"bytes={offset}-"
+            headers["If-Range"] = checkpoint.etag
+
+        async with session.get(url, headers=headers, allow_redirects=True, proxy=proxy_url or None,
+                               auto_decompress=False) as response:
+            if response.status not in {200, 206, 416}:
+                response.raise_for_status()
+                raise _RangeMismatch(f"意外的下载响应 HTTP {response.status}")
+            etag = _strong_etag(response.headers.get("ETag", ""))
+            resolved = _fingerprint(str(getattr(response, "url", url)))
+            same_entity = bool(checkpoint and etag == checkpoint.etag and resolved == checkpoint.response_fingerprint)
+            range_header = response.headers.get("Content-Range", "").strip()
+            if response.status == 416:
+                span = _UNSATISFIED_RANGE.fullmatch(range_header)
+                if same_entity and span and int(span[1]) == offset == checkpoint.total:
+                    return offset
+                raise _RangeMismatch("HTTP 416 无法确认断点对应同一完整文件")
+
+            encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+            if encoding not in {"", "identity"}:
+                raise _RangeMismatch("媒体响应经过内容编码，不能校验原始字节范围")
+            length = response.headers.get("Content-Length", "").strip()
+            expected = int(length) if length.isdigit() else 0
+
+            if response.status == 206:
+                span = _SATISFIED_RANGE.fullmatch(range_header)
+                if not same_entity or not span:
+                    raise _RangeMismatch("HTTP 206 缺少有效的范围或原文件校验标记")
+                start, end, total = map(int, span.groups())
+                if start != offset or not start <= end < total or total != checkpoint.total:
+                    raise _RangeMismatch("HTTP 206 返回的字节区间或总大小与断点不符")
+                span_bytes = end - start + 1
+                if length and expected != span_bytes:
+                    raise _RangeMismatch("HTTP 206 响应体长度与字节区间不符")
+                expected = span_bytes
+                mode = "ab"
+            else:
+                start = 0
+                total = expected
+                mode = "wb"
+
+            with disk.reserve(expected) as prepare_write:
+                if mode == "wb":
+                    if _size(part):
+                        part = new_part()
+                        emit("INFO", f"无法安全续接，保留原断点并重新下载: {title}")
+                    owned_parts.add(part)
+                    _write_checkpoint(part, DownloadCheckpoint(
+                        viewkey, current_quality, _fingerprint(url), resolved, etag, total,
+                    ))
+                    force_fresh = False
+
+                downloaded = start
+                bytes_since_tick = 0
+                last_tick = time.monotonic()
+                if on_progress:
+                    on_progress(downloaded, total, 0.0)
+                # Unbuffered writes make the free-space check cover bytes already written.
+                with open(part, mode, buffering=0) as fp:
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        if stop.is_set():
+                            raise StopRequested
+                        if expected and downloaded - start + len(chunk) > expected:
+                            raise _RangeMismatch("下载响应超过声明的字节范围")
+                        prepare_write(len(chunk))
+                        if fp.write(chunk) != len(chunk):
+                            raise OSError("未能写入全部下载数据")
+                        downloaded += len(chunk)
+                        bytes_since_tick += len(chunk)
+                        now = time.monotonic()
+                        if on_progress and now - last_tick >= 0.35:
+                            on_progress(downloaded, total, bytes_since_tick / (now - last_tick))
+                            last_tick, bytes_since_tick = now, 0
+                if on_progress:
+                    on_progress(downloaded, total, 0.0)
+                if total and downloaded != total:
+                    raise aiohttp.ClientPayloadError(f"下载不完整 ({downloaded}/{total})")
+                return downloaded
+
+    attempts = max(1, int(max_attempts))
+    last_error = "下载失败"
+    try:
+        if stop.is_set():
+            raise StopRequested
+        download_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for attempt in range(attempts):
+            if stop.is_set():
+                raise StopRequested
+            try:
+                if not url and not await until_stopped(refresh_link(), stop):
+                    last_error = "无法解析视频直链"
+                else:
+                    size = await until_stopped(receive(), stop)
+                    if await asyncio.to_thread(is_valid_video_file, part, min_file_size_bytes, size):
+                        if stop.is_set():
+                            raise StopRequested
+                        final = download_dir / f"{base_name}.mp4"
+                        if final.exists() and not replace_existing:
+                            # The other file may be a different quality or have unknown provenance.
+                            tag = normalized_quality(current_quality)
+                            stem = f"{base_name}.{tag + 'p' if tag else 'download'}"
+                            final = download_dir / f"{stem}.mp4"
+                            suffix = 2
+                            while final.exists():
+                                final = download_dir / f"{stem}.{suffix}.mp4"
+                                suffix += 1
+                        os.replace(part, final)
+                        with contextlib.suppress(OSError):
+                            remove_download_checkpoint(part)
+                        return DownloadOutcome(success=True, local_path=final, file_size=size,
+                                               quality=current_quality, download_url=url)
+                    last_error = "文件未通过完整性校验（大小或 MP4 结构不完整）"
+                    if part in owned_parts:
+                        part.unlink(missing_ok=True)
+                        remove_download_checkpoint(part)
+                    force_fresh = True
+            except _RangeMismatch as err:
+                last_error = str(err)
+                force_fresh = True
+            except aiohttp.ClientResponseError as err:
+                last_error = f"HTTP {err.status}"
+                if attempt < attempts - 1 and err.status in {403, 410, 472}:
+                    emit("INFO", f"{title}: 直链疑似过期，重新解析直链")
+                    await until_stopped(refresh_link(), stop)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                last_error = f"下载连接中断: {type(err).__name__}"
+            except _DiskSpaceError as err:
+                return incomplete(str(err))
+
+            if attempt < attempts - 1:
+                emit("WARNING", f"{title}: {last_error}，准备重试")
+                await until_stopped(asyncio.sleep(min(retry_delay_base * (2 ** attempt), retry_delay_max)), stop)
+    except StopRequested:
+        return incomplete("已取消", cancelled=True)
+    except OSError as err:
+        return incomplete(f"文件读写失败: {err.strerror or type(err).__name__}")
+    return incomplete(last_error)

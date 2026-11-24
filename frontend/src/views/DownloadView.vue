@@ -1,0 +1,1421 @@
+<script setup>
+import { computed, onActivated, reactive, ref, watch } from 'vue'
+import {
+  Download,
+  Play,
+  RefreshCw,
+  Users,
+  Upload,
+  SlidersHorizontal,
+  ChevronDown,
+  RotateCcw,
+  Trash2,
+  Clock,
+  CloudUpload,
+  Activity,
+  Loader2,
+  TriangleAlert,
+  ListChecks,
+  ChevronRight,
+  Zap,
+  Search,
+  Database,
+  Sparkles,
+  Link2,
+  FileText,
+  Heart,
+} from 'lucide-vue-next'
+import { useAppStore } from '../stores/app'
+import { api } from '../api/client'
+import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta } from '../utils/format'
+import { computeJobLiveMetrics, resolveJobVisual } from '../utils/jobMeta'
+import { parseVideoLinks } from '../utils/videoLinks'
+import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../utils/specificVideos'
+import Card from '../components/ui/Card.vue'
+import Button from '../components/ui/Button.vue'
+import Badge from '../components/ui/Badge.vue'
+import Progress from '../components/ui/Progress.vue'
+import Input from '../components/ui/Input.vue'
+import Textarea from '../components/ui/Textarea.vue'
+import Select from '../components/ui/Select.vue'
+import Switch from '../components/ui/Switch.vue'
+import Tabs from '../components/ui/Tabs.vue'
+import TagsInput from '../components/ui/TagsInput.vue'
+import ConfirmPopover from '../components/ui/ConfirmPopover.vue'
+import SubsPickerModal from '../components/SubsPickerModal.vue'
+
+const store = useAppStore()
+
+const sourceTab = ref('target')
+const showAdvanced = ref(true)
+const subsModalOpen = ref(false)
+const submitting = ref(false)
+const triggeringAuto = ref(false)
+const tempAction = ref('')
+const txtInputRef = ref(null)
+
+const sourceTabs = [
+  { value: 'target', label: '按用户名' },
+  { value: 'urls', label: '视频链接 / TXT' },
+]
+
+const targetTypeOptions = [
+  { label: '自动识别', value: 'auto' },
+  { label: 'Model / 个人', value: 'model' },
+  { label: 'Pornstar / 明星', value: 'pornstar' },
+  { label: 'User / 普通用户', value: 'users' },
+  { label: '收藏夹 (Favorites)', value: 'favorites' },
+  { label: '我的点赞 (Liked)', value: 'liked' },
+]
+
+const qualityChoices = ['2160', '1440', '1080', '720', '480']
+const pageMode = ref('all')
+const pageStart = ref(1)
+const pageEnd = ref(1)
+const videoMode = ref('scan')
+const scopeOptions = [
+  { label: '全部页', value: 'all' },
+  { label: '页码范围', value: 'range' },
+  { label: '指定视频', value: 'specific' },
+]
+const downloadScope = computed({
+  get: () => (videoMode.value === 'specific' ? 'specific' : pageMode.value),
+  set: (value) => {
+    videoMode.value = value === 'specific' ? 'specific' : 'scan'
+    if (value !== 'specific') pageMode.value = value
+  },
+})
+const specificPage = ref(1)
+const specificPositions = ref([])
+const urlDropping = ref(false)
+
+const parsedLinks = computed(() => parseVideoLinks(form.urlsText))
+const parsedUrls = computed(() => parsedLinks.value.urls)
+const ignoredLinksText = computed(() => {
+  const { invalid, duplicates } = parsedLinks.value
+  return [
+    invalid && `${invalid} 条无效内容`,
+    duplicates && `${duplicates} 条重复链接`,
+  ].filter(Boolean).join('、')
+})
+const cannotSubmit = computed(() =>
+  submitting.value || (sourceTab.value === 'urls' && parsedUrls.value.length === 0)
+)
+
+const selectedQualities = computed(() =>
+  new Set(
+    form.quality
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+  )
+)
+
+function toggleQuality(quality) {
+  const selected = new Set(selectedQualities.value)
+  if (selected.has(quality)) selected.delete(quality)
+  else selected.add(quality)
+  form.quality = Array.from(selected)
+    .sort((a, b) => Number(b) - Number(a))
+    .join(',')
+}
+
+function clearQuality() {
+  form.quality = ''
+}
+
+watch([pageMode, pageStart, pageEnd], () => {
+  if (pageMode.value === 'all') {
+    form.pages = ''
+    return
+  }
+  const start = Math.max(1, Number(pageStart.value) || 1)
+  const end = Math.max(start, Number(pageEnd.value) || start)
+  pageStart.value = start
+  pageEnd.value = end
+  form.pages = start === end ? String(start) : `${start}-${end}`
+})
+
+function parseSpecificDraft(raw, currentTags) {
+  const { tags, invalidFound } = parseSpecificVideoDraft(raw, currentTags, specificPage.value)
+  if (invalidFound) {
+    store.notify('序号格式应为 1,3-5', 'warning')
+    if (tags.length === currentTags.length) return false
+  }
+  return tags
+}
+
+watch([videoMode, specificPage, specificPositions], () => {
+  if (videoMode.value !== 'specific') {
+    form.videos = ''
+    if (pageMode.value === 'all') {
+      form.pages = ''
+    } else {
+      const start = Math.max(1, Number(pageStart.value) || 1)
+      const end = Math.max(start, Number(pageEnd.value) || start)
+      form.pages = start === end ? String(start) : `${start}-${end}`
+    }
+    return
+  }
+  const page = Math.max(1, Number(specificPage.value) || 1)
+  specificPage.value = page
+  form.pages = ''
+  form.videos = serializeSpecificVideoSpecs(specificPositions.value, page)
+})
+
+const form = reactive({
+  usernames: '',
+  target_type: 'auto',
+  urlsText: '',
+  group_by_uploader: true,
+  batch_name: 'url_batch',
+  quality: '',
+  pages: '',
+  videos: '',
+  keywords: [],
+  exclude_keywords: [],
+  redownload: false,
+  auto_upload:
+    typeof store.overview?.uploader_enabled === 'boolean'
+      ? store.overview.uploader_enabled
+      : true,
+  export_only: false,
+})
+
+const activeFilterCount = computed(() => {
+  const base = [form.quality, form.keywords.length, form.exclude_keywords.length]
+  if (sourceTab.value === 'target') {
+    base.push(form.pages, form.videos)
+  }
+  return base.filter((value) => (typeof value === 'number' ? value > 0 : String(value || '').trim().length > 0)).length
+})
+
+const showTempBanner = computed(
+  () => !store.overview?.running && store.tempFiles.length > 0
+)
+const legacyTempCount = computed(() => store.tempFiles.filter((file) => !file.verified_checkpoint).length)
+
+const recentJobs = computed(() => store.jobs.slice(0, 5))
+const brokenRecentAvatars = ref(new Set())
+const RECENT_CATEGORY_ICONS = {
+  download: Download,
+  link: Link2,
+  file: FileText,
+  refresh: RefreshCw,
+  zap: Zap,
+  search: Search,
+  database: Database,
+  rotate: RotateCcw,
+  sparkles: Sparkles,
+}
+
+function isRecentAvatarValid(entry) {
+  return Boolean(entry?.avatarUrl) && !brokenRecentAvatars.value.has(entry.avatarUrl)
+}
+
+function markRecentAvatarBroken(url) {
+  if (!url || brokenRecentAvatars.value.has(url)) return
+  const next = new Set(brokenRecentAvatars.value)
+  next.add(url)
+  brokenRecentAvatars.value = next
+}
+
+const recentJobCards = computed(() =>
+  recentJobs.value.map((job) => {
+    const visual = resolveJobVisual(job, store.targetsCache || [])
+    const metrics = computeJobLiveMetrics(job, store.liveProgress, store.jobItems[job.id])
+    const isActive = ['queued', 'scanning', 'running'].includes(job.status)
+    return {
+      job,
+      visual,
+      metrics,
+      isActive,
+      icon: RECENT_CATEGORY_ICONS[visual.category.icon] || Download,
+    }
+  })
+)
+const quickTargets = computed(() =>
+  (store.targetsCache || []).filter((target) => target.enabled).slice(0, 5)
+)
+
+function targetName(target) {
+  if (target.target_type === 'liked') return 'Liked Videos'
+  return (target.display_name || '').trim() || target.username
+}
+
+function isQuickTargetSelected(target) {
+  return target.target_type === 'liked'
+    ? form.target_type === 'liked'
+    : form.target_type === target.target_type && form.usernames === target.username
+}
+
+function fillQuickTarget(target) {
+  sourceTab.value = 'target'
+  form.target_type = target.target_type === 'liked' ? 'liked' : target.target_type
+  form.usernames = target.target_type === 'liked' ? '' : target.username
+}
+
+let activatedOnce = false
+
+onActivated(async () => {
+  if (!activatedOnce) {
+    activatedOnce = true
+    if (
+      store.hydratedFromCache &&
+      store.jobsLoaded &&
+      store.tempFilesLoaded &&
+      store.targetsCache !== null
+    ) {
+      return
+    }
+    const tasks = []
+    if (!store.overviewLoaded) tasks.push(store.refreshOverview())
+    if (!store.jobsLoaded || Date.now() - store.jobsLoadedAt > 3000) {
+      tasks.push(store.refreshJobs())
+    }
+    if (store.targetsCache === null) {
+      tasks.push(store.ensureTargets())
+    }
+    if (!store.tempFilesLoaded || Date.now() - store.tempFilesLoadedAt > 1500) {
+      tasks.push(store.refreshTempFiles())
+    }
+    if (tasks.length > 0) {
+      await Promise.all(tasks)
+    }
+    if (store.overview && typeof store.overview.uploader_enabled === 'boolean') {
+      form.auto_upload = store.overview.uploader_enabled
+    }
+    return
+  }
+  store.refreshJobs()
+  store.refreshTempFiles()
+})
+
+function importTxtFile(file) {
+  if (!file) return
+  if (!file.name.toLowerCase().endsWith('.txt')) {
+    store.notify('请选择 .txt 文件', 'warning')
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    const content = String(reader.result || '').trim()
+    if (content) {
+      form.urlsText = form.urlsText ? `${form.urlsText}\n${content}` : content
+      form.batch_name = file.name.replace(/\.txt$/i, '') || 'url_batch'
+      store.notify(`已导入 ${file.name}`, 'success')
+    }
+  }
+  reader.onerror = () => store.notify('无法读取 TXT 文件，请重试', 'error')
+  reader.readAsText(file, 'utf-8')
+}
+
+function handleTxtFileChange(evt) {
+  importTxtFile(evt.target.files?.[0])
+  evt.target.value = ''
+}
+
+function handleTxtDrop(evt) {
+  urlDropping.value = false
+  importTxtFile(evt.dataTransfer?.files?.[0])
+}
+
+function clearUrls() {
+  form.urlsText = ''
+}
+
+function handleSubsPicked(picked) {
+  const names = picked.map((p) => p.username)
+  const existing = form.usernames
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const merged = Array.from(new Set([...existing, ...names]))
+  form.usernames = merged.join(', ')
+  form.target_type = 'auto'
+  sourceTab.value = 'target'
+}
+
+async function submitDownload() {
+  if (cannotSubmit.value) {
+    if (!submitting.value) store.notify('请粘贴或导入至少一条有效视频链接', 'warning')
+    return
+  }
+  if (sourceTab.value === 'target' && videoMode.value === 'specific' && !form.videos) {
+    store.notify('请填写要下载的页码和页内视频序号', 'warning')
+    return
+  }
+  submitting.value = true
+  try {
+    const payload = {
+      source_mode: sourceTab.value,
+      quality: form.quality.trim(),
+      keywords: form.keywords.join(','),
+      exclude_keywords: form.exclude_keywords.join(','),
+      redownload: !form.export_only && form.redownload,
+      auto_upload: !form.export_only && form.auto_upload,
+      export_only: form.export_only,
+    }
+    if (sourceTab.value === 'target') {
+      payload.pages = form.pages.trim()
+      payload.videos = form.videos.trim()
+      payload.usernames = form.usernames
+        .split(/[\s,，]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+      payload.target_type = form.target_type
+    } else {
+      payload.urls = parsedUrls.value
+      payload.group_by_uploader = form.group_by_uploader
+      payload.batch_name = form.batch_name.trim() || 'url_batch'
+    }
+
+    const res = await api.createJob(payload)
+    store.notify(`任务 #${res.job.id} 已加入队列`, 'success')
+    await store.refreshJobs()
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function triggerQuickAutoUpdate() {
+  triggeringAuto.value = true
+  try {
+    const [res] = await Promise.all([
+      api.runUpdate({ auto_download: true }),
+      new Promise((r) => setTimeout(r, 550)),
+    ])
+    store.notify(`已启动全量追更任务 #${res.job.id}`, 'success')
+    await store.refreshJobs()
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    triggeringAuto.value = false
+  }
+}
+
+async function handleResumeTemp() {
+  if (tempAction.value) return
+  tempAction.value = 'resume'
+  try {
+    const res = await api.resumeTempFiles()
+    store.notify(`已创建断点续传任务 #${res.job.id}`, 'success')
+    await Promise.all([store.refreshJobs(), store.refreshTempFiles()])
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    tempAction.value = ''
+  }
+}
+
+async function handleClearTemp() {
+  if (tempAction.value) return
+  tempAction.value = 'clear'
+  try {
+    const res = await api.clearTempFiles()
+    store.notify(`已清理 ${res.removed} 个临时文件`, 'info')
+    await store.refreshTempFiles()
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    tempAction.value = ''
+  }
+}
+</script>
+
+<template>
+  <div class="download-page">
+    <!-- Page Heading with tinted brand icon badge -->
+    <div class="download-heading flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-3.5">
+        <div
+          class="w-10 h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+        >
+          <Download class="w-5 h-5" />
+        </div>
+        <div>
+          <h1 class="text-xl font-bold tracking-tight text-foreground">新建下载</h1>
+          <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
+            按用户名或视频链接创建任务，提交后可在侧边栏“任务队列”查看实时进度
+          </p>
+        </div>
+      </div>
+      <Button variant="outline" size="sm" :disabled="triggeringAuto" @click="triggerQuickAutoUpdate">
+        <RefreshCw :class="['w-3.5 h-3.5', triggeringAuto ? 'animate-spin text-brand' : '']" />
+        立即全量追更
+      </Button>
+    </div>
+
+    <!-- Elevated Semantic KPI Grid (inspired by rust-srec Dashboard) -->
+    <div class="overview-grid grid grid-cols-1 sm:grid-cols-3 gap-4">
+      <Card class="overview-card">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-semibold tracking-wide text-muted-foreground">引擎状态</span>
+          <span
+            class="overview-icon"
+            :class="[
+              'w-8 h-8 rounded-full flex items-center justify-center shrink-0',
+              store.overview?.running
+                ? 'bg-brand/12 text-brand'
+                : 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400',
+            ]"
+          >
+            <Activity class="w-4 h-4" />
+          </span>
+        </div>
+        <div class="overview-value flex items-center gap-2.5">
+          <span
+            :class="[
+              'w-2.5 h-2.5 rounded-full shrink-0',
+              store.overview?.running
+                ? 'bg-brand status-dot-glow-brand animate-pulse'
+                : 'bg-emerald-500 status-dot-glow-emerald',
+            ]"
+          />
+          <span class="overview-number font-bold tracking-tight text-foreground">
+            {{ store.overview?.running ? '运行中' : '空闲就绪' }}
+          </span>
+          <Badge
+            v-if="store.overview?.queued_count"
+            variant="secondary"
+            class="tabular-nums"
+          >
+            排队 {{ store.overview.queued_count }}
+          </Badge>
+        </div>
+        <p class="text-xs text-muted-foreground mt-1.5">
+          {{ store.overview?.running ? '当前有任务正在后台高速执行' : '引擎健康，随时可接收新任务' }}
+        </p>
+      </Card>
+
+      <Card class="overview-card">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-semibold tracking-wide text-muted-foreground">下次定时追更</span>
+          <span class="overview-icon w-8 h-8 rounded-full bg-secondary text-foreground flex items-center justify-center shrink-0">
+            <Clock class="w-4 h-4" />
+          </span>
+        </div>
+        <div class="overview-value font-bold tracking-tight text-foreground tabular-nums truncate">
+          {{
+            store.overview?.schedule?.enabled
+              ? formatDateTime(store.overview?.schedule?.next_run_at).slice(5)
+              : '已暂停'
+          }}
+        </div>
+        <p class="text-xs text-muted-foreground mt-1.5 tabular-nums">
+          已启用 <strong class="text-foreground font-medium">{{ store.overview?.targets_enabled ?? 0 }}</strong> / {{ store.overview?.targets_total ?? 0 }} 个监控目标
+        </p>
+      </Card>
+
+      <Card class="overview-card">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-semibold tracking-wide text-muted-foreground">已上传云端</span>
+          <span class="overview-icon w-8 h-8 rounded-full bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+            <CloudUpload class="w-4 h-4" />
+          </span>
+        </div>
+        <div class="overview-value font-bold tracking-tight text-foreground tabular-nums">
+          {{ store.overview?.videos?.uploaded ?? 0 }}
+        </div>
+        <p class="text-xs text-muted-foreground mt-1.5 tabular-nums">
+          去重索引总计 <strong class="text-foreground font-medium">{{ store.overview?.videos?.total ?? 0 }}</strong> 条记录
+        </p>
+      </Card>
+    </div>
+
+    <!-- Temp Resume Notice (only shown when idle, never during active download!) -->
+    <div
+      v-if="showTempBanner"
+      class="temp-notice rounded-xl border border-amber-500/30 bg-amber-500/8 px-3.5 py-2 flex flex-wrap items-center gap-2.5"
+    >
+      <span
+        class="w-8 h-8 rounded-full bg-amber-500/12 text-amber-600 dark:text-amber-400 flex items-center justify-center shrink-0"
+        aria-hidden="true"
+      >
+        <TriangleAlert class="w-4 h-4" />
+      </span>
+      <div class="min-w-0 flex-1 text-xs leading-5 text-foreground">
+        检测到 <strong class="font-semibold tabular-nums text-amber-600 dark:text-amber-400">{{ store.tempFiles.length }}</strong> 个未完成的下载。
+        <span v-if="legacyTempCount > 0">{{ legacyTempCount }} 个缺少续传校验记录，重新下载时会保留原断点。</span>
+        <span v-else>源文件校验一致时，将从断点继续。</span>
+      </div>
+      <div class="flex w-full sm:w-auto shrink-0 items-center justify-end gap-2">
+        <Button size="xs" :disabled="Boolean(tempAction)" @click="handleResumeTemp">
+          <Loader2 v-if="tempAction === 'resume'" class="w-3.5 h-3.5 animate-spin" />
+          <RotateCcw v-else class="w-3.5 h-3.5" />
+          恢复未完成下载
+        </Button>
+        <ConfirmPopover
+          :title="`确定清空全部 ${store.tempFiles.length} 个未完成临时文件？`"
+          confirm-text="清空"
+          @confirm="handleClearTemp"
+        >
+          <Button variant="outline" size="xs" :disabled="Boolean(tempAction)">
+            <Trash2 class="w-3.5 h-3.5" />
+            清空
+          </Button>
+        </ConfirmPopover>
+      </div>
+    </div>
+
+    <div class="download-workspace">
+      <Card class="composer-card">
+        <div class="workspace-card-header">
+          <div>
+            <h2 class="text-[15px] font-semibold tracking-tight text-foreground">新建下载任务</h2>
+            <p class="text-xs text-muted-foreground mt-0.5">按用户名批量抓取，或粘贴视频链接 / 导入 TXT</p>
+          </div>
+          <Tabs v-model="sourceTab" :items="sourceTabs" />
+        </div>
+
+        <form class="composer-form" @submit.prevent="submitDownload">
+          <div class="composer-body">
+            <!-- Both sources remain in the same grid cell so switching never changes its size. -->
+            <div class="mode-panels source-panels">
+              <div
+                :class="['mode-panel target-panel', { 'mode-panel-inactive': sourceTab !== 'target' }]"
+                :inert="sourceTab !== 'target'"
+                :aria-hidden="sourceTab !== 'target'"
+              >
+                <div class="target-source">
+                  <div class="username-field field">
+                    <div class="field-heading">
+                      <label for="download-usernames">用户名</label>
+                      <span>多个以逗号或空格分隔</span>
+                    </div>
+                    <Input
+                      id="download-usernames"
+                      v-model="form.usernames"
+                      :disabled="form.target_type === 'liked'"
+                      :placeholder="form.target_type === 'liked' ? 'Liked 模式无需输入用户名' : '例如: blowketing, candy-love'"
+                    />
+                  </div>
+                  <div class="field">
+                    <div class="field-heading"><label>目标类型</label></div>
+                    <Select v-model="form.target_type" :options="targetTypeOptions" aria-label="目标类型" />
+                  </div>
+                  <Button
+                    variant="outline"
+                    class="subscription-picker text-xs"
+                    :disabled="form.target_type === 'liked'"
+                    @click="subsModalOpen = true"
+                  >
+                    <Users class="w-3.5 h-3.5" />
+                    从订阅勾选
+                  </Button>
+                </div>
+
+                <div v-if="quickTargets.length > 0" class="quick-targets">
+                  <span class="text-[11px] text-muted-foreground shrink-0">快速填入</span>
+                  <Button
+                    v-for="target in quickTargets"
+                    :key="target.id"
+                    variant="outline"
+                    size="xs"
+                    :aria-pressed="isQuickTargetSelected(target)"
+                    :class="[
+                      'h-[26px] min-w-0 gap-1.5 rounded-full px-2 text-[11px] shadow-none hover:shadow-none',
+                      isQuickTargetSelected(target)
+                        ? 'border-brand/40 bg-brand/10 text-brand hover:border-brand/40 hover:bg-brand/10'
+                        : 'border-border text-muted-foreground hover:text-foreground',
+                    ]"
+                    @click="fillQuickTarget(target)"
+                  >
+                    <img
+                      v-if="target.avatar_url"
+                      :src="target.avatar_url"
+                      alt=""
+                      aria-hidden="true"
+                      class="w-4 h-4 rounded-full object-cover bg-secondary"
+                      loading="lazy"
+                      referrerpolicy="no-referrer"
+                    />
+                    <span v-else class="w-4 h-4 rounded-full bg-secondary flex items-center justify-center text-[9px]">
+                      {{ targetName(target).slice(0, 1).toUpperCase() }}
+                    </span>
+                    <span class="max-w-24 truncate" :title="targetName(target)">{{ targetName(target) }}</span>
+                  </Button>
+                </div>
+              </div>
+
+              <div
+                :class="['mode-panel url-panel', { 'mode-panel-inactive': sourceTab !== 'urls' }]"
+                :inert="sourceTab !== 'urls'"
+                :aria-hidden="sourceTab !== 'urls'"
+              >
+                <div class="url-source">
+                  <div class="field min-w-0">
+                    <div class="field-heading">
+                      <label for="download-urls">视频链接</label>
+                      <Badge variant="secondary" class="px-2 py-0 text-[10px] tabular-nums" aria-live="polite">已识别 {{ parsedUrls.length }}</Badge>
+                      <button v-if="form.urlsText" type="button" class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer" @click="clearUrls">清空</button>
+                    </div>
+                    <Textarea
+                      id="download-urls"
+                      v-model="form.urlsText"
+                      :rows="2"
+                      placeholder="每行粘贴一个视频页链接&#10;https://www.pornhub.com/view_video.php?viewkey=..."
+                      class="url-textarea font-mono text-xs"
+                    />
+                    <p class="source-note">
+                      {{ ignoredLinksText ? `已忽略 ${ignoredLinksText}。` : '支持 view_video、embed 和 shorties 链接，重复视频自动去重。' }}
+                    </p>
+                  </div>
+
+                  <Button
+                    variant="outline"
+                    :class="['txt-dropzone', urlDropping ? 'border-brand/50 bg-brand/5' : 'border-dashed bg-surface-subtle']"
+                    @click="txtInputRef?.click()"
+                    @dragover.prevent="urlDropping = true"
+                    @dragleave.prevent="urlDropping = false"
+                    @drop.prevent="handleTxtDrop"
+                  >
+                    <Upload class="w-4 h-4 text-muted-foreground" />
+                    <span class="text-xs font-medium">导入 TXT 文件</span>
+                    <span class="text-[10px] text-muted-foreground">拖入文件或点击选择</span>
+                  </Button>
+                  <input ref="txtInputRef" type="file" accept=".txt" class="hidden" @change="handleTxtFileChange" />
+                </div>
+
+                <div v-if="parsedUrls.length > 0" class="url-preview">
+                  <div class="field-heading">
+                    <span>链接预览</span>
+                    <span v-if="parsedUrls.length > 4" class="ml-auto">另有 {{ parsedUrls.length - 4 }} 条链接</span>
+                  </div>
+                  <div class="preview-grid">
+                    <div v-for="(url, index) in parsedUrls.slice(0, 4)" :key="index" class="preview-url">
+                      <span class="shrink-0 tabular-nums">{{ index + 1 }}</span>
+                      <span class="truncate font-mono" :title="url">{{ url }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="download-options">
+              <label :class="{ 'download-option-disabled': form.export_only }" :title="form.export_only ? '仅导出链接时不执行下载或上传' : undefined">
+                <Switch v-model="form.auto_upload" :disabled="form.export_only" />
+                <span>自动 rclone 上传并删本地</span>
+              </label>
+              <label :class="{ 'download-option-disabled': form.export_only }" :title="form.export_only ? '仅导出链接时不执行下载或上传' : undefined">
+                <Switch v-model="form.redownload" :disabled="form.export_only" />
+                <span>强制重下已记录</span>
+              </label>
+              <label>
+                <Switch v-model="form.export_only" />
+                <span>仅导出视频页链接 TXT</span>
+              </label>
+            </div>
+
+            <div
+              id="download-advanced-filters"
+              :class="['advanced-filters', { 'advanced-filters-collapsed': !showAdvanced }]"
+              :inert="!showAdvanced"
+            >
+              <div class="filters-clip">
+                <!-- The common fields keep the same two rows and columns for both sources. -->
+                <div class="filter-grid">
+                  <div class="field quality-field">
+                    <div class="field-heading">
+                      <label>画质偏好</label>
+                      <span>默认最高，可多选</span>
+                    </div>
+                    <div class="quality-choices">
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        class="quality-choice"
+                        :aria-pressed="form.quality === ''"
+                        @click="clearQuality"
+                      >自动最高</Button>
+                      <Button
+                        v-for="quality in qualityChoices"
+                        :key="quality"
+                        variant="outline"
+                        size="xs"
+                        class="quality-choice font-mono"
+                        :aria-pressed="selectedQualities.has(quality)"
+                        @click="toggleQuality(quality)"
+                      >{{ quality }}p</Button>
+                    </div>
+                  </div>
+
+                  <div class="mode-panels scope-panels">
+                    <div
+                      :class="['mode-panel field', { 'mode-panel-inactive': sourceTab !== 'target' }]"
+                      :inert="sourceTab !== 'target'"
+                      :aria-hidden="sourceTab !== 'target'"
+                    >
+                      <div class="field-heading">
+                        <label>下载范围</label>
+                        <span>{{ downloadScope === 'specific' ? '页码 / 页内序号' : downloadScope === 'range' ? '含起止页，单页填相同页码' : '扫描全部视频列表' }}</span>
+                      </div>
+                      <div class="scope-controls">
+                        <Select v-model="downloadScope" :options="scopeOptions" class="text-xs px-2" aria-label="下载范围" />
+                        <div class="mode-panels">
+                          <div :class="['mode-panel scope-all', { 'mode-panel-inactive': downloadScope !== 'all' }]" :inert="downloadScope !== 'all'" :aria-hidden="downloadScope !== 'all'">
+                            从第 1 页扫描至末页
+                          </div>
+                          <div :class="['mode-panel scope-range', { 'mode-panel-inactive': downloadScope !== 'range' }]" :inert="downloadScope !== 'range'" :aria-hidden="downloadScope !== 'range'">
+                            <Input v-model="pageStart" type="number" :min="1" class="min-w-0 px-2 text-xs" aria-label="起始页码" />
+                            <span class="text-[11px] text-muted-foreground">至</span>
+                            <Input v-model="pageEnd" type="number" :min="1" class="min-w-0 px-2 text-xs" aria-label="结束页码" />
+                          </div>
+                          <div :class="['mode-panel scope-specific', { 'mode-panel-inactive': downloadScope !== 'specific' }]" :inert="downloadScope !== 'specific'" :aria-hidden="downloadScope !== 'specific'">
+                            <Input v-model="specificPage" type="number" :min="1" class="min-w-0 px-2 text-xs" title="页码" aria-label="指定视频页码" />
+                            <TagsInput
+                              v-model="specificPositions"
+                              :commit-keys="['Enter', ';', '；']"
+                              :parse-draft="parseSpecificDraft"
+                              placeholder="序号，如 1,3-5"
+                              class="filter-tags scope-positions py-1"
+                              title="输入页内序号（如 1,3-5）回车，切换左侧页码可叠加多页"
+                              aria-label="页内视频序号"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div
+                      :class="['mode-panel field', { 'mode-panel-inactive': sourceTab !== 'urls' }]"
+                      :inert="sourceTab !== 'urls'"
+                      :aria-hidden="sourceTab !== 'urls'"
+                    >
+                      <div class="field-heading">
+                        <label>保存目录</label>
+                        <span>{{ form.group_by_uploader ? '自动按上传者分组' : '统一保存到批次目录' }}</span>
+                      </div>
+                      <div class="scope-controls">
+                        <label class="uploader-group">
+                          <Switch v-model="form.group_by_uploader" aria-label="按上传者自动分组" />
+                          <span>按上传者</span>
+                        </label>
+                        <Input v-model="form.batch_name" :disabled="form.group_by_uploader" placeholder="批次目录名" class="min-w-0 text-xs" aria-label="统一批次目录名" />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="field include-field">
+                    <div class="field-heading">
+                      <label>标题包含关键词</label>
+                      <span>任一命中才保留</span>
+                    </div>
+                    <TagsInput v-model="form.keywords" placeholder="输入关键词后按回车" class="filter-tags py-1" />
+                  </div>
+
+                  <div class="field exclude-field">
+                    <div class="field-heading">
+                      <label>标题排除关键词</label>
+                      <span>任一命中即跳过</span>
+                    </div>
+                    <TagsInput v-model="form.exclude_keywords" placeholder="输入关键词后按回车" class="filter-tags py-1" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="composer-footer">
+            <Button
+              variant="ghost"
+              size="sm"
+              class="text-muted-foreground hover:text-foreground"
+              :aria-expanded="showAdvanced"
+              aria-controls="download-advanced-filters"
+              @click="showAdvanced = !showAdvanced"
+            >
+              <SlidersHorizontal class="w-3.5 h-3.5" />
+              高级过滤
+              <Badge v-if="activeFilterCount > 0" variant="secondary" class="px-1.5 py-0 text-[10px] tabular-nums">{{ activeFilterCount }}</Badge>
+              <ChevronDown :class="['w-3.5 h-3.5 transition-transform', showAdvanced ? 'rotate-180' : '']" />
+            </Button>
+            <Button type="submit" size="sm" class="px-5" :disabled="cannotSubmit">
+              <Loader2 v-if="submitting" class="w-3.5 h-3.5 animate-spin" />
+              <Play v-else class="w-3.5 h-3.5" />
+              {{ form.export_only ? '导出页面链接' : '加入下载队列' }}
+            </Button>
+          </div>
+        </form>
+      </Card>
+
+      <aside class="recent-tasks min-w-0 flex">
+        <Card class="recent-card flex flex-col w-full overflow-hidden">
+          <div class="workspace-card-header flex items-center justify-between gap-2 border-b border-border">
+            <div class="flex items-center gap-2.5">
+              <span class="w-7 h-7 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                <ListChecks class="w-3.5 h-3.5" />
+              </span>
+              <h2 class="text-[15px] font-semibold tracking-tight text-foreground">最近任务</h2>
+            </div>
+            <RouterLink to="/jobs" class="inline-flex items-center gap-0.5 text-[11px] font-medium text-muted-foreground hover:text-foreground no-underline">
+              查看全部
+              <ChevronRight class="w-3 h-3" />
+            </RouterLink>
+          </div>
+
+          <div v-if="recentJobCards.length > 0" class="recent-list flex-1 flex flex-col gap-2">
+            <RouterLink
+              v-for="entry in recentJobCards"
+              :key="entry.job.id"
+              :to="{ name: 'jobs', query: { job: entry.job.id } }"
+              class="recent-job flex flex-col justify-center min-w-0 rounded-xl border border-border bg-card px-3 py-2.5 no-underline transition-colors hover:border-brand/30 hover:bg-accent/40"
+            >
+              <div class="flex items-center gap-2.5 min-w-0">
+                <div class="w-8 h-8 shrink-0 relative">
+                  <template v-if="entry.visual.avatars.length >= 1">
+                    <div
+                      v-if="entry.visual.avatars[0].isLiked"
+                      class="w-8 h-8 rounded-full bg-gradient-to-br from-rose-500 to-pink-600 text-white flex items-center justify-center"
+                    >
+                      <Heart class="w-3.5 h-3.5 fill-white/95" />
+                    </div>
+                    <img
+                      v-else-if="isRecentAvatarValid(entry.visual.avatars[0])"
+                      :src="entry.visual.avatars[0].avatarUrl"
+                      :alt="entry.visual.avatars[0].name"
+                      class="w-8 h-8 rounded-full object-cover bg-secondary ring-1 ring-border/70"
+                      loading="lazy"
+                      referrerpolicy="no-referrer"
+                      @error="markRecentAvatarBroken(entry.visual.avatars[0].avatarUrl)"
+                    />
+                    <div
+                      v-else
+                      :class="[
+                        'w-8 h-8 rounded-full bg-gradient-to-br text-white flex items-center justify-center text-[11px] font-semibold',
+                        avatarGradient(entry.visual.avatars[0].name),
+                      ]"
+                    >
+                      {{ entry.visual.avatars[0].name.slice(0, 1).toUpperCase() }}
+                    </div>
+                  </template>
+                  <div
+                    v-else
+                    :class="['w-8 h-8 rounded-lg flex items-center justify-center', entry.visual.category.iconClass]"
+                  >
+                    <component :is="entry.icon" class="w-3.5 h-3.5" />
+                  </div>
+                </div>
+
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-1.5 min-w-0">
+                    <span
+                      :class="[
+                        'inline-flex items-center rounded-full border px-1.5 py-0 text-[10px] leading-4 font-medium shrink-0',
+                        entry.visual.category.pillClass,
+                      ]"
+                    >
+                      {{ entry.visual.category.label }}
+                    </span>
+                    <span class="truncate text-xs font-semibold text-foreground" :title="entry.visual.title">
+                      {{ entry.visual.title }}
+                    </span>
+                    <ChevronRight class="w-3.5 h-3.5 text-muted-foreground/60 shrink-0 ml-auto" />
+                  </div>
+
+                  <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground tabular-nums">
+                    <Badge :variant="jobStatusMeta(entry.job.status).variant" :dot="jobStatusMeta(entry.job.status).dot" class="text-[10px] px-1.5 py-0 shrink-0">
+                      {{ jobStatusMeta(entry.job.status).label }}
+                    </Badge>
+                    <span class="font-mono">#{{ entry.job.id }}</span>
+                    <span>{{ entry.metrics.done }}/{{ entry.metrics.total }}</span>
+                    <span
+                      v-if="entry.isActive && entry.metrics.speedBps > 0"
+                      class="ml-auto font-mono font-semibold text-emerald-600 dark:text-emerald-400"
+                    >
+                      {{ formatSpeed(entry.metrics.speedBps) }}
+                    </span>
+                    <span v-else class="ml-auto">{{ formatDateTime(entry.job.created_at) }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <Progress
+                v-if="entry.isActive"
+                :model-value="entry.metrics.percent"
+                :indeterminate="entry.metrics.indeterminate"
+                class="mt-2 h-1"
+              />
+            </RouterLink>
+          </div>
+
+          <div v-else class="recent-empty m-4 flex-1 flex items-center justify-center rounded-xl border border-dashed border-border px-4 py-6 text-center text-xs text-muted-foreground">
+            暂无任务，提交后会在这里显示最近进度
+          </div>
+        </Card>
+      </aside>
+    </div>
+
+    <SubsPickerModal
+      :open="subsModalOpen"
+      confirm-label="填入用户名"
+      @close="subsModalOpen = false"
+      @confirm="handleSubsPicked"
+    />
+  </div>
+</template>
+
+<style scoped>
+.download-page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.overview-card {
+  position: relative;
+  min-height: 140px;
+  padding: 20px 24px;
+}
+
+.overview-icon {
+  position: absolute;
+  top: 20px;
+  right: 24px;
+  width: 36px;
+  height: 36px;
+}
+
+.overview-icon :deep(svg) {
+  width: 18px;
+  height: 18px;
+}
+
+.overview-value {
+  margin-top: 12px;
+  font-size: 32px;
+  line-height: 40px;
+}
+
+.overview-number {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.overview-card > p {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.download-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 20px;
+}
+
+.composer-card {
+  container-type: inline-size;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-card-header {
+  display: flex;
+  min-height: 64px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.composer-form {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+
+.composer-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px 20px;
+}
+
+.mode-panels {
+  display: grid;
+  min-width: 0;
+}
+
+.mode-panel {
+  grid-area: 1 / 1;
+  min-width: 0;
+  align-self: start;
+}
+
+.mode-panel-inactive {
+  /* Group opacity hides the whole subtree immediately; inherited visibility
+     would be delayed by the controls' transition-all animations. */
+  opacity: 0;
+  pointer-events: none;
+}
+
+.field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-heading {
+  display: flex;
+  min-height: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--muted-foreground);
+}
+
+.field-heading label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--foreground);
+}
+
+.target-source {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 12px;
+}
+
+.username-field {
+  grid-column: 1 / -1;
+}
+
+.quick-targets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.url-source {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.url-textarea {
+  height: 64px;
+  min-height: 64px;
+  resize: none;
+  transition-property: border-color, box-shadow;
+}
+
+.source-note {
+  font-size: 10px;
+  line-height: 15px;
+  color: var(--muted-foreground);
+}
+
+.txt-dropzone {
+  height: auto;
+  min-height: 44px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding: 10px 12px;
+}
+
+.url-preview {
+  margin-top: 8px;
+}
+
+.preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 8px;
+  margin-top: 4px;
+}
+
+.preview-url {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  padding: 4px 6px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--muted-foreground);
+}
+
+.download-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+
+.download-options label,
+.uploader-group {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.download-options .download-option-disabled {
+  color: var(--muted-foreground);
+  cursor: not-allowed;
+}
+
+.download-option-disabled > span {
+  opacity: 0.65;
+}
+
+.advanced-filters {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 180ms, opacity 180ms;
+}
+
+.advanced-filters-collapsed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.filters-clip {
+  overflow: hidden;
+}
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "quality" "scope" "include" "exclude";
+  align-items: start;
+  gap: 14px 20px;
+  padding: 3px;
+}
+
+.quality-field { grid-area: quality; }
+.scope-panels { grid-area: scope; }
+.include-field { grid-area: include; }
+.exclude-field { grid-area: exclude; }
+
+.quality-choices {
+  display: flex;
+  min-height: 36px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.quality-choice {
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--muted-foreground);
+  font-size: 11px;
+  box-shadow: none;
+}
+
+.quality-choice:hover {
+  color: var(--foreground);
+  border-color: var(--ring);
+}
+
+.quality-choice[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--brand) 40%, transparent);
+  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  color: var(--brand);
+}
+
+.scope-controls {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.scope-all {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--muted-foreground);
+}
+
+.scope-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scope-specific {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 6px;
+}
+
+.scope-positions :deep(input) {
+  min-width: 40px;
+  font-size: 12px;
+}
+
+.composer-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding: 10px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.recent-list {
+  padding: 14px;
+}
+
+.recent-job {
+  min-height: 64px;
+  padding: 8px 12px;
+}
+
+@container (min-width: 600px) {
+  .target-source {
+    grid-template-columns: minmax(0, 2fr) repeat(2, minmax(0, 1fr));
+  }
+
+  .username-field {
+    grid-column: auto;
+  }
+
+  .url-source {
+    grid-template-columns: minmax(0, 2.5fr) minmax(160px, 1fr);
+  }
+
+  .txt-dropzone {
+    flex-direction: column;
+    align-self: stretch;
+    justify-content: center;
+  }
+
+  .download-options {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas: "quality include" "scope exclude";
+  }
+}
+
+@media (min-width: 1280px) {
+  .download-workspace {
+    grid-template-columns: minmax(0, 2.3fr) minmax(280px, 1fr);
+  }
+}
+
+@media (min-width: 1280px) and (max-height: 800px) {
+  .overview-card {
+    min-height: 0;
+    padding: 8px 12px;
+  }
+
+  .overview-icon {
+    top: 12px;
+    right: 12px;
+    width: 28px;
+    height: 28px;
+  }
+
+  .overview-icon :deep(svg) {
+    width: 16px;
+    height: 16px;
+  }
+
+  .overview-value {
+    margin-top: 0;
+    font-size: 20px;
+    line-height: 22px;
+  }
+
+  .overview-card > p {
+    margin-top: 0;
+    font-size: 10px;
+    line-height: 14px;
+  }
+
+  .temp-notice {
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+
+  .temp-notice > span {
+    width: 28px;
+    height: 28px;
+  }
+
+  .workspace-card-header {
+    min-height: 56px;
+    padding: 8px 16px;
+  }
+
+  .composer-body {
+    gap: 12px;
+    padding: 12px 16px;
+  }
+
+  .url-textarea {
+    height: 56px;
+    min-height: 56px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+
+  .quick-targets {
+    margin-top: 8px;
+  }
+
+  .download-options {
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .filter-grid {
+    row-gap: 10px;
+  }
+
+  .composer-footer {
+    padding: 8px 16px;
+  }
+
+  .recent-list {
+    gap: 6px;
+    padding: 10px;
+  }
+
+  .recent-job {
+    min-height: 60px;
+    padding: 6px 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .advanced-filters {
+    transition: none;
+  }
+}
+</style>

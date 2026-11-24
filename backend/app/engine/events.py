@@ -1,0 +1,97 @@
+"""In-memory event bus for WebSocket real-time progress and structured logs."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Deque, Dict, List, Optional, Set
+
+logger = logging.getLogger("phdl")
+
+
+class EventBus:
+    def __init__(self, max_logs: int = 500) -> None:
+        self._subscribers: Set[asyncio.Queue[Dict[str, Any]]] = set()
+        self._logs: Deque[Dict[str, Any]] = deque(maxlen=max_logs)
+        self._log_seq: int = 0
+        self._live_progress: Dict[int, Dict[str, Any]] = {}
+
+    def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
+        q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=500)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[Dict[str, Any]]) -> None:
+        self._subscribers.discard(q)
+
+    def broadcast(self, event_type: str, data: Any) -> None:
+        packet = {
+            "type": event_type,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "data": data,
+        }
+        for q in list(self._subscribers):
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(packet)
+            except asyncio.QueueFull:
+                pass
+
+    def emit_log(self, level: str, message: str, job_id: Optional[int] = None) -> None:
+        lvl = (level or "INFO").upper()
+        self._log_seq += 1
+        entry = {
+            "id": self._log_seq,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "level": lvl,
+            "job_id": job_id,
+            "message": message,
+        }
+        self._logs.append(entry)
+        self.broadcast("log", entry)
+
+        py_level = getattr(logging, lvl, logging.INFO)
+        prefix = f"[Job #{job_id}] " if job_id is not None else ""
+        logger.log(py_level, f"{prefix}{message}")
+
+    def emit_item_progress(
+        self,
+        job_id: int,
+        item_id: int,
+        bytes_downloaded: int,
+        bytes_total: int,
+        speed_bps: float,
+    ) -> None:
+        payload = {
+            "job_id": job_id,
+            "item_id": item_id,
+            "bytes_downloaded": int(bytes_downloaded),
+            "bytes_total": int(bytes_total),
+            "speed_bps": round(float(speed_bps), 1),
+        }
+        self._live_progress[item_id] = payload
+        self.broadcast("item_progress", payload)
+
+    def clear_item_progress(self, item_id: int) -> None:
+        self._live_progress.pop(item_id, None)
+
+    def clear_job_progress(self, job_id: int) -> None:
+        for k in [k for k, v in self._live_progress.items() if v.get("job_id") == job_id]:
+            self._live_progress.pop(k, None)
+
+    def recent_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
+        return list(self._logs)[-limit:]
+
+    def clear_logs(self) -> None:
+        self._logs.clear()
+
+    def live_progress_snapshot(self) -> Dict[int, Dict[str, Any]]:
+        return dict(self._live_progress)

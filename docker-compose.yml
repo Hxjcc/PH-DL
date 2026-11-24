@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: phdl-backend
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PHDL_DATA_DIR=/data
+      - PHDL_ADMIN_PASSWORD=${PHDL_ADMIN_PASSWORD:?请在 .env 设置 PHDL_ADMIN_PASSWORD}
+      - PHDL_SECRET_KEY=${PHDL_SECRET_KEY:-}
+      - PHDL_COOKIE_SECURE=${PHDL_COOKIE_SECURE:-false}
+      - PHDL_ALLOWED_ORIGINS=${PHDL_ALLOWED_ORIGINS:-}
+      - PHDL_ENABLE_DOCS=${PHDL_ENABLE_DOCS:-false}
+    volumes:
+      - ./data:/data
+      - "${RCLONE_CONFIG_PATH:-./data/rclone}:/root/.config/rclone"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: phdl-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+        restart: true
+    ports:
+      - target: 80
+        published: "${PHDL_PORT:-8080}"
+        host_ip: "${PHDL_BIND_IP:-127.0.0.1}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

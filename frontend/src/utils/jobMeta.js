@@ -1,0 +1,439 @@
+import { targetTypeMeta } from './format.js'
+
+const CATEGORY_MAP = {
+  target_download: {
+    key: 'target_download',
+    group: 'download',
+    label: '目标下载',
+    icon: 'download',
+    pillClass: 'border-sky-500/25 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+    iconClass: 'bg-sky-500/12 text-sky-600 dark:text-sky-400 ring-1 ring-sky-500/20',
+  },
+  url_download: {
+    key: 'url_download',
+    group: 'download',
+    label: '链接下载',
+    icon: 'link',
+    pillClass: 'border-indigo-500/25 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300',
+    iconClass: 'bg-indigo-500/12 text-indigo-600 dark:text-indigo-400 ring-1 ring-indigo-500/20',
+  },
+  export: {
+    key: 'export',
+    group: 'download',
+    label: '链接导出',
+    icon: 'file',
+    pillClass: 'border-violet-500/25 bg-violet-500/10 text-violet-700 dark:text-violet-300',
+    iconClass: 'bg-violet-500/12 text-violet-600 dark:text-violet-400 ring-1 ring-violet-500/20',
+  },
+  auto_update: {
+    key: 'auto_update',
+    group: 'update',
+    label: '自动追更',
+    icon: 'refresh',
+    pillClass: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+    iconClass: 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 ring-1 ring-emerald-500/20',
+  },
+  targeted_update: {
+    key: 'targeted_update',
+    group: 'update',
+    label: '指定追更',
+    icon: 'zap',
+    pillClass: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+    iconClass: 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 ring-1 ring-emerald-500/20',
+  },
+  check_updates: {
+    key: 'check_updates',
+    group: 'update',
+    label: '更新检查',
+    icon: 'search',
+    pillClass: 'border-teal-500/25 bg-teal-500/10 text-teal-700 dark:text-teal-300',
+    iconClass: 'bg-teal-500/12 text-teal-600 dark:text-teal-400 ring-1 ring-teal-500/20',
+  },
+  baseline: {
+    key: 'baseline',
+    group: 'maintenance',
+    label: '基线同步',
+    icon: 'database',
+    pillClass: 'border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+    iconClass: 'bg-amber-500/12 text-amber-600 dark:text-amber-400 ring-1 ring-amber-500/20',
+  },
+  resume: {
+    key: 'resume',
+    group: 'download',
+    label: '断点续传',
+    icon: 'rotate',
+    pillClass: 'border-orange-500/25 bg-orange-500/10 text-orange-700 dark:text-orange-300',
+    iconClass: 'bg-orange-500/12 text-orange-600 dark:text-orange-400 ring-1 ring-orange-500/20',
+  },
+  retry: {
+    key: 'retry',
+    group: 'download',
+    label: '失败重试',
+    icon: 'rotate',
+    pillClass: 'border-orange-500/25 bg-orange-500/10 text-orange-700 dark:text-orange-300',
+    iconClass: 'bg-orange-500/12 text-orange-600 dark:text-orange-400 ring-1 ring-orange-500/20',
+  },
+  metadata: {
+    key: 'metadata',
+    group: 'maintenance',
+    label: '元数据补全',
+    icon: 'sparkles',
+    pillClass: 'border-purple-500/25 bg-purple-500/10 text-purple-700 dark:text-purple-300',
+    iconClass: 'bg-purple-500/12 text-purple-600 dark:text-purple-400 ring-1 ring-purple-500/20',
+  },
+}
+
+function stripKnownPrefix(rawLabel = '') {
+  let text = String(rawLabel || '').trim()
+  text = text.replace(/^(重试\/续传|续传|重试)\s*·\s*/, '')
+  text = text.replace(/\s*\(\d+\s*[项条个]\)\s*$/, '')
+  text = text.replace(
+    /^(下载目标|导出页面链接|链接下载|指定追更|指定检查更新|初始化基线|仅续传临时文件)\s*[:：]\s*/,
+    ''
+  )
+  return text.trim()
+}
+
+function buildTargetLookup(targetsList = []) {
+  const byId = new Map()
+  const byName = new Map()
+  for (const t of targetsList || []) {
+    if (!t) continue
+    if (t.id != null) byId.set(Number(t.id), t)
+    const uname = String(t.username || '').trim().toLowerCase()
+    const dname = String(t.display_name || '').trim().toLowerCase()
+    if (uname && !byName.has(uname)) byName.set(uname, t)
+    if (dname && !byName.has(dname)) byName.set(dname, t)
+  }
+  return { byId, byName }
+}
+
+function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames = {}) {
+  if (target) {
+    const isLiked = target.target_type === 'liked' || target.username === '_currentUser_'
+    const name = isLiked
+      ? '我的点赞'
+      : String(target.display_name || profileNames[target.username] || target.username || fallbackName || '').trim()
+    const username = isLiked ? '' : String(target.username || '').trim()
+    const avatarUrl = String(target.avatar_url || profileAvatars[target.username] || '').trim()
+    return {
+      key: `target-${target.id || username || name}`,
+      name: name || username || '未知目标',
+      username,
+      targetType: target.target_type || '',
+      avatarUrl,
+      isLiked,
+    }
+  }
+  const raw = String(fallbackName || '').trim()
+  const isLiked = raw.toLowerCase() === 'liked videos' || raw === '_currentUser_'
+  const displayName = isLiked ? '我的点赞' : String(profileNames[raw] || raw).trim()
+  const avatarUrl = isLiked ? '' : String(profileAvatars[raw] || '').trim()
+  return {
+    key: `raw-${raw}`,
+    name: displayName || '未知目标',
+    username: isLiked ? '' : raw,
+    targetType: isLiked ? 'liked' : '',
+    avatarUrl,
+    isLiked,
+  }
+}
+
+export function resolveJobCategory(job) {
+  const kind = job?.kind || ''
+  const params = job?.params || {}
+  const isExport = Boolean(params.export_only || job?.export_text)
+  if (isExport) return CATEGORY_MAP.export
+  if (kind === 'manual_target') return CATEGORY_MAP.target_download
+  if (kind === 'manual_urls') return CATEGORY_MAP.url_download
+  if (kind === 'auto_update') {
+    return Array.isArray(params.target_ids) && params.target_ids.length > 0
+      ? CATEGORY_MAP.targeted_update
+      : CATEGORY_MAP.auto_update
+  }
+  if (kind === 'check_updates') return CATEGORY_MAP.check_updates
+  if (kind === 'baseline_sync') return CATEGORY_MAP.baseline
+  if (kind === 'resume_temp') return CATEGORY_MAP.resume
+  if (kind === 'retry_items') {
+    const label = String(job?.label || '')
+    return label.startsWith('续传') ? CATEGORY_MAP.resume : CATEGORY_MAP.retry
+  }
+  if (kind === 'enrich_metadata') return CATEGORY_MAP.metadata
+  return CATEGORY_MAP.target_download
+}
+
+export function resolveJobVisual(job, targetsList = []) {
+  const category = resolveJobCategory(job)
+  const params = job?.params || {}
+  const profileAvatars = params.profile_avatars || {}
+  const profileNames = params.profile_names || {}
+  const { byId, byName } = buildTargetLookup(targetsList)
+
+  const avatars = []
+  const capsules = []
+  let title = ''
+
+  const pushUniqueAvatar = (entry) => {
+    if (!entry || !entry.name) return
+    if (avatars.some((x) => x.name.toLowerCase() === entry.name.toLowerCase())) return
+    avatars.push(entry)
+  }
+
+  const kind = job?.kind || ''
+
+  if (kind === 'manual_target') {
+    if (params.target_type === 'liked') {
+      const likedTarget = Array.from(byId.values()).find((t) => t.target_type === 'liked')
+      pushUniqueAvatar(makeAvatarEntry(likedTarget, 'Liked Videos', profileAvatars, profileNames))
+      title = '我的点赞视频'
+    } else {
+      const usernames = Array.isArray(params.usernames) ? params.usernames.filter(Boolean) : []
+      for (const u of usernames) {
+        const matched = byName.get(String(u).trim().toLowerCase())
+        pushUniqueAvatar(makeAvatarEntry(matched, u, profileAvatars, profileNames))
+      }
+      if (avatars.length === 1) {
+        title = avatars[0].name
+        if (avatars[0].username && avatars[0].username.toLowerCase() !== avatars[0].name.toLowerCase()) {
+          capsules.push({ text: `@${avatars[0].username}`, mono: true })
+        }
+        const tType = avatars[0].targetType || (params.target_type !== 'auto' ? params.target_type : '')
+        if (tType && tType !== 'auto') {
+          capsules.push({ text: targetTypeMeta(tType) })
+        }
+      } else if (avatars.length > 1) {
+        title = avatars.slice(0, 2).map((a) => a.name).join('、')
+        if (avatars.length > 2) {
+          capsules.push({ text: `共 ${avatars.length} 个目标` })
+        }
+      } else {
+        title = stripKnownPrefix(job?.label) || '目标下载'
+      }
+    }
+    if (params.pages) {
+      const p = String(params.pages).trim()
+      capsules.push({ text: p.toLowerCase() === 'all' ? '全部页' : `第 ${p} 页`, mono: true })
+    } else if (params.videos) {
+      capsules.push({ text: `指定序号 ${params.videos}`, mono: true })
+    }
+  } else if (kind === 'manual_urls') {
+    const urlCount = Array.isArray(params.urls) ? params.urls.length : 0
+    title = params.group_by_uploader === false && params.batch_name
+      ? params.batch_name
+      : '直链批量队列'
+    if (urlCount > 0) {
+      capsules.push({ text: `${urlCount} 条链接`, mono: true })
+    }
+    if (params.group_by_uploader) {
+      capsules.push({ text: '按博主归档' })
+    }
+  } else if (kind === 'auto_update' || kind === 'check_updates') {
+    const targetIds = Array.isArray(params.target_ids) ? params.target_ids : []
+    if (targetIds.length > 0) {
+      for (const tid of targetIds) {
+        const matched = byId.get(Number(tid))
+        if (matched) pushUniqueAvatar(makeAvatarEntry(matched, matched.username, profileAvatars, profileNames))
+      }
+      if (avatars.length === 1) {
+        title = avatars[0].name
+        if (avatars[0].username && avatars[0].username.toLowerCase() !== avatars[0].name.toLowerCase()) {
+          capsules.push({ text: `@${avatars[0].username}`, mono: true })
+        }
+        if (avatars[0].targetType) {
+          capsules.push({ text: targetTypeMeta(avatars[0].targetType) })
+        }
+      } else if (avatars.length > 1) {
+        title = avatars.slice(0, 2).map((a) => a.name).join('、')
+        if (targetIds.length > 2) capsules.push({ text: `共 ${targetIds.length} 个目标` })
+      } else {
+        title = stripKnownPrefix(job?.label) || `${targetIds.length} 个指定目标`
+      }
+    } else {
+      const enabledTargets = (targetsList || []).filter((t) => t && t.enabled)
+      for (const t of enabledTargets.slice(0, 3)) {
+        pushUniqueAvatar(makeAvatarEntry(t, t.username, profileAvatars, profileNames))
+      }
+      title = kind === 'auto_update' ? '全量监控目标' : '全量目标更新检查'
+      if (enabledTargets.length > 0) {
+        capsules.push({ text: `${enabledTargets.length} 个启用目标` })
+      }
+    }
+  } else if (kind === 'baseline_sync') {
+    const matched = params.target_id != null ? byId.get(Number(params.target_id)) : null
+    const rawClean = stripKnownPrefix(job?.label).replace(/\s*\([^)]+\)\s*$/, '').trim()
+    const fallbackMatch = !matched && rawClean ? byName.get(rawClean.toLowerCase()) : null
+    const targetObj = matched || fallbackMatch
+    if (targetObj || rawClean) {
+      pushUniqueAvatar(makeAvatarEntry(targetObj, rawClean, profileAvatars, profileNames))
+    }
+    title = avatars[0]?.name || rawClean || '基线初始化'
+    if (avatars[0]?.targetType) {
+      capsules.push({ text: targetTypeMeta(avatars[0].targetType) })
+    }
+    const pages = String(params.pages || '').trim()
+    capsules.push({ text: !pages || pages.toLowerCase() === 'all' ? '全量页码' : `第 ${pages} 页`, mono: true })
+  } else if (kind === 'retry_items' || kind === 'resume_temp') {
+    const baseLabel = stripKnownPrefix(params.origin_label || job?.label || '')
+    const candidateName = baseLabel.split(',')[0]?.trim() || ''
+    const matched = candidateName ? byName.get(candidateName.toLowerCase()) : null
+    if (matched || (candidateName && kind === 'retry_items' && !candidateName.includes('条链接'))) {
+      pushUniqueAvatar(makeAvatarEntry(matched, candidateName, profileAvatars, profileNames))
+    }
+    title = avatars[0]?.name || baseLabel || category.label
+  } else if (kind === 'enrich_metadata') {
+    title = '基线画质与大小补全'
+  } else {
+    title = stripKnownPrefix(job?.label) || job?.kind || '任务'
+  }
+
+  if (params.quality) {
+    const qText = String(params.quality)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => (s.endsWith('p') ? s : `${s}p`))
+      .join('/')
+    if (qText) capsules.push({ text: qText, mono: true })
+  }
+
+  if (params.auto_upload === true && !params.export_only && !['baseline_sync', 'check_updates', 'enrich_metadata'].includes(kind)) {
+    capsules.push({ text: '云端上传', tone: 'emerald' })
+  }
+  if (params.redownload) {
+    capsules.push({ text: '强制重下', tone: 'amber' })
+  }
+  if (job?.trigger === 'schedule') {
+    capsules.push({ text: '定时触发', tone: 'brand' })
+  }
+  if (params.source_job_id) {
+    capsules.push({ text: `源自 #${params.source_job_id}`, mono: true })
+  }
+
+  return {
+    category,
+    title: title || job?.label || job?.kind || '未命名任务',
+    avatars,
+    capsules,
+  }
+}
+
+export function formatDurationCompact(startedAt, finishedAt) {
+  if (!startedAt || !finishedAt) return ''
+  const s = new Date(startedAt).getTime()
+  const e = new Date(finishedAt).getTime()
+  if (Number.isNaN(s) || Number.isNaN(e) || e <= s) return ''
+  const sec = Math.max(1, Math.round((e - s) / 1000))
+  if (sec < 60) return `${sec}s`
+  const min = Math.floor(sec / 60)
+  const rem = sec % 60
+  if (min < 60) return rem > 0 ? `${min}m ${rem}s` : `${min}m`
+  const hr = Math.floor(min / 60)
+  return `${hr}h ${min % 60}m`
+}
+
+export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = null) {
+  let total = Number(job?.total_items || 0)
+  let done = Number(job?.done_items || 0)
+  let uploaded = Number(job?.uploaded_items || 0)
+  let skipped = Number(job?.skipped_items || 0)
+  let failed = Number(job?.failed_items || 0)
+  let downloadingCount = 0
+  let uploadingCount = 0
+
+  if (Array.isArray(jobItemsList) && jobItemsList.length > 0) {
+    let iDone = 0
+    let iUploaded = 0
+    let iSkipped = 0
+    let iFailed = 0
+    for (const it of jobItemsList) {
+      if (it.status === 'done') {
+        iDone += 1
+        if (job?.kind !== 'enrich_metadata') iUploaded += 1
+      } else if (it.status === 'downloaded' || it.status === 'uploading') {
+        iDone += 1
+        if (it.status === 'uploading') uploadingCount += 1
+      } else if (it.status === 'downloading') {
+        downloadingCount += 1
+      } else if (it.status === 'skipped') {
+        iSkipped += 1
+      } else if (it.status === 'failed') {
+        iFailed += 1
+      }
+    }
+    total = Math.max(total, jobItemsList.length)
+    done = Math.max(done, iDone)
+    uploaded = Math.max(uploaded, iUploaded)
+    skipped = Math.max(skipped, iSkipped)
+    failed = Math.max(failed, iFailed)
+  }
+
+  let speedBps = 0
+  let fractional = 0
+  let liveDlCount = 0
+  const jobIdNum = Number(job?.id)
+  if (liveProgressMap && jobIdNum > 0) {
+    for (const prog of Object.values(liveProgressMap)) {
+      if (!prog || Number(prog.job_id) !== jobIdNum) continue
+      liveDlCount += 1
+      if (Number(prog.speed_bps) > 0) {
+        speedBps += Number(prog.speed_bps)
+      }
+      const bDone = Number(prog.bytes_downloaded || 0)
+      const bTotal = Number(prog.bytes_total || 0)
+      if (bTotal > 0 && bDone > 0) {
+        fractional += Math.min(0.98, Math.max(0, bDone / bTotal))
+      }
+    }
+  }
+  downloadingCount = Math.max(downloadingCount, liveDlCount)
+
+  const finishedCount = done + skipped + failed
+  const isActive = ['queued', 'scanning', 'running'].includes(job?.status)
+  let percent = 0
+  if (total > 0) {
+    const effective = Math.min(total, finishedCount + (isActive ? fractional : 0))
+    const rawPct = (effective / total) * 100
+    percent = isActive && rawPct > 0 && rawPct < 99.5
+      ? Math.round(rawPct * 10) / 10
+      : Math.min(100, Math.round(rawPct))
+  } else if (job?.status === 'completed') {
+    percent = 100
+  }
+
+  const indeterminate =
+    (job?.status === 'scanning' && total === 0) ||
+    (isActive && total > 0 && uploadingCount > 0 && downloadingCount === 0 && finishedCount >= total)
+
+  let phaseText = ''
+  if (job?.status === 'queued') {
+    phaseText = '排队等待执行...'
+  } else if (job?.status === 'scanning' && total === 0) {
+    phaseText = '正在扫描页面并解析视频信息...'
+  } else if (isActive) {
+    if (downloadingCount > 0 && uploadingCount > 0) {
+      phaseText = `正在并发下载 (${downloadingCount}) · 云端上传 (${uploadingCount})`
+    } else if (downloadingCount > 0) {
+      phaseText = `正在下载 ${downloadingCount} 个视频`
+    } else if (uploadingCount > 0) {
+      phaseText = `正在校验上传 ${uploadingCount} 个视频至云端...`
+    } else {
+      phaseText = '正在准备下载队列...'
+    }
+  }
+
+  return {
+    total,
+    done,
+    uploaded,
+    skipped,
+    failed,
+    finishedCount,
+    percent,
+    speedBps,
+    downloadingCount,
+    uploadingCount,
+    indeterminate,
+    phaseText,
+    durationText: formatDurationCompact(job?.started_at, job?.finished_at),
+  }
+}

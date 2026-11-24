@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.pid
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Local configuration, credentials and runtime artifacts
+.env
+.env.*
+!.env.example
+.secret_key
+rclone.conf
+/data/
+/.local/
+/logs/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.tmp
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
