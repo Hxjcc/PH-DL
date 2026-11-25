@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Download,
@@ -14,15 +14,13 @@ import {
   X,
   PanelLeft,
   ChevronRight,
-  Sun,
-  Moon,
   UserRound,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
-import { useTheme } from '../composables/useTheme'
 import { useAuthTransition } from '../composables/useAuthTransition'
 import { formatBytes } from '../utils/format'
 import BrandMark from '../components/BrandMark.vue'
+import ThemeToggleButton from '../components/ThemeToggleButton.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
 import Progress from '../components/ui/Progress.vue'
@@ -30,7 +28,6 @@ import Progress from '../components/ui/Progress.vue'
 const route = useRoute()
 const router = useRouter()
 const store = useAppStore()
-const { isDark, toggleTheme } = useTheme()
 const { authTransition, runAuthTransition } = useAuthTransition()
 
 const collapsed = ref(false)
@@ -43,6 +40,24 @@ watch(
     headerAvatarBroken.value = false
   }
 )
+
+watch(
+  () => route.fullPath,
+  () => {
+    mobileOpen.value = false
+  }
+)
+
+watch(mobileOpen, (open) => {
+  if (typeof document === 'undefined') return
+  document.body.style.overflow = open ? 'hidden' : ''
+})
+
+onBeforeUnmount(() => {
+  if (typeof document !== 'undefined') {
+    document.body.style.overflow = ''
+  }
+})
 
 const navGroups = [
   {
@@ -252,9 +267,9 @@ onMounted(() => {
     <div class="flex-1 flex flex-col min-w-0 bg-background">
       <!-- Top Header Bar -->
       <header
-        class="h-14 px-4 md:px-6 border-b border-border bg-header backdrop-blur-md sticky top-0 z-20 flex items-center justify-between gap-3"
+        class="h-14 px-3 sm:px-4 md:px-6 border-b border-border bg-header backdrop-blur-md sticky top-0 z-20 flex items-center justify-between gap-2 sm:gap-3"
       >
-        <div class="flex items-center gap-2 min-w-0">
+        <div class="flex items-center gap-1.5 sm:gap-2 min-w-0">
           <Button
             variant="outline"
             size="icon"
@@ -268,7 +283,8 @@ onMounted(() => {
           <Button
             variant="ghost"
             size="icon"
-            class="md:hidden h-8 w-8 text-muted-foreground"
+            class="md:hidden h-8 w-8 -ml-1 text-muted-foreground shrink-0"
+            aria-label="打开导航菜单"
             @click="mobileOpen = true"
           >
             <Menu class="w-4 h-4" />
@@ -283,9 +299,9 @@ onMounted(() => {
           </nav>
         </div>
 
-        <div class="flex items-center gap-2 shrink-0">
+        <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
           <RouterLink v-if="store.overviewLoaded" to="/settings" class="no-underline">
-            <Badge variant="outline" :dot="cookieMeta.dot" class="hover:bg-accent cursor-pointer h-7 px-2.5">
+            <Badge variant="outline" :dot="cookieMeta.dot" class="hover:bg-accent cursor-pointer h-7 px-2 sm:px-2.5 text-[11px] sm:text-xs">
               {{ cookieMeta.text }}
             </Badge>
           </RouterLink>
@@ -297,27 +313,18 @@ onMounted(() => {
                 ? 'bg-emerald-500 status-dot-glow-emerald'
                 : 'bg-zinc-400'
             "
-            class="h-7 px-2.5"
+            class="h-7 w-7 px-0 justify-center sm:w-auto sm:px-2.5"
             :title="store.wsConnected ? 'WebSocket 实时同步已连接' : '连接中断，正在重连'"
           >
             <span class="hidden sm:inline">{{ store.wsConnected ? '实时同步' : '重连中' }}</span>
           </Badge>
 
-          <Button
-            variant="outline"
-            size="icon"
-            class="h-7 w-7 rounded-full border-border/80 text-muted-foreground hover:text-foreground"
-            :title="isDark ? '切换到浅色主题' : '切换到深色主题'"
-            @click="toggleTheme"
-          >
-            <Sun v-if="isDark" class="w-3.5 h-3.5 text-amber-400" />
-            <Moon v-else class="w-3.5 h-3.5" />
-          </Button>
+          <ThemeToggleButton />
 
           <RouterLink
             v-if="store.overviewLoaded && (store.accountAvatarUrl || store.accountUsername)"
             to="/settings"
-            class="inline-flex h-7 items-center gap-1.5 rounded-full border border-border/80 bg-card pl-0.5 pr-2 text-xs text-foreground/90 no-underline transition-colors hover:bg-accent"
+            class="inline-flex h-7 w-7 sm:w-auto items-center justify-center sm:justify-start gap-1.5 rounded-full border border-border/80 bg-card p-0.5 sm:pl-0.5 sm:pr-2 text-xs text-foreground/90 no-underline transition-colors hover:bg-accent"
             :title="`${store.accountUsername || '本地账号'} · 点击进入系统设置更换头像`"
           >
             <span class="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-full bg-secondary text-muted-foreground">
@@ -339,7 +346,7 @@ onMounted(() => {
       </header>
 
       <!-- Main Content Canvas -->
-      <main class="flex-1 w-full max-w-[1480px] mx-auto px-5 md:px-8 lg:px-10 py-6 md:py-7">
+      <main class="flex-1 w-full max-w-[1480px] mx-auto px-3.5 sm:px-5 md:px-8 lg:px-10 py-4 sm:py-6 md:py-7">
         <slot />
       </main>
     </div>
@@ -352,14 +359,17 @@ onMounted(() => {
           @click="mobileOpen = false"
         />
         <aside
-          class="fixed inset-y-0 left-0 w-64 bg-sidebar border-r border-border flex flex-col shadow-xl"
+          class="fixed inset-y-0 left-0 h-dvh w-[min(17rem,82vw)] bg-sidebar border-r border-border flex flex-col shadow-xl overscroll-contain animate-drawer-in"
         >
-          <div class="h-14 px-4 border-b border-border flex items-center justify-between">
+          <div class="h-14 px-4 border-b border-border flex items-center justify-between shrink-0">
             <div class="flex items-center gap-2.5">
               <BrandMark class="w-8 h-8 shrink-0 drop-shadow-[0_1px_2px_rgba(0,0,0,0.12)]" />
-              <span class="font-bold text-sm text-foreground">PH-DL</span>
+              <div class="leading-none">
+                <div class="font-bold text-sm text-foreground">PH-DL</div>
+                <div class="text-[11px] text-muted-foreground mt-0.5">Video Sync</div>
+              </div>
             </div>
-            <Button variant="ghost" size="icon" class="h-7 w-7" @click="mobileOpen = false">
+            <Button variant="ghost" size="icon" class="h-8 w-8" aria-label="关闭菜单" @click="mobileOpen = false">
               <X class="w-4 h-4" />
             </Button>
           </div>
@@ -374,7 +384,7 @@ onMounted(() => {
                 :key="item.name"
                 :to="item.path"
                 :class="[
-                  'relative flex items-center gap-2.5 px-3 h-9 rounded-md text-sm transition-colors overflow-hidden no-underline',
+                  'relative flex items-center gap-2.5 px-3 h-10 rounded-lg text-sm transition-colors overflow-hidden no-underline',
                   route.name === item.name
                     ? 'bg-secondary text-foreground font-medium'
                     : 'text-muted-foreground hover:bg-accent hover:text-foreground',
@@ -397,10 +407,23 @@ onMounted(() => {
             </div>
           </div>
 
-          <div class="p-3 border-t border-border space-y-2.5">
-            <div class="flex items-center justify-between text-xs px-1">
-              <span class="text-muted-foreground">可用磁盘</span>
-              <span class="font-medium tabular-nums">{{ diskInfo.freeText }}</span>
+          <div class="p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] border-t border-border space-y-2.5 shrink-0">
+            <div class="rounded-xl border border-border bg-background/70 dark:bg-card px-3 py-2 space-y-1.5">
+              <div class="flex items-center justify-between text-xs">
+                <span class="inline-flex items-center gap-1.5 text-muted-foreground">
+                  <HardDrive class="w-3.5 h-3.5 shrink-0 text-brand/85" />
+                  可用空间
+                </span>
+                <span class="font-semibold text-foreground tabular-nums">{{ diskInfo.freeText }}</span>
+              </div>
+              <Progress v-if="diskInfo.totalText" :model-value="diskInfo.pct" class="h-1.5" />
+              <div
+                v-if="diskInfo.totalText"
+                class="flex justify-between text-[11px] text-muted-foreground tabular-nums"
+              >
+                <span>已用 {{ diskInfo.pct }}%</span>
+                <span>{{ diskInfo.totalText }}</span>
+              </div>
             </div>
             <Button variant="outline" size="sm" class="w-full" @click="handleLogout">
               <LogOut class="w-3.5 h-3.5" />

@@ -647,29 +647,29 @@ async function handleClearTemp() {
 <template>
   <div class="download-page">
     <!-- Page Heading with tinted brand icon badge -->
-    <div class="download-heading flex flex-wrap items-center justify-between gap-3">
-      <div class="flex items-center gap-3.5">
+    <div class="download-heading flex flex-wrap items-center justify-between gap-2.5 sm:gap-3">
+      <div class="flex items-center gap-3 sm:gap-3.5 min-w-0">
         <div
-          class="w-10 h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+          class="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
         >
-          <Download class="w-5 h-5" />
+          <Download class="w-4 h-4 sm:w-5 sm:h-5" />
         </div>
-        <div>
-          <h1 class="text-xl font-bold tracking-tight text-foreground">新建下载</h1>
+        <div class="min-w-0">
+          <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground">新建下载</h1>
           <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
-            按用户名或视频链接创建任务，提交后可在侧边栏“任务队列”查看实时进度
+            按用户名或视频链接创建任务，提交后可在“任务队列”查看实时进度
           </p>
         </div>
       </div>
-      <Button variant="outline" size="sm" :disabled="triggeringAuto" @click="triggerQuickAutoUpdate">
+      <Button variant="outline" size="sm" class="w-full sm:w-auto shrink-0" :disabled="triggeringAuto" @click="triggerQuickAutoUpdate">
         <RefreshCw :class="['w-3.5 h-3.5', triggeringAuto ? 'animate-spin text-brand' : '']" />
         立即全量追更
       </Button>
     </div>
 
     <!-- Elevated Semantic KPI Grid (inspired by rust-srec Dashboard) -->
-    <div class="overview-grid grid grid-cols-1 sm:grid-cols-3 gap-4">
-      <Card class="overview-card">
+    <div class="overview-grid grid grid-cols-2 sm:grid-cols-3 gap-2.5 sm:gap-4">
+      <Card class="overview-card col-span-2 sm:col-span-1">
         <div class="flex items-center justify-between gap-2">
           <span class="text-xs font-semibold tracking-wide text-muted-foreground">引擎状态</span>
           <span
@@ -782,11 +782,13 @@ async function handleClearTemp() {
     <div class="download-workspace">
       <Card class="composer-card">
         <div class="workspace-card-header">
-          <div>
+          <div class="min-w-0">
             <h2 class="text-[15px] font-semibold tracking-tight text-foreground">新建下载任务</h2>
             <p class="text-xs text-muted-foreground mt-0.5">按用户名批量抓取，或粘贴视频链接 / 导入 TXT</p>
           </div>
-          <Tabs v-model="sourceTab" :items="sourceTabs" />
+          <div class="w-full sm:w-auto">
+            <Tabs v-model="sourceTab" :items="sourceTabs" class="grid grid-cols-2 w-full sm:inline-flex sm:w-auto" />
+          </div>
         </div>
 
         <form class="composer-form" @submit.prevent="submitDownload">
@@ -1816,6 +1818,85 @@ async function handleClearTemp() {
   .recent-job {
     min-height: 60px;
     padding: 6px 10px;
+  }
+}
+
+@media (max-width: 639px) {
+  .download-page {
+    gap: 14px;
+  }
+
+  .overview-card {
+    min-height: 0;
+    padding: 12px 14px;
+  }
+
+  .overview-icon {
+    top: 10px;
+    right: 12px;
+    width: 28px;
+    height: 28px;
+  }
+
+  .overview-icon :deep(svg) {
+    width: 15px;
+    height: 15px;
+  }
+
+  .overview-value {
+    margin-top: 6px;
+    font-size: 20px;
+    line-height: 26px;
+  }
+
+  .overview-card > p {
+    margin-top: 4px;
+    font-size: 11px;
+    line-height: 15px;
+  }
+
+  .download-workspace {
+    gap: 14px;
+  }
+
+  .workspace-card-header {
+    min-height: 0;
+    padding: 12px 14px;
+    gap: 10px;
+  }
+
+  .composer-body {
+    gap: 12px;
+    padding: 12px 14px;
+  }
+
+  .preview-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .scope-controls {
+    grid-template-columns: 96px minmax(0, 1fr);
+  }
+
+  .composer-footer {
+    padding: 10px 14px;
+  }
+
+  .recent-list {
+    padding: 10px;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .quick-edge-trigger {
+    display: none;
+  }
+
+  .quick-rail-mask-left,
+  .quick-rail-mask-right,
+  .quick-rail-mask-both {
+    -webkit-mask-image: none;
+    mask-image: none;
   }
 }
 

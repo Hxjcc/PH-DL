@@ -215,3 +215,55 @@ async def test_concurrent_downloads_cannot_allocate_the_same_free_space(tmp_path
         finally:
             release.set()
             assert (await asyncio.wait_for(first, 1.0)).success
+
+
+async def test_retry_without_etag_reuses_owned_part_and_leaves_no_orphan(tmp_path):
+    media = mp4_payload()
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # First attempt drops mid-stream without sending an ETag.
+            response = web.StreamResponse(headers={"Content-Length": str(len(media))})
+            await response.prepare(request)
+            await response.write(media[:64])
+            request.transport.close()
+            return response
+        return web.Response(body=media)
+
+    async with media_server(handler) as url, aiohttp.ClientSession() as session:
+        args = media_args(tmp_path, session, url, max_attempts=2, retry_delay_base=0.0, retry_delay_max=0.0)
+        result = await downloader.download_mp4_with_resume(**args)
+
+    assert calls == 2
+    assert result.success and result.local_path.read_bytes() == media
+    assert list(args["temp_dir"].glob("*.mp4.tmp*")) == []
+
+
+async def test_second_pass_cleans_superseded_same_quality_checkpoint_without_etag(tmp_path):
+    media = mp4_payload()
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            response = web.StreamResponse(headers={"Content-Length": str(len(media))})
+            await response.prepare(request)
+            await response.write(media[:64])
+            request.transport.close()
+            return response
+        return web.Response(body=media)
+
+    async with media_server(handler) as url, aiohttp.ClientSession() as session:
+        first_args = media_args(tmp_path, session, url, quality="2160p", max_attempts=1)
+        first = await downloader.download_mp4_with_resume(**first_args)
+        assert not first.success and first.temp_path is not None and first.temp_path.is_file()
+
+        second_args = media_args(tmp_path, session, url, quality="2160p", max_attempts=1, partial_path=first.temp_path)
+        second = await downloader.download_mp4_with_resume(**second_args)
+
+    assert second.success and second.local_path.read_bytes() == media
+    assert list(first_args["temp_dir"].glob("*.mp4.tmp*")) == []

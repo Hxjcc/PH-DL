@@ -388,23 +388,23 @@ async function handleTestNotify() {
 </script>
 
 <template>
-  <div class="space-y-6">
+  <div class="space-y-4 sm:space-y-6">
     <!-- Page Header -->
-    <div class="flex flex-wrap items-center justify-between gap-4">
-      <div class="flex items-center gap-3.5">
+    <div class="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+      <div class="flex items-center gap-3 sm:gap-3.5 min-w-0">
         <div
-          class="w-10 h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+          class="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
         >
-          <Settings class="w-5 h-5" />
+          <Settings class="w-4 h-4 sm:w-5 sm:h-5" />
         </div>
-        <div>
-          <h1 class="text-xl font-bold tracking-tight text-foreground">系统设置</h1>
+        <div class="min-w-0">
+          <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground">系统设置</h1>
           <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
             管理登录 Cookie、下载并发与磁盘背压、rclone 云端上传及通知策略
           </p>
         </div>
       </div>
-      <Button size="sm" :disabled="saving || !form" @click="saveAll">
+      <Button size="sm" class="w-full sm:w-auto" :disabled="saving || !form" @click="saveAll">
         <Loader2 v-if="saving" class="w-3.5 h-3.5 animate-spin" />
         <Save v-else class="w-3.5 h-3.5" />
         {{ saving ? '保存中...' : '保存全部设置' }}
@@ -417,13 +417,13 @@ async function handleTestNotify() {
     </div>
 
     <template v-else>
-      <div class="overflow-x-auto pb-1">
+      <div class="overflow-x-auto no-scrollbar -mx-3.5 px-3.5 sm:mx-0 sm:px-0 pb-0.5">
         <Tabs v-model="activeTab" :items="tabs" />
       </div>
 
       <!-- Tab 1: Cookie & Account -->
       <Card v-if="activeTab === 'cookie'" class="divide-y divide-border">
-        <div class="p-6 space-y-4">
+        <div class="p-4 sm:p-6 space-y-4">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div class="space-y-1">
               <div class="flex items-center gap-2">
@@ -476,7 +476,7 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <div class="p-6 space-y-4">
+        <div class="p-4 sm:p-6 space-y-4">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h3 class="text-sm font-semibold text-foreground">账号凭据与本地头像（可选）</h3>
@@ -552,7 +552,7 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <div class="p-6 space-y-4">
+        <div class="p-4 sm:p-6 space-y-4">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div class="flex items-center gap-3">
               <div
@@ -611,7 +611,7 @@ async function handleTestNotify() {
       </Card>
 
       <!-- Tab 2: Download & Backpressure -->
-      <Card v-if="activeTab === 'download'" class="p-5 space-y-4">
+      <Card v-if="activeTab === 'download'" class="p-4 sm:p-5 space-y-4">
         <div>
           <h3 class="text-sm font-semibold text-foreground">并发与磁盘背压控制</h3>
           <p class="text-xs text-muted-foreground mt-0.5">
@@ -679,7 +679,7 @@ async function handleTestNotify() {
 
       <!-- Tab 3: rclone Uploader -->
       <Card v-if="activeTab === 'rclone'" class="divide-y divide-border">
-        <div class="px-5 py-3.5 flex flex-wrap items-center justify-between gap-3">
+        <div class="px-4 sm:px-5 py-3.5 flex flex-wrap items-center justify-between gap-3">
           <div class="flex items-center gap-3">
             <Switch v-model="form.uploader_enabled" />
             <div>
@@ -690,7 +690,7 @@ async function handleTestNotify() {
             </div>
           </div>
 
-          <div class="flex flex-wrap items-center gap-2 ml-auto">
+          <div class="flex flex-wrap items-center gap-2 sm:ml-auto">
             <div v-if="rcloneRemotes.length > 0" class="flex flex-wrap items-center gap-1.5">
               <button
                 v-for="r in rcloneRemotes"
@@ -725,7 +725,7 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <div class="p-5 space-y-4">
+        <div class="p-4 sm:p-5 space-y-4">
           <!-- Section 1: Core Common Settings (4x2 Compact Grid) -->
           <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
             <div class="space-y-1">
@@ -847,8 +847,8 @@ async function handleTestNotify() {
                   <label class="text-xs font-medium text-foreground">PikPak 分块并发（--pikpak-upload-concurrency）</label>
                   <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
                 </div>
-                <div class="flex items-end gap-2">
-                  <div class="space-y-1 flex-1">
+                <div class="flex flex-col sm:flex-row sm:items-end gap-2">
+                  <div class="space-y-1 flex-1 min-w-0">
                     <label class="text-xs font-medium text-foreground">PikPak 分块大小（--pikpak-chunk-size）</label>
                     <Input v-model="form.rclone_pikpak_chunk_size" placeholder="16Mi" />
                   </div>
@@ -878,8 +878,8 @@ async function handleTestNotify() {
             <!-- Google Drive -->
             <div v-else-if="providerTab === 'drive'" class="p-3.5 space-y-2.5">
               <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5 items-end">
-                <div class="flex items-end gap-2">
-                  <div class="space-y-1 flex-1">
+                <div class="flex flex-col sm:flex-row sm:items-end gap-2">
+                  <div class="space-y-1 flex-1 min-w-0">
                     <label class="text-xs font-medium text-foreground">GD 分块大小（--drive-chunk-size，2 的幂）</label>
                     <Input v-model="form.rclone_drive_chunk_size" placeholder="64Mi" />
                   </div>
@@ -933,7 +933,7 @@ async function handleTestNotify() {
 
       <!-- Tab 4: Schedule, Proxy & ServerChan -->
       <Card v-if="activeTab === 'notify'" class="divide-y divide-border">
-        <div class="p-6 space-y-5">
+        <div class="p-4 sm:p-6 space-y-5">
           <div>
             <h3 class="text-sm font-semibold text-foreground">追更调度与网络代理</h3>
             <p class="text-xs text-muted-foreground mt-0.5">
@@ -973,7 +973,7 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <div class="p-6 space-y-4">
+        <div class="p-4 sm:p-6 space-y-4">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div class="flex items-center gap-3">
               <Switch v-model="form.serverchan_enabled" />
@@ -1003,7 +1003,7 @@ async function handleTestNotify() {
 
       <!-- Tab 5: Hot-updatable CSS Selectors -->
       <Card v-if="activeTab === 'selectors' && form.selectors" class="divide-y divide-border">
-        <div class="p-6 flex flex-wrap items-center justify-between gap-4">
+        <div class="p-4 sm:p-6 flex flex-wrap items-center justify-between gap-3 sm:gap-4">
           <div>
             <h3 class="text-sm font-semibold text-foreground">页面解析 CSS 选择器</h3>
             <p class="text-xs text-muted-foreground mt-0.5">
@@ -1016,9 +1016,9 @@ async function handleTestNotify() {
           </Button>
         </div>
 
-        <div class="p-6 grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div v-for="field in SELECTOR_FIELDS" :key="field.key" class="space-y-1.5">
-            <div class="flex items-center justify-between gap-2">
+            <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5">
               <label class="text-xs font-medium text-foreground">{{ field.label }}</label>
               <span class="font-mono text-[10px] text-muted-foreground">{{ field.key }}</span>
             </div>

@@ -759,13 +759,27 @@ class TaskManager:
                     )
 
                     if ledger and ledger["status"] == "uploaded" and (not requested or quality_matches):
+                        cleaned_stale = False
+                        if partial_path is not None and partial_path.name.endswith(".mp4.tmp") and partial_path.is_file():
+                            with contextlib.suppress(OSError):
+                                partial_path.unlink(missing_ok=True)
+                                remove_download_checkpoint(partial_path)
+                                cleaned_stale = True
                         it = await self.repo.update_job_item(
                             item_id,
                             status="skipped",
-                            error_message="已在云端上传记录中，跳过",
+                            temp_path="" if cleaned_stale else item.get("temp_path") or "",
+                            error_message="已在云端上传记录中，跳过（已清理残留临时文件）" if cleaned_stale else "已在云端上传记录中，跳过",
                         )
                         if it:
                             self.events.broadcast("item_updated", it)
+                        if cleaned_stale:
+                            self.events.emit_log(
+                                "INFO",
+                                f"已在云端上传记录中，已自动清理残留临时文件: {partial_path.name}",
+                                job_id=job_id,
+                            )
+                            self.events.broadcast("overview_changed", {})
                         await _refresh_job_progress()
                         return
 

@@ -22,6 +22,7 @@ from app.main import create_app
 from app.parsers.http_session import PowFetchResult, TaskHttpContext
 from app.parsers.list_scanner import ListedVideo, scan_list_pages
 from app.parsers.video import VideoDetail, fetch_single_video_detail
+from app.services import downloader
 from app.services.cookie import CookieCheckResult
 from app.services.downloader import DownloadOutcome
 from app.services.filename import video_filename_base
@@ -518,3 +519,40 @@ async def test_large_html_parses_via_offload_thread(monkeypatch):
     monkeypatch.setattr(ctx, "fetch_with_pow", fetch)
     res = await fetch_single_video_detail(ctx, href, SelectorSettings(), uploader_hint=("alice", "model"))
     assert res.error is None and res.title == "Big HTML Page" and res.quality == "1080p"
+
+
+async def test_resume_temp_cleans_stale_partial_when_already_uploaded(job_engine):
+    manager, repo, env = job_engine
+    parent = env.temp_dir / "arinafox"
+    parent.mkdir(parents=True, exist_ok=True)
+    part = parent / "Already Uploaded [donevk1].mp4.tmp"
+    part.write_bytes(mp4_payload()[:96])
+    downloader._write_checkpoint(
+        part,
+        downloader.DownloadCheckpoint(
+            viewkey="donevk1",
+            quality="2160p",
+            request_fingerprint="req",
+            response_fingerprint="res",
+            etag="",
+            total=1024,
+        ),
+    )
+    await repo.upsert_video(
+        "donevk1",
+        title="Already Uploaded",
+        uploader="arinafox",
+        target_type="model",
+        quality="2160p",
+        video_page_url=page("donevk1"),
+        status="uploaded",
+        force_status=True,
+    )
+
+    assert len(manager.list_temp_files()) == 1
+    job = await run_job(manager, repo, "resume_temp", auto_upload=True)
+    assert job["status"] == "completed"
+    assert job["skipped_items"] == 1
+    assert not part.exists()
+    assert downloader.read_download_checkpoint(part) is None
+    assert manager.list_temp_files() == []

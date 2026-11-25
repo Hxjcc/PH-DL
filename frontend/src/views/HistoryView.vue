@@ -603,17 +603,17 @@ onDeactivated(() => {
 </script>
 
 <template>
-  <div class="space-y-6">
+  <div class="space-y-4 sm:space-y-6">
     <!-- Page Header with tinted section icon -->
-    <div class="flex flex-wrap items-center justify-between gap-4">
-      <div class="flex items-center gap-3.5">
+    <div class="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+      <div class="flex items-center gap-3 sm:gap-3.5 min-w-0">
         <div
-          class="w-10 h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+          class="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
         >
-          <Database class="w-5 h-5" />
+          <Database class="w-4 h-4 sm:w-5 sm:h-5" />
         </div>
-        <div>
-          <h1 class="text-xl font-bold tracking-tight text-foreground">历史记录</h1>
+        <div class="min-w-0">
+          <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground">历史记录</h1>
           <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
             统一 SQLite 视频去重索引库，点击统计卡片可快速筛选对应状态
           </p>
@@ -628,7 +628,7 @@ onDeactivated(() => {
         <Button
           variant="outline"
           size="sm"
-          class="border-brand/25 bg-brand/5 text-brand hover:bg-brand/10"
+          class="border-brand/25 bg-brand/5 text-brand hover:bg-brand/10 w-full sm:w-auto"
           :disabled="enriching || metadataCandidates <= 0"
         >
           <Loader2 v-if="enriching" class="w-3.5 h-3.5 animate-spin" />
@@ -642,13 +642,13 @@ onDeactivated(() => {
     </div>
 
     <!-- Interactive Semantic KPI Cards (inspired by rust-srec Pipeline Statistics) -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 sm:gap-3.5">
       <button
         v-for="card in statCards"
         :key="card.key || 'all'"
         type="button"
         :class="[
-          'text-left rounded-2xl border bg-card p-4 shadow-[var(--card-shadow)] transition-all duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30',
+          'text-left rounded-2xl border bg-card p-3.5 sm:p-4 shadow-[var(--card-shadow)] transition-all duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30',
           filters.status === card.key
             ? 'border-brand/45 ring-2 ring-brand/12'
             : 'border-border hover:border-foreground/20',
@@ -657,20 +657,20 @@ onDeactivated(() => {
       >
         <div class="flex items-center justify-between gap-2">
           <span class="text-xs font-medium text-muted-foreground">{{ card.label }}</span>
-          <span :class="['w-8 h-8 rounded-full flex items-center justify-center shrink-0', card.iconBox]">
-            <component :is="card.icon" class="w-4 h-4" />
+          <span :class="['w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center shrink-0', card.iconBox]">
+            <component :is="card.icon" class="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </span>
         </div>
-        <div class="mt-2.5 text-2xl font-bold tracking-tight text-foreground tabular-nums">
+        <div class="mt-2 sm:mt-2.5 text-xl sm:text-2xl font-bold tracking-tight text-foreground tabular-nums">
           {{ card.value }}
         </div>
       </button>
     </div>
 
-    <!-- Filter Bar + Elevated DataTable -->
+    <!-- Filter Bar + Elevated DataTable / Mobile Card List -->
     <div class="space-y-3">
-      <div class="flex flex-wrap items-center gap-2">
-        <div class="relative flex-1 min-w-[200px]">
+      <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+        <div class="relative w-full sm:flex-1 sm:min-w-[200px]">
           <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center">
             <Loader2 v-if="fetching" class="w-3.5 h-3.5 text-brand animate-spin" />
             <Search v-else class="w-3.5 h-3.5 text-muted-foreground" />
@@ -683,69 +683,270 @@ onDeactivated(() => {
           />
         </div>
 
-        <Select
-          v-model="filters.uploader"
-          :options="uploaderOptions"
-          class="w-40"
-          @change="changeFilter"
-        />
-        <Select
-          v-model="filters.status"
-          :options="statusOptions"
-          class="w-32"
-          @change="changeFilter"
-        />
-        <Select
-          v-model="filters.quality"
-          :options="qualityOptions"
-          class="w-28"
-          @change="changeFilter"
-        />
-        <Select
-          v-model="filters.sort_by"
-          :options="sortOptions"
-          class="w-32"
-          @change="changeFilter"
-        />
-        <label for="history-page-size" class="inline-flex items-center gap-2 text-xs text-muted-foreground">
-          每页
+        <div class="grid grid-cols-2 gap-2 sm:contents">
           <Select
-            id="history-page-size"
-            :model-value="filters.page_size"
-            :options="pageSizeOptions"
-            class="w-24"
-            @update:model-value="changePageSize"
+            v-model="filters.uploader"
+            :options="uploaderOptions"
+            class="w-full sm:w-40"
+            @change="changeFilter"
           />
-        </label>
-        <template v-if="selectedCount > 0">
-          <Badge variant="secondary" class="h-9 px-2.5 tabular-nums">已选 {{ selectedCount }}</Badge>
-          <ConfirmPopover
-            :title="`确定从去重库删除选中的 ${selectedCount} 条记录？`"
-            description="删除后自动追更会重新视这些视频为未下载。"
-            confirm-text="删除所选"
-            @open-change="(val) => { if (val) deleteLocalBatch = false }"
-            @confirm="handleBatchDelete"
-          >
-            <template v-if="selectedHasLocalFiles" #extra>
-              <label class="flex items-center gap-2 text-xs leading-4 text-foreground cursor-pointer select-none">
-                <Checkbox v-model="deleteLocalBatch" />
-                <span>同时删除本地已下载的视频文件</span>
-              </label>
+          <Select
+            v-model="filters.status"
+            :options="statusOptions"
+            class="w-full sm:w-32"
+            @change="changeFilter"
+          />
+          <Select
+            v-model="filters.quality"
+            :options="qualityOptions"
+            class="w-full sm:w-28"
+            @change="changeFilter"
+          />
+          <Select
+            v-model="filters.sort_by"
+            :options="sortOptions"
+            class="w-full sm:w-32"
+            @change="changeFilter"
+          />
+        </div>
+
+        <div class="flex flex-wrap items-center justify-between sm:justify-start gap-2 sm:contents">
+          <label for="history-page-size" class="inline-flex items-center gap-2 text-xs text-muted-foreground">
+            每页
+            <Select
+              id="history-page-size"
+              :model-value="filters.page_size"
+              :options="pageSizeOptions"
+              class="w-24"
+              @update:model-value="changePageSize"
+            />
+          </label>
+          <div class="flex flex-wrap items-center gap-2 sm:contents">
+            <template v-if="selectedCount > 0">
+              <Badge variant="secondary" class="h-9 px-2.5 tabular-nums">已选 {{ selectedCount }}</Badge>
+              <ConfirmPopover
+                :title="`确定从去重库删除选中的 ${selectedCount} 条记录？`"
+                description="删除后自动追更会重新视这些视频为未下载。"
+                confirm-text="删除所选"
+                @open-change="(val) => { if (val) deleteLocalBatch = false }"
+                @confirm="handleBatchDelete"
+              >
+                <template v-if="selectedHasLocalFiles" #extra>
+                  <label class="flex items-center gap-2 text-xs leading-4 text-foreground cursor-pointer select-none">
+                    <Checkbox v-model="deleteLocalBatch" />
+                    <span>同时删除本地已下载的视频文件</span>
+                  </label>
+                </template>
+                <Button variant="destructive" size="sm" :disabled="batchDeleting">
+                  <Loader2 v-if="batchDeleting" class="w-3.5 h-3.5 animate-spin" />
+                  <Trash2 v-else class="w-3.5 h-3.5" />
+                  删除所选
+                </Button>
+              </ConfirmPopover>
             </template>
-            <Button variant="destructive" size="sm" :disabled="batchDeleting">
-              <Loader2 v-if="batchDeleting" class="w-3.5 h-3.5 animate-spin" />
-              <Trash2 v-else class="w-3.5 h-3.5" />
-              删除所选
+            <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" title="刷新" @click="handleRefresh">
+              <RefreshCw :class="['w-3.5 h-3.5', refreshing ? 'animate-spin text-brand' : '']" />
             </Button>
-          </ConfirmPopover>
-        </template>
-        <Button variant="outline" size="icon" class="h-9 w-9" title="刷新" @click="handleRefresh">
-          <RefreshCw :class="['w-3.5 h-3.5', refreshing ? 'animate-spin text-brand' : '']" />
-        </Button>
+          </div>
+        </div>
       </div>
 
       <Card class="overflow-hidden">
-        <div class="overflow-x-auto">
+        <!-- Mobile Card List (< md) -->
+        <div class="md:hidden">
+          <div
+            v-if="items.length > 0"
+            class="px-3.5 py-2.5 border-b border-border bg-surface-subtle flex items-center justify-between gap-2 text-xs text-muted-foreground"
+          >
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+              <Checkbox
+                :model-value="allSelected"
+                :indeterminate="partiallySelected"
+                title="全选本页"
+                @update:model-value="toggleSelectAll"
+              />
+              <span>{{ selectedCount > 0 ? `已选 ${selectedCount} 条` : '全选本页' }}</span>
+            </label>
+            <span class="tabular-nums text-[11px]">本页 {{ items.length }} 条</span>
+          </div>
+
+          <div v-if="loading && items.length === 0" class="py-12 text-center text-xs text-muted-foreground">
+            <div class="inline-flex items-center justify-center gap-2 leading-none">
+              <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
+              <span>加载中...</span>
+            </div>
+          </div>
+
+          <div v-else-if="items.length === 0" class="py-14 text-center text-xs text-muted-foreground">
+            暂无匹配的历史记录
+          </div>
+
+          <div
+            v-else
+            :class="['divide-y divide-border transition-opacity duration-150', fetching ? 'opacity-65' : '']"
+          >
+            <div
+              v-for="v in items"
+              :key="`m-${v.viewkey}`"
+              class="px-3.5 py-3 space-y-2"
+            >
+              <div class="flex items-start gap-2.5">
+                <button
+                  type="button"
+                  role="checkbox"
+                  :aria-checked="selectedViewkeys.has(v.viewkey)"
+                  :title="`选择 ${v.viewkey}`"
+                  :class="[
+                    'mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-[5px] border transition-colors cursor-pointer active:scale-90 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-foreground/15',
+                    selectedViewkeys.has(v.viewkey)
+                      ? 'border-primary bg-primary text-primary-foreground shadow-xs'
+                      : 'border-input bg-card hover:border-foreground/40',
+                  ]"
+                  @click="toggleSelectVideo(v.viewkey)"
+                >
+                  <svg
+                    v-if="selectedViewkeys.has(v.viewkey)"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-3 w-3"
+                    aria-hidden="true"
+                  >
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                </button>
+
+                <div class="min-w-0 flex-1 space-y-1">
+                  <div class="flex items-start justify-between gap-2">
+                    <div class="text-[13px] font-medium text-foreground leading-snug line-clamp-2" :title="v.title">
+                      {{ v.title || v.viewkey }}
+                    </div>
+                    <span class="inline-flex items-center gap-1 rounded-full border border-border bg-card/90 text-foreground px-2 py-0.5 text-[10px] font-medium whitespace-nowrap shrink-0">
+                      <span :class="['w-1.5 h-1.5 rounded-full shrink-0', videoStatusMeta(v.status).dot]" />
+                      {{ videoStatusMeta(v.status).label }}
+                    </span>
+                  </div>
+
+                  <div class="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
+                    <span v-if="v.uploader_display_name || v.uploader" class="font-medium text-foreground/80 truncate max-w-[140px]">
+                      {{ v.uploader_display_name || v.uploader }}
+                    </span>
+                    <span v-if="v.uploader_display_name || v.uploader" class="opacity-40 select-none">·</span>
+                    <span class="font-mono">{{ v.viewkey }}</span>
+                    <template v-if="formatPublishedDate(v.published_at)">
+                      <span class="opacity-40 select-none">·</span>
+                      <span class="font-mono">{{ formatPublishedDate(v.published_at) }}</span>
+                    </template>
+                    <template v-if="formatVideoDuration(v.duration_seconds)">
+                      <span class="opacity-40 select-none">·</span>
+                      <span class="font-mono">{{ formatVideoDuration(v.duration_seconds) }}</span>
+                    </template>
+                  </div>
+                </div>
+              </div>
+
+              <div class="flex flex-wrap items-center justify-between gap-2 pl-6">
+                <div class="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground tabular-nums">
+                  <span
+                    v-if="v.quality"
+                    class="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 font-mono text-[10px] text-secondary-foreground"
+                  >
+                    {{ v.quality }}
+                  </span>
+                  <span
+                    v-if="v.file_size > 0"
+                    class="inline-flex items-center rounded-full border border-border bg-surface-subtle px-2 py-0.5 text-[10px] tabular-nums text-muted-foreground"
+                  >
+                    {{ formatBytes(v.file_size) }}
+                  </span>
+                  <span class="text-[10px] text-muted-foreground/80">
+                    {{ formatDateTime(v.uploaded_at || v.downloaded_at || v.created_at) }}
+                  </span>
+                </div>
+
+                <div class="inline-flex items-center gap-1 shrink-0 ml-auto">
+                  <button
+                    type="button"
+                    class="inline-flex items-center justify-center h-8 w-8 rounded-lg bg-secondary text-secondary-foreground border border-transparent hover:border-brand/35 hover:bg-brand/12 hover:text-brand aria-expanded:border-brand/35 aria-expanded:bg-brand/12 aria-expanded:text-brand transition-colors cursor-pointer"
+                    aria-label="在线播放"
+                    aria-haspopup="dialog"
+                    :aria-expanded="playingVideo?.viewkey === v.viewkey"
+                    title="在线播放"
+                    @click="openPlayback(v, $event)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                      <polygon points="6 3 20 12 6 21 6 3" />
+                    </svg>
+                  </button>
+                  <a
+                    v-if="v.video_page_url"
+                    :href="v.video_page_url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="inline-flex items-center justify-center h-8 w-8 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                    title="打开原网页"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                      <path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                    </svg>
+                  </a>
+                  <button
+                    type="button"
+                    class="inline-flex items-center justify-center h-8 w-8 rounded-lg text-muted-foreground hover:text-brand hover:bg-brand/10 transition-colors cursor-pointer"
+                    title="强制重新下载"
+                    @click="handleRedownload(v)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" />
+                    </svg>
+                  </button>
+                  <ConfirmPopover
+                    v-if="activeDeleteKey === v.viewkey"
+                    :title="`从去重库删除 [${v.viewkey}]？`"
+                    description="删除后自动追更将重新视该视频为未下载。"
+                    confirm-text="删除"
+                    :default-open="deletePopoverDefaultOpen"
+                    @open-change="(val) => { if (val) deleteLocalSingle = false; else deletePopoverDefaultOpen = false }"
+                    @confirm="handleDelete(v)"
+                  >
+                    <template v-if="v.status === 'downloaded' || v.local_path" #extra>
+                      <label class="flex items-center gap-2 text-xs leading-4 text-foreground cursor-pointer select-none">
+                        <Checkbox v-model="deleteLocalSingle" />
+                        <span>同时删除本地已下载的视频文件</span>
+                      </label>
+                    </template>
+                    <button
+                      type="button"
+                      class="inline-flex items-center justify-center h-8 w-8 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors cursor-pointer"
+                      title="删除去重记录"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                        <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" />
+                      </svg>
+                    </button>
+                  </ConfirmPopover>
+                  <button
+                    v-else
+                    type="button"
+                    class="inline-flex items-center justify-center h-8 w-8 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors cursor-pointer"
+                    title="删除去重记录"
+                    @click="openDeleteRowPopoverNow(v.viewkey)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                      <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Desktop DataTable (>= md) -->
+        <div class="hidden md:block overflow-x-auto">
           <table class="w-full min-w-[1060px] text-left text-sm">
             <thead>
               <tr class="border-b border-border bg-surface-subtle text-xs font-medium text-muted-foreground whitespace-nowrap">
@@ -941,7 +1142,7 @@ onDeactivated(() => {
         </div>
 
         <!-- Pagination Bar -->
-        <div class="px-5 py-3.5 border-t border-border bg-surface-subtle flex items-center justify-between text-xs text-muted-foreground">
+        <div class="px-3.5 sm:px-5 py-3 sm:py-3.5 border-t border-border bg-surface-subtle flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
           <span class="tabular-nums">共 {{ total }} 条 · 第 {{ filters.page }} / {{ totalPages }} 页</span>
           <div class="flex items-center gap-1.5">
             <Button

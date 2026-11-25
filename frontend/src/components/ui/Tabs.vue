@@ -31,7 +31,7 @@ const emit = defineEmits(['update:modelValue'])
         <Button
           variant="ghost"
           size="sm"
-          class="gap-1.5 px-3.5 text-muted-foreground hover:bg-brand/8 hover:text-foreground data-[state=active]:bg-card data-[state=active]:text-foreground data-[state=active]:shadow-xs"
+          class="gap-1.5 px-2.5 sm:px-3.5 whitespace-nowrap text-muted-foreground hover:bg-brand/8 hover:text-foreground data-[state=active]:bg-card data-[state=active]:text-foreground data-[state=active]:shadow-xs"
         >
           <component :is="item.icon" v-if="item.icon" class="w-3.5 h-3.5" />
           <span>{{ item.label }}</span>

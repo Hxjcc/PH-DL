@@ -444,11 +444,11 @@ function downloadExportTxt() {
     @pointerenter="prefetchItemsOnHover"
   >
     <!-- Job Header -->
-    <div class="px-4 sm:px-5 py-4 cursor-pointer select-none" @click="toggleExpand">
-      <div class="flex flex-wrap items-center justify-between gap-3.5">
+    <div class="px-3.5 sm:px-5 py-3.5 sm:py-4 cursor-pointer select-none" @click="toggleExpand">
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5 sm:gap-3.5">
         <!-- Left: Checkbox + Avatar/Icon + Title & Capsules -->
-        <div class="min-w-0 flex-1 flex items-center gap-3.5">
-          <div v-if="selectable" class="shrink-0" @click.stop>
+        <div class="min-w-0 w-full sm:w-auto sm:flex-1 flex items-start sm:items-center gap-2.5 sm:gap-3.5">
+          <div v-if="selectable" class="shrink-0 pt-2 sm:pt-0" @click.stop>
             <Checkbox
               :model-value="selected"
               :disabled="isActive"
@@ -538,7 +538,7 @@ function downloadExportTxt() {
             <div class="flex flex-wrap items-center gap-1.5 min-w-0">
               <span
                 :class="[
-                  'inline-flex h-[22px] items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium leading-none shrink-0',
+                  'inline-flex h-[22px] items-center gap-1 rounded-full border px-2 sm:px-2.5 text-[11px] font-medium leading-none shrink-0 whitespace-nowrap',
                   visual.category.pillClass,
                 ]"
               >
@@ -547,7 +547,7 @@ function downloadExportTxt() {
               </span>
 
               <span
-                class="text-[15px] font-semibold tracking-tight text-foreground truncate max-w-[220px] sm:max-w-[340px]"
+                class="text-sm sm:text-[15px] font-semibold tracking-tight text-foreground truncate max-w-full sm:max-w-[340px]"
                 :title="job.label || visual.title"
               >
                 {{ visual.title }}
@@ -557,7 +557,7 @@ function downloadExportTxt() {
                 v-for="(cap, cIdx) in visual.capsules"
                 :key="cIdx"
                 :class="[
-                  'inline-flex h-[22px] items-center rounded-full border px-2.5 text-[11px] leading-none shrink-0',
+                  'inline-flex h-[22px] items-center rounded-full border px-2 sm:px-2.5 text-[11px] leading-none shrink-0 whitespace-nowrap',
                   cap.handle ? 'font-normal tracking-normal' : cap.mono ? 'font-mono tabular-nums' : 'font-medium',
                   capsuleClass(cap),
                 ]"
@@ -569,14 +569,14 @@ function downloadExportTxt() {
                 <template v-else>{{ cap.text }}</template>
               </span>
 
-              <span class="inline-flex h-[22px] items-center rounded-full bg-secondary/80 px-2 text-[11px] leading-none font-mono text-muted-foreground tabular-nums shrink-0">
+              <span class="inline-flex h-[22px] items-center rounded-full bg-secondary/80 px-2 text-[11px] leading-none font-mono text-muted-foreground tabular-nums shrink-0 whitespace-nowrap">
                 #{{ job.id }}
               </span>
             </div>
 
             <!-- Row 2: Compact Metric Chips + Timestamp -->
             <div class="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground tabular-nums">
-              <span class="inline-flex items-center gap-1 rounded-md border border-border/70 bg-surface-subtle px-2 py-0.5">
+              <span class="inline-flex items-center gap-1 rounded-md border border-border/70 bg-surface-subtle px-2 py-0.5 whitespace-nowrap">
                 <span>进度</span>
                 <strong class="font-semibold text-foreground">{{ liveMetrics.done }}</strong>
                 <span class="text-muted-foreground/60">/</span>
@@ -585,28 +585,28 @@ function downloadExportTxt() {
 
               <span
                 v-if="liveMetrics.uploaded > 0"
-                class="inline-flex items-center gap-1 rounded-md border border-emerald-500/20 bg-emerald-500/8 px-2 py-0.5 text-emerald-700 dark:text-emerald-300 font-medium"
+                class="inline-flex items-center gap-1 rounded-md border border-emerald-500/20 bg-emerald-500/8 px-2 py-0.5 text-emerald-700 dark:text-emerald-300 font-medium whitespace-nowrap"
               >
-                <CloudUpload class="w-3 h-3" />
+                <CloudUpload class="w-3 h-3 shrink-0" />
                 已上传 {{ liveMetrics.uploaded }}
               </span>
 
               <span
                 v-if="liveMetrics.skipped > 0"
-                class="inline-flex items-center rounded-md border border-border/70 bg-surface-subtle px-2 py-0.5"
+                class="inline-flex items-center rounded-md border border-border/70 bg-surface-subtle px-2 py-0.5 whitespace-nowrap"
               >
                 跳过 {{ liveMetrics.skipped }}
               </span>
 
               <span
                 v-if="liveMetrics.failed > 0"
-                class="inline-flex items-center rounded-md border border-red-500/25 bg-red-500/8 px-2 py-0.5 text-red-600 dark:text-red-400 font-medium"
+                class="inline-flex items-center rounded-md border border-red-500/25 bg-red-500/8 px-2 py-0.5 text-red-600 dark:text-red-400 font-medium whitespace-nowrap"
               >
                 失败 {{ liveMetrics.failed }}
               </span>
 
-              <span class="inline-flex items-center gap-1 text-muted-foreground/85 pl-0.5">
-                <Clock class="w-3 h-3 opacity-70" />
+              <span class="inline-flex items-center gap-1 text-muted-foreground/85 pl-0.5 whitespace-nowrap">
+                <Clock class="w-3 h-3 opacity-70 shrink-0" />
                 <span>{{ formatDateTime(job.created_at) }}</span>
                 <span v-if="liveMetrics.durationText" class="text-muted-foreground/70">
                   · {{ liveMetrics.durationText }}
@@ -617,7 +617,10 @@ function downloadExportTxt() {
         </div>
 
         <!-- Right: Status Pill + Action Buttons -->
-        <div class="flex items-center gap-1.5 shrink-0 ml-auto" @click.stop>
+        <div
+          class="flex flex-wrap items-center justify-between sm:justify-end gap-1.5 shrink-0 w-full sm:w-auto sm:ml-auto pt-2 sm:pt-0 border-t sm:border-t-0 border-border/60"
+          @click.stop
+        >
           <span
             :class="[
               'inline-flex items-center gap-1.5 rounded-full border font-medium whitespace-nowrap h-6 px-2.5 text-[11px]',
@@ -628,92 +631,94 @@ function downloadExportTxt() {
             {{ statusMeta.label }}
           </span>
 
-          <Button
-            v-if="job.export_text"
-            variant="outline"
-            size="xs"
-            :title="`导出为 ${exportFilename}`"
-            @click="downloadExportTxt"
-          >
-            <DownloadIcon class="w-3.5 h-3.5" />
-            导出 TXT
-          </Button>
-
-          <Button
-            v-if="isActive"
-            variant="outline"
-            size="xs"
-            class="text-red-600 dark:text-red-400 hover:text-red-600 hover:bg-red-500/10 border-red-500/30"
-            :disabled="busyAction"
-            @click="handleCancel"
-          >
-            <Square class="w-3 h-3" />
-            停止
-          </Button>
-
-          <Button
-            v-if="canRetry"
-            variant="outline"
-            size="xs"
-            :disabled="busyAction"
-            :title="retryButtonTitle"
-            @click="handleRetry"
-          >
-            <RotateCcw :class="['w-3.5 h-3.5', busyAction ? 'animate-spin' : '']" />
-            {{ retryButtonText }}
-          </Button>
-
-          <template v-if="!isActive">
-            <ConfirmPopover
-              v-if="deletePopoverMounted"
-              :title="`删除任务记录 #${job.id}？`"
-              description="仅删除队列记录，不会删除已下载的视频与历史去重记录。"
-              confirm-text="删除"
-              :default-open="deletePopoverDefaultOpen"
-              @confirm="handleDelete"
-              @open-change="(v) => { if (!v) deletePopoverDefaultOpen = false }"
+          <div class="flex items-center gap-1.5">
+            <Button
+              v-if="job.export_text"
+              variant="outline"
+              size="xs"
+              :title="`导出为 ${exportFilename}`"
+              @click="downloadExportTxt"
             >
+              <DownloadIcon class="w-3.5 h-3.5" />
+              导出 TXT
+            </Button>
+
+            <Button
+              v-if="isActive"
+              variant="outline"
+              size="xs"
+              class="text-red-600 dark:text-red-400 hover:text-red-600 hover:bg-red-500/10 border-red-500/30"
+              :disabled="busyAction"
+              @click="handleCancel"
+            >
+              <Square class="w-3 h-3" />
+              停止
+            </Button>
+
+            <Button
+              v-if="canRetry"
+              variant="outline"
+              size="xs"
+              :disabled="busyAction"
+              :title="retryButtonTitle"
+              @click="handleRetry"
+            >
+              <RotateCcw :class="['w-3.5 h-3.5', busyAction ? 'animate-spin' : '']" />
+              {{ retryButtonText }}
+            </Button>
+
+            <template v-if="!isActive">
+              <ConfirmPopover
+                v-if="deletePopoverMounted"
+                :title="`删除任务记录 #${job.id}？`"
+                description="仅删除队列记录，不会删除已下载的视频与历史去重记录。"
+                confirm-text="删除"
+                :default-open="deletePopoverDefaultOpen"
+                @confirm="handleDelete"
+                @open-change="(v) => { if (!v) deletePopoverDefaultOpen = false }"
+              >
+                <button
+                  type="button"
+                  class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-red-600 transition-colors cursor-pointer disabled:pointer-events-none disabled:opacity-50"
+                  title="删除任务记录"
+                  :disabled="busyAction"
+                >
+                  <Trash2 class="w-3.5 h-3.5" />
+                </button>
+              </ConfirmPopover>
               <button
+                v-else
                 type="button"
                 class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-red-600 transition-colors cursor-pointer disabled:pointer-events-none disabled:opacity-50"
                 title="删除任务记录"
                 :disabled="busyAction"
+                @pointerenter="warmDeletePopover"
+                @focus="warmDeletePopover"
+                @click="openDeletePopoverNow"
               >
                 <Trash2 class="w-3.5 h-3.5" />
               </button>
-            </ConfirmPopover>
-            <button
-              v-else
-              type="button"
-              class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-red-600 transition-colors cursor-pointer disabled:pointer-events-none disabled:opacity-50"
-              title="删除任务记录"
-              :disabled="busyAction"
-              @pointerenter="warmDeletePopover"
-              @focus="warmDeletePopover"
-              @click="openDeletePopoverNow"
-            >
-              <Trash2 class="w-3.5 h-3.5" />
-            </button>
-          </template>
+            </template>
 
-          <button
-            type="button"
-            class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors cursor-pointer"
-            :aria-label="expanded ? '收起任务明细' : '展开任务明细'"
-            :aria-expanded="expanded"
-            :aria-controls="`job-details-${job.id}`"
-            :aria-busy="loadingItems"
-            @click="toggleExpand"
-          >
-            <ChevronDown :class="['w-4 h-4 transition-transform duration-[260ms] ease-[cubic-bezier(0.22,1,0.36,1)]', expanded ? 'rotate-180' : '']" />
-          </button>
+            <button
+              type="button"
+              class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors cursor-pointer"
+              :aria-label="expanded ? '收起任务明细' : '展开任务明细'"
+              :aria-expanded="expanded"
+              :aria-controls="`job-details-${job.id}`"
+              :aria-busy="loadingItems"
+              @click="toggleExpand"
+            >
+              <ChevronDown :class="['w-4 h-4 transition-transform duration-[260ms] ease-[cubic-bezier(0.22,1,0.36,1)]', expanded ? 'rotate-180' : '']" />
+            </button>
+          </div>
         </div>
       </div>
 
       <!-- Live Telemetry & Progress Bar Strip -->
       <div
         v-if="isActive"
-        class="mt-3.5 rounded-xl border border-border/75 bg-surface-subtle/80 dark:bg-surface-subtle/45 px-3.5 py-2.5 space-y-1.5"
+        class="mt-3 sm:mt-3.5 rounded-xl border border-border/75 bg-surface-subtle/80 dark:bg-surface-subtle/45 px-3 sm:px-3.5 py-2 sm:py-2.5 space-y-1.5"
       >
         <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] tabular-nums">
           <span class="inline-flex items-center gap-1.5 text-muted-foreground">
@@ -783,7 +788,7 @@ function downloadExportTxt() {
     >
       <div
         v-if="detailsMounted"
-        class="job-details border-t border-border bg-surface-subtle/50 dark:bg-surface-subtle/25 px-4 sm:px-5 py-3.5"
+        class="job-details border-t border-border bg-surface-subtle/50 dark:bg-surface-subtle/25 px-3 sm:px-5 py-3 sm:py-3.5"
         @click="!focused && emit('activate', job.id, true)"
       >
         <div v-if="loadingItems && items.length === 0" class="py-5 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
@@ -825,14 +830,14 @@ function downloadExportTxt() {
 
         <div v-else class="space-y-2.5">
           <div v-if="itemFilterPills.length > 1" class="flex flex-wrap items-center justify-between gap-2">
-            <div class="flex flex-wrap items-center gap-1.5">
+            <div class="flex items-center gap-1.5 flex-nowrap overflow-x-auto no-scrollbar max-w-full sm:flex-wrap">
               <button
                 v-for="pill in itemFilterPills"
                 :key="pill.value"
                 type="button"
                 :aria-pressed="itemStatusFilter === pill.value"
                 :class="[
-                  'inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full border text-[11px] font-medium transition-colors cursor-pointer select-none tabular-nums',
+                  'inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full border text-[11px] font-medium shrink-0 transition-colors cursor-pointer select-none tabular-nums',
                   itemStatusFilter === pill.value
                     ? 'border-brand/35 bg-brand/10 dark:bg-brand/15 text-brand'
                     : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-foreground/20',
@@ -853,16 +858,16 @@ function downloadExportTxt() {
             当前筛选下没有条目
           </div>
 
-          <div v-else class="space-y-1.5 max-h-96 overflow-y-auto pr-1" @scroll.passive="handleItemsScroll">
+          <div v-else class="space-y-1.5 max-h-96 overflow-y-auto pr-0.5 sm:pr-1" @scroll.passive="handleItemsScroll">
             <div
               v-for="(item, idx) in visibleItems"
               :key="item.id"
-              class="job-item-row rounded-lg border border-border/80 bg-card px-3.5 py-2.5 space-y-2 transition-colors hover:border-foreground/20"
+              class="job-item-row rounded-lg border border-border/80 bg-card px-3 sm:px-3.5 py-2 sm:py-2.5 space-y-1.5 sm:space-y-2 transition-colors hover:border-foreground/20"
             >
-              <div class="flex items-center justify-between gap-2.5">
+              <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5 sm:gap-2.5">
                 <!-- Left: Index + Status Badge + Title -->
-                <div class="min-w-0 flex-1 flex items-center gap-2">
-                  <span class="w-5 shrink-0 text-[11px] font-mono text-muted-foreground/65 tabular-nums">
+                <div class="min-w-0 flex-1 flex items-center gap-1.5 sm:gap-2">
+                  <span class="w-4 sm:w-5 shrink-0 text-[11px] font-mono text-muted-foreground/65 tabular-nums">
                     {{ String(idx + 1).padStart(2, '0') }}
                   </span>
                   <span class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card/90 text-foreground font-medium whitespace-nowrap shrink-0 h-5 px-2 text-[10px]">
@@ -875,7 +880,7 @@ function downloadExportTxt() {
                 </div>
 
                 <!-- Right: Capsules (Uploader, Quality, Size / Live Speed, Source Link) -->
-                <div class="flex items-center gap-1.5 shrink-0 text-[11px] tabular-nums">
+                <div class="flex flex-wrap items-center sm:justify-end gap-1.5 shrink-0 text-[11px] tabular-nums pl-5 sm:pl-0">
                   <span
                     v-if="showItemUploader && item.uploader"
                     class="hidden md:inline-flex h-[21px] items-center rounded-full border border-border/80 bg-surface-subtle px-2.5 text-[11px] leading-none text-muted-foreground max-w-32"
@@ -900,7 +905,7 @@ function downloadExportTxt() {
                       <span class="text-muted-foreground text-[11px]">等待响应...</span>
                     </template>
                     <template v-else>
-                      <span class="hidden sm:inline text-muted-foreground font-mono text-[11px]">
+                      <span class="text-muted-foreground font-mono text-[10px] sm:text-[11px]">
                         {{ transferProgressMap[item.id]?.doneText || '0 B' }}
                         <template v-if="transferProgressMap[item.id]?.totalText"> / {{ transferProgressMap[item.id].totalText }}</template>
                       </span>
@@ -910,7 +915,7 @@ function downloadExportTxt() {
                       >
                         ↓ {{ transferProgressMap[item.id].speedText }}
                       </span>
-                      <span class="font-mono font-semibold text-foreground w-11 text-right">
+                      <span class="font-mono font-semibold text-foreground sm:w-11 text-right">
                         {{ transferProgressMap[item.id]?.pct || 0 }}%
                       </span>
                     </template>
@@ -918,11 +923,11 @@ function downloadExportTxt() {
                   <template v-else-if="item.status === 'uploading'">
                     <span
                       v-if="transferProgressMap[item.id]?.hasProgress && transferProgressMap[item.id]?.totalText"
-                      class="hidden sm:inline text-muted-foreground font-mono text-[11px]"
+                      class="text-muted-foreground font-mono text-[10px] sm:text-[11px]"
                     >
                       {{ transferProgressMap[item.id].doneText }} / {{ transferProgressMap[item.id].totalText }}
                     </span>
-                    <span v-else-if="item.bytes_total > 0" class="hidden sm:inline text-muted-foreground font-mono text-[11px]">
+                    <span v-else-if="item.bytes_total > 0" class="text-muted-foreground font-mono text-[10px] sm:text-[11px]">
                       {{ formatBytes(item.bytes_total) }}
                     </span>
                     <span
@@ -939,12 +944,12 @@ function downloadExportTxt() {
                     </span>
                     <span
                       v-if="transferProgressMap[item.id]?.hasProgress"
-                      class="font-mono font-semibold text-foreground w-11 text-right"
+                      class="font-mono font-semibold text-foreground sm:w-11 text-right"
                     >
                       {{ transferProgressMap[item.id].pct }}%
                     </span>
                   </template>
-                  <span v-else-if="item.bytes_total > 0" class="text-muted-foreground font-mono text-[11px] min-w-[54px] text-right">
+                  <span v-else-if="item.bytes_total > 0" class="text-muted-foreground font-mono text-[11px] sm:min-w-[54px] sm:text-right">
                     {{ formatBytes(item.bytes_total) }}
                   </span>
                   <span
@@ -960,7 +965,7 @@ function downloadExportTxt() {
                     :href="item.page_url"
                     target="_blank"
                     rel="noopener noreferrer"
-                    class="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                    class="inline-flex h-6 w-6 ml-auto sm:ml-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
                     :title="`打开原视频页 (${item.viewkey || 'PornHub'})`"
                     @click.stop
                   >

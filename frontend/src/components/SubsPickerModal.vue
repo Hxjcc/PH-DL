@@ -311,14 +311,16 @@ function confirm() {
         </template>
       </div>
 
-      <div class="flex flex-wrap items-center gap-2">
-        <div class="relative min-w-[180px] flex-1">
+      <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+        <div class="relative w-full sm:min-w-[180px] sm:flex-1">
           <Search class="absolute left-3 top-1/2 w-3.5 h-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input ref="searchInput" v-model="query" placeholder="搜索用户名或显示名..." aria-label="搜索订阅" class="pl-8" />
         </div>
-        <Select v-model="typeFilter" :options="typeOptions" class="w-28" aria-label="订阅类型" />
-        <Button variant="outline" size="sm" @click="selectAllFiltered">全选</Button>
-        <Button variant="ghost" size="sm" @click="clearSelection">清空</Button>
+        <div class="flex items-center gap-2 sm:contents">
+          <Select v-model="typeFilter" :options="typeOptions" class="flex-1 sm:flex-none sm:w-28" aria-label="订阅类型" />
+          <Button variant="outline" size="sm" @click="selectAllFiltered">全选</Button>
+          <Button variant="ghost" size="sm" @click="clearSelection">清空</Button>
+        </div>
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
@@ -366,14 +368,14 @@ function confirm() {
             type="button"
             :aria-pressed="selected.has(subKey(sub))"
             :class="[
-              'flex min-w-0 items-center gap-3 rounded-xl border px-3 py-3 text-left transition-colors cursor-pointer',
+              'flex min-w-0 items-center gap-2.5 sm:gap-3 rounded-xl border px-2.5 sm:px-3 py-2.5 sm:py-3 text-left transition-colors cursor-pointer',
               selected.has(subKey(sub)) ? 'border-brand/45 bg-brand/5 text-foreground' : 'border-border bg-card text-foreground hover:bg-accent',
             ]"
             @click="toggle(sub)"
           >
             <span class="relative shrink-0">
-              <img v-if="avatarFor(sub)" :key="avatarFor(sub)" :src="avatarFor(sub)" alt="" aria-hidden="true" class="w-10 h-10 rounded-full object-cover bg-secondary" loading="lazy" decoding="async" referrerpolicy="no-referrer" @error="markAvatarFailed" />
-              <span v-else class="flex w-10 h-10 items-center justify-center rounded-full bg-secondary text-sm font-semibold text-muted-foreground">{{ (sub.display_name || sub.username).slice(0, 1).toUpperCase() }}</span>
+              <img v-if="avatarFor(sub)" :key="avatarFor(sub)" :src="avatarFor(sub)" alt="" aria-hidden="true" class="w-9 h-9 sm:w-10 sm:h-10 rounded-full object-cover bg-secondary" loading="lazy" decoding="async" referrerpolicy="no-referrer" @error="markAvatarFailed" />
+              <span v-else class="flex w-9 h-9 sm:w-10 sm:h-10 items-center justify-center rounded-full bg-secondary text-sm font-semibold text-muted-foreground">{{ (sub.display_name || sub.username).slice(0, 1).toUpperCase() }}</span>
               <span v-if="selected.has(subKey(sub))" class="absolute -bottom-0.5 -right-0.5 flex w-4 h-4 items-center justify-center rounded-full bg-primary text-primary-foreground ring-2 ring-card" aria-hidden="true">
                 <Check class="w-2.5 h-2.5" />
               </span>
@@ -382,11 +384,11 @@ function confirm() {
               <span class="block truncate text-sm font-medium" :title="sub.display_name || sub.username">{{ sub.display_name || sub.username }}</span>
               <span v-if="sub.display_name && sub.display_name !== sub.username" class="mt-0.5 block truncate text-[11px] text-muted-foreground">{{ sub.username }}</span>
             </span>
-            <span class="flex shrink-0 items-center gap-1.5">
+            <span class="flex shrink-0 items-center gap-1 sm:gap-1.5">
               <span
                 v-if="trackedTargetFor(sub)"
                 :class="[
-                  'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium',
+                  'inline-flex items-center gap-1 rounded-full border px-1.5 sm:px-2 py-0.5 text-[10px] font-medium whitespace-nowrap',
                   trackedTargetFor(sub).enabled
                     ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
                     : 'border-border bg-secondary text-muted-foreground',
@@ -400,7 +402,7 @@ function confirm() {
                 />
                 {{ trackedTargetFor(sub).enabled ? '已追更' : '已暂停' }}
               </span>
-              <Badge variant="outline" class="h-6 shrink-0 rounded-md px-2 text-xs">{{ targetTypeMeta(sub.type) }}</Badge>
+              <Badge variant="outline" class="h-6 shrink-0 rounded-md px-1.5 sm:px-2 text-[11px] sm:text-xs">{{ targetTypeMeta(sub.type) }}</Badge>
             </span>
           </button>
         </div>
@@ -427,7 +429,7 @@ function confirm() {
             <span>同时加入自动追更</span>
           </label>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center justify-end gap-2 w-full sm:w-auto">
           <Button variant="outline" size="sm" @click="emit('close')">取消</Button>
           <Button size="sm" :disabled="selected.size === 0 || (showBaselineOption && initBaseline && !baselinePagesValid)" @click="confirm">{{ confirmLabel }}</Button>
         </div>

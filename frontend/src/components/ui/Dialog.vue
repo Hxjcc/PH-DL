@@ -36,13 +36,13 @@ function onOpenChange(val) {
         @open-auto-focus="emit('open-auto-focus', $event)"
         :class="
           cn(
-            'fixed left-1/2 top-1/2 z-50 w-[94vw] max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border bg-card p-6 text-card-foreground shadow-xl outline-none animate-dialog-in',
+            'fixed left-1/2 top-1/2 z-50 w-[calc(100vw-1.5rem)] max-w-lg max-h-[calc(100dvh-2rem)] overflow-y-auto -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border bg-card p-4 sm:p-6 text-card-foreground shadow-xl outline-none animate-dialog-in',
             props.class
           )
         "
       >
-        <div v-if="title || description" class="space-y-1 pr-6 mb-4">
-          <DialogTitle v-if="title" class="text-base font-semibold tracking-tight text-foreground">
+        <div v-if="title || description" class="space-y-1 pr-7 mb-3.5 sm:mb-4">
+          <DialogTitle v-if="title" class="text-base font-semibold tracking-tight text-foreground leading-snug">
             {{ title }}
           </DialogTitle>
           <DialogDescription v-if="description" class="text-xs text-muted-foreground">
@@ -52,12 +52,12 @@ function onOpenChange(val) {
 
         <slot />
 
-        <div v-if="$slots.footer" class="mt-5 flex items-center justify-end gap-2">
+        <div v-if="$slots.footer" class="mt-4 sm:mt-5 flex flex-wrap items-center justify-end gap-2">
           <slot name="footer" />
         </div>
 
         <DialogClose
-          class="absolute right-4 top-4 rounded-sm opacity-60 transition-opacity hover:opacity-100 focus:outline-none focus:ring-1 focus:ring-ring cursor-pointer"
+          class="absolute right-3.5 top-3.5 sm:right-4 sm:top-4 rounded-sm opacity-60 transition-opacity hover:opacity-100 focus:outline-none focus:ring-1 focus:ring-ring cursor-pointer"
           aria-label="关闭"
         >
           <X class="h-4 w-4" />

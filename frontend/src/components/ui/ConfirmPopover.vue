@@ -34,7 +34,8 @@ function handleConfirm() {
         side="top"
         align="end"
         :side-offset="6"
-        class="z-50 w-72 rounded-xl border border-border bg-popover p-4 text-popover-foreground shadow-md outline-none animate-popover-in"
+        :collision-padding="12"
+        class="z-50 w-[min(18rem,calc(100vw-1.5rem))] rounded-xl border border-border bg-popover p-3.5 sm:p-4 text-popover-foreground shadow-md outline-none animate-popover-in"
       >
         <div class="text-xs font-medium text-foreground leading-relaxed">{{ title }}</div>
         <div v-if="description" class="text-[11px] text-muted-foreground mt-1 leading-relaxed">

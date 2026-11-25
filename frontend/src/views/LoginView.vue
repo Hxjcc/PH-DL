@@ -1,10 +1,10 @@
 <script setup>
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Eye, EyeOff, Loader2, Sun, Moon } from 'lucide-vue-next'
+import { Eye, EyeOff, Loader2 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
-import { useTheme } from '../composables/useTheme'
 import BrandMark from '../components/BrandMark.vue'
+import ThemeToggleButton from '../components/ThemeToggleButton.vue'
 import Card from '../components/ui/Card.vue'
 import Input from '../components/ui/Input.vue'
 import Button from '../components/ui/Button.vue'
@@ -14,7 +14,6 @@ import { markBrowserEntry } from '../utils/browserEntry'
 const route = useRoute()
 const router = useRouter()
 const store = useAppStore()
-const { isDark, toggleTheme } = useTheme()
 const { authTransition, runAuthTransition } = useAuthTransition()
 
 const password = ref('')
@@ -51,19 +50,14 @@ async function submit() {
 </script>
 
 <template>
-  <div :class="['auth-scene login-scene relative min-h-screen flex flex-col items-center justify-center bg-background bg-dot-grid px-4 py-12 overflow-hidden', { 'auth-scene-leaving': authTransition.visible && authTransition.kind === 'login' }]" :inert="authTransition.visible">
+  <div :class="['auth-scene login-scene relative min-h-dvh flex flex-col items-center justify-center bg-background bg-dot-grid px-4 py-8 sm:py-12 overflow-hidden', { 'auth-scene-leaving': authTransition.visible && authTransition.kind === 'login' }]" :inert="authTransition.visible">
     <!-- Top-right theme switcher -->
     <div class="fixed top-4 right-4 z-10">
-      <Button
-        variant="outline"
-        size="icon"
-        class="h-8 w-8 rounded-full border-border/80 bg-card/85 backdrop-blur-sm text-muted-foreground hover:text-foreground"
-        :title="isDark ? '切换到浅色主题' : '切换到深色主题'"
-        @click="toggleTheme"
-      >
-        <Sun v-if="isDark" class="w-4 h-4 text-amber-400" />
-        <Moon v-else class="w-4 h-4" />
-      </Button>
+      <ThemeToggleButton
+        size-class="h-8 w-8"
+        icon-class="w-4 h-4"
+        class="bg-card/85 backdrop-blur-sm"
+      />
     </div>
 
     <div class="relative z-10 w-full max-w-[380px] space-y-6">
@@ -75,7 +69,7 @@ async function submit() {
         </div>
       </div>
 
-      <Card class="p-6">
+      <Card class="p-5 sm:p-6">
         <form class="space-y-4" @submit.prevent="submit">
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">管理员密码</label>

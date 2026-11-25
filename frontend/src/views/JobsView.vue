@@ -267,16 +267,16 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="space-y-5">
-    <div class="flex flex-wrap items-center justify-between gap-4">
-      <div class="flex items-center gap-3.5">
+  <div class="space-y-4 sm:space-y-5">
+    <div class="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+      <div class="flex items-center gap-3 sm:gap-3.5 min-w-0">
         <div
-          class="w-10 h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+          class="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
         >
-          <ListChecks class="w-5 h-5" />
+          <ListChecks class="w-4 h-4 sm:w-5 sm:h-5" />
         </div>
-        <div>
-          <h1 class="text-xl font-bold tracking-tight text-foreground">任务队列</h1>
+        <div class="min-w-0">
+          <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground">任务队列</h1>
           <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
             查看下载、追更与基线任务明细，实时追踪单视频进度与云端同步状态
           </p>
@@ -294,10 +294,10 @@ onBeforeUnmount(() => {
     </div>
 
     <Card>
-      <div class="px-5 py-3.5 border-b border-border bg-surface-subtle rounded-t-[calc(var(--radius-2xl)-1px)] flex flex-wrap items-center justify-between gap-3 min-h-[56px]">
-        <div class="flex flex-wrap items-center gap-2">
+      <div class="px-3.5 sm:px-5 py-3 sm:py-3.5 border-b border-border bg-surface-subtle rounded-t-[calc(var(--radius-2xl)-1px)] flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2.5 sm:gap-3 min-h-[56px]">
+        <div class="flex flex-wrap items-center gap-2 min-w-0">
           <!-- Category Filter Pills -->
-          <div class="flex flex-wrap items-center gap-1.5">
+          <div class="flex items-center gap-1.5 flex-nowrap overflow-x-auto no-scrollbar max-w-full sm:flex-wrap">
             <Button
               v-for="pill in categoryPills"
               :key="pill.value"
@@ -305,7 +305,7 @@ onBeforeUnmount(() => {
               size="xs"
               :aria-pressed="categoryFilter === pill.value"
               :class="[
-                'h-7 px-2.5 rounded-full text-xs gap-1.5 shadow-none hover:shadow-none',
+                'h-7 px-2.5 rounded-full text-xs gap-1.5 shrink-0 shadow-none hover:shadow-none',
                 categoryFilter === pill.value
                   ? 'border-brand/35 bg-brand/10 dark:bg-brand/15 text-brand hover:bg-brand/10 hover:border-brand/35 dark:hover:bg-brand/15'
                   : 'border-border bg-card text-muted-foreground hover:text-foreground',
@@ -319,8 +319,8 @@ onBeforeUnmount(() => {
           </div>
 
           <template v-if="deletableJobs.length > 0">
-            <span class="h-3.5 w-px bg-border mx-0.5" />
-            <label class="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer select-none">
+            <span class="hidden sm:inline-block h-3.5 w-px bg-border mx-0.5" />
+            <label class="hidden sm:inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer select-none">
               <Checkbox
                 :model-value="allSelected"
                 :indeterminate="partiallySelected"
@@ -331,35 +331,49 @@ onBeforeUnmount(() => {
           </template>
         </div>
 
-        <div class="flex flex-wrap items-center gap-1.5">
-          <label for="jobs-display-limit" class="mr-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
-            显示条数
-            <Select
-              id="jobs-display-limit"
-              :model-value="store.jobsLimit"
-              :options="limitOptions"
-              :disabled="changingLimit"
-              class="h-8 w-28 text-xs"
-              @update:model-value="changeJobsLimit"
+        <div class="flex flex-wrap items-center justify-between sm:justify-end gap-2 sm:gap-1.5">
+          <label
+            v-if="deletableJobs.length > 0"
+            class="inline-flex sm:hidden items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground cursor-pointer select-none"
+          >
+            <Checkbox
+              :model-value="allSelected"
+              :indeterminate="partiallySelected"
+              @update:model-value="toggleSelectAll"
             />
+            <span>{{ validSelectedIds.length > 0 ? `已选 ${validSelectedIds.length} 项` : '全选' }}</span>
           </label>
-          <template v-if="validSelectedIds.length > 0">
-            <Button variant="ghost" size="xs" class="text-muted-foreground" @click="clearSelectedJobs">
-              取消
-            </Button>
-            <ConfirmPopover
-              :title="`确定批量删除选中的 ${validSelectedIds.length} 条任务记录？`"
-              description="仅清理队列记录，不影响已下载的视频和历史去重库。"
-              confirm-text="删除所选"
-              @confirm="handleBatchDeleteJobs"
-            >
-              <Button variant="destructive" size="xs" :disabled="batchDeleting">
-                <Loader2 v-if="batchDeleting" class="w-3.5 h-3.5 animate-spin" />
-                <Trash2 v-else class="w-3.5 h-3.5" />
-                删除所选 ({{ validSelectedIds.length }})
+
+          <div class="flex flex-wrap items-center gap-1.5 ml-auto sm:ml-0">
+            <label for="jobs-display-limit" class="sm:mr-2 inline-flex items-center gap-1.5 sm:gap-2 text-xs text-muted-foreground">
+              <span>显示<span class="hidden sm:inline">条数</span></span>
+              <Select
+                id="jobs-display-limit"
+                :model-value="store.jobsLimit"
+                :options="limitOptions"
+                :disabled="changingLimit"
+                class="h-8 w-24 sm:w-28 text-xs"
+                @update:model-value="changeJobsLimit"
+              />
+            </label>
+            <template v-if="validSelectedIds.length > 0">
+              <Button variant="ghost" size="xs" class="text-muted-foreground" @click="clearSelectedJobs">
+                取消
               </Button>
-            </ConfirmPopover>
-          </template>
+              <ConfirmPopover
+                :title="`确定批量删除选中的 ${validSelectedIds.length} 条任务记录？`"
+                description="仅清理队列记录，不影响已下载的视频和历史去重库。"
+                confirm-text="删除所选"
+                @confirm="handleBatchDeleteJobs"
+              >
+                <Button variant="destructive" size="xs" :disabled="batchDeleting">
+                  <Loader2 v-if="batchDeleting" class="w-3.5 h-3.5 animate-spin" />
+                  <Trash2 v-else class="w-3.5 h-3.5" />
+                  删除所选 ({{ validSelectedIds.length }})
+                </Button>
+              </ConfirmPopover>
+            </template>
+          </div>
         </div>
       </div>
 
@@ -383,7 +397,7 @@ onBeforeUnmount(() => {
         </p>
       </div>
 
-      <div v-else class="jobs-list p-4 space-y-3 bg-background rounded-b-[calc(var(--radius-2xl)-1px)]">
+      <div v-else class="jobs-list p-2.5 sm:p-4 space-y-2.5 sm:space-y-3 bg-background rounded-b-[calc(var(--radius-2xl)-1px)]">
         <JobCard
           v-for="job in visibleJobs"
           :id="`job-${job.id}`"

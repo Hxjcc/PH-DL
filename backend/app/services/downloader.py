@@ -275,6 +275,7 @@ async def download_mp4_with_resume(
         current_quality = initial_checkpoint.quality
     disk = disk_budget or DownloadDiskBudget(temp_dir, 0)
     owned_parts: Set[Path] = set()
+    superseded_parts: Set[Path] = set()
     force_fresh = False
 
     def emit(level: str, message: str) -> None:
@@ -286,6 +287,10 @@ async def download_mp4_with_resume(
             size = _size(part)
         except OSError:
             size = 0
+        if not size and part in owned_parts:
+            with contextlib.suppress(OSError):
+                part.unlink(missing_ok=True)
+                remove_download_checkpoint(part)
         return DownloadOutcome(
             success=False,
             cancelled=cancelled,
@@ -382,7 +387,16 @@ async def download_mp4_with_resume(
 
             with disk.reserve(expected) as prepare_write:
                 if mode == "wb":
-                    if _size(part):
+                    if _size(part) and part not in owned_parts:
+                        prev_cp = read_download_checkpoint(part)
+                        if (
+                            prev_cp is not None
+                            and prev_cp.viewkey == viewkey
+                            and normalized_quality(prev_cp.quality) == normalized_quality(current_quality)
+                        ):
+                            # Same video & quality written by an earlier pass/attempt: keep intact
+                            # during retry, then remove automatically once the new file validates.
+                            superseded_parts.add(part)
                         part = new_part()
                         emit("INFO", f"无法安全续接，保留原断点并重新下载: {title}")
                     owned_parts.add(part)
@@ -460,6 +474,10 @@ async def download_mp4_with_resume(
                         os.replace(part, final)
                         with contextlib.suppress(OSError):
                             remove_download_checkpoint(part)
+                        for stale in (owned_parts | superseded_parts) - {part}:
+                            with contextlib.suppress(OSError):
+                                stale.unlink(missing_ok=True)
+                                remove_download_checkpoint(stale)
                         return DownloadOutcome(success=True, local_path=final, file_size=size,
                                                quality=current_quality, download_url=url)
                     last_error = "文件未通过完整性校验（大小或 MP4 结构不完整）"

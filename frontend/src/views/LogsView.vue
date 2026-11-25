@@ -90,23 +90,23 @@ async function handleClear() {
 </script>
 
 <template>
-  <div class="space-y-5">
+  <div class="space-y-4 sm:space-y-5">
     <!-- Page Header -->
-    <div class="flex flex-wrap items-center justify-between gap-4">
-      <div class="flex items-center gap-3.5">
+    <div class="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+      <div class="flex items-center gap-3 sm:gap-3.5 min-w-0">
         <div
-          class="w-10 h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+          class="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
         >
-          <Terminal class="w-5 h-5" />
+          <Terminal class="w-4 h-4 sm:w-5 sm:h-5" />
         </div>
-        <div>
-          <h1 class="text-xl font-bold tracking-tight text-foreground">实时日志</h1>
+        <div class="min-w-0">
+          <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground">实时日志</h1>
           <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
             后端解析、下载与 rclone 上传的实时输出流
           </p>
         </div>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
         <Badge
           v-if="loopHealth"
           variant="outline"
@@ -129,9 +129,9 @@ async function handleClear() {
     </div>
 
     <!-- Filter Strip -->
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div class="flex flex-wrap items-center gap-2 flex-1">
-        <div class="flex items-center gap-1.5" role="group" aria-label="按日志级别筛选">
+    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2.5 sm:gap-3">
+      <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2 sm:flex-1 min-w-0">
+        <div class="flex items-center gap-1.5 flex-nowrap overflow-x-auto no-scrollbar max-w-full sm:flex-wrap" role="group" aria-label="按日志级别筛选">
           <Button
             v-for="pill in levelPills"
             :key="pill.value"
@@ -139,7 +139,7 @@ async function handleClear() {
             size="sm"
             :aria-pressed="levelFilter === pill.value"
             :class="[
-              'rounded-full px-3 shadow-none hover:shadow-none',
+              'h-8 rounded-full px-3 text-xs shrink-0 shadow-none hover:shadow-none',
               levelFilter === pill.value
                 ? 'bg-brand/10 dark:bg-brand/15 text-brand border-brand/35 hover:bg-brand/10 hover:border-brand/35 dark:hover:bg-brand/15'
                 : 'text-muted-foreground border-border hover:text-foreground',
@@ -150,15 +150,17 @@ async function handleClear() {
           </Button>
         </div>
 
-        <div class="relative flex-1 min-w-[200px] max-w-xs">
-          <Search class="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2" />
-          <Input v-model="search" placeholder="过滤日志关键词..." class="pl-8 rounded-full" />
-        </div>
+        <div class="flex items-center gap-2 w-full sm:w-auto sm:flex-1 sm:max-w-sm">
+          <div class="relative flex-1 min-w-0">
+            <Search class="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2" />
+            <Input v-model="search" placeholder="过滤日志关键词..." class="pl-8 rounded-full" />
+          </div>
 
-        <Badge variant="secondary" class="tabular-nums h-8 px-3">{{ filtered.length }} 条</Badge>
+          <Badge variant="secondary" class="tabular-nums h-8 px-2.5 sm:px-3 shrink-0">{{ filtered.length }} 条</Badge>
+        </div>
       </div>
 
-      <label class="inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+      <label class="inline-flex items-center gap-2 text-xs text-muted-foreground cursor-pointer self-start sm:self-auto">
         <Switch v-model="autoScroll" />
         <span>自动滚动到底部</span>
       </label>
@@ -168,7 +170,7 @@ async function handleClear() {
     <Card class="overflow-hidden">
       <div
         ref="boxRef"
-        class="p-4 font-mono text-xs leading-relaxed h-[calc(100vh-17.5rem)] min-h-[380px] overflow-y-auto space-y-1 bg-surface-subtle/70 dark:bg-[#0c0c0f]"
+        class="p-2.5 sm:p-4 font-mono text-[11px] sm:text-xs leading-relaxed h-[calc(100dvh-19.5rem)] sm:h-[calc(100dvh-17.5rem)] min-h-[340px] sm:min-h-[380px] overflow-y-auto space-y-1 bg-surface-subtle/70 dark:bg-[#0c0c0f]"
       >
         <div
           v-if="filtered.length === 0"
@@ -180,19 +182,21 @@ async function handleClear() {
         <div
           v-for="entry in filtered"
           :key="entry.boot_id ? `${entry.boot_id}:${entry.id}` : entry.id"
-          class="flex items-start gap-2.5 px-2.5 py-1 rounded-lg hover:bg-card transition-colors break-all"
+          class="flex flex-col sm:flex-row sm:items-start gap-0.5 sm:gap-2.5 px-2 sm:px-2.5 py-1.5 sm:py-1 rounded-lg hover:bg-card transition-colors"
         >
-          <span class="text-muted-foreground/75 shrink-0 tabular-nums">{{ formatLogTime(entry.ts) }}</span>
-          <span :class="['shrink-0 w-16 font-semibold', levelStyle(entry.level)]">
-            [{{ entry.level }}]
-          </span>
-          <span
-            v-if="entry.job_id"
-            class="shrink-0 rounded-md bg-brand/12 px-1.5 text-[11px] font-medium text-brand"
-          >
-            #{{ entry.job_id }}
-          </span>
-          <span class="text-foreground/90">{{ entry.message }}</span>
+          <div class="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+            <span class="text-muted-foreground/75 shrink-0 tabular-nums">{{ formatLogTime(entry.ts) }}</span>
+            <span :class="['shrink-0 sm:w-16 font-semibold', levelStyle(entry.level)]">
+              [{{ entry.level }}]
+            </span>
+            <span
+              v-if="entry.job_id"
+              class="shrink-0 rounded-md bg-brand/12 px-1.5 text-[10px] sm:text-[11px] font-medium text-brand"
+            >
+              #{{ entry.job_id }}
+            </span>
+          </div>
+          <span class="text-foreground/90 break-words [overflow-wrap:anywhere] min-w-0">{{ entry.message }}</span>
         </div>
       </div>
     </Card>

@@ -483,29 +483,29 @@ async function handleDelete(t) {
 </script>
 
 <template>
-  <div class="space-y-6">
+  <div class="space-y-4 sm:space-y-6">
     <!-- Page Header with tinted section icon -->
-    <div class="flex flex-wrap items-center justify-between gap-4">
-      <div class="flex items-center gap-3.5">
+    <div class="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+      <div class="flex items-center gap-3 sm:gap-3.5 min-w-0">
         <div
-          class="w-10 h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
+          class="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-brand/10 text-brand flex items-center justify-center shrink-0 ring-1 ring-brand/15"
         >
-          <RefreshCw class="w-5 h-5" />
+          <RefreshCw class="w-4 h-4 sm:w-5 sm:h-5" />
         </div>
-        <div>
-          <h1 class="text-xl font-bold tracking-tight text-foreground">自动追更</h1>
+        <div class="min-w-0">
+          <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground">自动追更</h1>
           <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
             每日定时检查已启用目标的新发布视频，自动下载并上传云端
           </p>
         </div>
       </div>
 
-      <div class="flex flex-wrap items-center gap-2">
-        <Button variant="outline" size="sm" @click="triggerUpdate(null, false)">
+      <div class="grid grid-cols-2 w-full sm:flex sm:w-auto sm:flex-wrap items-center gap-2">
+        <Button variant="outline" size="sm" class="w-full sm:w-auto" @click="triggerUpdate(null, false)">
           <Eye class="w-3.5 h-3.5" />
           仅检查更新
         </Button>
-        <Button size="sm" @click="triggerUpdate(null, true)">
+        <Button size="sm" class="w-full sm:w-auto" @click="triggerUpdate(null, true)">
           <Play class="w-3.5 h-3.5" />
           立即全量追更
         </Button>
@@ -513,10 +513,10 @@ async function handleDelete(t) {
     </div>
 
     <!-- Compact Schedule Strip -->
-    <Card class="px-5 py-4 flex flex-wrap items-center justify-between gap-4">
-      <div class="flex flex-wrap items-center gap-3.5">
+    <Card class="px-3.5 sm:px-5 py-3.5 sm:py-4 flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+      <div class="flex flex-wrap items-center gap-2.5 sm:gap-3.5">
         <div class="inline-flex items-center gap-2 text-sm font-medium text-foreground">
-          <span class="w-7 h-7 rounded-lg bg-brand/10 text-brand flex items-center justify-center">
+          <span class="w-7 h-7 rounded-lg bg-brand/10 text-brand flex items-center justify-center shrink-0">
             <Clock class="w-3.5 h-3.5" />
           </span>
           <span>每日定时执行</span>
@@ -534,12 +534,12 @@ async function handleDelete(t) {
         </span>
       </div>
 
-      <div class="flex items-center gap-2">
-        <Button variant="outline" size="sm" @click="subsModalOpen = true">
+      <div class="grid grid-cols-2 w-full sm:flex sm:w-auto items-center gap-2">
+        <Button variant="outline" size="sm" class="w-full sm:w-auto" @click="subsModalOpen = true">
           <Users class="w-3.5 h-3.5" />
           从订阅导入
         </Button>
-        <Button variant="outline" size="sm" @click="addModalOpen = true">
+        <Button variant="outline" size="sm" class="w-full sm:w-auto" @click="addModalOpen = true">
           <Plus class="w-3.5 h-3.5" />
           添加目标
         </Button>
@@ -547,10 +547,10 @@ async function handleDelete(t) {
     </Card>
 
     <!-- Quick Filter Pills + Search + View Switcher (inspired by rust-srec Streamers toolbar) -->
-    <div class="space-y-4">
-      <div class="flex flex-wrap items-center justify-between gap-3">
+    <div class="space-y-3 sm:space-y-4">
+      <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2.5 sm:gap-3">
         <!-- Pill Filter Strip -->
-        <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="按目标状态筛选">
+        <div class="flex items-center gap-1.5 flex-nowrap overflow-x-auto no-scrollbar max-w-full sm:flex-wrap" role="group" aria-label="按目标状态筛选">
           <Button
             v-for="pill in statusPills"
             :key="pill.value"
@@ -558,7 +558,7 @@ async function handleDelete(t) {
             size="sm"
             :aria-pressed="statusFilter === pill.value"
             :class="[
-              'gap-1.5 rounded-full shadow-none hover:shadow-none',
+              'h-8 px-2.5 sm:px-3 text-xs sm:text-sm gap-1.5 rounded-full shrink-0 shadow-none hover:shadow-none',
               statusFilter === pill.value
                 ? 'bg-brand/10 dark:bg-brand/15 text-brand border-brand/35 hover:bg-brand/10 hover:border-brand/35 dark:hover:bg-brand/15'
                 : 'text-muted-foreground border-border hover:text-foreground',
@@ -660,12 +660,12 @@ async function handleDelete(t) {
       <!-- Card Grid View (Default, inspired by rust-srec) -->
       <div
         v-else-if="viewMode === 'grid'"
-        class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
+        class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 sm:gap-4"
       >
         <Card
           v-for="t in filteredTargets"
           :key="t.id"
-          class="group p-5 flex flex-col justify-between gap-4 transition-all duration-200 hover:border-brand/35"
+          class="group p-4 sm:p-5 flex flex-col justify-between gap-3 sm:gap-4 transition-all duration-200 hover:border-brand/35"
         >
           <!-- Card Top Row: Status Pill + Enable Switch -->
           <div class="space-y-4">
@@ -746,8 +746,8 @@ async function handleDelete(t) {
           </div>
 
           <!-- Card Footer: Metrics + Quick Actions -->
-          <div class="pt-3 border-t border-border/80 flex items-center justify-between gap-2">
-            <div class="flex items-center gap-2.5 text-xs text-muted-foreground tabular-nums min-w-0">
+          <div class="pt-3 border-t border-border/80 flex flex-wrap items-center justify-between gap-x-2 gap-y-2">
+            <div class="flex items-center gap-2 text-xs text-muted-foreground tabular-nums min-w-0">
               <span class="truncate" :title="`上次检查: ${formatDateTime(t.last_checked_at)}`">
                 {{ formatDateTime(t.last_checked_at) }}
               </span>
@@ -767,7 +767,7 @@ async function handleDelete(t) {
               </span>
             </div>
 
-            <div class="inline-flex items-center gap-1 shrink-0">
+            <div class="inline-flex items-center gap-0.5 sm:gap-1 shrink-0 ml-auto">
               <Button
                 variant="ghost"
                 size="icon"
@@ -990,7 +990,7 @@ async function handleDelete(t) {
           />
         </div>
 
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">目标类型</label>
             <Select v-model="newTarget.target_type" :options="targetTypeOptions" />

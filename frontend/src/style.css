@@ -105,8 +105,15 @@
   }
 
   html {
-    overflow-y: scroll;
-    scrollbar-gutter: stable;
+    overflow-y: auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  @media (min-width: 768px) {
+    html {
+      overflow-y: scroll;
+      scrollbar-gutter: stable;
+    }
   }
 
   body {
@@ -157,6 +164,59 @@
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+@keyframes drawer-slide-in {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.animate-drawer-in {
+  animation: drawer-slide-in 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Smooth circular View Transition for Light / Dark theme switching */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-old(root) {
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 9999;
+}
+
+html.theme-view-transition *,
+html.theme-view-transition *::before,
+html.theme-view-transition *::after {
+  transition: none !important;
+}
+
+html.theme-fallback-transition,
+html.theme-fallback-transition * {
+  transition:
+    background-color 260ms ease,
+    border-color 260ms ease,
+    color 260ms ease,
+    fill 260ms ease,
+    stroke 260ms ease !important;
 }
 
 .auth-scene {
@@ -323,5 +383,5 @@
     animation: none !important;
     transition: none !important;
   }
-  .auth-scene, .login-scene { animation: none; transition: none; }
+  .auth-scene, .login-scene, .animate-drawer-in { animation: none; transition: none; }
 }
