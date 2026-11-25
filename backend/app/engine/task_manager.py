@@ -720,7 +720,7 @@ class TaskManager:
                     if refreshed:
                         self.events.broadcast("job_updated", refreshed)
 
-            timeout = aiohttp.ClientTimeout(total=None, connect=30.0, sock_read=300.0)
+            timeout = aiohttp.ClientTimeout(total=None, connect=20.0, sock_connect=20.0, sock_read=45.0)
             connector = aiohttp.TCPConnector(limit=64, limit_per_host=16)
 
             async with aiohttp.ClientSession(

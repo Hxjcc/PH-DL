@@ -896,19 +896,24 @@ function downloadExportTxt() {
                   </span>
 
                   <template v-if="item.status === 'downloading'">
-                    <span class="hidden sm:inline text-muted-foreground font-mono text-[11px]">
-                      {{ transferProgressMap[item.id]?.doneText || '0 B' }}
-                      <template v-if="transferProgressMap[item.id]?.totalText"> / {{ transferProgressMap[item.id].totalText }}</template>
-                    </span>
-                    <span
-                      v-if="transferProgressMap[item.id]?.speedText"
-                      class="rounded-full bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400"
-                    >
-                      ↓ {{ transferProgressMap[item.id].speedText }}
-                    </span>
-                    <span class="font-mono font-semibold text-foreground w-11 text-right">
-                      {{ transferProgressMap[item.id]?.pct || 0 }}%
-                    </span>
+                    <template v-if="!transferProgressMap[item.id]?.hasProgress && !transferProgressMap[item.id]?.totalText">
+                      <span class="text-muted-foreground text-[11px]">等待响应...</span>
+                    </template>
+                    <template v-else>
+                      <span class="hidden sm:inline text-muted-foreground font-mono text-[11px]">
+                        {{ transferProgressMap[item.id]?.doneText || '0 B' }}
+                        <template v-if="transferProgressMap[item.id]?.totalText"> / {{ transferProgressMap[item.id].totalText }}</template>
+                      </span>
+                      <span
+                        v-if="transferProgressMap[item.id]?.speedText"
+                        class="rounded-full bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400"
+                      >
+                        ↓ {{ transferProgressMap[item.id].speedText }}
+                      </span>
+                      <span class="font-mono font-semibold text-foreground w-11 text-right">
+                        {{ transferProgressMap[item.id]?.pct || 0 }}%
+                      </span>
+                    </template>
                   </template>
                   <template v-else-if="item.status === 'uploading'">
                     <span
@@ -984,6 +989,10 @@ function downloadExportTxt() {
                 <div
                   v-if="item.status === 'uploading' && !transferProgressMap[item.id]?.hasProgress"
                   class="h-full w-full bg-primary/80 animate-pulse"
+                />
+                <div
+                  v-else-if="item.status === 'downloading' && !transferProgressMap[item.id]?.hasProgress && !transferProgressMap[item.id]?.totalText"
+                  class="h-full w-full bg-primary/40 animate-pulse"
                 />
                 <div
                   v-else
