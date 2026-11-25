@@ -4,18 +4,18 @@ import Input from './ui/Input.vue'
 import Select from './ui/Select.vue'
 
 const props = defineProps({
-  modelValue: { type: String, default: '1' },
+  modelValue: { type: String, default: 'all' },
   disabled: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue', 'validity-change'])
 
-const mode = ref('first')
+const mode = ref('all')
 const startPage = ref(1)
 const endPage = ref(3)
 const options = [
+  { label: '全部视频', value: 'all' },
   { label: '仅第 1 页', value: 'first' },
   { label: '指定页码范围', value: 'range' },
-  { label: '全部视频', value: 'all' },
 ]
 
 const pages = computed(() => {
@@ -33,8 +33,8 @@ const rangeError = computed(() => {
 
 watch(() => props.modelValue, (value) => {
   if (value === pages.value) return
-  if (!value || value === '1') mode.value = 'first'
-  else if (value === 'all') mode.value = 'all'
+  if (!value || value === 'all') mode.value = 'all'
+  else if (value === '1') mode.value = 'first'
   else {
     const match = value.match(/^(\d+)(?:-(\d+))?$/)
     mode.value = 'range'

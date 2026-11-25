@@ -15,7 +15,7 @@ export const DEFAULT_HISTORY_FILTERS = Object.freeze({
 })
 
 const SESSION_CACHE_KEY = 'phdl-session-cache-v1'
-const SESSION_CACHE_TTL_MS = 30 * 60 * 1000
+const SESSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
 
 const inflight = new Map()
@@ -199,7 +199,7 @@ export const useAppStore = defineStore('app', {
     hasRouteCache(routeName) {
       if (!this.overviewLoaded) return false
       if (routeName === 'download') {
-        return this.tempFilesLoaded && this.jobsLoaded
+        return this.tempFilesLoaded && this.jobsLoaded && this.targetsCache !== null
       }
       if (routeName === 'jobs') {
         return this.jobsLoaded && this.jobsFetchedLimit >= this.jobsLimit
@@ -736,7 +736,7 @@ export const useAppStore = defineStore('app', {
       if (!this.authenticated) return
       const tasks = [this.ensureOverview()]
       if (routeName === 'download') {
-        tasks.push(this.ensureTempFiles(), this.ensureJobs())
+        tasks.push(this.ensureTempFiles(), this.ensureJobs(), this.ensureTargets())
       } else if (routeName === 'jobs') {
         tasks.push(this.ensureJobs(), this.ensureTargets())
       } else if (routeName === 'targets') {

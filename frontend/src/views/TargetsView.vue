@@ -62,7 +62,7 @@ const updatingTargetId = ref(null)
 const newBaselineValid = ref(true)
 const baselineModalOpen = ref(false)
 const baselineTarget = ref(null)
-const baselinePages = ref('1')
+const baselinePages = ref('all')
 const baselinePagesValid = ref(true)
 const baselineSubmitting = ref(false)
 const editModalOpen = ref(false)
@@ -97,7 +97,7 @@ const newTarget = reactive({
   target_type: 'auto',
   preferred_quality: '',
   init_baseline: true,
-  baseline_pages: '1',
+  baseline_pages: 'all',
 })
 
 const targetTypeOptions = [
@@ -346,7 +346,7 @@ async function handleImportSubs(picked, opts = {}) {
         avatar_url: p.avatar_url || '',
       })),
       init_baseline: initBaseline,
-      baseline_pages: opts?.baselinePages || '1',
+      baseline_pages: opts?.baselinePages || 'all',
     })
     const baselineCount = (res.baseline_jobs || []).length
     store.notify(
@@ -392,7 +392,7 @@ async function triggerUpdate(targetIds, autoDownload) {
 
 function openBaselineDialog(target) {
   baselineTarget.value = target
-  baselinePages.value = '1'
+  baselinePages.value = 'all'
   baselinePagesValid.value = true
   baselineModalOpen.value = true
 }

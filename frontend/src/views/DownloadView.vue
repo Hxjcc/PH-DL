@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import {
   Download,
   Play,
@@ -16,6 +16,7 @@ import {
   Loader2,
   TriangleAlert,
   ListChecks,
+  ChevronLeft,
   ChevronRight,
   Zap,
   Search,
@@ -305,18 +306,155 @@ function clearTargetUsernames() {
   if (form.target_type !== 'liked') form.target_type = 'auto'
 }
 
+const quickRailRef = ref(null)
+const quickCanScrollLeft = ref(false)
+const quickCanScrollRight = ref(false)
+const quickHoverDir = ref(0) // -1 left, 0 idle, 1 right
+
+let quickGlideRaf = 0
+let quickGlideLastTs = 0
+let quickGlideVelocity = 0
+let quickResizeObserver = null
+const QUICK_GLIDE_MAX_SPEED = 240 // px/sec — smooth and easy to read while gliding
+
+function updateQuickScrollState() {
+  const el = quickRailRef.value
+  if (!el) {
+    quickCanScrollLeft.value = false
+    quickCanScrollRight.value = false
+    return
+  }
+  const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth)
+  quickCanScrollLeft.value = el.scrollLeft > 4
+  quickCanScrollRight.value = maxScroll > 4 && el.scrollLeft < maxScroll - 4
+  if ((quickHoverDir.value < 0 && !quickCanScrollLeft.value) || (quickHoverDir.value > 0 && !quickCanScrollRight.value)) {
+    quickHoverDir.value = 0
+  }
+}
+
+function stopQuickGlide({ immediate = false } = {}) {
+  quickHoverDir.value = 0
+  if (immediate) {
+    quickGlideVelocity = 0
+    if (quickGlideRaf) {
+      cancelAnimationFrame(quickGlideRaf)
+      quickGlideRaf = 0
+    }
+    quickGlideLastTs = 0
+  }
+}
+
+function stepQuickGlide(ts) {
+  const el = quickRailRef.value
+  if (!el) {
+    stopQuickGlide({ immediate: true })
+    return
+  }
+  if (!quickGlideLastTs) quickGlideLastTs = ts
+  const dt = Math.min(0.032, Math.max(0.001, (ts - quickGlideLastTs) / 1000))
+  quickGlideLastTs = ts
+
+  const targetVelocity = quickHoverDir.value * QUICK_GLIDE_MAX_SPEED
+  // Smooth spring-like acceleration on hover, silky inertia coast on leave
+  const smoothing = quickHoverDir.value !== 0 ? 10 : 14
+  const factor = 1 - Math.exp(-smoothing * dt)
+  quickGlideVelocity += (targetVelocity - quickGlideVelocity) * factor
+
+  if (Math.abs(quickGlideVelocity) < 4 && quickHoverDir.value === 0) {
+    stopQuickGlide({ immediate: true })
+    updateQuickScrollState()
+    return
+  }
+
+  const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth)
+  const nextLeft = Math.min(maxScroll, Math.max(0, el.scrollLeft + quickGlideVelocity * dt))
+  el.scrollLeft = nextLeft
+  updateQuickScrollState()
+
+  const hitLeft = nextLeft <= 0 && quickGlideVelocity < 0
+  const hitRight = nextLeft >= maxScroll && quickGlideVelocity > 0
+  if (hitLeft || hitRight) {
+    stopQuickGlide({ immediate: true })
+    return
+  }
+
+  quickGlideRaf = requestAnimationFrame(stepQuickGlide)
+}
+
+function startQuickGlide(dir) {
+  if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches) {
+    return
+  }
+  if ((dir < 0 && !quickCanScrollLeft.value) || (dir > 0 && !quickCanScrollRight.value)) return
+  quickHoverDir.value = dir
+  if (!quickGlideRaf) {
+    quickGlideLastTs = 0
+    quickGlideRaf = requestAnimationFrame(stepQuickGlide)
+  }
+}
+
+function nudgeQuickRail(dir) {
+  const el = quickRailRef.value
+  if (!el) return
+  stopQuickGlide({ immediate: true })
+  const step = Math.max(180, Math.round(el.clientWidth * 0.55))
+  el.scrollBy({ left: dir * step, behavior: 'smooth' })
+}
+
 function handleQuickTargetsWheel(event) {
   const el = event.currentTarget
   if (!el || el.scrollWidth <= el.clientWidth) return
   if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
     event.preventDefault()
+    stopQuickGlide({ immediate: true })
     el.scrollLeft += event.deltaY
+    updateQuickScrollState()
   }
 }
+
+const quickRailMaskClass = computed(() => {
+  if (quickCanScrollLeft.value && quickCanScrollRight.value) return 'quick-rail-mask-both'
+  if (quickCanScrollRight.value) return 'quick-rail-mask-right'
+  if (quickCanScrollLeft.value) return 'quick-rail-mask-left'
+  return ''
+})
+
+watch(
+  () => quickTargets.value.length,
+  async () => {
+    await nextTick()
+    updateQuickScrollState()
+  }
+)
+
+onMounted(() => {
+  updateQuickScrollState()
+  if (typeof ResizeObserver !== 'undefined') {
+    quickResizeObserver = new ResizeObserver(() => updateQuickScrollState())
+    if (quickRailRef.value) quickResizeObserver.observe(quickRailRef.value)
+  }
+})
+
+watch(quickRailRef, (el, prev) => {
+  if (prev && quickResizeObserver) quickResizeObserver.unobserve(prev)
+  if (el && quickResizeObserver) quickResizeObserver.observe(el)
+  nextTick(updateQuickScrollState)
+})
+
+onDeactivated(() => {
+  stopQuickGlide({ immediate: true })
+})
+
+onBeforeUnmount(() => {
+  stopQuickGlide({ immediate: true })
+  quickResizeObserver?.disconnect()
+  quickResizeObserver = null
+})
 
 let activatedOnce = false
 
 onActivated(async () => {
+  nextTick(updateQuickScrollState)
   if (!activatedOnce) {
     activatedOnce = true
     if (
@@ -340,6 +478,7 @@ onActivated(async () => {
     }
     if (tasks.length > 0) {
       await Promise.all(tasks)
+      nextTick(updateQuickScrollState)
     }
     if (store.overview && typeof store.overview.uploader_enabled === 'boolean') {
       form.auto_upload = store.overview.uploader_enabled
@@ -688,36 +827,82 @@ async function handleClearTemp() {
 
                 <div v-if="quickTargets.length > 0" class="quick-targets">
                   <span class="text-[11px] text-muted-foreground shrink-0">快速填入</span>
-                  <div class="quick-targets-rail" @wheel="handleQuickTargetsWheel">
-                    <Button
-                      v-for="target in quickTargets"
-                      :key="target.id"
-                      variant="outline"
-                      size="xs"
-                      :aria-pressed="isQuickTargetSelected(target)"
-                      :title="isQuickTargetSelected(target) ? `点击取消选择 ${targetName(target)}` : `点击加入 ${targetName(target)}（可多选）`"
-                      :class="[
-                        'h-[26px] shrink-0 gap-1.5 rounded-full px-2 text-[11px] shadow-none hover:shadow-none',
-                        isQuickTargetSelected(target)
-                          ? 'border-brand/40 bg-brand/10 text-brand hover:border-brand/40 hover:bg-brand/10'
-                          : 'border-border text-muted-foreground hover:text-foreground',
-                      ]"
-                      @click="fillQuickTarget(target)"
+                  <div class="quick-targets-stage">
+                    <div
+                      ref="quickRailRef"
+                      :class="['quick-targets-rail', quickRailMaskClass]"
+                      @scroll.passive="updateQuickScrollState"
+                      @wheel="handleQuickTargetsWheel"
                     >
-                      <img
-                        v-if="target.avatar_url"
-                        :src="target.avatar_url"
-                        alt=""
-                        aria-hidden="true"
-                        class="w-4 h-4 rounded-full object-cover bg-secondary shrink-0"
-                        loading="lazy"
-                        referrerpolicy="no-referrer"
-                      />
-                      <span v-else class="w-4 h-4 rounded-full bg-secondary flex items-center justify-center text-[9px] shrink-0">
-                        {{ targetName(target).slice(0, 1).toUpperCase() }}
+                      <Button
+                        v-for="target in quickTargets"
+                        :key="target.id"
+                        variant="outline"
+                        size="xs"
+                        :aria-pressed="isQuickTargetSelected(target)"
+                        :title="isQuickTargetSelected(target) ? `点击取消选择 ${targetName(target)}` : `点击加入 ${targetName(target)}（可多选）`"
+                        :class="[
+                          'h-[26px] shrink-0 gap-1.5 rounded-full px-2 text-[11px] shadow-none hover:shadow-none',
+                          isQuickTargetSelected(target)
+                            ? 'border-brand/40 bg-brand/10 text-brand hover:border-brand/40 hover:bg-brand/10'
+                            : 'border-border text-muted-foreground hover:text-foreground',
+                        ]"
+                        @click="fillQuickTarget(target)"
+                      >
+                        <span class="relative w-4 h-4 rounded-full overflow-hidden bg-secondary flex items-center justify-center text-[9px] shrink-0">
+                          <span>{{ targetName(target).slice(0, 1).toUpperCase() }}</span>
+                          <img
+                            v-if="target.avatar_url && !brokenRecentAvatars.has(target.avatar_url)"
+                            :src="target.avatar_url"
+                            alt=""
+                            aria-hidden="true"
+                            class="absolute inset-0 w-full h-full object-cover"
+                            decoding="sync"
+                            referrerpolicy="no-referrer"
+                            @error="markRecentAvatarBroken(target.avatar_url)"
+                          />
+                        </span>
+                        <span class="max-w-24 truncate">{{ targetName(target) }}</span>
+                      </Button>
+                    </div>
+
+                    <button
+                      type="button"
+                      :class="[
+                        'quick-edge-trigger quick-edge-left',
+                        quickCanScrollLeft ? 'quick-edge-visible' : 'quick-edge-hidden',
+                        quickHoverDir === -1 ? 'quick-edge-gliding' : '',
+                      ]"
+                      :tabindex="quickCanScrollLeft ? 0 : -1"
+                      aria-label="向左滚动查看前面的博主"
+                      title="悬停自动向左滑动，点击快速翻页"
+                      @pointerenter="startQuickGlide(-1)"
+                      @pointerleave="stopQuickGlide()"
+                      @click="nudgeQuickRail(-1)"
+                    >
+                      <span class="quick-edge-pill">
+                        <ChevronLeft class="w-3.5 h-3.5 quick-edge-chevron-left" />
                       </span>
-                      <span class="max-w-24 truncate">{{ targetName(target) }}</span>
-                    </Button>
+                    </button>
+
+                    <button
+                      type="button"
+                      :class="[
+                        'quick-edge-trigger quick-edge-right',
+                        quickCanScrollRight ? 'quick-edge-visible' : 'quick-edge-hidden',
+                        quickHoverDir === 1 ? 'quick-edge-gliding' : '',
+                      ]"
+                      :tabindex="quickCanScrollRight ? 0 : -1"
+                      aria-label="向右滚动查看后面的博主"
+                      title="悬停自动向右滑动，点击快速翻页"
+                      @pointerenter="startQuickGlide(1)"
+                      @pointerleave="stopQuickGlide()"
+                      @click="nudgeQuickRail(1)"
+                    >
+                      <span class="quick-edge-pill">
+                        <ChevronRight class="w-3.5 h-3.5 quick-edge-chevron-right" />
+                      </span>
+                    </button>
                   </div>
                 </div>
               </div>
@@ -954,23 +1139,23 @@ async function handleClearTemp() {
                     >
                       <Heart class="w-3.5 h-3.5 fill-white/95" />
                     </div>
-                    <img
-                      v-else-if="isRecentAvatarValid(entry.visual.avatars[0])"
-                      :src="entry.visual.avatars[0].avatarUrl"
-                      :alt="entry.visual.avatars[0].name"
-                      class="w-8 h-8 rounded-full object-cover bg-secondary ring-1 ring-border/70"
-                      loading="lazy"
-                      referrerpolicy="no-referrer"
-                      @error="markRecentAvatarBroken(entry.visual.avatars[0].avatarUrl)"
-                    />
                     <div
                       v-else
                       :class="[
-                        'w-8 h-8 rounded-full bg-gradient-to-br text-white flex items-center justify-center text-[11px] font-semibold',
+                        'relative w-8 h-8 rounded-full overflow-hidden bg-gradient-to-br text-white flex items-center justify-center text-[11px] font-semibold ring-1 ring-border/70',
                         avatarGradient(entry.visual.avatars[0].name),
                       ]"
                     >
-                      {{ entry.visual.avatars[0].name.slice(0, 1).toUpperCase() }}
+                      <span>{{ entry.visual.avatars[0].name.slice(0, 1).toUpperCase() }}</span>
+                      <img
+                        v-if="isRecentAvatarValid(entry.visual.avatars[0])"
+                        :src="entry.visual.avatars[0].avatarUrl"
+                        :alt="entry.visual.avatars[0].name"
+                        class="absolute inset-0 w-full h-full object-cover"
+                        decoding="sync"
+                        referrerpolicy="no-referrer"
+                        @error="markRecentAvatarBroken(entry.visual.avatars[0].avatarUrl)"
+                      />
                     </div>
                   </template>
                   <div
@@ -1184,6 +1369,14 @@ async function handleClearTemp() {
   margin-top: 12px;
 }
 
+.quick-targets-stage {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+}
+
 .quick-targets-rail {
   display: flex;
   flex: 1;
@@ -1192,13 +1385,117 @@ async function handleClearTemp() {
   align-items: center;
   gap: 6px;
   overflow-x: auto;
-  padding-bottom: 2px;
+  padding: 2px 0;
   scrollbar-width: none;
   -ms-overflow-style: none;
 }
 
 .quick-targets-rail::-webkit-scrollbar {
   display: none;
+}
+
+.quick-rail-mask-right {
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 46px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 46px), transparent 100%);
+}
+
+.quick-rail-mask-left {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 46px, #000 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 46px, #000 100%);
+}
+
+.quick-rail-mask-both {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 46px, #000 calc(100% - 46px), transparent 100%);
+  mask-image: linear-gradient(to right, transparent 0, #000 46px, #000 calc(100% - 46px), transparent 100%);
+}
+
+.quick-edge-trigger {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  width: 40px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  transition: opacity 200ms cubic-bezier(0.22, 1, 0.36, 1), transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.quick-edge-left {
+  left: 0;
+  justify-content: flex-start;
+}
+
+.quick-edge-right {
+  right: 0;
+  justify-content: flex-end;
+}
+
+.quick-edge-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.quick-edge-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.quick-edge-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 9999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 86%, transparent);
+  backdrop-filter: blur(8px);
+  color: var(--muted-foreground);
+  box-shadow: 0 2px 8px -2px rgba(9, 9, 11, 0.12);
+  transition:
+    transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 180ms ease,
+    color 180ms ease,
+    background-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.quick-edge-trigger:hover .quick-edge-pill,
+.quick-edge-gliding .quick-edge-pill {
+  transform: scale(1.06);
+  border-color: color-mix(in srgb, var(--brand) 42%, transparent);
+  background: var(--card);
+  color: var(--brand);
+  box-shadow: 0 4px 12px -3px rgba(9, 9, 11, 0.18);
+}
+
+.quick-edge-gliding .quick-edge-chevron-right {
+  animation: quick-nudge-right 750ms ease-in-out infinite;
+}
+
+.quick-edge-gliding .quick-edge-chevron-left {
+  animation: quick-nudge-left 750ms ease-in-out infinite;
+}
+
+@keyframes quick-nudge-right {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(2.5px); }
+}
+
+@keyframes quick-nudge-left {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(-2.5px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quick-edge-gliding .quick-edge-chevron-right,
+  .quick-edge-gliding .quick-edge-chevron-left {
+    animation: none;
+  }
 }
 
 .url-source {

@@ -46,7 +46,7 @@ class TargetBatchItem(BaseModel):
 class TargetBatchCreateRequest(BaseModel):
     items: List[TargetBatchItem] = Field(default_factory=list)
     init_baseline: bool = False
-    baseline_pages: str = "1"
+    baseline_pages: str = "all"
 
 
 class TargetUpdateRequest(BaseModel):

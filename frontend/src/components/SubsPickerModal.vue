@@ -34,10 +34,11 @@ const uploadingAvatar = ref(false)
 const items = ref([])
 const query = ref('')
 const typeFilter = ref('all')
+const trackFilter = ref('all')
 const selected = ref(new Set())
 const initBaseline = ref(true)
 const addToAutoTrack = ref(false)
-const baselinePages = ref('1')
+const baselinePages = ref('all')
 const baselinePagesValid = ref(true)
 const fetchedAt = ref(0)
 const fromCache = ref(false)
@@ -71,10 +72,40 @@ const typeOptions = [
   { label: 'Model', value: 'model' },
   { label: 'Pornstar', value: 'pornstar' },
 ]
+const trackedTargetsMap = computed(() => {
+  const byPair = new Map()
+  const byUser = new Map()
+  for (const target of store.targetsCache || []) {
+    const tType = String(target?.target_type || '').toLowerCase()
+    const uLow = String(target?.username || '').trim().toLowerCase()
+    if (!uLow || tType === 'liked' || tType === 'favorites') continue
+    byPair.set(`${tType}:${uLow}`, target)
+    if (!byUser.has(uLow)) byUser.set(uLow, target)
+  }
+  return { byPair, byUser }
+})
+function trackedTargetFor(sub) {
+  const uLow = String(sub?.username || '').trim().toLowerCase()
+  const tType = String(sub?.type || '').toLowerCase()
+  if (!uLow) return null
+  return trackedTargetsMap.value.byPair.get(`${tType}:${uLow}`) || trackedTargetsMap.value.byUser.get(uLow) || null
+}
+function isSubTracked(sub) {
+  return Boolean(trackedTargetFor(sub))
+}
+const trackedSubCount = computed(() => availableItems.value.filter((sub) => isSubTracked(sub)).length)
+const untrackedSubCount = computed(() => availableItems.value.length - trackedSubCount.value)
+const trackFilterPills = computed(() => [
+  { value: 'all', label: '全部', count: availableItems.value.length },
+  { value: 'untracked', label: '未追更', count: untrackedSubCount.value },
+  { value: 'tracked', label: '已追更', count: trackedSubCount.value },
+])
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase()
   return availableItems.value.filter((sub) => {
     if (typeFilter.value !== 'all' && sub.type !== typeFilter.value) return false
+    if (trackFilter.value === 'tracked' && !isSubTracked(sub)) return false
+    if (trackFilter.value === 'untracked' && isSubTracked(sub)) return false
     return !q || [sub.display_name, sub.username].some((name) => String(name || '').toLowerCase().includes(q))
   })
 })
@@ -151,9 +182,12 @@ watch(() => props.open, (isOpen) => {
     selected.value = new Set()
     query.value = ''
     typeFilter.value = 'all'
+    trackFilter.value = 'all'
     addToAutoTrack.value = false
+    baselinePages.value = 'all'
     editingSource.value = false
     if (!manualSource.value) sourceUser.value = defaultSource.value
+    if (store.targetsCache === null) store.ensureTargets()
     loadSubs()
   } else {
     requestVersion++
@@ -288,7 +322,27 @@ function confirm() {
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
-        <span>{{ filtered.length }} / {{ availableItems.length }} 个订阅</span>
+        <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="按追更状态筛选">
+          <button
+            v-for="pill in trackFilterPills"
+            :key="pill.value"
+            type="button"
+            :aria-pressed="trackFilter === pill.value"
+            :class="[
+              'inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors cursor-pointer select-none tabular-nums',
+              trackFilter === pill.value
+                ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand'
+                : 'border-border bg-card text-muted-foreground hover:text-foreground',
+            ]"
+            @click="trackFilter = pill.value"
+          >
+            <span>{{ pill.label }}</span>
+            <span class="font-mono text-[10px] opacity-80">{{ pill.count }}</span>
+          </button>
+          <span v-if="filtered.length !== availableItems.length" class="ml-1 tabular-nums">
+            当前显示 {{ filtered.length }} 个
+          </span>
+        </div>
         <span v-if="fetchedAt" :title="new Date(fetchedAt).toLocaleString()">
           {{ fromCache ? '已缓存 · ' : '' }}更新于 {{ updatedTime }}
         </span>
@@ -328,7 +382,26 @@ function confirm() {
               <span class="block truncate text-sm font-medium" :title="sub.display_name || sub.username">{{ sub.display_name || sub.username }}</span>
               <span v-if="sub.display_name && sub.display_name !== sub.username" class="mt-0.5 block truncate text-[11px] text-muted-foreground">{{ sub.username }}</span>
             </span>
-            <Badge variant="outline" class="h-6 shrink-0 rounded-md px-2 text-xs">{{ targetTypeMeta(sub.type) }}</Badge>
+            <span class="flex shrink-0 items-center gap-1.5">
+              <span
+                v-if="trackedTargetFor(sub)"
+                :class="[
+                  'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium',
+                  trackedTargetFor(sub).enabled
+                    ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                    : 'border-border bg-secondary text-muted-foreground',
+                ]"
+              >
+                <span
+                  :class="[
+                    'h-1.5 w-1.5 rounded-full',
+                    trackedTargetFor(sub).enabled ? 'bg-emerald-500' : 'bg-zinc-400',
+                  ]"
+                />
+                {{ trackedTargetFor(sub).enabled ? '已追更' : '已暂停' }}
+              </span>
+              <Badge variant="outline" class="h-6 shrink-0 rounded-md px-2 text-xs">{{ targetTypeMeta(sub.type) }}</Badge>
+            </span>
           </button>
         </div>
       </div>
