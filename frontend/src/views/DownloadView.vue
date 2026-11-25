@@ -25,7 +25,6 @@ import {
   Link2,
   FileText,
   Heart,
-  CalendarDays,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
@@ -210,7 +209,6 @@ const RECENT_CATEGORY_ICONS = {
   database: Database,
   rotate: RotateCcw,
   sparkles: Sparkles,
-  calendar: CalendarDays,
 }
 
 function isRecentAvatarValid(entry) {

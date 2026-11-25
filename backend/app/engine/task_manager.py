@@ -27,7 +27,6 @@ from ..parsers.video import (
     collect_video_urls,
     extract_viewkey_from_url,
     fetch_video_details_batch,
-    fetch_video_published_meta,
 )
 from ..services.cookie import check_cookie_valid, login_and_get_cookies
 from ..services.downloader import (
@@ -38,7 +37,6 @@ from ..services.downloader import (
     remove_download_checkpoint,
 )
 from ..services.filename import (
-    build_dated_remote_path,
     format_remote_video_filename,
     is_valid_video_file,
     normalized_quality,
@@ -47,17 +45,13 @@ from ..services.filename import (
 )
 from ..services.notifier import build_auto_update_report, send_serverchan
 from ..services.uploader import (
-    RemoteRenameSession,
     UploadSessionCache,
     delete_verified_source,
     file_snapshot,
-    rename_remote_file,
     upload_file_batch,
 )
 from .events import EventBus
 from .disk_scheduler import AdaptiveDiskScheduler, SmartUploadPool, UploadQueuedItem
-
-_DEFAULT_RENAME_REMOTE_FILE = rename_remote_file
 
 
 def _split_csv_set(raw: Optional[str], lower: bool = False) -> Optional[Set[str]]:
@@ -373,8 +367,6 @@ class TaskManager:
                 await self._exec_baseline_sync(job_id, params, settings, ctx)
             elif kind == "enrich_metadata":
                 await self._exec_enrich_metadata(job_id, params, settings, ctx)
-            elif kind == "rename_remote_dates":
-                await self._exec_rename_remote_dates(job_id, params, settings, ctx)
             elif kind == "retry_items":
                 await self._exec_retry_items(job_id, params, settings, ctx)
             elif kind == "resume_temp":
@@ -2418,333 +2410,6 @@ class TaskManager:
             "INFO",
             f"元数据补全完成：画质/大小均成功 {completed_with_size} 条，"
             f"详情失败 {detail_failures} 条，大小获取失败 {size_failures} 条。",
-            job_id=job_id,
-        )
-
-    async def _exec_rename_remote_dates(
-        self,
-        job_id: int,
-        params: Dict[str, Any],
-        settings: RuntimeSettings,
-        ctx: TaskHttpContext,
-    ) -> None:
-        if not (settings.rclone_remote or "").strip():
-            await self.repo.update_job(job_id, error_message="未配置 rclone 远端名称，无法重命名云端文件")
-            self.events.emit_log("ERROR", "未配置 rclone 远端名称，无法执行云端补全日期任务。", job_id=job_id)
-            return
-
-        limit = int(params.get("limit") or 0)
-        candidates = await self.repo.list_remote_date_rename_candidates(limit=limit)
-        if not candidates:
-            self.events.emit_log("INFO", "所有已上传网盘文件均已包含发布日期前缀，无需处理。", job_id=job_id)
-            return
-
-        self.events.emit_log(
-            "INFO",
-            f"开始为 {len(candidates)} 个已上传网盘文件补全发布日期前缀（YYYY-MM-DD_原文件名）...",
-            job_id=job_id,
-        )
-        item_specs = [
-            {
-                "viewkey": c["viewkey"],
-                "title": c.get("title") or c["viewkey"],
-                "uploader": c.get("uploader") or "",
-                "target_type": c.get("target_type") or "model",
-                "page_url": c.get("video_page_url") or f"https://www.pornhub.com/view_video.php?viewkey={c['viewkey']}",
-                "quality": c.get("quality") or "",
-                "status": "pending",
-                "published_at": c.get("published_at") or "",
-                "duration_seconds": int(c.get("duration_seconds") or 0),
-            }
-            for c in candidates
-        ]
-        inserted_items = await self.repo.add_job_items_batch(job_id, item_specs)
-        item_ids: Dict[str, int] = {row["viewkey"]: int(row["id"]) for row in inserted_items}
-        for row in inserted_items:
-            self.events.broadcast("item_updated", row)
-
-        created_job = await self.repo.update_job(job_id, total_items=len(candidates))
-        if created_job:
-            self.events.broadcast("job_updated", created_job)
-
-        pub_by_vk: Dict[str, str] = {
-            c["viewkey"]: str(c.get("published_at") or "").strip() for c in candidates
-        }
-        dur_by_vk: Dict[str, int] = {
-            c["viewkey"]: int(c.get("duration_seconds") or 0) for c in candidates
-        }
-
-        # Phase 1: Bulk list-page date/duration extraction grouped by uploader (fast, 30+ videos/page).
-        missing_vks = [vk for vk, pub in pub_by_vk.items() if not pub]
-        if missing_vks and not ctx.cancel_event.is_set():
-            all_targets = await self.repo.list_targets()
-            target_type_by_user: Dict[str, str] = {}
-            target_display_by_user: Dict[str, str] = {}
-            for t in all_targets:
-                uname_low = str(t.get("username") or "").strip().lower()
-                if uname_low:
-                    target_type_by_user[uname_low] = str(t.get("target_type") or "model")
-                    target_display_by_user[uname_low] = str(t.get("display_name") or t.get("username") or "")
-
-            generic_folders = {"", "ungrouped", "url_batch", "my_liked", "my_liked_videos", "_currentuser_"}
-            uploader_groups: Dict[Tuple[str, str], List[str]] = defaultdict(list)
-            for c in candidates:
-                vk = c["viewkey"]
-                if pub_by_vk.get(vk):
-                    continue
-                uploader = str(c.get("uploader") or "").strip()
-                utype = str(c.get("target_type") or "model").strip().lower()
-                if utype == "liked":
-                    uploader_groups[("_currentUser_", "liked")].append(vk)
-                    continue
-                if uploader.lower() in generic_folders:
-                    continue
-                resolved_type = target_type_by_user.get(uploader.lower()) or (
-                    utype if utype in {"model", "pornstar", "favorites"} else "model"
-                )
-                uploader_groups[(uploader, resolved_type)].append(vk)
-
-            group_list = list(uploader_groups.items())
-            if group_list:
-                self.events.emit_log(
-                    "INFO",
-                    f"第 1 阶段：优先按 {len(group_list)} 个创作者列表页批量提取上传日期与时长...",
-                    job_id=job_id,
-                )
-                found_from_list = 0
-                for idx, ((uname, utype), _vks) in enumerate(group_list):
-                    if ctx.cancel_event.is_set():
-                        break
-                    disp = "Liked Videos" if utype == "liked" else (target_display_by_user.get(uname.lower()) or uname)
-                    self.events.emit_scan_status(
-                        job_id,
-                        {
-                            "mode": "targets",
-                            "scanned": idx,
-                            "total": len(group_list),
-                            "current_target": disp,
-                            "found_new": found_from_list,
-                        },
-                    )
-                    list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
-
-                    async def _on_list_page(page_videos: List[ListedVideo]) -> None:
-                        nonlocal found_from_list
-                        updates: List[Tuple[str, str, int]] = []
-                        for lv in page_videos:
-                            if lv.published_at or lv.duration_seconds > 0:
-                                updates.append((lv.viewkey, lv.published_at, lv.duration_seconds))
-                            if lv.viewkey in pub_by_vk and not pub_by_vk[lv.viewkey] and lv.published_at:
-                                pub_by_vk[lv.viewkey] = lv.published_at
-                                found_from_list += 1
-                            if lv.viewkey in dur_by_vk and dur_by_vk[lv.viewkey] <= 0 and lv.duration_seconds > 0:
-                                dur_by_vk[lv.viewkey] = lv.duration_seconds
-                        if updates:
-                            await self.repo.backfill_videos_published_meta(updates)
-
-                    try:
-                        await scan_list_pages(
-                            ctx,
-                            list_url,
-                            settings.selectors,
-                            target_type=utype,
-                            delay_min=settings.page_delay_min,
-                            delay_max=settings.page_delay_max,
-                            page_concurrency=settings.max_concurrent_list_pages,
-                            timeout=settings.request_timeout,
-                            on_page=_on_list_page,
-                        )
-                    except Exception as err:
-                        self.events.emit_log("WARNING", f"列表页批量提取日期失败 ({disp}): {err}", job_id=job_id)
-
-                self.events.emit_scan_status(
-                    job_id,
-                    {
-                        "mode": "targets",
-                        "scanned": len(group_list),
-                        "total": len(group_list),
-                        "current_target": "",
-                        "found_new": found_from_list,
-                    },
-                )
-
-        # Phase 2: Lightweight detail-HTML fallback ONLY for candidates still missing published_at.
-        still_missing = [c for c in candidates if not pub_by_vk.get(c["viewkey"])]
-        if still_missing and not ctx.cancel_event.is_set():
-            self.events.emit_log(
-                "INFO",
-                f"第 2 阶段：对列表页未命中的 {len(still_missing)} 条视频从详情页补取发布日期...",
-                job_id=job_id,
-            )
-            detail_sem = asyncio.Semaphore(max(1, settings.max_concurrent_video_details))
-
-            async def _fetch_one_date(cand: Dict[str, Any]) -> Tuple[str, str, int]:
-                async with detail_sem:
-                    if ctx.cancel_event.is_set():
-                        return cand["viewkey"], "", 0
-                    page_url = cand.get("video_page_url") or f"https://www.pornhub.com/view_video.php?viewkey={cand['viewkey']}"
-                    pub, dur, _ = await fetch_video_published_meta(ctx, page_url, timeout=settings.request_timeout)
-                    return cand["viewkey"], pub, dur
-
-            detail_results = await asyncio.gather(*(_fetch_one_date(c) for c in still_missing))
-            detail_updates: List[Tuple[str, str, int]] = []
-            for vk, pub, dur in detail_results:
-                if pub:
-                    pub_by_vk[vk] = pub
-                if dur > 0 and dur_by_vk.get(vk, 0) <= 0:
-                    dur_by_vk[vk] = dur
-                if pub or dur > 0:
-                    detail_updates.append((vk, pub, dur))
-            if detail_updates:
-                await self.repo.backfill_videos_published_meta(detail_updates)
-
-        self.events.clear_scan_status(job_id)
-        if ctx.cancel_event.is_set():
-            for c in candidates:
-                it = await self.repo.update_job_item(item_ids[c["viewkey"]], status="cancelled", error_message="已取消")
-                if it:
-                    self.events.broadcast("item_updated", it)
-            return
-
-        # Phase 3: Server-side zero-bandwidth rename via persistent `rclone rcd` (cached dir IDs).
-        running_job = await self.repo.update_job(job_id, status="running")
-        if running_job:
-            self.events.broadcast("job_updated", running_job)
-
-        rename_concurrency = max(4, min(6, int(getattr(settings, "upload_workers", 4) or 4)))
-        rename_sem = asyncio.Semaphore(rename_concurrency)
-        refresh_lock = asyncio.Lock()
-        last_refresh_at = 0.0
-        renamed_count = 0
-        skipped_count = 0
-        failed_count = 0
-        processed = 0
-
-        use_rcd = rename_remote_file is _DEFAULT_RENAME_REMOTE_FILE
-        async with contextlib.AsyncExitStack() as stack:
-            renamer: Optional[RemoteRenameSession] = None
-            if use_rcd:
-                renamer = await stack.enter_async_context(
-                    RemoteRenameSession(
-                        settings,
-                        cancel_event=ctx.cancel_event,
-                        fallback_fn=rename_remote_file,
-                    )
-                )
-                if renamer.using_rcd:
-                    self.events.emit_log(
-                        "INFO",
-                        f"第 3 阶段：已启用常驻 rclone rcd 目录缓存模式（并发 {rename_concurrency}）批量云端改名...",
-                        job_id=job_id,
-                    )
-                else:
-                    self.events.emit_log(
-                        "INFO",
-                        f"第 3 阶段：使用标准 rclone moveto 模式（并发 {rename_concurrency}）执行云端改名...",
-                        job_id=job_id,
-                    )
-
-            async def _do_rename(old_p: str, new_p: str) -> Tuple[bool, str, bool]:
-                if renamer is not None:
-                    return await renamer.rename(old_p, new_p)
-                return await rename_remote_file(old_p, new_p, settings, cancel_event=ctx.cancel_event)
-
-            async def _rename_one(cand: Dict[str, Any]) -> None:
-                nonlocal renamed_count, skipped_count, failed_count, processed, last_refresh_at
-                vk = cand["viewkey"]
-                iid = item_ids[vk]
-                old_remote = str(cand.get("remote_path") or "").strip()
-                pub_date = pub_by_vk.get(vk, "")
-                file_size = int(cand.get("file_size") or 0)
-
-                async with rename_sem:
-                    if ctx.cancel_event.is_set():
-                        it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                        if it:
-                            self.events.broadcast("item_updated", it)
-                        return
-
-                    if not pub_date:
-                        skipped_count += 1
-                        it = await self.repo.update_job_item(
-                            iid,
-                            status="skipped",
-                            bytes_total=file_size,
-                            error_message="未能获取发布日期（可能原视频已删除），保留原文件名",
-                        )
-                        if it:
-                            self.events.broadcast("item_updated", it)
-                    else:
-                        new_remote = build_dated_remote_path(old_remote, pub_date)
-                        if not new_remote or new_remote == old_remote:
-                            skipped_count += 1
-                            it = await self.repo.update_job_item(
-                                iid,
-                                status="skipped",
-                                bytes_total=file_size,
-                                published_at=pub_date,
-                                error_message="远端文件名已包含日期前缀",
-                            )
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                        else:
-                            ok, detail, already_done = await _do_rename(old_remote, new_remote)
-                            if ctx.cancel_event.is_set() and not ok:
-                                it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                                if it:
-                                    self.events.broadcast("item_updated", it)
-                                return
-                            if ok:
-                                await self.repo.update_video_remote_path(vk, new_remote)
-                                renamed_count += 1
-                                it = await self.repo.update_job_item(
-                                    iid,
-                                    status="done",
-                                    bytes_total=file_size,
-                                    published_at=pub_date,
-                                    error_message="",
-                                )
-                                if it:
-                                    self.events.broadcast("item_updated", it)
-                                old_name = old_remote.rsplit("/", 1)[-1]
-                                new_name = new_remote.rsplit("/", 1)[-1]
-                                note = "（已存在目标文件）" if already_done else ""
-                                self.events.emit_log(
-                                    "INFO",
-                                    f"[云端改名] {old_name} -> {new_name}{note}",
-                                    job_id=job_id,
-                                )
-                            else:
-                                failed_count += 1
-                                it = await self.repo.update_job_item(
-                                    iid,
-                                    status="failed",
-                                    bytes_total=file_size,
-                                    published_at=pub_date,
-                                    error_message=f"云端改名失败: {detail}",
-                                )
-                                if it:
-                                    self.events.broadcast("item_updated", it)
-                                self.events.emit_log(
-                                    "WARNING",
-                                    f"[云端改名失败] {old_remote}: {detail}",
-                                    job_id=job_id,
-                                )
-
-                    async with refresh_lock:
-                        processed += 1
-                        now_m = time.monotonic()
-                        if processed == len(candidates) or processed % 5 == 0 or (now_m - last_refresh_at) >= 1.0:
-                            last_refresh_at = now_m
-                            refreshed = await self.repo.recalculate_job_counts(job_id)
-                            if refreshed:
-                                self.events.broadcast("job_updated", refreshed)
-
-            await asyncio.gather(*(_rename_one(c) for c in candidates))
-        self.events.broadcast("overview_changed", {})
-        self.events.emit_log(
-            "INFO",
-            f"网盘补全发布日期完成：成功改名 {renamed_count} 条，跳过 {skipped_count} 条，失败 {failed_count} 条。",
             job_id=job_id,
         )
 

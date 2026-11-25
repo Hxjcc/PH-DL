@@ -341,7 +341,7 @@ test('buildTargetProfileVideosUrl builds /videos profile links for all target ty
   )
 })
 
-test('formatPublishedDate, formatVideoDuration, and rename_remote_dates job metadata', () => {
+test('formatPublishedDate, formatVideoDuration, and enrich_metadata phase text', () => {
   assert.equal(formatPublishedDate('2026-10-05T10:35:49+00:00'), '2026-10-05')
   assert.equal(formatPublishedDate('2026-10-05'), '2026-10-05')
   assert.equal(formatPublishedDate(''), '')
@@ -350,38 +350,10 @@ test('formatPublishedDate, formatVideoDuration, and rename_remote_dates job meta
   assert.equal(formatVideoDuration(3920), '1:05:20')
   assert.equal(formatVideoDuration(0), '')
 
-  const job = { id: 88, kind: 'rename_remote_dates', status: 'completed', total_items: 3, done_items: 2, skipped_items: 1 }
-  const visual = resolveJobVisual(job, [])
-  assert.equal(visual.category.key, 'rename_dates')
-  assert.equal(visual.category.group, 'maintenance')
-  assert.equal(visual.title, '网盘文件补全发布日期')
-
-  const pills = buildItemStatusPills(
-    [
-      { id: 1, status: 'done' },
-      { id: 2, status: 'pending' },
-      { id: 3, status: 'skipped' },
-    ],
-    { isRenameDatesJob: true }
-  )
-  assert.deepEqual(
-    pills.map((p) => [p.value, p.label, p.count]),
-    [
-      ['all', '全部', 3],
-      ['pending', '等待改名', 1],
-      ['done', '已改名', 1],
-      ['skipped', '已跳过', 1],
-    ]
-  )
-
-  const metrics = computeJobLiveMetrics(job, {}, [{ status: 'done' }, { status: 'done' }, { status: 'skipped' }])
-  assert.equal(metrics.done, 2)
-  assert.equal(metrics.uploaded, 0)
-
-  const runningRename = computeJobLiveMetrics(
-    { id: 89, kind: 'rename_remote_dates', status: 'running', total_items: 100, done_items: 12 },
+  const runningMeta = computeJobLiveMetrics(
+    { id: 89, kind: 'enrich_metadata', status: 'running', total_items: 100, done_items: 12 },
     {},
     null
   )
-  assert.equal(runningRename.phaseText, '正在云端重命名网盘文件 (12/100)...')
+  assert.equal(runningMeta.phaseText, '正在补全基线元数据 (12/100)...')
 })

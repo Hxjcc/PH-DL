@@ -264,16 +264,6 @@ async def retry_failed_items(job_id: int, container: AppContainer = Depends(requ
             params={},
         )
         return {"job": job}
-    if source_job.get("kind") == "rename_remote_dates":
-        count = await container.repo.count_remote_date_rename_candidates()
-        if count == 0:
-            raise HTTPException(status_code=400, detail="所有已上传网盘文件均已包含发布日期")
-        job = await container.tasks.enqueue_job(
-            kind="rename_remote_dates",
-            label=f"重试网盘补全发布日期 ({count} 条)",
-            params={},
-        )
-        return {"job": job}
     items = await container.repo.list_job_items(job_id)
     retryable = [
         it

@@ -14,7 +14,6 @@ import {
   Bookmark,
   Layers,
   Sparkles,
-  CalendarDays,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
@@ -37,7 +36,6 @@ const loading = ref(false)
 const fetching = ref(false)
 const refreshing = ref(false)
 const enriching = ref(false)
-const renamingRemoteDates = ref(false)
 const batchDeleting = ref(false)
 const playingVideo = shallowRef(null)
 let playbackTrigger = null
@@ -85,9 +83,6 @@ const pageSizeOptions = HISTORY_PAGE_SIZES.map((value) => ({ label: `${value} �
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / filters.page_size)))
 const metadataCandidates = computed(
   () => stats.value.baseline_missing_metadata ?? stats.value.baseline ?? 0
-)
-const remoteDateCandidates = computed(
-  () => Number(stats.value.pending_remote_date_rename || 0)
 )
 
 const selectedCount = computed(() => selectedViewkeys.value.size)
@@ -556,21 +551,6 @@ async function handleEnrichMetadata() {
   }
 }
 
-async function handleRenameRemoteDates() {
-  if (renamingRemoteDates.value || remoteDateCandidates.value <= 0) return
-  renamingRemoteDates.value = true
-  try {
-    const res = await api.renameRemoteDates()
-    store.notify(`已创建网盘补日期任务 #${res.job.id}，共 ${res.count} 条`, 'success')
-    await store.refreshJobs()
-    router.push({ name: 'jobs' })
-  } catch (err) {
-    store.notify(err.message, 'error')
-  } finally {
-    renamingRemoteDates.value = false
-  }
-}
-
 watch(
   () => store.historyCache,
   (val) => {
@@ -639,50 +619,26 @@ onDeactivated(() => {
           </p>
         </div>
       </div>
-      <div class="flex flex-wrap items-center gap-2">
-        <ConfirmPopover
-          v-if="remoteDateCandidates > 0"
-          :title="`为 ${remoteDateCandidates} 个已上传网盘文件补全发布日期？`"
-          description="优先从创作者列表页批量提取日期，再用 rclone moveto 云端原地改名为 YYYY-MM-DD_原文件名（零流量、不重传，已有日期自动跳过）。"
-          confirm-text="开始补全"
-          @confirm="handleRenameRemoteDates"
+      <ConfirmPopover
+        :title="`补全 ${metadataCandidates} 条基线视频的画质和大小？`"
+        description="会解析视频详情并用 Range 请求读取媒体大小，不会下载视频文件。记录较多时可能需要数分钟。"
+        confirm-text="开始补全"
+        @confirm="handleEnrichMetadata"
+      >
+        <Button
+          variant="outline"
+          size="sm"
+          class="border-brand/25 bg-brand/5 text-brand hover:bg-brand/10"
+          :disabled="enriching || metadataCandidates <= 0"
         >
-          <Button
-            variant="outline"
-            size="sm"
-            class="border-cyan-500/30 bg-cyan-500/8 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-500/15"
-            :disabled="renamingRemoteDates || remoteDateCandidates <= 0"
-          >
-            <Loader2 v-if="renamingRemoteDates" class="w-3.5 h-3.5 animate-spin" />
-            <CalendarDays v-else class="w-3.5 h-3.5" />
-            {{ renamingRemoteDates ? '提交中...' : '网盘补全日期' }}
-            <Badge variant="secondary" class="px-1.5 py-0 text-[10px]">
-              {{ remoteDateCandidates }}
-            </Badge>
-          </Button>
-        </ConfirmPopover>
-
-        <ConfirmPopover
-          :title="`补全 ${metadataCandidates} 条基线视频的画质和大小？`"
-          description="会解析视频详情并用 Range 请求读取媒体大小，不会下载视频文件。记录较多时可能需要数分钟。"
-          confirm-text="开始补全"
-          @confirm="handleEnrichMetadata"
-        >
-          <Button
-            variant="outline"
-            size="sm"
-            class="border-brand/25 bg-brand/5 text-brand hover:bg-brand/10"
-            :disabled="enriching || metadataCandidates <= 0"
-          >
-            <Loader2 v-if="enriching" class="w-3.5 h-3.5 animate-spin" />
-            <Sparkles v-else class="w-3.5 h-3.5" />
-            {{ enriching ? '提交中...' : '补全基线元数据' }}
-            <Badge v-if="metadataCandidates > 0" variant="secondary" class="px-1.5 py-0 text-[10px]">
-              {{ metadataCandidates }}
-            </Badge>
-          </Button>
-        </ConfirmPopover>
-      </div>
+          <Loader2 v-if="enriching" class="w-3.5 h-3.5 animate-spin" />
+          <Sparkles v-else class="w-3.5 h-3.5" />
+          {{ enriching ? '提交中...' : '补全基线元数据' }}
+          <Badge v-if="metadataCandidates > 0" variant="secondary" class="px-1.5 py-0 text-[10px]">
+            {{ metadataCandidates }}
+          </Badge>
+        </Button>
+      </ConfirmPopover>
     </div>
 
     <!-- Interactive Semantic KPI Cards (inspired by rust-srec Pipeline Statistics) -->

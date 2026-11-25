@@ -81,14 +81,6 @@ const CATEGORY_MAP = {
     pillClass: 'border-purple-500/25 bg-purple-500/10 text-purple-700 dark:text-purple-300',
     iconClass: 'bg-purple-500/12 text-purple-600 dark:text-purple-400 ring-1 ring-purple-500/20',
   },
-  rename_dates: {
-    key: 'rename_dates',
-    group: 'maintenance',
-    label: '云端补日期',
-    icon: 'calendar',
-    pillClass: 'border-cyan-500/25 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
-    iconClass: 'bg-cyan-500/12 text-cyan-600 dark:text-cyan-400 ring-1 ring-cyan-500/20',
-  },
 }
 
 function stripKnownPrefix(rawLabel = '') {
@@ -178,7 +170,6 @@ export function resolveJobCategory(job) {
     return label.startsWith('续传') ? CATEGORY_MAP.resume : CATEGORY_MAP.retry
   }
   if (kind === 'enrich_metadata') return CATEGORY_MAP.metadata
-  if (kind === 'rename_remote_dates') return CATEGORY_MAP.rename_dates
   return CATEGORY_MAP.target_download
 }
 
@@ -305,8 +296,6 @@ export function resolveJobVisual(job, targetsList = []) {
     title = avatars[0]?.name || baseLabel || category.label
   } else if (kind === 'enrich_metadata') {
     title = '基线画质与大小补全'
-  } else if (kind === 'rename_remote_dates') {
-    title = '网盘文件补全发布日期'
   } else {
     title = stripKnownPrefix(job?.label) || job?.kind || '任务'
   }
@@ -321,11 +310,7 @@ export function resolveJobVisual(job, targetsList = []) {
     if (qText) capsules.push({ text: qText, mono: true })
   }
 
-  if (
-    params.auto_upload === true &&
-    !params.export_only &&
-    !['baseline_sync', 'check_updates', 'enrich_metadata', 'rename_remote_dates'].includes(kind)
-  ) {
+  if (params.auto_upload === true && !params.export_only && !['baseline_sync', 'check_updates', 'enrich_metadata'].includes(kind)) {
     capsules.push({ text: '云端上传', tone: 'emerald' })
   }
   if (params.redownload) {
@@ -377,7 +362,7 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
     for (const it of jobItemsList) {
       if (it.status === 'done') {
         iDone += 1
-        if (!['enrich_metadata', 'rename_remote_dates'].includes(job?.kind)) iUploaded += 1
+        if (job?.kind !== 'enrich_metadata') iUploaded += 1
       } else if (it.status === 'downloaded' || it.status === 'uploading') {
         iDone += 1
         if (it.status === 'uploading') uploadingCount += 1
@@ -493,12 +478,7 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
   } else if (job?.status === 'scanning' && total === 0) {
     phaseText = '正在扫描页面并解析视频信息...'
   } else if (isActive) {
-    if (job?.kind === 'rename_remote_dates') {
-      phaseText =
-        total > 0
-          ? `正在云端重命名网盘文件 (${finishedCount}/${total})...`
-          : '正在准备云端改名队列...'
-    } else if (job?.kind === 'enrich_metadata') {
+    if (job?.kind === 'enrich_metadata') {
       phaseText =
         total > 0
           ? `正在补全基线元数据 (${finishedCount}/${total})...`
@@ -563,29 +543,15 @@ const METADATA_ITEM_STATUS_LABELS = {
   cancelled: '已取消',
 }
 
-const RENAME_DATES_ITEM_STATUS_LABELS = {
-  pending: '等待改名',
-  done: '已改名',
-  skipped: '已跳过',
-  failed: '失败',
-  cancelled: '已取消',
-}
-
-function getItemStatusPillMeta(status, { isMetadataJob = false, isRenameDatesJob = false } = {}) {
+function getItemStatusPillMeta(status, isMetadataJob = false) {
   const base = ITEM_STATUS_PILL_META[status] || { label: status || '未知', dot: 'bg-zinc-400' }
   if (isMetadataJob && METADATA_ITEM_STATUS_LABELS[status]) {
     return { label: METADATA_ITEM_STATUS_LABELS[status], dot: base.dot }
   }
-  if (isRenameDatesJob && RENAME_DATES_ITEM_STATUS_LABELS[status]) {
-    return { label: RENAME_DATES_ITEM_STATUS_LABELS[status], dot: base.dot }
-  }
   return base
 }
 
-export function buildItemStatusPills(
-  items = [],
-  { isMetadataJob = false, isRenameDatesJob = false, activeFilter = 'all' } = {}
-) {
+export function buildItemStatusPills(items = [], { isMetadataJob = false, activeFilter = 'all' } = {}) {
   const list = Array.isArray(items) ? items : []
   const counts = Object.create(null)
   const extraStatuses = []
@@ -612,7 +578,7 @@ export function buildItemStatusPills(
   for (const status of orderedStatuses) {
     const count = counts[status] || 0
     if (count > 0 || activeFilter === status) {
-      const meta = getItemStatusPillMeta(status, { isMetadataJob, isRenameDatesJob })
+      const meta = getItemStatusPillMeta(status, isMetadataJob)
       pills.push({
         value: status,
         label: meta.label,

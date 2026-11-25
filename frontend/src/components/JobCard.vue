@@ -17,7 +17,6 @@ import {
   Heart,
   Clock,
   CloudUpload,
-  CalendarDays,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
@@ -52,7 +51,6 @@ const CATEGORY_ICONS = {
   database: Database,
   rotate: RotateCcw,
   sparkles: Sparkles,
-  calendar: CalendarDays,
 }
 
 const props = defineProps({
@@ -142,7 +140,6 @@ const canRetry = computed(
   )
 )
 const isMetadataJob = computed(() => props.job.kind === 'enrich_metadata')
-const isRenameDatesJob = computed(() => props.job.kind === 'rename_remote_dates')
 const isExportJob = computed(() => Boolean(props.job.params?.export_only || props.job.export_text))
 const hasNoJobItems = computed(
   () => isExportJob.value || props.job.kind === 'check_updates' || props.job.kind === 'baseline_sync'
@@ -176,7 +173,6 @@ function openDeletePopoverNow() {
 const retryButtonText = computed(() => {
   if (isExportJob.value) return '重试导出'
   if (isMetadataJob.value) return '重试补全'
-  if (isRenameDatesJob.value) return '重试改名'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成'
   }
@@ -190,7 +186,6 @@ const retryButtonText = computed(() => {
 const retryButtonTitle = computed(() => {
   if (isExportJob.value) return '按原筛选条件重新导出链接'
   if (isMetadataJob.value) return '重新补全仍缺少画质或文件大小的基线视频'
-  if (isRenameDatesJob.value) return '继续为剩余未带日期前缀的网盘视频补全发布日期'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成条目；如果之前还没有生成明细，将按原设置重试'
   }
@@ -204,7 +199,6 @@ const retryButtonTitle = computed(() => {
 const itemFilterPills = computed(() =>
   buildItemStatusPills(items.value, {
     isMetadataJob: isMetadataJob.value,
-    isRenameDatesJob: isRenameDatesJob.value,
     activeFilter: itemStatusFilter.value,
   })
 )
@@ -305,15 +299,6 @@ function itemStatusLabel(item) {
     return {
       pending: '等待补全',
       done: '已补全',
-      failed: '失败',
-      cancelled: '取消',
-    }[item.status] || itemStatusMeta(item.status).label
-  }
-  if (isRenameDatesJob.value) {
-    return {
-      pending: '等待改名',
-      done: '已改名',
-      skipped: '已跳过',
       failed: '失败',
       cancelled: '取消',
     }[item.status] || itemStatusMeta(item.status).label

@@ -466,66 +466,6 @@ class Repository:
         )
         return True
 
-    async def backfill_videos_published_meta(
-        self,
-        updates: List[Tuple[str, str, int]],
-    ) -> int:
-        """Fill missing ``published_at`` / ``duration_seconds`` for existing ``videos`` rows."""
-        clean = [
-            (pub.strip(), int(dur or 0), vk.strip())
-            for vk, pub, dur in updates
-            if (vk or "").strip() and ((pub or "").strip() or int(dur or 0) > 0)
-        ]
-        if not clean:
-            return 0
-        await self.db.executemany(
-            """
-            UPDATE videos
-            SET published_at = CASE WHEN published_at = '' AND ? != '' THEN ? ELSE published_at END,
-                duration_seconds = CASE WHEN duration_seconds <= 0 AND ? > 0 THEN ? ELSE duration_seconds END
-            WHERE viewkey = ?
-              AND (
-                  (published_at = '' AND ? != '')
-                  OR (duration_seconds <= 0 AND ? > 0)
-              )
-            """,
-            [(pub, pub, dur, dur, vk, pub, dur) for pub, dur, vk in clean],
-        )
-        return len(clean)
-
-    async def update_video_remote_path(self, viewkey: str, remote_path: str) -> None:
-        if not viewkey or not remote_path:
-            return
-        await self.db.execute(
-            "UPDATE videos SET remote_path = ? WHERE viewkey = ?",
-            (remote_path.strip(), viewkey.strip()),
-        )
-
-    async def list_remote_date_rename_candidates(self, limit: int = 0) -> List[Dict[str, Any]]:
-        from ..services.filename import has_date_prefix
-
-        rows = await self.db.fetch_all(
-            """
-            SELECT viewkey, title, uploader, target_type, quality, file_size,
-                   video_page_url, remote_path, published_at, duration_seconds
-            FROM videos
-            WHERE status = 'uploaded' AND remote_path != ''
-            ORDER BY LOWER(uploader) ASC, COALESCE(uploaded_at, created_at) ASC, viewkey ASC
-            """
-        )
-        filtered = [row for row in rows if not has_date_prefix(row.get("remote_path"))]
-        if limit > 0:
-            return filtered[: int(limit)]
-        return filtered
-
-    async def count_remote_date_rename_candidates(self) -> int:
-        from ..services.filename import has_date_prefix
-
-        rows = await self.db.fetch_all(
-            "SELECT remote_path FROM videos WHERE status = 'uploaded' AND remote_path != ''"
-        )
-        return sum(1 for row in rows if not has_date_prefix(row.get("remote_path")))
-
     _UPSERT_VIDEO_SQL = """
         INSERT INTO videos (
             viewkey, title, uploader, target_type, quality, video_page_url,
@@ -902,7 +842,6 @@ class Repository:
             if r["status"] in counts:
                 counts[r["status"]] = c
         counts["baseline_missing_metadata"] = await self.count_baseline_metadata_candidates()
-        counts["pending_remote_date_rename"] = await self.count_remote_date_rename_candidates()
         return counts
 
     # ------------------------------------------------------------------
@@ -1236,7 +1175,7 @@ class Repository:
             total += c
             if st == "done":
                 done += c
-                if job_kind not in {"enrich_metadata", "rename_remote_dates"}:
+                if job_kind != "enrich_metadata":
                     uploaded += c
             elif st in {"downloaded", "uploading"}:
                 done += c

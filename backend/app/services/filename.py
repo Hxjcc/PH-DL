@@ -135,18 +135,6 @@ def format_remote_video_filename(local_filename: str, published_at: Optional[str
     return f"{prefix}{suffix_tag.strip() or 'video'}{ext}"
 
 
-def build_dated_remote_path(remote_path: str, published_at: Optional[str]) -> str:
-    """Return ``remote_path`` with its basename prefixed as ``YYYY-MM-DD_<name>``."""
-    raw = str(remote_path or "").strip()
-    if not raw:
-        return ""
-    prefix, name = _split_remote_path(raw)
-    if not name:
-        return raw
-    dated_name = format_remote_video_filename(name, published_at)
-    return f"{prefix}{dated_name}" if dated_name != name else raw
-
-
 def normalized_quality(quality: str) -> str:
     match = re.fullmatch(r"(\d+)p?", (quality or "").strip(), re.IGNORECASE)
     return match.group(1) if match and int(match.group(1)) > 0 else ""

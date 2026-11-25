@@ -436,36 +436,6 @@ def _parse_video_html_fields(
     return vdata, title, uploader_name, uploader_type, published_at, duration_seconds
 
 
-async def fetch_video_published_meta(
-    ctx: TaskHttpContext,
-    page_url: str,
-    *,
-    timeout: Optional[float] = None,
-) -> Tuple[str, int, Optional[str]]:
-    """Fetch only the detail HTML (no ``get_media`` call) to read ``(published_at, duration_seconds, error)``."""
-    vkey = extract_viewkey_from_url(page_url) or ""
-    page_timeout = max(5.0, float(timeout or 15.0))
-    res, err = await ctx.fetch_with_pow(
-        page_url, timeout=page_timeout, log_label=f"详情日期 {vkey or page_url}",
-    )
-    if res is None:
-        return "", 0, err or "页面获取失败"
-    if res.status_code == 404:
-        return "", 0, "404 无效/已删除视频"
-    if res.status_code >= 400:
-        return "", 0, f"详情页返回 HTTP {res.status_code}"
-
-    def _parse(body: str = res.text, url: str = res.final_url) -> Tuple[str, int]:
-        vdata = extract_flashvars(body, url, vkey)
-        return extract_detail_published_and_duration(body, vdata)
-
-    if len(res.text) >= _OFFLOAD_HTML_THRESHOLD:
-        pub, dur = await asyncio.to_thread(_parse)
-    else:
-        pub, dur = _parse()
-    return pub, dur, None
-
-
 async def fetch_single_video_detail(
     ctx: TaskHttpContext,
     page_url: str,
