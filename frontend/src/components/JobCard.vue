@@ -2,6 +2,8 @@
 import { computed, ref, watch } from 'vue'
 import {
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Square,
   RotateCcw,
   Download as DownloadIcon,
@@ -74,9 +76,9 @@ const itemsLoadError = ref('')
 const deletePopoverMounted = ref(false)
 const deletePopoverDefaultOpen = ref(false)
 const itemStatusFilter = ref('all')
-const INITIAL_ITEM_LIMIT = 12
-const ITEM_PAGE_STEP = 30
-const itemRenderLimit = ref(INITIAL_ITEM_LIMIT)
+const ITEMS_PER_PAGE = 50
+const itemPage = ref(1)
+const itemListScrollRef = ref(null)
 const brokenAvatars = ref(new Set())
 
 const isActive = computed(() => ['queued', 'scanning', 'running'].includes(props.job.status))
@@ -90,7 +92,7 @@ const liveMetrics = computed(() =>
   computeJobLiveMetrics(
     props.job,
     tracksLiveProgress.value ? store.liveProgress : null,
-    store.jobItems[props.job.id],
+    isActive.value ? store.jobItems[props.job.id] : null,
     tracksLiveProgress.value ? store.scanStatus : null
   )
 )
@@ -140,9 +142,14 @@ const canRetry = computed(
   )
 )
 const isMetadataJob = computed(() => props.job.kind === 'enrich_metadata')
+const isBackfillDatesJob = computed(() => props.job.kind === 'backfill_dates')
 const isExportJob = computed(() => Boolean(props.job.params?.export_only || props.job.export_text))
 const hasNoJobItems = computed(
-  () => isExportJob.value || props.job.kind === 'check_updates' || props.job.kind === 'baseline_sync'
+  () =>
+    isExportJob.value ||
+    props.job.kind === 'check_updates' ||
+    props.job.kind === 'baseline_sync' ||
+    props.job.kind === 'backfill_dates'
 )
 const detailsOpen = computed(() => expanded.value)
 const detailsContentKey = computed(() => {
@@ -150,7 +157,7 @@ const detailsContentKey = computed(() => {
   if (itemsLoadError.value && items.value.length === 0) return 'error'
   if (items.value.length === 0) return 'empty'
   const heightBucket = visibleItems.value.length >= 9 ? '9+' : String(visibleItems.value.length)
-  return `ready:${itemStatusFilter.value}:${heightBucket}:${remainingItemsCount.value > 0 ? 1 : 0}`
+  return `ready:${itemStatusFilter.value}:${heightBucket}:${totalItemPages.value > 1 ? 1 : 0}`
 })
 
 function statusPillClass(variant) {
@@ -173,6 +180,7 @@ function openDeletePopoverNow() {
 const retryButtonText = computed(() => {
   if (isExportJob.value) return '重试导出'
   if (isMetadataJob.value) return '重试补全'
+  if (isBackfillDatesJob.value) return '继续补全'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成'
   }
@@ -186,6 +194,7 @@ const retryButtonText = computed(() => {
 const retryButtonTitle = computed(() => {
   if (isExportJob.value) return '按原筛选条件重新导出链接'
   if (isMetadataJob.value) return '重新补全仍缺少画质或文件大小的基线视频'
+  if (isBackfillDatesJob.value) return '继续补全仍缺少发布日期或时长的历史视频'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成条目；如果之前还没有生成明细，将按原设置重试'
   }
@@ -204,9 +213,24 @@ const itemFilterPills = computed(() =>
 )
 
 const filteredItems = computed(() => filterJobItemsByStatus(items.value, itemStatusFilter.value))
+const totalItemPages = computed(() => Math.max(1, Math.ceil(filteredItems.value.length / ITEMS_PER_PAGE)))
+const safeItemPage = computed(() => Math.min(Math.max(1, itemPage.value), totalItemPages.value))
+const itemPageStart = computed(() => (safeItemPage.value - 1) * ITEMS_PER_PAGE)
+const visibleItems = computed(() =>
+  filteredItems.value.slice(itemPageStart.value, itemPageStart.value + ITEMS_PER_PAGE)
+)
+const itemIndexWidthClass = computed(() => {
+  const len = filteredItems.value.length
+  if (len >= 1000) return 'w-9 sm:w-10'
+  if (len >= 100) return 'w-7 sm:w-8'
+  return 'w-5 sm:w-6'
+})
 
-const visibleItems = computed(() => filteredItems.value.slice(0, itemRenderLimit.value))
-const remainingItemsCount = computed(() => Math.max(0, filteredItems.value.length - visibleItems.value.length))
+watch(totalItemPages, (maxPage) => {
+  if (itemPage.value > maxPage) {
+    itemPage.value = maxPage
+  }
+})
 
 const transferProgressMap = computed(() => {
   if (!detailsMounted.value || !tracksLiveProgress.value) return {}
@@ -280,16 +304,15 @@ const schedulerChip = computed(() => {
 function selectItemFilter(val) {
   if (itemStatusFilter.value === val) return
   itemStatusFilter.value = val
-  itemRenderLimit.value = INITIAL_ITEM_LIMIT
+  itemPage.value = 1
+  if (itemListScrollRef.value) itemListScrollRef.value.scrollTop = 0
 }
 
-function handleItemsScroll(event) {
-  if (remainingItemsCount.value <= 0) return
-  const el = event.currentTarget
-  if (!el) return
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 96) {
-    itemRenderLimit.value = Math.min(filteredItems.value.length, itemRenderLimit.value + ITEM_PAGE_STEP)
-  }
+function goItemPage(nextPage) {
+  const clamped = Math.min(Math.max(1, nextPage), totalItemPages.value)
+  if (clamped === itemPage.value) return
+  itemPage.value = clamped
+  if (itemListScrollRef.value) itemListScrollRef.value.scrollTop = 0
 }
 
 const exportFilename = computed(() => buildExportFilename(props.job))
@@ -300,10 +323,17 @@ function itemStatusLabel(item) {
       pending: '等待补全',
       done: '已补全',
       failed: '失败',
-      cancelled: '取消',
+      cancelled: '已取消',
     }[item.status] || itemStatusMeta(item.status).label
   }
   return itemStatusMeta(item.status).label
+}
+
+function visibleItemError(item) {
+  const msg = String(item?.error_message || '').trim()
+  if (!msg) return ''
+  if (item?.status === 'cancelled' && msg === '已取消') return ''
+  return msg
 }
 
 async function ensureItemsLoaded(force = false, { silent = false } = {}) {
@@ -348,7 +378,7 @@ async function toggleExpand() {
 function handleDetailsAfterLeave() {
   if (!expanded.value) {
     detailsMounted.value = false
-    itemRenderLimit.value = INITIAL_ITEM_LIMIT
+    itemPage.value = 1
   }
 }
 
@@ -722,7 +752,7 @@ function downloadExportTxt() {
       >
         <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] tabular-nums">
           <span class="inline-flex items-center gap-1.5 text-muted-foreground">
-            <Loader2 class="w-3 h-3 animate-spin text-brand shrink-0" />
+            <Loader2 class="w-3 h-3 animate-spin text-brand shrink-0 will-change-transform" />
             <span>{{ liveMetrics.phaseText }}</span>
           </span>
           <div class="flex flex-wrap items-center gap-1.5 ml-auto">
@@ -823,6 +853,13 @@ function downloadExportTxt() {
                   : '基线初始化完成：未发现可登记的视频'
             }}
           </template>
+          <template v-else-if="job.kind === 'backfill_dates'">
+            {{
+              isActive
+                ? liveMetrics.phaseText || '正在补全历史视频的发布日期与时长...'
+                : `发布日期与时长补全结束：已更新 ${Number(job.done_items || 0)} / ${Number(job.total_items || 0)} 条历史记录`
+            }}
+          </template>
           <template v-else>
             暂无视频条目（可能仍在扫描列表或无新视频）
           </template>
@@ -849,8 +886,8 @@ function downloadExportTxt() {
                 <span class="font-mono text-[10px] opacity-80">{{ pill.count }}</span>
               </button>
             </div>
-            <span v-if="filteredItems.length > INITIAL_ITEM_LIMIT" class="text-[11px] text-muted-foreground tabular-nums">
-              显示 {{ visibleItems.length }} / {{ filteredItems.length }} 项
+            <span v-if="filteredItems.length > ITEMS_PER_PAGE" class="text-[11px] text-muted-foreground tabular-nums">
+              第 {{ itemPageStart + 1 }}–{{ itemPageStart + visibleItems.length }} / 共 {{ filteredItems.length }} 项
             </span>
           </div>
 
@@ -858,7 +895,7 @@ function downloadExportTxt() {
             当前筛选下没有条目
           </div>
 
-          <div v-else class="space-y-1.5 max-h-96 overflow-y-auto pr-0.5 sm:pr-1" @scroll.passive="handleItemsScroll">
+          <div v-else ref="itemListScrollRef" class="space-y-1.5 max-h-96 overflow-y-auto pr-0.5 sm:pr-1">
             <div
               v-for="(item, idx) in visibleItems"
               :key="item.id"
@@ -867,10 +904,15 @@ function downloadExportTxt() {
               <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5 sm:gap-2.5">
                 <!-- Left: Index + Status Badge + Title -->
                 <div class="min-w-0 flex-1 flex items-center gap-1.5 sm:gap-2">
-                  <span class="w-4 sm:w-5 shrink-0 text-[11px] font-mono text-muted-foreground/65 tabular-nums">
-                    {{ String(idx + 1).padStart(2, '0') }}
+                  <span
+                    :class="[
+                      'shrink-0 text-right text-[11px] font-mono text-muted-foreground/65 tabular-nums',
+                      itemIndexWidthClass,
+                    ]"
+                  >
+                    {{ String(itemPageStart + idx + 1).padStart(2, '0') }}
                   </span>
-                  <span class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card/90 text-foreground font-medium whitespace-nowrap shrink-0 h-5 px-2 text-[10px]">
+                  <span class="inline-flex items-center justify-center gap-1.5 min-w-[68px] rounded-full border border-border bg-card/90 text-foreground font-medium whitespace-nowrap shrink-0 h-5 px-2 text-[10px]">
                     <span :class="['w-1.5 h-1.5 rounded-full shrink-0', itemStatusMeta(item.status).dot]" />
                     {{ itemStatusLabel(item) }}
                   </span>
@@ -1006,17 +1048,33 @@ function downloadExportTxt() {
                 />
               </div>
 
-              <div v-if="item.error_message" class="text-[11px] text-red-600 dark:text-red-400 pl-7">
-                {{ item.error_message }}
+              <div v-if="visibleItemError(item)" class="text-[11px] text-red-600 dark:text-red-400 pl-7">
+                {{ visibleItemError(item) }}
               </div>
             </div>
+          </div>
 
-            <div v-if="remainingItemsCount > 0" class="pt-1.5 flex items-center justify-center gap-2">
-              <Button variant="outline" size="xs" @click="itemRenderLimit += ITEM_PAGE_STEP">
-                加载更多 (+{{ Math.min(ITEM_PAGE_STEP, remainingItemsCount) }})
+          <div
+            v-if="totalItemPages > 1"
+            class="pt-1 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground tabular-nums"
+          >
+            <span>
+              每页 {{ ITEMS_PER_PAGE }} 项 · 第 {{ safeItemPage }} / {{ totalItemPages }} 页
+            </span>
+            <div class="flex items-center gap-1">
+              <Button variant="outline" size="xs" :disabled="safeItemPage <= 1" @click="goItemPage(1)">
+                首页
               </Button>
-              <Button v-if="remainingItemsCount > ITEM_PAGE_STEP" variant="ghost" size="xs" class="text-muted-foreground" @click="itemRenderLimit = filteredItems.length">
-                显示全部 ({{ filteredItems.length }})
+              <Button variant="outline" size="xs" :disabled="safeItemPage <= 1" @click="goItemPage(safeItemPage - 1)">
+                <ChevronLeft class="w-3.5 h-3.5" />
+                上一页
+              </Button>
+              <Button variant="outline" size="xs" :disabled="safeItemPage >= totalItemPages" @click="goItemPage(safeItemPage + 1)">
+                下一页
+                <ChevronRight class="w-3.5 h-3.5" />
+              </Button>
+              <Button variant="outline" size="xs" :disabled="safeItemPage >= totalItemPages" @click="goItemPage(totalItemPages)">
+                末页
               </Button>
             </div>
           </div>

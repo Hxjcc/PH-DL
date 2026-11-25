@@ -33,6 +33,7 @@ from ..parsers.target import (
 from ..parsers.video import (
     VideoDetail,
     collect_video_urls,
+    extract_detail_published_and_duration,
     extract_viewkey_from_url,
     fetch_video_details_batch,
 )
@@ -375,6 +376,8 @@ class TaskManager:
                 await self._exec_baseline_sync(job_id, params, settings, ctx)
             elif kind == "enrich_metadata":
                 await self._exec_enrich_metadata(job_id, params, settings, ctx)
+            elif kind == "backfill_dates":
+                await self._exec_backfill_dates(job_id, params, settings, ctx)
             elif kind == "retry_items":
                 await self._exec_retry_items(job_id, params, settings, ctx)
             elif kind == "resume_temp":
@@ -388,7 +391,10 @@ class TaskManager:
                 )
                 return
 
-        uses_job_items = kind not in {"baseline_sync", "check_updates"} and not bool(params.get("export_only", False))
+        uses_job_items = (
+            kind not in {"baseline_sync", "check_updates", "backfill_dates"}
+            and not bool(params.get("export_only", False))
+        )
         final_job = (
             await self.repo.recalculate_job_counts(job_id)
             if uses_job_items
@@ -740,9 +746,6 @@ class TaskManager:
             ) as dl_session:
                 async def _dl_one(item_id: int) -> None:
                     if ctx.cancel_event.is_set():
-                        it = await self.repo.update_job_item(item_id, status="cancelled", error_message="已取消")
-                        if it:
-                            self.events.broadcast("item_updated", it)
                         return
 
                     item = await self.repo.get_job_item(item_id)
@@ -1074,25 +1077,16 @@ class TaskManager:
                                             continue
 
                                         if ctx.cancel_event.is_set():
-                                            it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                                            if it:
-                                                self.events.broadcast("item_updated", it)
                                             continue
 
                                         try:
                                             await until_stopped(window_sem.acquire(), ctx.cancel_event)
                                         except StopRequested:
-                                            it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                                            if it:
-                                                self.events.broadcast("item_updated", it)
                                             continue
 
                                         handed_off = False
                                         try:
                                             if ctx.cancel_event.is_set():
-                                                it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                                                if it:
-                                                    self.events.broadcast("item_updated", it)
                                                 continue
 
                                             details = await fetch_video_details_batch(
@@ -1246,6 +1240,9 @@ class TaskManager:
                         tasks_to_wait = [*workers, *([producer_task] if producer_task is not None else [])]
                         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
                         raise
+                if ctx.cancel_event.is_set():
+                    await self.repo.bulk_cancel_pending_job_items(job_id, error_message="已取消")
+                    self.events.broadcast("job_items_changed", {"job_id": job_id})
                 await _refresh_job_progress(force=True)
 
             return pass_failed
@@ -2513,61 +2510,9 @@ class TaskManager:
             row["viewkey"]: int(row["id"]) for row in inserted_items
         }
 
-        created_job = await self.repo.update_job(job_id, total_items=len(candidates))
+        created_job = await self.repo.update_job(job_id, total_items=len(candidates), status="running")
         if created_job:
             self.events.broadcast("job_updated", created_job)
-
-        details = await fetch_video_details_batch(
-            ctx,
-            [
-                (candidate["video_page_url"], 0, idx + 1)
-                for idx, candidate in enumerate(candidates)
-            ],
-            settings.selectors,
-            concurrency=settings.max_concurrent_video_details,
-            skip_dom=True,
-            timeout=settings.request_timeout,
-        )
-        detail_by_viewkey = {
-            detail.viewkey: detail for detail in details if detail.viewkey
-        }
-
-        ready: List[Tuple[Dict[str, Any], VideoDetail]] = []
-        detail_failures = 0
-        for candidate in candidates:
-            detail = detail_by_viewkey.get(candidate["viewkey"])
-            if ctx.cancel_event.is_set() or (detail is not None and detail.error == "操作已取消"):
-                item = await self.repo.update_job_item(
-                    item_ids[candidate["viewkey"]],
-                    status="cancelled",
-                    error_message="已取消",
-                )
-                if item:
-                    self.events.broadcast("item_updated", item)
-                continue
-            if detail is None or not detail.download_url:
-                detail_failures += 1
-                error = detail.error if detail else "详情页未返回结果"
-                item = await self.repo.update_job_item(
-                    item_ids[candidate["viewkey"]],
-                    status="failed",
-                    error_message=error or "没有可用 MP4",
-                )
-                if item:
-                    self.events.broadcast("item_updated", item)
-                continue
-            ready.append((candidate, detail))
-
-        if ctx.cancel_event.is_set():
-            self.events.emit_log("WARNING", "元数据补全任务已取消。", job_id=job_id)
-            return
-
-        self.events.emit_log(
-            "INFO",
-            f"详情解析完成：{len(ready)} 条可继续，{detail_failures} 条详情失败；"
-            "开始读取媒体文件大小...",
-            job_id=job_id,
-        )
 
         size_limit = max(1, min(20, settings.max_concurrent_video_details))
         size_sem = asyncio.Semaphore(size_limit)
@@ -2597,60 +2542,362 @@ class TaskManager:
                     return candidate, detail, None, True
                 return candidate, detail, size, False
 
+        chunk_size = max(20, min(60, int(settings.max_concurrent_video_details) * 2))
+        detail_failures = 0
         size_failures = 0
-        processed = 0
         completed_with_size = 0
-        if ready:
-            timeout = aiohttp.ClientTimeout(total=25.0, connect=10.0, sock_read=20.0)
-            connector = aiohttp.TCPConnector(limit=size_limit + 8, limit_per_host=16)
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as size_session:
-                probe_results = await asyncio.gather(
-                    *[
-                        _probe(size_session, candidate, detail)
-                        for candidate, detail in ready
-                    ]
-                )
 
-            for candidate, detail, file_size, cancelled in probe_results:
-                if cancelled or ctx.cancel_event.is_set():
-                    item = await self.repo.update_job_item(
-                        item_ids[candidate["viewkey"]],
-                        status="cancelled",
-                        error_message="已取消",
+        timeout = aiohttp.ClientTimeout(total=25.0, connect=10.0, sock_read=20.0)
+        connector = aiohttp.TCPConnector(limit=size_limit + 8, limit_per_host=16)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as size_session:
+            for start in range(0, len(candidates), chunk_size):
+                if ctx.cancel_event.is_set():
+                    break
+                batch = candidates[start : start + chunk_size]
+                details = await fetch_video_details_batch(
+                    ctx,
+                    [
+                        (candidate["video_page_url"], 0, start + idx + 1)
+                        for idx, candidate in enumerate(batch)
+                    ],
+                    settings.selectors,
+                    concurrency=settings.max_concurrent_video_details,
+                    skip_dom=True,
+                    timeout=settings.request_timeout,
+                )
+                if ctx.cancel_event.is_set():
+                    break
+                detail_by_viewkey = {
+                    detail.viewkey: detail for detail in details if detail.viewkey
+                }
+
+                ready: List[Tuple[Dict[str, Any], VideoDetail]] = []
+                for candidate in batch:
+                    detail = detail_by_viewkey.get(candidate["viewkey"])
+                    if detail is not None and detail.error == "操作已取消":
+                        continue
+                    if detail is None or not detail.download_url:
+                        detail_failures += 1
+                        error = detail.error if detail else "详情页未返回结果"
+                        await self.repo.update_job_item(
+                            item_ids[candidate["viewkey"]],
+                            status="failed",
+                            error_message=error or "没有可用 MP4",
+                        )
+                        continue
+                    ready.append((candidate, detail))
+
+                if ctx.cancel_event.is_set():
+                    break
+
+                if ready:
+                    probe_results = await asyncio.gather(
+                        *[
+                            _probe(size_session, candidate, detail)
+                            for candidate, detail in ready
+                        ]
                     )
-                    if item:
-                        self.events.broadcast("item_updated", item)
-                    continue
-                if file_size:
-                    completed_with_size += 1
-                else:
-                    size_failures += 1
-                await self.repo.update_video_metadata(
-                    candidate["viewkey"],
-                    quality=detail.quality or "",
-                    file_size=int(file_size or 0),
-                    published_at=detail.published_at or "",
-                    duration_seconds=int(detail.duration_seconds or 0),
-                )
-                item = await self.repo.update_job_item(
-                    item_ids[candidate["viewkey"]],
-                    status="done" if file_size else "failed",
-                    quality=detail.quality or "",
-                    bytes_total=int(file_size or 0),
-                    error_message="" if file_size else "画质已保存，但无法确认媒体文件大小",
-                )
-                if item:
-                    self.events.broadcast("item_updated", item)
-                processed += 1
-                if processed % 25 == 0:
-                    refreshed = await self.repo.recalculate_job_counts(job_id)
-                    if refreshed:
-                        self.events.broadcast("job_updated", refreshed)
+                    for candidate, detail, file_size, cancelled in probe_results:
+                        if cancelled or ctx.cancel_event.is_set():
+                            continue
+                        if file_size:
+                            completed_with_size += 1
+                        else:
+                            size_failures += 1
+                        await self.repo.update_video_metadata(
+                            candidate["viewkey"],
+                            quality=detail.quality or "",
+                            file_size=int(file_size or 0),
+                            published_at=detail.published_at or "",
+                            duration_seconds=int(detail.duration_seconds or 0),
+                        )
+                        await self.repo.update_job_item(
+                            item_ids[candidate["viewkey"]],
+                            status="done" if file_size else "failed",
+                            quality=detail.quality or "",
+                            bytes_total=int(file_size or 0),
+                            error_message="" if file_size else "画质已保存，但无法确认媒体文件大小",
+                        )
+
+                if ctx.cancel_event.is_set():
+                    break
+
+                refreshed = await self.repo.recalculate_job_counts(job_id)
+                if refreshed:
+                    self.events.broadcast("job_updated", refreshed)
+                self.events.broadcast("job_items_changed", {"job_id": job_id})
+
+        if ctx.cancel_event.is_set():
+            await self.repo.bulk_cancel_pending_job_items(job_id, error_message="已取消")
+            self.events.broadcast("job_items_changed", {"job_id": job_id})
+            self.events.emit_log(
+                "WARNING",
+                f"元数据补全已取消：已完成 {completed_with_size} 条，其余条目已批量取消。",
+                job_id=job_id,
+            )
+            return
 
         self.events.emit_log(
             "INFO",
             f"元数据补全完成：画质/大小均成功 {completed_with_size} 条，"
             f"详情失败 {detail_failures} 条，大小获取失败 {size_failures} 条。",
+            job_id=job_id,
+        )
+
+    async def _exec_backfill_dates(
+        self,
+        job_id: int,
+        params: Dict[str, Any],
+        settings: RuntimeSettings,
+        ctx: TaskHttpContext,
+    ) -> None:
+        """Backfill missing published_at and duration_seconds across all history videos.
+
+        Stage 1 sweeps creator list pages (~32-44 videos per request).
+        Stage 2 falls back to lightweight detail HTML JSON-LD extraction for any leftovers.
+        """
+        limit = int(params.get("limit") or 0)
+        candidates = await self.repo.list_missing_date_duration_candidates(limit=limit)
+        if not candidates:
+            self.events.emit_log("INFO", "所有历史视频的发布日期与时长均已完整。", job_id=job_id)
+            return
+
+        total_candidates = len(candidates)
+        remaining: Dict[str, Dict[str, Any]] = {}
+        for c in candidates:
+            vk = str(c.get("viewkey") or "").strip()
+            if vk and vk not in remaining:
+                remaining[vk] = dict(c)
+
+        running_job = await self.repo.update_job(
+            job_id,
+            status="running",
+            total_items=len(remaining),
+            done_items=0,
+            failed_items=0,
+        )
+        if running_job:
+            self.events.broadcast("job_updated", running_job)
+
+        self.events.emit_log(
+            "INFO",
+            f"开始补全 {len(remaining)} 条历史视频的发布日期与时长（优先列表页快扫，其余轻量补全）...",
+            job_id=job_id,
+        )
+
+        # Build creator lookup from targets so model vs pornstar list URLs are accurate.
+        targets = await self.repo.list_targets()
+        target_type_by_user: Dict[str, str] = {}
+        display_by_user: Dict[str, str] = {}
+        for t in targets:
+            u_low = str(t.get("username") or "").strip().lower()
+            t_low = str(t.get("target_type") or "model").strip().lower()
+            if u_low and t_low in {"model", "pornstar"} and u_low not in target_type_by_user:
+                target_type_by_user[u_low] = t_low
+            if u_low and str(t.get("display_name") or "").strip() and u_low not in display_by_user:
+                display_by_user[u_low] = str(t["display_name"]).strip()
+
+        grouped: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        for rec in remaining.values():
+            raw_up = str(rec.get("uploader") or "").strip()
+            raw_type = str(rec.get("target_type") or "model").strip().lower()
+            up_low = raw_up.lower()
+            if raw_type == "liked" or up_low == "my_liked":
+                grouped[("_currentuser_", "liked")] = ("_currentUser_", "liked")
+                continue
+            if not raw_up or up_low in {"url_batch", "ungrouped"}:
+                continue
+            eff_type = raw_type if raw_type == "favorites" else target_type_by_user.get(up_low, raw_type)
+            if eff_type not in {"model", "pornstar", "favorites"}:
+                continue
+            grouped.setdefault((up_low, eff_type), (raw_up, eff_type))
+
+        updated_vkeys: Set[str] = set()
+        list_updated_count = 0
+        detail_updated_count = 0
+        failed_count = 0
+        state_lock = asyncio.Lock()
+
+        group_list = list(grouped.values())
+        scanned_groups = 0
+
+        if group_list and not ctx.cancel_event.is_set():
+            group_concurrency = max(1, min(4, int(getattr(settings, "update_target_concurrency", 2) or 1)))
+            group_sem = asyncio.Semaphore(group_concurrency)
+
+            async def _sweep_group(uname: str, utype: str) -> None:
+                nonlocal scanned_groups, list_updated_count
+                async with group_sem:
+                    if ctx.cancel_event.is_set():
+                        return
+                    display_label = (
+                        "Liked Videos"
+                        if utype == "liked"
+                        else (display_by_user.get(uname.lower()) or uname)
+                    )
+                    self.events.emit_scan_status(
+                        job_id,
+                        {
+                            "mode": "backfill_dates",
+                            "stage": "list",
+                            "current_target": display_label,
+                            "scanned_targets": scanned_groups,
+                            "total_targets": len(group_list),
+                            "done": len(updated_vkeys),
+                            "total": total_candidates,
+                        },
+                    )
+                    list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
+                    listed = await scan_list_pages(
+                        ctx,
+                        list_url,
+                        settings.selectors,
+                        target_type=utype,
+                        delay_min=settings.page_delay_min,
+                        delay_max=settings.page_delay_max,
+                        page_concurrency=settings.max_concurrent_list_pages,
+                        timeout=settings.request_timeout,
+                    )
+                    pending_updates: List[Tuple[str, str, int]] = []
+                    async with state_lock:
+                        for lv in listed:
+                            rec = remaining.get(lv.viewkey)
+                            if rec is None:
+                                continue
+                            new_pub = lv.published_at if (not rec.get("published_at") and lv.published_at) else ""
+                            new_dur = (
+                                int(lv.duration_seconds)
+                                if (int(rec.get("duration_seconds") or 0) <= 0 and int(lv.duration_seconds or 0) > 0)
+                                else 0
+                            )
+                            if not new_pub and new_dur <= 0:
+                                continue
+                            if new_pub:
+                                rec["published_at"] = new_pub
+                            if new_dur > 0:
+                                rec["duration_seconds"] = new_dur
+                            pending_updates.append((lv.viewkey, new_pub, new_dur))
+                            if lv.viewkey not in updated_vkeys:
+                                updated_vkeys.add(lv.viewkey)
+                                list_updated_count += 1
+                            if rec.get("published_at") and int(rec.get("duration_seconds") or 0) > 0:
+                                remaining.pop(lv.viewkey, None)
+
+                    if pending_updates:
+                        await self.repo.bulk_update_video_dates_and_durations(pending_updates)
+
+                    async with state_lock:
+                        scanned_groups += 1
+                        done_now = len(updated_vkeys)
+                    updated_job = await self.repo.update_job(job_id, done_items=done_now)
+                    if updated_job:
+                        self.events.broadcast("job_updated", updated_job)
+                    self.events.emit_scan_status(
+                        job_id,
+                        {
+                            "mode": "backfill_dates",
+                            "stage": "list",
+                            "current_target": display_label,
+                            "scanned_targets": scanned_groups,
+                            "total_targets": len(group_list),
+                            "done": done_now,
+                            "total": total_candidates,
+                        },
+                    )
+
+            await asyncio.gather(*(_sweep_group(u, t) for u, t in group_list))
+
+        leftovers = list(remaining.values())
+        if leftovers and not ctx.cancel_event.is_set():
+            self.events.emit_log(
+                "INFO",
+                f"列表快扫已补全 {list_updated_count} 条，剩余 {len(leftovers)} 条改用详情页轻量补全...",
+                job_id=job_id,
+            )
+            detail_sem = asyncio.Semaphore(max(1, int(settings.max_concurrent_video_details)))
+            chunk_size = max(20, min(60, int(settings.max_concurrent_video_details) * 2))
+
+            async def _fetch_one_date(rec: Dict[str, Any]) -> Tuple[str, str, int, bool]:
+                vk = rec["viewkey"]
+                page_url = (
+                    str(rec.get("video_page_url") or "").strip()
+                    or f"https://www.pornhub.com/view_video.php?viewkey={vk}"
+                )
+                async with detail_sem:
+                    if ctx.cancel_event.is_set():
+                        return vk, "", 0, True
+                    res, _ = await ctx.fetch_with_pow(
+                        page_url,
+                        timeout=settings.request_timeout,
+                        max_retries=1,
+                        log_label=f"补全日期 {vk}",
+                    )
+                    if ctx.cancel_event.is_set():
+                        return vk, "", 0, True
+                    if res is None or res.status_code >= 400 or not res.text:
+                        return vk, "", 0, False
+                    pub, dur = extract_detail_published_and_duration(res.text)
+                    new_pub = pub if (not rec.get("published_at") and pub) else ""
+                    new_dur = dur if (int(rec.get("duration_seconds") or 0) <= 0 and dur > 0) else 0
+                    return vk, new_pub, new_dur, False
+
+            for start in range(0, len(leftovers), chunk_size):
+                if ctx.cancel_event.is_set():
+                    break
+                chunk = leftovers[start : start + chunk_size]
+                self.events.emit_scan_status(
+                    job_id,
+                    {
+                        "mode": "backfill_dates",
+                        "stage": "detail",
+                        "current_target": "",
+                        "done": len(updated_vkeys),
+                        "total": total_candidates,
+                        "remaining": len(leftovers) - start,
+                    },
+                )
+                results = await asyncio.gather(*(_fetch_one_date(rec) for rec in chunk))
+                chunk_updates: List[Tuple[str, str, int]] = []
+                for vk, new_pub, new_dur, was_cancelled in results:
+                    if was_cancelled:
+                        continue
+                    if new_pub or new_dur > 0:
+                        chunk_updates.append((vk, new_pub, new_dur))
+                        if vk not in updated_vkeys:
+                            updated_vkeys.add(vk)
+                            detail_updated_count += 1
+                    else:
+                        failed_count += 1
+                if chunk_updates:
+                    await self.repo.bulk_update_video_dates_and_durations(chunk_updates)
+                updated_job = await self.repo.update_job(
+                    job_id,
+                    done_items=len(updated_vkeys),
+                    failed_items=failed_count,
+                )
+                if updated_job:
+                    self.events.broadcast("job_updated", updated_job)
+
+        self.events.clear_scan_status(job_id)
+        final_done = len(updated_vkeys)
+        await self.repo.update_job(
+            job_id,
+            total_items=total_candidates,
+            done_items=final_done,
+            failed_items=failed_count,
+        )
+        self.events.broadcast("overview_changed", {})
+        if ctx.cancel_event.is_set():
+            self.events.emit_log(
+                "WARNING",
+                f"发布日期与时长补全已取消：已保存 {final_done} 条（列表快扫 {list_updated_count}，详情页 {detail_updated_count}）。",
+                job_id=job_id,
+            )
+            return
+        self.events.emit_log(
+            "INFO",
+            f"发布日期与时长补全完成：共更新 {final_done}/{total_candidates} 条"
+            f"（列表快扫 {list_updated_count}，详情页 {detail_updated_count}，未获取到 {failed_count} 条）。",
             job_id=job_id,
         )
 

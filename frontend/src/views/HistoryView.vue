@@ -38,6 +38,7 @@ const loading = ref(false)
 const fetching = ref(false)
 const refreshing = ref(false)
 const enriching = ref(false)
+const backfillingDates = ref(false)
 const batchDeleting = ref(false)
 const playingVideo = shallowRef(null)
 let playbackTrigger = null
@@ -59,10 +60,10 @@ const facets = ref(
 )
 const stats = ref(
   cached
-    ? { published_7d: 0, ...cached.stats }
+    ? { published_7d: 0, missing_date_duration: 0, ...cached.stats }
     : store.overview?.videos
-      ? { published_7d: 0, ...store.overview.videos }
-      : { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0 }
+      ? { published_7d: 0, missing_date_duration: 0, ...store.overview.videos }
+      : { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0, missing_date_duration: 0 }
 )
 
 const filters = reactive({
@@ -93,6 +94,9 @@ const pageSizeOptions = HISTORY_PAGE_SIZES.map((value) => ({ label: `${value} �
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / filters.page_size)))
 const metadataCandidates = computed(
   () => stats.value.baseline_missing_metadata ?? stats.value.baseline ?? 0
+)
+const missingDateDurationCount = computed(
+  () => Number(stats.value.missing_date_duration ?? 0)
 )
 
 const selectedCount = computed(() => selectedViewkeys.value.size)
@@ -640,6 +644,21 @@ async function handleEnrichMetadata() {
   }
 }
 
+async function handleBackfillDates() {
+  if (backfillingDates.value || missingDateDurationCount.value <= 0) return
+  backfillingDates.value = true
+  try {
+    const res = await api.backfillVideoDates()
+    store.notify(`已创建日期与时长补全任务 #${res.job.id}，共 ${res.count} 条`, 'success')
+    await store.refreshJobs()
+    router.push({ name: 'jobs' })
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    backfillingDates.value = false
+  }
+}
+
 watch(
   () => store.historyCache,
   (val) => {
@@ -654,6 +673,7 @@ watch(
     }
     stats.value = {
       published_7d: 0,
+      missing_date_duration: 0,
       ...(val.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0 }),
     }
   }
@@ -733,26 +753,49 @@ onDeactivated(() => {
           </p>
         </div>
       </div>
-      <ConfirmPopover
-        :title="`补全 ${metadataCandidates} 条基线视频的画质和大小？`"
-        description="会解析视频详情并用 Range 请求读取媒体大小，不会下载视频文件。记录较多时可能需要数分钟。"
-        confirm-text="开始补全"
-        @confirm="handleEnrichMetadata"
-      >
-        <Button
-          variant="outline"
-          size="sm"
-          class="border-brand/25 bg-brand/5 text-brand hover:bg-brand/10 w-full sm:w-auto"
-          :disabled="enriching || metadataCandidates <= 0"
+      <div class="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+        <ConfirmPopover
+          :title="`补全 ${missingDateDurationCount} 条历史记录的发布日期与时长？`"
+          description="优先通过博主列表页批量快扫补全，剩余记录仅读取详情页日期与时长，不下载视频也不探测文件大小。"
+          confirm-text="开始补全"
+          @confirm="handleBackfillDates"
         >
-          <Loader2 v-if="enriching" class="w-3.5 h-3.5 animate-spin" />
-          <Sparkles v-else class="w-3.5 h-3.5" />
-          {{ enriching ? '提交中...' : '补全基线元数据' }}
-          <Badge v-if="metadataCandidates > 0" variant="secondary" class="px-1.5 py-0 text-[10px]">
-            {{ metadataCandidates }}
-          </Badge>
-        </Button>
-      </ConfirmPopover>
+          <Button
+            variant="outline"
+            size="sm"
+            class="border-amber-500/30 bg-amber-500/8 text-amber-700 dark:text-amber-300 hover:bg-amber-500/15 flex-1 sm:flex-none"
+            :disabled="backfillingDates || missingDateDurationCount <= 0"
+          >
+            <Loader2 v-if="backfillingDates" class="w-3.5 h-3.5 animate-spin" />
+            <CalendarDays v-else class="w-3.5 h-3.5" />
+            {{ backfillingDates ? '提交中...' : '补全日期与时长' }}
+            <Badge v-if="missingDateDurationCount > 0" variant="secondary" class="px-1.5 py-0 text-[10px]">
+              {{ missingDateDurationCount }}
+            </Badge>
+          </Button>
+        </ConfirmPopover>
+
+        <ConfirmPopover
+          :title="`补全 ${metadataCandidates} 条基线视频的画质和大小？`"
+          description="会解析视频详情并用 Range 请求读取媒体大小，不会下载视频文件。记录较多时可能需要数分钟。"
+          confirm-text="开始补全"
+          @confirm="handleEnrichMetadata"
+        >
+          <Button
+            variant="outline"
+            size="sm"
+            class="border-brand/25 bg-brand/5 text-brand hover:bg-brand/10 flex-1 sm:flex-none"
+            :disabled="enriching || metadataCandidates <= 0"
+          >
+            <Loader2 v-if="enriching" class="w-3.5 h-3.5 animate-spin" />
+            <Sparkles v-else class="w-3.5 h-3.5" />
+            {{ enriching ? '提交中...' : '补全基线元数据' }}
+            <Badge v-if="metadataCandidates > 0" variant="secondary" class="px-1.5 py-0 text-[10px]">
+              {{ metadataCandidates }}
+            </Badge>
+          </Button>
+        </ConfirmPopover>
+      </div>
     </div>
 
     <!-- Interactive Semantic KPI Cards (inspired by rust-srec Pipeline Statistics) -->

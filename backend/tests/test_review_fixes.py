@@ -16,6 +16,7 @@ from app.db.repo import Repository
 from app.engine import task_manager as engine
 from app.engine.events import EventBus
 from app.main import create_app
+from app.parsers.http_session import PowFetchResult, TaskHttpContext
 from app.parsers.list_scanner import ListedVideo
 from app.parsers.video import VideoDetail
 from app.services.cookie import CookieCheckResult
@@ -545,3 +546,192 @@ def test_target_validation_empty_username_fallback_public_auto_probe_and_case_co
         conflict = client.patch(f"/api/targets/{t_lower['id']}", json={"target_type": "model"})
         assert conflict.status_code == 409
         assert t_upper["id"] != t_lower["id"]
+
+
+async def test_backfill_dates_list_sweep_and_detail_fallback_and_endpoint(
+    tmp_path: Path, monkeypatch
+):
+    env = EnvSettings(data_dir=tmp_path)
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    try:
+        await repo.save_settings(
+            RuntimeSettings(
+                ph_cookie="sess=test",
+                uploader_enabled=False,
+                page_delay_min=0.0,
+                page_delay_max=0.0,
+            )
+        )
+        await repo.upsert_target("alice", "model", enabled=True, display_name="Alice Star")
+        await repo.upsert_video(
+            "vk_list_full",
+            title="Uploaded Missing Both",
+            uploader="alice",
+            target_type="model",
+            status="uploaded",
+            force_status=True,
+        )
+        await repo.upsert_video(
+            "vk_list_dur_only",
+            title="Baseline Missing Duration",
+            uploader="alice",
+            target_type="model",
+            status="baseline",
+            published_at="2026-10-01",
+            duration_seconds=0,
+            force_status=True,
+        )
+        await repo.upsert_video(
+            "vk_detail_orphan",
+            title="Orphan URL Batch",
+            uploader="url_batch",
+            target_type="model",
+            status="uploaded",
+            force_status=True,
+        )
+        await repo.upsert_video(
+            "vk_complete",
+            title="Already Complete",
+            uploader="alice",
+            target_type="model",
+            status="uploaded",
+            published_at="2026-08-01",
+            duration_seconds=120,
+            force_status=True,
+        )
+
+        stats_before = await repo.get_video_stats()
+        assert stats_before["missing_date_duration"] == 3
+
+        async def ok_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_scan(*args, **kwargs):
+            return [
+                ListedVideo(
+                    viewkey="vk_list_full",
+                    title="Uploaded Missing Both",
+                    url="https://www.pornhub.com/view_video.php?viewkey=vk_list_full",
+                    page_num=1,
+                    item_num=1,
+                    total_on_page=2,
+                    published_at="2026-11-10",
+                    duration_seconds=510,
+                ),
+                ListedVideo(
+                    viewkey="vk_list_dur_only",
+                    title="Baseline Missing Duration",
+                    url="https://www.pornhub.com/view_video.php?viewkey=vk_list_dur_only",
+                    page_num=1,
+                    item_num=2,
+                    total_on_page=2,
+                    published_at="2026-11-11",  # must NOT overwrite existing 2026-10-01
+                    duration_seconds=320,
+                ),
+            ]
+
+        fetched_detail_urls: list[str] = []
+
+        async def fake_fetch(self, url, **kwargs):
+            fetched_detail_urls.append(url)
+            html = """
+            <html><head><script type="application/ld+json">
+            {"@type":"VideoObject","uploadDate":"2026-09-15T10:00:00+00:00","duration":"PT12M25S"}
+            </script></head></html>
+            """
+            return PowFetchResult(html, url, 200, 0, False), None
+
+        monkeypatch.setattr(engine, "check_cookie_valid", ok_cookie)
+        monkeypatch.setattr(engine, "scan_list_pages", fake_scan)
+        monkeypatch.setattr(TaskHttpContext, "fetch_with_pow", fake_fetch)
+
+        manager = engine.TaskManager(env, repo, EventBus())
+        job = await repo.create_job("backfill_dates", "补全日期与时长 (3 条)", {})
+        await manager._run_job(job["id"])
+
+        final_job = await repo.get_job(job["id"])
+        assert final_job["status"] == "completed"
+        assert final_job["done_items"] == 3
+        assert final_job["failed_items"] == 0
+        # Only the orphan video needed a detail-page fetch (list sweep handled alice's 2!)
+        assert len(fetched_detail_urls) == 1
+        assert "vk_detail_orphan" in fetched_detail_urls[0]
+
+        v1 = await repo.get_video("vk_list_full")
+        assert v1["published_at"] == "2026-11-10" and v1["duration_seconds"] == 510
+        v2 = await repo.get_video("vk_list_dur_only")
+        assert v2["published_at"] == "2026-10-01" and v2["duration_seconds"] == 320
+        v3 = await repo.get_video("vk_detail_orphan")
+        assert v3["published_at"] == "2026-09-15" and v3["duration_seconds"] == 745
+
+        stats_after = await repo.get_video_stats()
+        assert stats_after["missing_date_duration"] == 0
+    finally:
+        await db.close()
+
+    # Verify REST API endpoint enqueue & empty 400 check
+    with _make_client(tmp_path / "api") as client:
+        assert client.post("/api/auth/login", json={"password": "super-secret-password"}).status_code == 200
+        assert client.post("/api/videos/metadata/backfill-dates").status_code == 400
+        container = client.app.state.container
+
+        async def _seed_one():
+            await container.repo.upsert_video("vk_api_bf", title="Missing", uploader="alice", status="uploaded")
+
+        client.portal.call(_seed_one)
+        resp = client.post("/api/videos/metadata/backfill-dates")
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 1
+        assert resp.json()["job"]["kind"] == "backfill_dates"
+
+
+async def test_bulk_cancel_pending_job_items_avoids_per_item_ws_flood(tmp_path: Path, monkeypatch):
+    env = EnvSettings(data_dir=tmp_path)
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    try:
+        await repo.save_settings(RuntimeSettings(ph_cookie="sess=test", uploader_enabled=False))
+        for i in range(60):
+            await repo.upsert_video(f"vk_m{i}", title=f"M{i}", uploader="alice", status="baseline")
+
+        async def ok_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_details_cancel(ctx, items, _selectors, **kwargs):
+            ctx.cancel_event.set()
+            return [
+                VideoDetail(
+                    viewkey=url.split("viewkey=")[1],
+                    title="",
+                    page_url=url,
+                    referer_url=url,
+                    error="操作已取消",
+                )
+                for url, _, _ in items
+            ]
+
+        monkeypatch.setattr(engine, "check_cookie_valid", ok_cookie)
+        monkeypatch.setattr(engine, "fetch_video_details_batch", fake_details_cancel)
+
+        events = EventBus()
+        seen_events: list[str] = []
+        orig_broadcast = events.broadcast
+        events.broadcast = lambda etype, data: (seen_events.append(etype), orig_broadcast(etype, data))
+
+        manager = engine.TaskManager(env, repo, events)
+        job = await repo.create_job("enrich_metadata", "补全 60 条", {})
+        await manager._run_job(job["id"])
+
+        items = await repo.list_job_items(job["id"])
+        assert len(items) == 60
+        assert all(it["status"] == "cancelled" for it in items)
+        assert "job_items_changed" in seen_events
+        # Must NOT spam 60 individual item_updated events on cancel!
+        assert seen_events.count("item_updated") == 0
+    finally:
+        await db.close()

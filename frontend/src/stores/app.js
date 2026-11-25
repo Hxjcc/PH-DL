@@ -1,3 +1,4 @@
+import { markRaw } from 'vue'
 import { defineStore } from 'pinia'
 import { toast } from 'vue-sonner'
 import { api } from '../api/client'
@@ -20,6 +21,8 @@ const SESSION_CACHE_KEY = 'phdl-session-cache-v1'
 const SESSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
 const LIVE_PROGRESS_FLUSH_MS = 140
+const ITEM_UPDATE_FLUSH_MS = 120
+const JOB_ITEMS_RELOAD_DEBOUNCE_MS = 240
 
 const inflight = new Map()
 const latestSeq = new Map()
@@ -29,6 +32,95 @@ let persistIdleId = null
 let persistGen = 0
 let pendingLiveProgress = null
 let liveProgressFlushTimer = null
+let pendingItemUpdates = null
+let itemUpdateFlushTimer = null
+const jobItemIndexMap = new Map()
+const jobItemsReloadTimers = new Map()
+
+function indexJobItems(jobId, items) {
+  const jid = Number(jobId)
+  if (!jid || !Array.isArray(items)) return
+  const map = new Map()
+  for (let i = 0; i < items.length; i++) {
+    map.set(items[i].id, i)
+  }
+  jobItemIndexMap.set(jid, map)
+}
+
+function clearPendingItemUpdates() {
+  if (itemUpdateFlushTimer !== null) {
+    clearTimeout(itemUpdateFlushTimer)
+    itemUpdateFlushTimer = null
+  }
+  pendingItemUpdates = null
+  jobItemIndexMap.clear()
+  for (const timer of jobItemsReloadTimers.values()) {
+    clearTimeout(timer)
+  }
+  jobItemsReloadTimers.clear()
+}
+
+function flushPendingItemUpdates(store) {
+  if (itemUpdateFlushTimer !== null) {
+    clearTimeout(itemUpdateFlushTimer)
+    itemUpdateFlushTimer = null
+  }
+  if (!pendingItemUpdates || pendingItemUpdates.size === 0) return
+  const batchByJob = pendingItemUpdates
+  pendingItemUpdates = null
+  for (const [jid, updatesById] of batchByJob) {
+    const list = store.jobItems[jid]
+    if (!Array.isArray(list)) continue
+    let idxMap = jobItemIndexMap.get(jid)
+    if (!idxMap || idxMap.size !== list.length) {
+      indexJobItems(jid, list)
+      idxMap = jobItemIndexMap.get(jid)
+    }
+    const nextList = list.slice()
+    for (const [itemId, item] of updatesById) {
+      const idx = idxMap.get(itemId)
+      if (idx !== undefined && idx < nextList.length) {
+        nextList[idx] = { ...nextList[idx], ...item }
+      } else {
+        idxMap.set(itemId, nextList.length)
+        nextList.push(item)
+      }
+    }
+    store.jobItems[jid] = markRaw(nextList)
+  }
+}
+
+function queueItemUpdate(store, item) {
+  if (!item || item.id == null || item.job_id == null) return
+  if (item.status !== 'downloading' && item.status !== 'uploading') {
+    pendingLiveProgress?.delete(item.id)
+    delete store.liveProgress[item.id]
+  }
+  const jid = Number(item.job_id)
+  if (!Array.isArray(store.jobItems[jid])) return
+  if (!pendingItemUpdates) pendingItemUpdates = new Map()
+  let jobMap = pendingItemUpdates.get(jid)
+  if (!jobMap) {
+    jobMap = new Map()
+    pendingItemUpdates.set(jid, jobMap)
+  }
+  jobMap.set(item.id, item)
+  if (itemUpdateFlushTimer === null) {
+    itemUpdateFlushTimer = setTimeout(() => flushPendingItemUpdates(store), ITEM_UPDATE_FLUSH_MS)
+  }
+}
+
+function scheduleJobItemsReload(store, jobId) {
+  const jid = Number(jobId)
+  if (!jid || !store.authenticated || !Array.isArray(store.jobItems[jid])) return
+  if (jobItemsReloadTimers.has(jid)) return
+  const timer = setTimeout(() => {
+    jobItemsReloadTimers.delete(jid)
+    if (!store.authenticated || !Array.isArray(store.jobItems[jid])) return
+    store.loadJobDetail(jid).catch(() => {})
+  }, JOB_ITEMS_RELOAD_DEBOUNCE_MS)
+  jobItemsReloadTimers.set(jid, timer)
+}
 
 function clearPendingLiveProgress() {
   if (liveProgressFlushTimer !== null) {
@@ -215,7 +307,17 @@ export const useAppStore = defineStore('app', {
       historyCache: hasCache && cached.historyCache ? cached.historyCache : null,
       historyLoadedAt: 0,
       historyPageSize: readListPreference('history', HISTORY_PAGE_SIZES),
-      jobItems: hasCache && cached.jobItems && typeof cached.jobItems === 'object' ? cached.jobItems : {},
+      jobItems: (() => {
+        if (!hasCache || !cached.jobItems || typeof cached.jobItems !== 'object') return {}
+        const hydrated = {}
+        for (const [jid, list] of Object.entries(cached.jobItems)) {
+          if (Array.isArray(list)) {
+            hydrated[jid] = markRaw(list)
+            indexJobItems(jid, list)
+          }
+        }
+        return hydrated
+      })(),
       liveProgress: {},
       schedulerStatus: {},
       scanStatus: {},
@@ -393,6 +495,7 @@ export const useAppStore = defineStore('app', {
         this._overviewTimer = null
       }
       clearPendingLiveProgress()
+      clearPendingItemUpdates()
       clearSessionCache()
       this.hydratedFromCache = false
       this.authenticated = false
@@ -711,7 +814,7 @@ export const useAppStore = defineStore('app', {
         items: data.items || [],
         total: Number(data.total || 0),
         facets: data.facets || { uploaders: [], qualities: [] },
-        stats: data.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0 },
+        stats: data.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0, missing_date_duration: 0 },
         page_size: pageSize,
       }
       this.historyLoadedAt = Date.now()
@@ -831,6 +934,12 @@ export const useAppStore = defineStore('app', {
       for (const jid of idSet) {
         delete this.jobItems[jid]
         delete this.schedulerStatus[jid]
+        jobItemIndexMap.delete(jid)
+        pendingItemUpdates?.delete(jid)
+        if (jobItemsReloadTimers.has(jid)) {
+          clearTimeout(jobItemsReloadTimers.get(jid))
+          jobItemsReloadTimers.delete(jid)
+        }
       }
       this.persistCache()
     },
@@ -841,7 +950,10 @@ export const useAppStore = defineStore('app', {
         this._upsertJob(res.job)
       }
       if (Array.isArray(res?.items)) {
-        this.jobItems[jobId] = res.items
+        const jid = Number(jobId)
+        pendingItemUpdates?.delete(jid)
+        this.jobItems[jid] = markRaw(res.items)
+        indexJobItems(jid, res.items)
         for (const it of res.items) {
           if (it.speed_bps > 0 || it.status === 'downloading' || it.status === 'uploading') {
             const isUploading = it.status === 'uploading' || ['uploading', 'verifying'].includes(it.progress_phase)
@@ -904,18 +1016,7 @@ export const useAppStore = defineStore('app', {
     },
 
     _upsertItem(item) {
-      if (item.status !== 'downloading' && item.status !== 'uploading') {
-        pendingLiveProgress?.delete(item.id)
-        delete this.liveProgress[item.id]
-      }
-      const list = this.jobItems[item.job_id]
-      if (!list) return
-      const idx = list.findIndex((x) => x.id === item.id)
-      if (idx >= 0) {
-        list[idx] = { ...list[idx], ...item }
-      } else {
-        list.push(item)
-      }
+      queueItemUpdate(this, item)
     },
 
     startRealtime() {
@@ -969,6 +1070,7 @@ export const useAppStore = defineStore('app', {
             this._upsertJob(msg.data)
             this._scheduleOverviewRefresh()
             if (['completed', 'cancelled', 'failed', 'partial_failed'].includes(msg.data?.status)) {
+              flushPendingItemUpdates(this)
               clearLiveProgressForJob(this, msg.data.id)
               delete this.schedulerStatus[msg.data.id]
               delete this.scanStatus[msg.data.id]
@@ -984,6 +1086,8 @@ export const useAppStore = defineStore('app', {
             }
           } else if (msg.type === 'item_updated') {
             this._upsertItem(msg.data)
+          } else if (msg.type === 'job_items_changed') {
+            scheduleJobItemsReload(this, msg.data?.job_id)
           } else if (msg.type === 'item_progress') {
             queueLiveProgress(this, msg.data)
           } else if (msg.type === 'job_scheduler') {
@@ -1020,6 +1124,7 @@ export const useAppStore = defineStore('app', {
 
     stopRealtime() {
       clearPendingLiveProgress()
+      clearPendingItemUpdates()
       if (this._wsGraceTimer) {
         clearTimeout(this._wsGraceTimer)
         this._wsGraceTimer = null

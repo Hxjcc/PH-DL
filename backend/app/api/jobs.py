@@ -279,6 +279,16 @@ async def retry_failed_items(job_id: int, container: AppContainer = Depends(requ
             params={},
         )
         return {"job": job}
+    if source_job.get("kind") == "backfill_dates":
+        count = await container.repo.count_missing_date_duration_candidates()
+        if count == 0:
+            raise HTTPException(status_code=400, detail="所有视频的发布日期与时长均已完整")
+        job = await container.tasks.enqueue_job(
+            kind="backfill_dates",
+            label=f"重试补全日期与时长 ({count} 条)",
+            params={},
+        )
+        return {"job": job}
     items = await container.repo.list_job_items(job_id)
     retryable = [
         it

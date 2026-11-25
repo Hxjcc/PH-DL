@@ -36,7 +36,7 @@ function onOpenChange(val) {
         @open-auto-focus="emit('open-auto-focus', $event)"
         :class="
           cn(
-            'fixed left-1/2 top-1/2 z-50 w-[calc(100vw-1.5rem)] max-w-lg max-h-[calc(100dvh-2rem)] overflow-y-auto -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-border bg-card p-4 sm:p-6 text-card-foreground shadow-xl outline-none animate-dialog-in',
+            'fixed inset-0 m-auto h-fit z-50 w-[calc(100vw-1.5rem)] max-w-lg max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-2xl border border-border bg-card p-4 sm:p-6 text-card-foreground shadow-xl outline-none animate-dialog-in',
             props.class
           )
         "

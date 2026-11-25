@@ -245,7 +245,7 @@ onBeforeUnmount(() => {
       <div class="playback-stage relative overflow-hidden bg-black">
         <div
           ref="mountPoint"
-          class="absolute inset-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-zinc-200"
+          class="absolute inset-0 focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-zinc-200"
           :inert="phase !== 'ready'"
           tabindex="0"
           role="group"
@@ -325,50 +325,35 @@ onBeforeUnmount(() => {
 <style scoped>
 .playback-frame {
   position: relative;
-  border-radius: 0.75rem;
+  width: 100%;
+  max-width: calc(66dvh * 16 / 9);
+  margin-inline: auto;
+  border-radius: 12px;
 }
 
 .playback-frame::after {
   content: '';
   position: absolute;
-  inset: 0;
-  border-radius: inherit;
+  inset: -2px;
+  border-radius: 16px;
+  border: 4px solid var(--card);
+  box-shadow: inset 0 0 0 1px rgba(9, 9, 11, 0.08);
   pointer-events: none;
   z-index: 72;
-  box-shadow:
-    0 0 0 1.5px var(--card),
-    inset 0 0 0 1px rgba(9, 9, 11, 0.12);
 }
 
 :global(.dark) .playback-frame::after {
-  box-shadow:
-    0 0 0 1.5px var(--card),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+}
+
+.playback-frame:has(.art-fullscreen-web, .art-fullscreen, :fullscreen)::after {
+  display: none;
 }
 
 .playback-stage {
+  width: 100%;
   aspect-ratio: 16 / 9;
-  max-height: 66dvh;
-  border-radius: inherit;
-  isolation: isolate;
-  transform: translateZ(0);
-}
-
-.playback-stage :deep(.art-video-player),
-.playback-stage :deep(.art-video-player .art-video) {
-  border-radius: inherit;
-  overflow: hidden;
-}
-
-.playback-stage :deep(.art-video-player:fullscreen),
-.playback-stage :deep(.art-video-player:fullscreen .art-video),
-.playback-stage :deep(.art-video-player:-webkit-full-screen),
-.playback-stage :deep(.art-video-player:-webkit-full-screen .art-video),
-.playback-stage :deep(.art-video-player.art-fullscreen),
-.playback-stage :deep(.art-video-player.art-fullscreen .art-video),
-.playback-stage :deep(.art-video-player.art-fullscreen-web),
-.playback-stage :deep(.art-video-player.art-fullscreen-web .art-video) {
-  border-radius: 0;
+  border-radius: 13px;
 }
 
 .playback-stage :deep(.art-video-player .art-loading) {

@@ -369,6 +369,19 @@ test('formatPublishedDate, formatVideoDuration, and enrich_metadata phase text',
     null
   )
   assert.equal(runningMeta.phaseText, '正在补全基线元数据 (12/100)...')
+
+  const backfillJob = { id: 90, kind: 'backfill_dates', status: 'running', total_items: 500, done_items: 120 }
+  assert.equal(resolveJobVisual(backfillJob, []).title, '发布日期与时长补全')
+  const bfListMetrics = computeJobLiveMetrics(backfillJob, {}, null, {
+    90: { mode: 'backfill_dates', stage: 'list', current_target: 'Alice', scanned_targets: 4, total_targets: 10, done: 150, total: 500 },
+  })
+  assert.equal(bfListMetrics.percent, 30)
+  assert.match(bfListMetrics.phaseText, /列表快扫 \(4\/10\) · Alice · 已补全 150\/500/)
+  const bfDetailMetrics = computeJobLiveMetrics(backfillJob, {}, null, {
+    90: { mode: 'backfill_dates', stage: 'detail', done: 400, total: 500 },
+  })
+  assert.equal(bfDetailMetrics.percent, 80)
+  assert.match(bfDetailMetrics.phaseText, /详情页轻量补全 · 已补全 400\/500/)
 })
 
 test('listPreferences supports 10-item job limit and target page sizes including 0 (all)', () => {
