@@ -179,7 +179,7 @@ async function handleClear() {
 
         <div
           v-for="entry in filtered"
-          :key="entry.id"
+          :key="entry.boot_id ? `${entry.boot_id}:${entry.id}` : entry.id"
           class="flex items-start gap-2.5 px-2.5 py-1 rounded-lg hover:bg-card transition-colors break-all"
         >
           <span class="text-muted-foreground/75 shrink-0 tabular-nums">{{ formatLogTime(entry.ts) }}</span>

@@ -342,7 +342,7 @@ export function formatDurationCompact(startedAt, finishedAt) {
   return `${hr}h ${min % 60}m`
 }
 
-export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = null) {
+export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = null, scanStatusMap = null) {
   let total = Number(job?.total_items || 0)
   let done = Number(job?.done_items || 0)
   let uploaded = Number(job?.uploaded_items || 0)
@@ -413,8 +413,22 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
 
   const finishedCount = done + skipped + failed
   const isActive = ['queued', 'scanning', 'running'].includes(job?.status)
+  const scanState =
+    isActive && scanStatusMap && jobIdNum > 0 && typeof scanStatusMap === 'object'
+      ? scanStatusMap[jobIdNum] || null
+      : null
+  const useScanOverlay =
+    Boolean(scanState) &&
+    (job?.status === 'scanning' || (total === 0 && downloadingCount === 0 && uploadingCount === 0))
+
   let percent = 0
-  if (total > 0) {
+  let hasScanProgress = false
+  if (useScanOverlay && scanState.mode === 'targets' && Number(scanState.total || 0) > 0) {
+    const scanTotal = Number(scanState.total)
+    const scanned = Math.min(scanTotal, Math.max(0, Number(scanState.scanned || 0)))
+    percent = Math.min(100, Math.round((scanned / scanTotal) * 100))
+    hasScanProgress = true
+  } else if (total > 0) {
     const effective = Math.min(total, finishedCount + (isActive ? fractional : 0))
     const rawPct = (effective / total) * 100
     percent = isActive && rawPct > 0 && rawPct < 99.5
@@ -425,12 +439,39 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
   }
 
   const indeterminate =
-    (job?.status === 'scanning' && total === 0) ||
-    (isActive && total > 0 && uploadingCount > 0 && downloadingCount === 0 && finishedCount >= total)
+    !hasScanProgress && (
+      (job?.status === 'scanning' && total === 0) ||
+      (useScanOverlay && (scanState.mode === 'pages' || scanState.mode === 'baseline')) ||
+      (isActive && total > 0 && uploadingCount > 0 && downloadingCount === 0 && finishedCount >= total)
+    )
 
   let phaseText = ''
   if (job?.status === 'queued') {
     phaseText = '排队等待执行...'
+  } else if (useScanOverlay && scanState.mode === 'targets' && Number(scanState.total || 0) > 0) {
+    const scanTotal = Number(scanState.total)
+    const scanned = Math.min(scanTotal, Math.max(0, Number(scanState.scanned || 0)))
+    const currentName = String(scanState.current_target || '').trim()
+    const foundNew = Math.max(0, Number(scanState.found_new || 0))
+    const foundSuffix = foundNew > 0 ? ` · 已发现 ${foundNew} 新` : ''
+    if (scanned < scanTotal) {
+      phaseText = `正在扫描目标 (${scanned}/${scanTotal})${currentName ? ` · ${currentName}` : ''}${foundSuffix}`
+    } else {
+      phaseText = `目标扫描完成 (${scanTotal}/${scanTotal})${foundSuffix}`
+    }
+  } else if (useScanOverlay && scanState.mode === 'baseline') {
+    const page = Math.max(1, Number(scanState.page || 1))
+    const found = Math.max(0, Number(scanState.found_videos || 0))
+    const targetName = String(scanState.current_target || '').trim()
+    phaseText = `正在扫描基线${targetName ? `「${targetName}」` : ''}第 ${page} 页${found > 0 ? `（已收集 ${found} 个）` : '...'}`
+  } else if (useScanOverlay && scanState.mode === 'pages') {
+    const page = Math.max(1, Number(scanState.page || 1))
+    const found = Math.max(0, Number(scanState.found_videos || 0))
+    const targetName = String(scanState.current_target || '').trim()
+    const tIdx = Number(scanState.target_index || 0)
+    const tTot = Number(scanState.total_targets || 0)
+    const prefix = tTot > 1 && tIdx > 0 ? `(${tIdx}/${tTot}) ` : ''
+    phaseText = `${prefix}正在扫描${targetName ? `「${targetName}」` : ''}第 ${page} 页${found > 0 ? `（已收集 ${found} 个待处理）` : '...'}`
   } else if (job?.status === 'scanning' && total === 0) {
     phaseText = '正在扫描页面并解析视频信息...'
   } else if (isActive) {
@@ -453,6 +494,7 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
     failed,
     finishedCount,
     percent,
+    hasScanProgress,
     speedBps,
     downloadSpeedBps,
     uploadSpeedBps,

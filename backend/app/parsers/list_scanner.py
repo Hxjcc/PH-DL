@@ -284,6 +284,7 @@ async def scan_list_pages(
     profile_username: Optional[str] = None,
     on_profile: Optional[Callable[[str, str], Awaitable[None]]] = None,
     on_page: Optional[Callable[[List[ListedVideo]], Awaitable[None]]] = None,
+    on_page_progress: Optional[Callable[[int, int, int], None]] = None,
     on_error: Optional[Callable[[str], None]] = None,
 ) -> List[ListedVideo]:
     """Scan list pages with bounded prefetch, optionally streaming each page to a callback."""
@@ -456,6 +457,8 @@ async def scan_list_pages(
                 "INFO",
                 f"第 {current_page} 页解析到 {total_on_page} 个视频，筛选后待处理 {added_this_page} 个。",
             )
+            if on_page_progress:
+                on_page_progress(current_page, total_on_page, len(collected))
 
             if is_natural and current_page > 1 and new_unique_on_page == 0:
                 ctx._emit("INFO", f"第 {current_page} 页无新增唯一视频，结束扫描。")

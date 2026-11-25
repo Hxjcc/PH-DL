@@ -820,6 +820,7 @@ class TaskManager:
                                 self.events.emit_item_progress(
                                     job_id, item_id, dl_bytes, tot_bytes, speed_bps, phase="downloading",
                                 )
+                                scheduler.emit_status()
 
                             outcome = await download_mp4_with_resume(
                                 session=dl_session,
@@ -1357,6 +1358,7 @@ class TaskManager:
         exclude_keywords: Optional[Set[str]] = None,
         uploader_hint: Optional[Tuple[str, str]] = None,
         on_profile: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_page_progress: Optional[Callable[[int, int, int], None]] = None,
         on_scan_error: Optional[Callable[[str], None]] = None,
     ) -> Tuple[List[ListedVideo], List[VideoDetail]]:
         """Scan list pages with 4-way prefetch and stream details through one concurrency limit."""
@@ -1387,23 +1389,28 @@ class TaskManager:
             job_id=job_id,
         )
         try:
+            scan_kwargs: Dict[str, Any] = {
+                "target_type": target_type,
+                "pages_spec": pages_spec,
+                "videos_spec": videos_spec,
+                "catch_up": catch_up,
+                "skip_vkeys": skip_vkeys,
+                "delay_min": settings.page_delay_min,
+                "delay_max": settings.page_delay_max,
+                "page_concurrency": settings.max_concurrent_list_pages,
+                "timeout": settings.request_timeout,
+                "profile_username": uploader_hint[0] if uploader_hint else None,
+                "on_profile": on_profile,
+                "on_page": _on_page,
+                "on_error": on_scan_error,
+            }
+            if on_page_progress is not None:
+                scan_kwargs["on_page_progress"] = on_page_progress
             listed = await scan_list_pages(
                 ctx,
                 list_url,
                 settings.selectors,
-                target_type=target_type,
-                pages_spec=pages_spec,
-                videos_spec=videos_spec,
-                catch_up=catch_up,
-                skip_vkeys=skip_vkeys,
-                delay_min=settings.page_delay_min,
-                delay_max=settings.page_delay_max,
-                page_concurrency=settings.max_concurrent_list_pages,
-                timeout=settings.request_timeout,
-                profile_username=uploader_hint[0] if uploader_hint else None,
-                on_profile=on_profile,
-                on_page=_on_page,
-                on_error=on_scan_error,
+                **scan_kwargs,
             )
         except BaseException:
             for task in page_detail_tasks:
@@ -1491,10 +1498,32 @@ class TaskManager:
         profile_avatars: Dict[str, str] = dict(params.get("profile_avatars") or {})
         profile_names: Dict[str, str] = dict(params.get("profile_names") or {})
 
-        for uname, utype in targets:
+        for target_idx, (uname, utype) in enumerate(targets):
             if ctx.cancel_event.is_set():
                 break
             list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
+            target_display = "Liked Videos" if utype == "liked" else (profile_names.get(uname) or uname)
+
+            def _emit_manual_page_progress(
+                page_num: int,
+                _page_total: int,
+                found_count: int,
+                t_idx: int = target_idx,
+                t_name: str = target_display,
+            ) -> None:
+                self.events.emit_scan_status(
+                    job_id,
+                    {
+                        "mode": "pages",
+                        "target_index": t_idx + 1,
+                        "total_targets": len(targets),
+                        "current_target": t_name,
+                        "page": int(page_num),
+                        "found_videos": int(found_count),
+                    },
+                )
+
+            _emit_manual_page_progress(1, 0, len(scoped_listed))
 
             async def _save_target_profile(
                 url: str,
@@ -1542,6 +1571,7 @@ class TaskManager:
                     exclude_keywords=exclude_kw,
                     uploader_hint=(resolved_user, utype),
                     on_profile=_save_target_profile,
+                    on_page_progress=_emit_manual_page_progress,
                     on_scan_error=page_errors.append,
                 )
                 scan_errors.extend(f"{uname}: {error}" for error in page_errors)
@@ -1566,6 +1596,7 @@ class TaskManager:
                     timeout=settings.request_timeout,
                     profile_username=resolved_user,
                     on_profile=_save_target_profile,
+                    on_page_progress=_emit_manual_page_progress,
                     on_error=page_errors.append,
                 )
                 scan_errors.extend(f"{uname}: {error}" for error in page_errors)
@@ -1630,6 +1661,7 @@ class TaskManager:
             job_id=job_id,
         )
         if all_item_ids and not ctx.cancel_event.is_set():
+            self.events.clear_scan_status(job_id)
             await self._run_download_upload_pipeline(
                 job_id,
                 all_item_ids,
@@ -1848,7 +1880,19 @@ class TaskManager:
             uname = target["username"]
             utype = target["target_type"]
             display = "Liked Videos" if utype == "liked" else uname
+            display_label = "Liked Videos" if utype == "liked" else ((target.get("display_name") or "").strip() or uname)
             qual_set = _quality_set(target.get("preferred_quality") or settings.preferred_quality)
+
+            self.events.emit_scan_status(
+                job_id,
+                {
+                    "mode": "targets",
+                    "scanned": target_idx,
+                    "total": len(targets),
+                    "current_target": display_label,
+                    "found_new": sum(new_by_target.values()),
+                },
+            )
 
             async def _save_profile(
                 url: str,
@@ -1897,6 +1941,16 @@ class TaskManager:
                 target_error_count += 1
                 await self.repo.mark_target_checked(tid, 0, error=str(err))
                 self.events.emit_log("WARNING", f"检查 '{display}' 失败: {err}", job_id=job_id)
+                self.events.emit_scan_status(
+                    job_id,
+                    {
+                        "mode": "targets",
+                        "scanned": target_idx + 1,
+                        "total": len(targets),
+                        "current_target": display_label,
+                        "found_new": sum(new_by_target.values()),
+                    },
+                )
                 continue
 
             if ctx.cancel_event.is_set():
@@ -1917,6 +1971,16 @@ class TaskManager:
             await self.repo.mark_target_checked(tid, len(valid_new), error="；".join(errors[:3]))
 
             if not valid_new and not detail_failures:
+                self.events.emit_scan_status(
+                    job_id,
+                    {
+                        "mode": "targets",
+                        "scanned": target_idx + 1,
+                        "total": len(targets),
+                        "current_target": display_label,
+                        "found_new": sum(new_by_target.values()),
+                    },
+                )
                 continue
 
             folder = _target_folder_name(uname, utype)
@@ -1924,6 +1988,17 @@ class TaskManager:
                 new_by_target[folder] = new_by_target.get(folder, 0) + len(valid_new)
             for d in valid_new:
                 known_vkeys.add(d.viewkey)
+
+            self.events.emit_scan_status(
+                job_id,
+                {
+                    "mode": "targets",
+                    "scanned": target_idx + 1,
+                    "total": len(targets),
+                    "current_target": display_label,
+                    "found_new": sum(new_by_target.values()),
+                },
+            )
 
             if auto_download:
                 created = await self._create_items_from_details(
@@ -1962,6 +2037,7 @@ class TaskManager:
         pipeline_item_ids = [*pending_upload_ids, *new_item_ids]
         if auto_download:
             if pipeline_item_ids:
+                self.events.clear_scan_status(job_id)
                 uploaded_by, failed_urls_by = await self._run_download_upload_pipeline(
                     job_id,
                     pipeline_item_ids,
@@ -2043,6 +2119,21 @@ class TaskManager:
                 display_name=display_name,
             )
 
+        target_label = "Liked Videos" if utype == "liked" else ((target.get("display_name") or "").strip() or uname)
+
+        def _emit_baseline_page_progress(page_num: int, _page_total: int, found_count: int) -> None:
+            self.events.emit_scan_status(
+                job_id,
+                {
+                    "mode": "baseline",
+                    "current_target": target_label,
+                    "page": int(page_num),
+                    "found_videos": int(found_count),
+                },
+            )
+
+        _emit_baseline_page_progress(1, 0, 0)
+
         page_errors: List[str] = []
         listed = await scan_list_pages(
             ctx,
@@ -2056,6 +2147,7 @@ class TaskManager:
             timeout=settings.request_timeout,
             profile_username=uname,
             on_profile=_save_profile,
+            on_page_progress=_emit_baseline_page_progress,
             on_error=page_errors.append,
         )
 

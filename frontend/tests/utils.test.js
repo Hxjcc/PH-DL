@@ -11,6 +11,7 @@ import {
   filterJobItemsByStatus,
   resolveJobVisual,
 } from '../src/utils/jobMeta.js'
+import { appendLiveLog, mergeLogsSnapshot } from '../src/utils/logBuffer.js'
 
 test('parseVideoLinks deduplicates by viewkey and counts invalid rows', () => {
   const input = [
@@ -211,4 +212,76 @@ test('computeJobLiveMetrics separates download and upload speeds by progress pha
   assert.equal(metrics.uploadSpeedBps, 95 * 1024 * 1024)
   assert.equal(metrics.speedBps, 60 * 1024 * 1024)
   assert.equal(metrics.percent, 25)
+})
+
+test('logBuffer discards stale pre-restart logs when backend boot_id resets log ids', () => {
+  const preRestart = [
+    { id: 1, boot_id: 'boot-old', ts: '2026-11-25T07:40:00+00:00', message: 'old 1' },
+    { id: 2, boot_id: 'boot-old', ts: '2026-11-25T07:40:01+00:00', message: 'old 2' },
+    { id: 3, boot_id: 'boot-old', ts: '2026-11-25T07:40:02+00:00', message: 'old 3' },
+  ]
+  const afterRestartSnapshot = [
+    { id: 1, boot_id: 'boot-new', ts: '2026-11-25T08:02:00+00:00', message: 'PH-DL 后端已启动' },
+  ]
+  const merged = mergeLogsSnapshot(preRestart, afterRestartSnapshot)
+  assert.deepEqual(
+    merged.map((x) => `${x.boot_id}:${x.id}`),
+    ['boot-new:1']
+  )
+
+  // Live WS log with id=2 from new boot must NOT be dropped as duplicate
+  const afterLive = appendLiveLog(merged, {
+    id: 2,
+    boot_id: 'boot-new',
+    ts: '2026-11-25T08:05:00+00:00',
+    message: '开始检查 34 个追更目标的更新...',
+  })
+  assert.equal(afterLive.length, 2)
+  assert.equal(afterLive[1].message, '开始检查 34 个追更目标的更新...')
+
+  // Even if live WS log arrives directly before snapshot with a new boot_id, reset cleanly
+  const directReset = appendLiveLog(preRestart, {
+    id: 2,
+    boot_id: 'boot-new',
+    ts: '2026-11-25T08:05:00+00:00',
+    message: 'fresh log',
+  })
+  assert.deepEqual(
+    directReset.map((x) => `${x.boot_id}:${x.id}`),
+    ['boot-new:2']
+  )
+
+  // Legacy cached logs without boot_id are cleanly replaced by new boot_id snapshot
+  const legacyCached = [
+    { id: 1, ts: '2026-11-25T07:40:00+00:00', message: 'legacy 1' },
+    { id: 50, ts: '2026-11-25T07:40:47+00:00', message: 'legacy 50' },
+  ]
+  const upgraded = mergeLogsSnapshot(legacyCached, afterRestartSnapshot)
+  assert.deepEqual(
+    upgraded.map((x) => `${x.boot_id}:${x.id}`),
+    ['boot-new:1']
+  )
+})
+
+test('computeJobLiveMetrics renders determinate scan bar for target updates and page text for single-target scans', () => {
+  const updateJob = { id: 77, kind: 'check_updates', status: 'scanning', total_items: 0, done_items: 0 }
+  const targetScan = computeJobLiveMetrics(updateJob, {}, [], {
+    77: { mode: 'targets', scanned: 17, total: 34, current_target: 'Kuporovaa Krupa', found_new: 2 },
+  })
+  assert.equal(targetScan.indeterminate, false)
+  assert.equal(targetScan.hasScanProgress, true)
+  assert.equal(targetScan.percent, 50)
+  assert.match(targetScan.phaseText, /17\/34/)
+  assert.match(targetScan.phaseText, /Kuporovaa Krupa/)
+  assert.match(targetScan.phaseText, /已发现 2 新/)
+
+  const manualJob = { id: 78, kind: 'manual_target', status: 'scanning', total_items: 0, done_items: 0 }
+  const pageScan = computeJobLiveMetrics(manualJob, {}, [], {
+    78: { mode: 'pages', target_index: 1, total_targets: 1, current_target: 'alice', page: 3, found_videos: 42 },
+  })
+  assert.equal(pageScan.indeterminate, true)
+  assert.equal(pageScan.hasScanProgress, false)
+  assert.match(pageScan.phaseText, /alice/)
+  assert.match(pageScan.phaseText, /第 3 页/)
+  assert.match(pageScan.phaseText, /42/)
 })

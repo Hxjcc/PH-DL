@@ -67,7 +67,7 @@ class AdaptiveDiskScheduler:
         self.avg_video_bytes = self.DEFAULT_EST_VIDEO_BYTES
         self._waiting_large: List[int] = []
         self._last_emit_at = 0.0
-        self._last_level = "green"
+        self._last_signature: Optional[Tuple[Any, ...]] = None
 
     def free_bytes(self) -> int:
         try:
@@ -131,16 +131,28 @@ class AdaptiveDiskScheduler:
             "prefer_largest_upload": self.prefer_largest_upload,
         }
 
+    @staticmethod
+    def _status_signature(snap: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (
+            snap["level"],
+            snap["active_downloads"],
+            snap["allowed_downloads"],
+            snap["active_uploads"],
+            snap["pending_uploads"],
+            snap["waiting_for_space"],
+        )
+
     def emit_status(self, *, force: bool = False) -> None:
         if self._on_status is None:
             return
         now = time.monotonic()
         snap = self.snapshot()
-        level_changed = snap["level"] != self._last_level
-        if not force and not level_changed and (now - self._last_emit_at) < 0.8:
+        sig = self._status_signature(snap)
+        state_changed = sig != self._last_signature
+        if not force and not state_changed and (now - self._last_emit_at) < 0.8:
             return
         self._last_emit_at = now
-        self._last_level = snap["level"]
+        self._last_signature = sig
         self._on_status(snap)
 
     async def notify_changed(self, *, force_emit: bool = False) -> None:
@@ -184,7 +196,6 @@ class AdaptiveDiskScheduler:
                 if req > 0:
                     self._waiting_large.append(req)
                     registered_large = True
-                    self.emit_status(force=True)
 
                 while not cancel_event.is_set():
                     level, allowed, free, headroom = self.compute_waterline()

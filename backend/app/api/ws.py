@@ -33,6 +33,7 @@ async def ws_events(websocket: WebSocket):
                     "logs": container.events.recent_logs(200),
                     "live_progress": container.events.live_progress_snapshot(),
                     "scheduler_status": container.events.scheduler_status_snapshot(),
+                    "scan_status": container.events.scan_status_snapshot(),
                 },
             }
         )

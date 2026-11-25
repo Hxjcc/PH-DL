@@ -89,7 +89,8 @@ const liveMetrics = computed(() =>
   computeJobLiveMetrics(
     props.job,
     tracksLiveProgress.value ? store.liveProgress : null,
-    store.jobItems[props.job.id]
+    store.jobItems[props.job.id],
+    tracksLiveProgress.value ? store.scanStatus : null
   )
 )
 
@@ -715,7 +716,10 @@ function downloadExportTxt() {
             >
               ↑ {{ formatSpeed(liveMetrics.uploadSpeedBps) }}
             </span>
-            <span v-if="!liveMetrics.indeterminate && liveMetrics.total > 0" class="font-mono font-semibold text-foreground">
+            <span
+              v-if="!liveMetrics.indeterminate && (liveMetrics.total > 0 || liveMetrics.hasScanProgress)"
+              class="font-mono font-semibold text-foreground"
+            >
               {{ liveMetrics.percent }}%
             </span>
           </div>

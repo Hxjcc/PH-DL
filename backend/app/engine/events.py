@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Set
@@ -15,9 +16,11 @@ class EventBus:
     def __init__(self, max_logs: int = 500) -> None:
         self._subscribers: Set[asyncio.Queue[Dict[str, Any]]] = set()
         self._logs: Deque[Dict[str, Any]] = deque(maxlen=max_logs)
+        self._boot_id: str = secrets.token_hex(4)
         self._log_seq: int = 0
         self._live_progress: Dict[int, Dict[str, Any]] = {}
         self._scheduler_status: Dict[int, Dict[str, Any]] = {}
+        self._scan_status: Dict[int, Dict[str, Any]] = {}
 
     def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
         q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=500)
@@ -49,6 +52,7 @@ class EventBus:
         self._log_seq += 1
         entry = {
             "id": self._log_seq,
+            "boot_id": self._boot_id,
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "level": lvl,
             "job_id": job_id,
@@ -93,10 +97,20 @@ class EventBus:
         if self._scheduler_status.pop(int(job_id), None) is not None:
             self.broadcast("job_scheduler", {"job_id": int(job_id), "cleared": True})
 
+    def emit_scan_status(self, job_id: int, status: Dict[str, Any]) -> None:
+        payload = {"job_id": int(job_id), **status}
+        self._scan_status[int(job_id)] = payload
+        self.broadcast("job_scan", payload)
+
+    def clear_scan_status(self, job_id: int) -> None:
+        if self._scan_status.pop(int(job_id), None) is not None:
+            self.broadcast("job_scan", {"job_id": int(job_id), "cleared": True})
+
     def clear_job_progress(self, job_id: int) -> None:
         for k in [k for k, v in self._live_progress.items() if v.get("job_id") == job_id]:
             self._live_progress.pop(k, None)
         self.clear_scheduler_status(job_id)
+        self.clear_scan_status(job_id)
 
     def recent_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
         if limit <= 0:
@@ -111,3 +125,6 @@ class EventBus:
 
     def scheduler_status_snapshot(self) -> Dict[int, Dict[str, Any]]:
         return dict(self._scheduler_status)
+
+    def scan_status_snapshot(self) -> Dict[int, Dict[str, Any]]:
+        return dict(self._scan_status)

@@ -1563,3 +1563,94 @@ async def test_streaming_preparse_overlaps_download_and_runs_multi_worker_upload
     finally:
         await tm.stop()
         await db.close()
+
+
+async def test_adaptive_scheduler_emits_active_download_changes_immediately(tmp_path: Path):
+    """Acquiring/releasing download slots right after initial emit must never be throttled away."""
+    from types import SimpleNamespace
+    from app.engine.disk_scheduler import AdaptiveDiskScheduler, GIB
+    from app.services.downloader import DownloadDiskBudget
+
+    emitted: list[dict] = []
+    budget = DownloadDiskBudget(tmp_path, 4 * GIB)
+    sched = AdaptiveDiskScheduler(
+        tmp_path,
+        budget,
+        max_downloads=5,
+        max_uploads=4,
+        min_free_disk_gb=4.0,
+        disk_usage_fn=lambda _: SimpleNamespace(free=40 * GIB),
+        on_status=emitted.append,
+    )
+    cancel = asyncio.Event()
+
+    sched.emit_status(force=True)
+    ok1, _ = await sched.acquire_download_slot(will_upload=True, cancel_event=cancel)
+    ok2, _ = await sched.acquire_download_slot(will_upload=True, cancel_event=cancel)
+    assert ok1 and ok2
+    # Calling emit_status again with identical counts within 0.8s should still be throttled
+    before_noop = len(emitted)
+    sched.emit_status()
+    assert len(emitted) == before_noop
+
+    await sched.release_download_slot()
+    await sched.release_download_slot()
+
+    assert [s["active_downloads"] for s in emitted] == [0, 1, 2, 1, 0]
+
+
+async def test_check_updates_emits_target_scan_progress_and_clears_on_finish(tmp_path: Path, monkeypatch):
+    """check_updates broadcasts per-target scan progress (0..N/N) and clears scan_status when done."""
+    from app.engine import task_manager as tm_mod
+
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": False,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        await repo.upsert_target("alice", "model", display_name="Alice Star")
+        await repo.upsert_target("bob", "model", display_name="Bob Pro")
+
+        scan_events: list[dict] = []
+        orig_emit_scan = events.emit_scan_status
+
+        def spy_emit_scan(job_id: int, status: dict) -> None:
+            scan_events.append(dict(status))
+            orig_emit_scan(job_id, status)
+
+        monkeypatch.setattr(events, "emit_scan_status", spy_emit_scan)
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_scan_list(ctx, initial_url, selectors, **kwargs):
+            return []
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "scan_list_pages", fake_scan_list)
+
+        tm.start()
+        job = await tm.enqueue_job("check_updates", "全量检查更新", {"target_ids": None})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+        assert done is not None
+        assert done["status"] == "completed"
+        assert [e["scanned"] for e in scan_events] == [0, 1, 1, 2]
+        assert all(e["mode"] == "targets" and e["total"] == 2 for e in scan_events)
+        assert scan_events[0]["current_target"] == "Alice Star"
+        assert scan_events[2]["current_target"] == "Bob Pro"
+        assert events.scan_status_snapshot() == {}
+    finally:
+        await tm.stop()
+        await db.close()

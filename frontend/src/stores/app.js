@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { toast } from 'vue-sonner'
 import { api } from '../api/client'
 import { EventStreamClient } from '../api/ws'
+import { appendLiveLog, mergeLogsSnapshot } from '../utils/logBuffer'
 import { JOB_LIMITS, HISTORY_PAGE_SIZES, readListPreference, saveListPreference } from '../utils/listPreferences'
 
 export const DEFAULT_HISTORY_FILTERS = Object.freeze({
@@ -165,6 +166,7 @@ export const useAppStore = defineStore('app', {
       jobItems: hasCache && cached.jobItems && typeof cached.jobItems === 'object' ? cached.jobItems : {},
       liveProgress: {},
       schedulerStatus: {},
+      scanStatus: {},
       logs: hasCache && Array.isArray(cached.logs) ? cached.logs : [],
       logsLoaded: Boolean(hasCache && Array.isArray(cached.logs)),
       _wsClient: null,
@@ -342,6 +344,8 @@ export const useAppStore = defineStore('app', {
       this.historyLoadedAt = 0
       this.jobItems = {}
       this.liveProgress = {}
+      this.schedulerStatus = {}
+      this.scanStatus = {}
       this.logs = []
       this.logsLoaded = false
     },
@@ -622,34 +626,10 @@ export const useAppStore = defineStore('app', {
 
     _applyLogsSnapshot(incoming) {
       if (!Array.isArray(incoming)) return
-      if (incoming.length === 0) {
-        if (this.logs.length > 0) this.logs = []
-        this.logsLoaded = true
-        this.persistCache()
-        return
+      const merged = mergeLogsSnapshot(this.logs, incoming, 500)
+      if (merged !== this.logs) {
+        this.logs = merged
       }
-      if (
-        this.logs.length === incoming.length &&
-        this.logs[0]?.id === incoming[0]?.id &&
-        this.logs[this.logs.length - 1]?.id === incoming[incoming.length - 1]?.id
-      ) {
-        this.logsLoaded = true
-        this.persistCache()
-        return
-      }
-      const map = new Map()
-      for (const item of incoming) {
-        if (item && item.id != null) map.set(item.id, item)
-      }
-      const maxIncoming = incoming.reduce((m, x) => Math.max(m, Number(x?.id || 0)), 0)
-      for (const cur of this.logs) {
-        if (cur && cur.id != null && Number(cur.id) > maxIncoming && !map.has(cur.id)) {
-          map.set(cur.id, cur)
-        }
-      }
-      this.logs = Array.from(map.values())
-        .sort((a, b) => Number(a.id) - Number(b.id))
-        .slice(-500)
       this.logsLoaded = true
       this.persistCache()
     },
@@ -858,11 +838,13 @@ export const useAppStore = defineStore('app', {
             this._applyLogsSnapshot(msg.data?.logs || [])
             this.liveProgress = msg.data?.live_progress || {}
             this.schedulerStatus = msg.data?.scheduler_status || {}
+            this.scanStatus = msg.data?.scan_status || {}
           } else if (msg.type === 'log') {
             const entry = msg.data
-            if (entry && (entry.id == null || !this.logs.some((x) => x.id === entry.id))) {
-              this.logs.push(entry)
-              if (this.logs.length > 500) this.logs.shift()
+            const nextLogs = appendLiveLog(this.logs, entry, 500)
+            if (nextLogs !== this.logs) {
+              this.logs = nextLogs
+              this.persistCache()
             }
             this.logsLoaded = true
           } else if (msg.type === 'job_updated') {
@@ -870,6 +852,7 @@ export const useAppStore = defineStore('app', {
             this._scheduleOverviewRefresh()
             if (['completed', 'cancelled', 'failed', 'partial_failed'].includes(msg.data?.status)) {
               delete this.schedulerStatus[msg.data.id]
+              delete this.scanStatus[msg.data.id]
               this.refreshTempFiles()
               this.historyLoadedAt = 0
               if (this.historyCache !== null) {
@@ -887,6 +870,15 @@ export const useAppStore = defineStore('app', {
                 delete this.schedulerStatus[jid]
               } else {
                 this.schedulerStatus[jid] = msg.data
+              }
+            }
+          } else if (msg.type === 'job_scan') {
+            const jid = Number(msg.data?.job_id)
+            if (jid > 0) {
+              if (msg.data?.cleared) {
+                delete this.scanStatus[jid]
+              } else {
+                this.scanStatus[jid] = msg.data
               }
             }
           } else if (msg.type === 'overview_changed') {
