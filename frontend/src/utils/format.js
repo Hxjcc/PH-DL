@@ -41,6 +41,24 @@ export function formatDateTime(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+export function formatPublishedDate(raw) {
+  const text = String(raw || '').trim()
+  if (!text) return ''
+  const match = text.match(/^(\d{4}-\d{2}-\d{2})/)
+  return match ? match[1] : ''
+}
+
+export function formatVideoDuration(seconds) {
+  const total = Math.floor(Number(seconds || 0))
+  if (!Number.isFinite(total) || total <= 0) return ''
+  const hrs = Math.floor(total / 3600)
+  const mins = Math.floor((total % 3600) / 60)
+  const secs = total % 60
+  const pad = (v) => String(v).padStart(2, '0')
+  if (hrs > 0) return `${hrs}:${pad(mins)}:${pad(secs)}`
+  return `${mins}:${pad(secs)}`
+}
+
 export function jobStatusMeta(status) {
   const map = {
     queued: { label: '排队中', dot: 'bg-amber-400', variant: 'outline' },

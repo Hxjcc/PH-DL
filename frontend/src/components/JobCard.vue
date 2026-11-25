@@ -17,6 +17,7 @@ import {
   Heart,
   Clock,
   CloudUpload,
+  CalendarDays,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
@@ -37,7 +38,6 @@ import {
 import { buildExportFilename } from '../utils/exportFilename'
 import Card from './ui/Card.vue'
 import Button from './ui/Button.vue'
-import Progress from './ui/Progress.vue'
 import Checkbox from './ui/Checkbox.vue'
 import ConfirmPopover from './ui/ConfirmPopover.vue'
 import AnimatedCollapse from './ui/AnimatedCollapse.vue'
@@ -52,6 +52,7 @@ const CATEGORY_ICONS = {
   database: Database,
   rotate: RotateCcw,
   sparkles: Sparkles,
+  calendar: CalendarDays,
 }
 
 const props = defineProps({
@@ -60,6 +61,7 @@ const props = defineProps({
   selectable: { type: Boolean, default: false },
   selected: { type: Boolean, default: false },
   focused: { type: Boolean, default: false },
+  routeActive: { type: Boolean, default: true },
 })
 
 const emit = defineEmits(['toggle-select', 'deleted', 'activate'])
@@ -74,12 +76,13 @@ const itemsLoadError = ref('')
 const deletePopoverMounted = ref(false)
 const deletePopoverDefaultOpen = ref(false)
 const itemStatusFilter = ref('all')
+const INITIAL_ITEM_LIMIT = 12
 const ITEM_PAGE_STEP = 30
-const itemRenderLimit = ref(ITEM_PAGE_STEP)
+const itemRenderLimit = ref(INITIAL_ITEM_LIMIT)
 const brokenAvatars = ref(new Set())
 
 const isActive = computed(() => ['queued', 'scanning', 'running'].includes(props.job.status))
-const tracksLiveProgress = computed(() => ['scanning', 'running'].includes(props.job.status))
+const tracksLiveProgress = computed(() => props.routeActive && ['scanning', 'running'].includes(props.job.status))
 const items = computed(() => store.jobItems[props.job.id] || [])
 const statusMeta = computed(() => jobStatusMeta(props.job.status))
 
@@ -139,6 +142,7 @@ const canRetry = computed(
   )
 )
 const isMetadataJob = computed(() => props.job.kind === 'enrich_metadata')
+const isRenameDatesJob = computed(() => props.job.kind === 'rename_remote_dates')
 const isExportJob = computed(() => Boolean(props.job.params?.export_only || props.job.export_text))
 const hasNoJobItems = computed(
   () => isExportJob.value || props.job.kind === 'check_updates' || props.job.kind === 'baseline_sync'
@@ -148,7 +152,8 @@ const detailsContentKey = computed(() => {
   if (loadingItems.value && items.value.length === 0) return 'loading'
   if (itemsLoadError.value && items.value.length === 0) return 'error'
   if (items.value.length === 0) return 'empty'
-  return `ready:${itemStatusFilter.value}:${visibleItems.value.length}:${filteredItems.value.length}`
+  const heightBucket = visibleItems.value.length >= 9 ? '9+' : String(visibleItems.value.length)
+  return `ready:${itemStatusFilter.value}:${heightBucket}:${remainingItemsCount.value > 0 ? 1 : 0}`
 })
 
 function statusPillClass(variant) {
@@ -171,6 +176,7 @@ function openDeletePopoverNow() {
 const retryButtonText = computed(() => {
   if (isExportJob.value) return '重试导出'
   if (isMetadataJob.value) return '重试补全'
+  if (isRenameDatesJob.value) return '重试改名'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成'
   }
@@ -184,6 +190,7 @@ const retryButtonText = computed(() => {
 const retryButtonTitle = computed(() => {
   if (isExportJob.value) return '按原筛选条件重新导出链接'
   if (isMetadataJob.value) return '重新补全仍缺少画质或文件大小的基线视频'
+  if (isRenameDatesJob.value) return '继续为剩余未带日期前缀的网盘视频补全发布日期'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成条目；如果之前还没有生成明细，将按原设置重试'
   }
@@ -197,6 +204,7 @@ const retryButtonTitle = computed(() => {
 const itemFilterPills = computed(() =>
   buildItemStatusPills(items.value, {
     isMetadataJob: isMetadataJob.value,
+    isRenameDatesJob: isRenameDatesJob.value,
     activeFilter: itemStatusFilter.value,
   })
 )
@@ -278,7 +286,16 @@ const schedulerChip = computed(() => {
 function selectItemFilter(val) {
   if (itemStatusFilter.value === val) return
   itemStatusFilter.value = val
-  itemRenderLimit.value = ITEM_PAGE_STEP
+  itemRenderLimit.value = INITIAL_ITEM_LIMIT
+}
+
+function handleItemsScroll(event) {
+  if (remainingItemsCount.value <= 0) return
+  const el = event.currentTarget
+  if (!el) return
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 96) {
+    itemRenderLimit.value = Math.min(filteredItems.value.length, itemRenderLimit.value + ITEM_PAGE_STEP)
+  }
 }
 
 const exportFilename = computed(() => buildExportFilename(props.job))
@@ -288,6 +305,15 @@ function itemStatusLabel(item) {
     return {
       pending: '等待补全',
       done: '已补全',
+      failed: '失败',
+      cancelled: '取消',
+    }[item.status] || itemStatusMeta(item.status).label
+  }
+  if (isRenameDatesJob.value) {
+    return {
+      pending: '等待改名',
+      done: '已改名',
+      skipped: '已跳过',
       failed: '失败',
       cancelled: '取消',
     }[item.status] || itemStatusMeta(item.status).label
@@ -337,7 +363,7 @@ async function toggleExpand() {
 function handleDetailsAfterLeave() {
   if (!expanded.value) {
     detailsMounted.value = false
-    itemRenderLimit.value = ITEM_PAGE_STEP
+    itemRenderLimit.value = INITIAL_ITEM_LIMIT
   }
 }
 
@@ -421,7 +447,7 @@ function downloadExportTxt() {
 <template>
   <Card
     :class="[
-      'job-card overflow-hidden transition-[border-color,background-color,box-shadow] duration-200',
+      'job-card overflow-hidden transition-[border-color,background-color] duration-150',
       selected
         ? 'border-brand/45 bg-brand/[0.03] dark:bg-brand/[0.06]'
         : focused
@@ -742,7 +768,17 @@ function downloadExportTxt() {
             </span>
           </div>
         </div>
-        <Progress :model-value="liveMetrics.percent" :indeterminate="liveMetrics.indeterminate" class="h-1.5" />
+        <div class="relative h-1.5 w-full overflow-hidden rounded-full bg-secondary">
+          <div
+            v-if="liveMetrics.indeterminate"
+            class="h-full w-full bg-primary/80 animate-pulse"
+          />
+          <div
+            v-else
+            class="h-full w-full bg-primary transition-transform duration-200 ease-out"
+            :style="{ transform: `translateX(-${100 - Math.max(0, Math.min(100, liveMetrics.percent || 0))}%)` }"
+          />
+        </div>
       </div>
 
       <div
@@ -823,7 +859,7 @@ function downloadExportTxt() {
                 <span class="font-mono text-[10px] opacity-80">{{ pill.count }}</span>
               </button>
             </div>
-            <span v-if="filteredItems.length > ITEM_PAGE_STEP" class="text-[11px] text-muted-foreground tabular-nums">
+            <span v-if="filteredItems.length > INITIAL_ITEM_LIMIT" class="text-[11px] text-muted-foreground tabular-nums">
               显示 {{ visibleItems.length }} / {{ filteredItems.length }} 项
             </span>
           </div>
@@ -832,7 +868,7 @@ function downloadExportTxt() {
             当前筛选下没有条目
           </div>
 
-          <div v-else class="space-y-1.5 max-h-96 overflow-y-auto pr-1">
+          <div v-else class="space-y-1.5 max-h-96 overflow-y-auto pr-1" @scroll.passive="handleItemsScroll">
             <div
               v-for="(item, idx) in visibleItems"
               :key="item.id"
@@ -956,13 +992,20 @@ function downloadExportTxt() {
                 </div>
               </div>
 
-              <Progress v-if="item.status === 'downloading'" :model-value="transferProgressMap[item.id]?.pct || 0" class="h-1" />
-              <Progress
-                v-else-if="item.status === 'uploading'"
-                :model-value="transferProgressMap[item.id]?.pct || 0"
-                :indeterminate="!transferProgressMap[item.id]?.hasProgress"
-                class="h-1"
-              />
+              <div
+                v-if="item.status === 'downloading' || item.status === 'uploading'"
+                class="relative h-1 w-full overflow-hidden rounded-full bg-secondary"
+              >
+                <div
+                  v-if="item.status === 'uploading' && !transferProgressMap[item.id]?.hasProgress"
+                  class="h-full w-full bg-primary/80 animate-pulse"
+                />
+                <div
+                  v-else
+                  class="h-full w-full bg-primary transition-transform duration-200 ease-out"
+                  :style="{ transform: `translateX(-${100 - Math.max(0, Math.min(100, transferProgressMap[item.id]?.pct || 0))}%)` }"
+                />
+              </div>
 
               <div v-if="item.error_message" class="text-[11px] text-red-600 dark:text-red-400 pl-7">
                 {{ item.error_message }}
@@ -987,5 +1030,10 @@ function downloadExportTxt() {
 <style scoped>
 .job-card {
   overflow-anchor: none;
+  contain: layout style;
+}
+
+.job-details {
+  contain: layout paint;
 }
 </style>

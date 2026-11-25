@@ -27,6 +27,7 @@ from ..parsers.video import (
     collect_video_urls,
     extract_viewkey_from_url,
     fetch_video_details_batch,
+    fetch_video_published_meta,
 )
 from ..services.cookie import check_cookie_valid, login_and_get_cookies
 from ..services.downloader import (
@@ -36,12 +37,20 @@ from ..services.downloader import (
     read_download_checkpoint,
     remove_download_checkpoint,
 )
-from ..services.filename import is_valid_video_file, normalized_quality, sanitize_filename, video_filename_base
+from ..services.filename import (
+    build_dated_remote_path,
+    format_remote_video_filename,
+    is_valid_video_file,
+    normalized_quality,
+    sanitize_filename,
+    video_filename_base,
+)
 from ..services.notifier import build_auto_update_report, send_serverchan
 from ..services.uploader import (
     UploadSessionCache,
     delete_verified_source,
     file_snapshot,
+    rename_remote_file,
     upload_file_batch,
 )
 from .events import EventBus
@@ -92,6 +101,7 @@ async def _invoke_upload_file_batch(
     cancel_event: Optional[asyncio.Event],
     session_cache: UploadSessionCache,
     on_progress: Optional[Callable[[str, int, int, float, str], None]],
+    remote_names_by_viewkey: Optional[Dict[str, str]] = None,
 ):
     """Invoke `upload_file_batch`, staying compatible with legacy 5-arg test mocks."""
     params = inspect.signature(upload_file_batch).parameters
@@ -107,6 +117,8 @@ async def _invoke_upload_file_batch(
         kwargs["session_cache"] = session_cache
     if has_var_kw or "on_progress" in params:
         kwargs["on_progress"] = on_progress
+    if remote_names_by_viewkey and (has_var_kw or "remote_names_by_viewkey" in params):
+        kwargs["remote_names_by_viewkey"] = remote_names_by_viewkey
     return await upload_file_batch(**kwargs)
 
 
@@ -358,6 +370,8 @@ class TaskManager:
                 await self._exec_baseline_sync(job_id, params, settings, ctx)
             elif kind == "enrich_metadata":
                 await self._exec_enrich_metadata(job_id, params, settings, ctx)
+            elif kind == "rename_remote_dates":
+                await self._exec_rename_remote_dates(job_id, params, settings, ctx)
             elif kind == "retry_items":
                 await self._exec_retry_items(job_id, params, settings, ctx)
             elif kind == "resume_temp":
@@ -514,12 +528,19 @@ class TaskManager:
                 )
 
             files_map = {e.viewkey: e.local_path for e in chunk}
+            remote_names_map: Dict[str, str] = {}
+            for entry in chunk:
+                dated_name = format_remote_video_filename(entry.local_path.name, entry.published_at)
+                if dated_name and dated_name != entry.local_path.name:
+                    remote_names_map[entry.viewkey] = dated_name
+
             if len(chunk) == 1:
                 size_mb = chunk[0].file_size / (1024 * 1024)
                 size_tag = f" ({size_mb:.1f} MB)" if chunk[0].file_size > 0 else ""
+                remote_label = remote_names_map.get(chunk[0].viewkey) or chunk[0].local_path.name
                 self.events.emit_log(
                     "INFO",
-                    f"[上传] 开始上传至 {remote_target}: {chunk[0].local_path.name}{size_tag}",
+                    f"[上传] 开始上传至 {remote_target}: {remote_label}{size_tag}",
                     job_id=job_id,
                 )
             else:
@@ -552,6 +573,7 @@ class TaskManager:
                     cancel_event=ctx.cancel_event,
                     session_cache=upload_session_cache,
                     on_progress=_on_upload_progress,
+                    remote_names_by_viewkey=remote_names_map or None,
                 )
                 elapsed = max(0.0, time.monotonic() - upload_started)
                 uploaded_set = set(up_res.uploaded_viewkeys)
@@ -559,13 +581,24 @@ class TaskManager:
                 for entry in chunk:
                     self.events.clear_item_progress(entry.item_id)
                     snapshot = up_res.verified_sources.get(entry.viewkey)
+                    local_rel = entry.local_path.relative_to(download_dir).as_posix()
+                    custom_remote_name = remote_names_map.get(entry.viewkey)
+                    if custom_remote_name:
+                        parent_rel = Path(local_rel).parent.as_posix()
+                        fallback_remote_rel = f"{parent_rel}/{custom_remote_name}" if parent_rel not in {"", "."} else custom_remote_name
+                    else:
+                        fallback_remote_rel = local_rel
+                    verified_remote_path = (
+                        (getattr(up_res, "remote_paths", None) or {}).get(entry.viewkey)
+                        or f"{up_res.remote_dir}/{fallback_remote_rel}"
+                    )
                     if (
                         entry.viewkey in uploaded_set and snapshot is not None
                         and not ctx.cancel_event.is_set() and file_snapshot(entry.local_path) == snapshot
                         and await self.repo.record_verified_upload(
                             entry.viewkey,
                             str(entry.local_path),
-                            f"{up_res.remote_dir}/{entry.local_path.relative_to(download_dir).as_posix()}",
+                            verified_remote_path,
                         )
                     ):
                         local_path = str(entry.local_path)
@@ -595,9 +628,10 @@ class TaskManager:
                         if elapsed > 0.1 and entry.file_size > 0 and len(chunk) == 1:
                             speed_mb_s = (entry.file_size / (1024 * 1024)) / elapsed
                             speed_note = f", {speed_mb_s:.1f} MB/s"
+                        remote_display_name = custom_remote_name or entry.local_path.name
                         self.events.emit_log(
                             "INFO",
-                            f"[上传成功] {entry.local_path.name} -> {up_res.remote_dir} "
+                            f"[上传成功] {remote_display_name} -> {up_res.remote_dir} "
                             f"(耗时 {elapsed:.1f}s{speed_note}{cleanup_note})",
                             job_id=job_id,
                         )
@@ -642,6 +676,7 @@ class TaskManager:
             local_path: Path,
             page_url: str,
             file_size: int,
+            published_at: str = "",
         ) -> None:
             size = int(file_size or 0)
             if size <= 0:
@@ -657,6 +692,7 @@ class TaskManager:
                     local_path=local_path,
                     page_url=page_url,
                     file_size=size,
+                    published_at=(published_at or "").strip(),
                 )
             )
 
@@ -744,12 +780,16 @@ class TaskManager:
                             is_valid_video_file, existing_local, settings.min_file_size_bytes, ledger["file_size"] or None,
                         ):
                             existing_size = existing_local.stat().st_size
+                            pub_date = str(item.get("published_at") or ledger.get("published_at") or "").strip()
+                            dur_sec = int(item.get("duration_seconds") or ledger.get("duration_seconds") or 0)
                             await self.repo.upsert_video(
                                 vkey,
                                 status="downloaded",
                                 local_path=str(existing_local),
                                 file_size=existing_size,
                                 upload_requested=will_upload,
+                                published_at=pub_date,
+                                duration_seconds=dur_sec,
                             )
                             it = await self.repo.update_job_item(
                                 item_id,
@@ -772,6 +812,7 @@ class TaskManager:
                                     local_path=existing_local,
                                     page_url=item["page_url"],
                                     file_size=existing_size,
+                                    published_at=pub_date,
                                 )
                             await _refresh_job_progress()
                             return
@@ -924,6 +965,14 @@ class TaskManager:
                         return
 
                     scheduler.record_video_size(outcome.file_size)
+                    pub_date = str(item.get("published_at") or "").strip()
+                    dur_sec = int(item.get("duration_seconds") or 0)
+                    if not pub_date or dur_sec <= 0:
+                        existing_video = ledger or (await self.repo.get_video(vkey) if vkey else None)
+                        if existing_video:
+                            pub_date = pub_date or str(existing_video.get("published_at") or "").strip()
+                            if dur_sec <= 0:
+                                dur_sec = int(existing_video.get("duration_seconds") or 0)
                     await self.repo.upsert_video(
                         vkey,
                         title=item["title"],
@@ -937,6 +986,8 @@ class TaskManager:
                         downloaded_at=utc_now_iso(),
                         force_status=True,
                         upload_requested=will_upload,
+                        published_at=pub_date,
+                        duration_seconds=dur_sec,
                     )
                     it = await self.repo.update_job_item(
                         item_id,
@@ -968,6 +1019,7 @@ class TaskManager:
                             local_path=outcome.local_path,
                             page_url=item["page_url"],
                             file_size=outcome.file_size,
+                            published_at=pub_date,
                         )
 
                     await _refresh_job_progress()
@@ -1104,6 +1156,10 @@ class TaskManager:
                                             }
                                             if detail.title:
                                                 patch["title"] = detail.title
+                                            if detail.published_at:
+                                                patch["published_at"] = detail.published_at
+                                            if detail.duration_seconds > 0:
+                                                patch["duration_seconds"] = detail.duration_seconds
                                             it = await self.repo.update_job_item(iid, **patch)
                                             if it:
                                                 self.events.broadcast("item_updated", it)
@@ -1213,6 +1269,10 @@ class TaskManager:
                                 "referer_url": d.referer_url,
                                 "quality": d.quality,
                             }
+                            if d.published_at:
+                                patch["published_at"] = d.published_at
+                            if d.duration_seconds > 0:
+                                patch["duration_seconds"] = d.duration_seconds
                             await self.repo.update_job_item(fid, **patch)
                             ready_for_pass2.append(fid)
                         else:
@@ -1282,6 +1342,8 @@ class TaskManager:
                     "status": "failed" if error else "pending",
                     "error_message": error,
                     "upload_requested": upload_requested,
+                    "published_at": detail.published_at,
+                    "duration_seconds": detail.duration_seconds,
                 }
             )
             if error:
@@ -1630,6 +1692,8 @@ class TaskManager:
                 "status": "pending",
                 "error_message": "",
                 "upload_requested": auto_upload,
+                "published_at": lv.published_at,
+                "duration_seconds": lv.duration_seconds,
             }
             for lv, uname, utype in listed_entries
         ]
@@ -1829,6 +1893,8 @@ class TaskManager:
                     "status": "pending",
                     "local_path": str(video.get("local_path") or "").strip(),
                     "upload_requested": True,
+                    "published_at": str(video.get("published_at") or "").strip(),
+                    "duration_seconds": int(video.get("duration_seconds") or 0),
                 }
                 for video in valid_pending
             ]
@@ -2190,6 +2256,8 @@ class TaskManager:
                     "target_type": utype,
                     "video_page_url": lv.url,
                     "status": "baseline",
+                    "published_at": lv.published_at,
+                    "duration_seconds": lv.duration_seconds,
                 }
             )
         count = await self.repo.upsert_videos_batch(batch_records)
@@ -2325,6 +2393,8 @@ class TaskManager:
                     candidate["viewkey"],
                     quality=detail.quality or "",
                     file_size=int(file_size or 0),
+                    published_at=detail.published_at or "",
+                    duration_seconds=int(detail.duration_seconds or 0),
                 )
                 item = await self.repo.update_job_item(
                     item_ids[candidate["viewkey"]],
@@ -2345,6 +2415,306 @@ class TaskManager:
             "INFO",
             f"元数据补全完成：画质/大小均成功 {completed_with_size} 条，"
             f"详情失败 {detail_failures} 条，大小获取失败 {size_failures} 条。",
+            job_id=job_id,
+        )
+
+    async def _exec_rename_remote_dates(
+        self,
+        job_id: int,
+        params: Dict[str, Any],
+        settings: RuntimeSettings,
+        ctx: TaskHttpContext,
+    ) -> None:
+        if not (settings.rclone_remote or "").strip():
+            await self.repo.update_job(job_id, error_message="未配置 rclone 远端名称，无法重命名云端文件")
+            self.events.emit_log("ERROR", "未配置 rclone 远端名称，无法执行云端补全日期任务。", job_id=job_id)
+            return
+
+        limit = int(params.get("limit") or 0)
+        candidates = await self.repo.list_remote_date_rename_candidates(limit=limit)
+        if not candidates:
+            self.events.emit_log("INFO", "所有已上传网盘文件均已包含发布日期前缀，无需处理。", job_id=job_id)
+            return
+
+        self.events.emit_log(
+            "INFO",
+            f"开始为 {len(candidates)} 个已上传网盘文件补全发布日期前缀（YYYY-MM-DD_原文件名）...",
+            job_id=job_id,
+        )
+        item_specs = [
+            {
+                "viewkey": c["viewkey"],
+                "title": c.get("title") or c["viewkey"],
+                "uploader": c.get("uploader") or "",
+                "target_type": c.get("target_type") or "model",
+                "page_url": c.get("video_page_url") or f"https://www.pornhub.com/view_video.php?viewkey={c['viewkey']}",
+                "quality": c.get("quality") or "",
+                "status": "pending",
+                "published_at": c.get("published_at") or "",
+                "duration_seconds": int(c.get("duration_seconds") or 0),
+            }
+            for c in candidates
+        ]
+        inserted_items = await self.repo.add_job_items_batch(job_id, item_specs)
+        item_ids: Dict[str, int] = {row["viewkey"]: int(row["id"]) for row in inserted_items}
+        for row in inserted_items:
+            self.events.broadcast("item_updated", row)
+
+        created_job = await self.repo.update_job(job_id, total_items=len(candidates))
+        if created_job:
+            self.events.broadcast("job_updated", created_job)
+
+        pub_by_vk: Dict[str, str] = {
+            c["viewkey"]: str(c.get("published_at") or "").strip() for c in candidates
+        }
+        dur_by_vk: Dict[str, int] = {
+            c["viewkey"]: int(c.get("duration_seconds") or 0) for c in candidates
+        }
+
+        # Phase 1: Bulk list-page date/duration extraction grouped by uploader (fast, 30+ videos/page).
+        missing_vks = [vk for vk, pub in pub_by_vk.items() if not pub]
+        if missing_vks and not ctx.cancel_event.is_set():
+            all_targets = await self.repo.list_targets()
+            target_type_by_user: Dict[str, str] = {}
+            target_display_by_user: Dict[str, str] = {}
+            for t in all_targets:
+                uname_low = str(t.get("username") or "").strip().lower()
+                if uname_low:
+                    target_type_by_user[uname_low] = str(t.get("target_type") or "model")
+                    target_display_by_user[uname_low] = str(t.get("display_name") or t.get("username") or "")
+
+            generic_folders = {"", "ungrouped", "url_batch", "my_liked", "my_liked_videos", "_currentuser_"}
+            uploader_groups: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+            for c in candidates:
+                vk = c["viewkey"]
+                if pub_by_vk.get(vk):
+                    continue
+                uploader = str(c.get("uploader") or "").strip()
+                utype = str(c.get("target_type") or "model").strip().lower()
+                if utype == "liked":
+                    uploader_groups[("_currentUser_", "liked")].append(vk)
+                    continue
+                if uploader.lower() in generic_folders:
+                    continue
+                resolved_type = target_type_by_user.get(uploader.lower()) or (
+                    utype if utype in {"model", "pornstar", "favorites"} else "model"
+                )
+                uploader_groups[(uploader, resolved_type)].append(vk)
+
+            group_list = list(uploader_groups.items())
+            if group_list:
+                self.events.emit_log(
+                    "INFO",
+                    f"第 1 阶段：优先按 {len(group_list)} 个创作者列表页批量提取上传日期与时长...",
+                    job_id=job_id,
+                )
+                found_from_list = 0
+                for idx, ((uname, utype), _vks) in enumerate(group_list):
+                    if ctx.cancel_event.is_set():
+                        break
+                    disp = "Liked Videos" if utype == "liked" else (target_display_by_user.get(uname.lower()) or uname)
+                    self.events.emit_scan_status(
+                        job_id,
+                        {
+                            "mode": "targets",
+                            "scanned": idx,
+                            "total": len(group_list),
+                            "current_target": disp,
+                            "found_new": found_from_list,
+                        },
+                    )
+                    list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
+
+                    async def _on_list_page(page_videos: List[ListedVideo]) -> None:
+                        nonlocal found_from_list
+                        updates: List[Tuple[str, str, int]] = []
+                        for lv in page_videos:
+                            if lv.published_at or lv.duration_seconds > 0:
+                                updates.append((lv.viewkey, lv.published_at, lv.duration_seconds))
+                            if lv.viewkey in pub_by_vk and not pub_by_vk[lv.viewkey] and lv.published_at:
+                                pub_by_vk[lv.viewkey] = lv.published_at
+                                found_from_list += 1
+                            if lv.viewkey in dur_by_vk and dur_by_vk[lv.viewkey] <= 0 and lv.duration_seconds > 0:
+                                dur_by_vk[lv.viewkey] = lv.duration_seconds
+                        if updates:
+                            await self.repo.backfill_videos_published_meta(updates)
+
+                    try:
+                        await scan_list_pages(
+                            ctx,
+                            list_url,
+                            settings.selectors,
+                            target_type=utype,
+                            delay_min=settings.page_delay_min,
+                            delay_max=settings.page_delay_max,
+                            page_concurrency=settings.max_concurrent_list_pages,
+                            timeout=settings.request_timeout,
+                            on_page=_on_list_page,
+                        )
+                    except Exception as err:
+                        self.events.emit_log("WARNING", f"列表页批量提取日期失败 ({disp}): {err}", job_id=job_id)
+
+                self.events.emit_scan_status(
+                    job_id,
+                    {
+                        "mode": "targets",
+                        "scanned": len(group_list),
+                        "total": len(group_list),
+                        "current_target": "",
+                        "found_new": found_from_list,
+                    },
+                )
+
+        # Phase 2: Lightweight detail-HTML fallback ONLY for candidates still missing published_at.
+        still_missing = [c for c in candidates if not pub_by_vk.get(c["viewkey"])]
+        if still_missing and not ctx.cancel_event.is_set():
+            self.events.emit_log(
+                "INFO",
+                f"第 2 阶段：对列表页未命中的 {len(still_missing)} 条视频从详情页补取发布日期...",
+                job_id=job_id,
+            )
+            detail_sem = asyncio.Semaphore(max(1, settings.max_concurrent_video_details))
+
+            async def _fetch_one_date(cand: Dict[str, Any]) -> Tuple[str, str, int]:
+                async with detail_sem:
+                    if ctx.cancel_event.is_set():
+                        return cand["viewkey"], "", 0
+                    page_url = cand.get("video_page_url") or f"https://www.pornhub.com/view_video.php?viewkey={cand['viewkey']}"
+                    pub, dur, _ = await fetch_video_published_meta(ctx, page_url, timeout=settings.request_timeout)
+                    return cand["viewkey"], pub, dur
+
+            detail_results = await asyncio.gather(*(_fetch_one_date(c) for c in still_missing))
+            detail_updates: List[Tuple[str, str, int]] = []
+            for vk, pub, dur in detail_results:
+                if pub:
+                    pub_by_vk[vk] = pub
+                if dur > 0 and dur_by_vk.get(vk, 0) <= 0:
+                    dur_by_vk[vk] = dur
+                if pub or dur > 0:
+                    detail_updates.append((vk, pub, dur))
+            if detail_updates:
+                await self.repo.backfill_videos_published_meta(detail_updates)
+
+        self.events.clear_scan_status(job_id)
+        if ctx.cancel_event.is_set():
+            for c in candidates:
+                it = await self.repo.update_job_item(item_ids[c["viewkey"]], status="cancelled", error_message="已取消")
+                if it:
+                    self.events.broadcast("item_updated", it)
+            return
+
+        # Phase 3: Server-side zero-bandwidth rclone moveto rename.
+        running_job = await self.repo.update_job(job_id, status="running")
+        if running_job:
+            self.events.broadcast("job_updated", running_job)
+
+        rename_concurrency = max(1, min(4, int(settings.rclone_transfers or 2)))
+        rename_sem = asyncio.Semaphore(rename_concurrency)
+        refresh_lock = asyncio.Lock()
+        renamed_count = 0
+        skipped_count = 0
+        failed_count = 0
+        processed = 0
+
+        async def _rename_one(cand: Dict[str, Any]) -> None:
+            nonlocal renamed_count, skipped_count, failed_count, processed
+            vk = cand["viewkey"]
+            iid = item_ids[vk]
+            old_remote = str(cand.get("remote_path") or "").strip()
+            pub_date = pub_by_vk.get(vk, "")
+            file_size = int(cand.get("file_size") or 0)
+
+            async with rename_sem:
+                if ctx.cancel_event.is_set():
+                    it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                    if it:
+                        self.events.broadcast("item_updated", it)
+                    return
+
+                if not pub_date:
+                    skipped_count += 1
+                    it = await self.repo.update_job_item(
+                        iid,
+                        status="skipped",
+                        bytes_total=file_size,
+                        error_message="未能获取发布日期（可能原视频已删除），保留原文件名",
+                    )
+                    if it:
+                        self.events.broadcast("item_updated", it)
+                else:
+                    new_remote = build_dated_remote_path(old_remote, pub_date)
+                    if not new_remote or new_remote == old_remote:
+                        skipped_count += 1
+                        it = await self.repo.update_job_item(
+                            iid,
+                            status="skipped",
+                            bytes_total=file_size,
+                            published_at=pub_date,
+                            error_message="远端文件名已包含日期前缀",
+                        )
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                    else:
+                        ok, detail, already_done = await rename_remote_file(
+                            old_remote,
+                            new_remote,
+                            settings,
+                            cancel_event=ctx.cancel_event,
+                        )
+                        if ctx.cancel_event.is_set() and not ok:
+                            it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                            if it:
+                                self.events.broadcast("item_updated", it)
+                            return
+                        if ok:
+                            await self.repo.update_video_remote_path(vk, new_remote)
+                            renamed_count += 1
+                            it = await self.repo.update_job_item(
+                                iid,
+                                status="done",
+                                bytes_total=file_size,
+                                published_at=pub_date,
+                                error_message="",
+                            )
+                            if it:
+                                self.events.broadcast("item_updated", it)
+                            old_name = old_remote.rsplit("/", 1)[-1]
+                            new_name = new_remote.rsplit("/", 1)[-1]
+                            note = "（已存在目标文件）" if already_done else ""
+                            self.events.emit_log(
+                                "INFO",
+                                f"[云端改名] {old_name} -> {new_name}{note}",
+                                job_id=job_id,
+                            )
+                        else:
+                            failed_count += 1
+                            it = await self.repo.update_job_item(
+                                iid,
+                                status="failed",
+                                bytes_total=file_size,
+                                published_at=pub_date,
+                                error_message=f"云端改名失败: {detail}",
+                            )
+                            if it:
+                                self.events.broadcast("item_updated", it)
+                            self.events.emit_log(
+                                "WARNING",
+                                f"[云端改名失败] {old_remote}: {detail}",
+                                job_id=job_id,
+                            )
+
+                async with refresh_lock:
+                    processed += 1
+                    if processed % 10 == 0 or processed == len(candidates):
+                        refreshed = await self.repo.recalculate_job_counts(job_id)
+                        if refreshed:
+                            self.events.broadcast("job_updated", refreshed)
+
+        await asyncio.gather(*(_rename_one(c) for c in candidates))
+        self.events.broadcast("overview_changed", {})
+        self.events.emit_log(
+            "INFO",
+            f"网盘补全发布日期完成：成功改名 {renamed_count} 条，跳过 {skipped_count} 条，失败 {failed_count} 条。",
             job_id=job_id,
         )
 
@@ -2427,9 +2797,16 @@ class TaskManager:
             elif detail and (not detail.download_url or detail.error):
                 status, error = "failed", detail.error or "重新解析视频失败"
             elif detail:
-                old = {**old, "viewkey": detail.viewkey, "title": detail.title,
-                       "download_url": detail.download_url, "referer_url": detail.referer_url,
-                       "quality": detail.quality}
+                old = {
+                    **old,
+                    "viewkey": detail.viewkey,
+                    "title": detail.title,
+                    "download_url": detail.download_url,
+                    "referer_url": detail.referer_url,
+                    "quality": detail.quality,
+                    "published_at": detail.published_at or old.get("published_at") or "",
+                    "duration_seconds": detail.duration_seconds or int(old.get("duration_seconds") or 0),
+                }
             elif old["page_url"] in lookup_urls:
                 status, error = "failed", "重新解析视频没有返回结果"
             row = await self.repo.add_job_item(
@@ -2448,6 +2825,8 @@ class TaskManager:
                 upload_requested=wanted_upload,
                 status=status,
                 error_message=error,
+                published_at=str(old.get("published_at") or ""),
+                duration_seconds=int(old.get("duration_seconds") or 0),
             )
             if status == "pending":
                 new_item_ids.append(int(row["id"]))
@@ -2519,6 +2898,8 @@ class TaskManager:
                 temp_path=tf["path"],
                 bytes_downloaded=int(tf.get("size_bytes") or 0),
                 upload_requested=auto_upload and bool(original_opt_in),
+                published_at=str(prior.get("published_at") or ""),
+                duration_seconds=int(prior.get("duration_seconds") or 0),
             )
             new_item_ids.append(int(row["id"]))
             wanted_quality = normalized_quality(quality)

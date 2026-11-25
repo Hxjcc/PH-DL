@@ -14,10 +14,99 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from ..config import SelectorSettings
+from ..services.filename import extract_date_from_cdn_url, normalize_published_date
 from .http_session import TaskHttpContext
 from .target import select_one
 
 _FLASHVARS_START_RE = re.compile(r"var\s+flashvars_\d+\s*=\s*\{")
+_JSONLD_SCRIPT_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+_SUBMITTED_DATE_RE = re.compile(r"Submitted:\s*(\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE)
+_ISO_DURATION_RE = re.compile(
+    r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$",
+    re.IGNORECASE,
+)
+
+
+def parse_duration_seconds(raw: Any) -> int:
+    """Parse ``MM:SS``, ``HH:MM:SS``, ISO-8601 ``PT..``, or numeric seconds into an integer."""
+    if raw is None or isinstance(raw, bool):
+        return 0
+    if isinstance(raw, (int, float)):
+        return max(0, int(raw))
+    text = str(raw).strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return max(0, int(text))
+    m_iso = _ISO_DURATION_RE.match(text)
+    if m_iso and any(m_iso.groups()):
+        hours = int(m_iso.group(1) or 0)
+        minutes = int(m_iso.group(2) or 0)
+        seconds = int(m_iso.group(3) or 0)
+        return max(0, hours * 3600 + minutes * 60 + seconds)
+    if ":" in text:
+        parts = text.split(":")
+        if 2 <= len(parts) <= 3 and all(p.strip().isdigit() for p in parts):
+            nums = [int(p.strip()) for p in parts]
+            if len(nums) == 2:
+                return max(0, nums[0] * 60 + nums[1])
+            return max(0, nums[0] * 3600 + nums[1] * 60 + nums[2])
+    return 0
+
+
+def extract_detail_published_and_duration(
+    html: str,
+    video_data: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, int]:
+    """Extract ``(YYYY-MM-DD, duration_seconds)`` from detail-page HTML without DOM parsing."""
+    published_at = ""
+    duration_seconds = 0
+    thumb_candidate = ""
+
+    if html:
+        for match in _JSONLD_SCRIPT_RE.finditer(html):
+            body = (match.group(1) or "").strip()
+            if not body:
+                continue
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            nodes = parsed if isinstance(parsed, list) else [parsed]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if not published_at:
+                    published_at = normalize_published_date(node.get("uploadDate") or node.get("datePublished"))
+                if duration_seconds <= 0:
+                    duration_seconds = parse_duration_seconds(node.get("duration"))
+                if not thumb_candidate and isinstance(node.get("thumbnailUrl"), str):
+                    thumb_candidate = node["thumbnailUrl"]
+            if published_at and duration_seconds > 0:
+                break
+
+        if not published_at:
+            m_sub = _SUBMITTED_DATE_RE.search(html)
+            if m_sub:
+                published_at = normalize_published_date(m_sub.group(1))
+
+    if isinstance(video_data, dict):
+        if duration_seconds <= 0:
+            duration_seconds = parse_duration_seconds(
+                video_data.get("video_duration") or video_data.get("duration")
+            )
+        if not published_at:
+            published_at = extract_date_from_cdn_url(
+                video_data.get("image_url") or video_data.get("poster") or ""
+            )
+
+    if not published_at and thumb_candidate:
+        published_at = extract_date_from_cdn_url(thumb_candidate)
+
+    return published_at, duration_seconds
 
 
 @dataclass(frozen=True)
@@ -42,6 +131,8 @@ class VideoDetail:
     error: Optional[str] = None
     filtered_out: bool = False
     mp4_sources: Tuple[MediaSource, ...] = ()
+    published_at: str = ""
+    duration_seconds: int = 0
 
 
 def extract_viewkey_from_url(url: Optional[str]) -> Optional[str]:
@@ -324,8 +415,9 @@ def _parse_video_html_fields(
     selectors: SelectorSettings,
     uploader_hint: Optional[Tuple[str, str]],
     skip_dom: bool,
-) -> Tuple[Optional[Dict[str, Any]], str, str, str]:
+) -> Tuple[Optional[Dict[str, Any]], str, str, str, str, int]:
     vdata = extract_flashvars(html, final_url, vkey)
+    published_at, duration_seconds = extract_detail_published_and_duration(html, vdata)
     js_title = (vdata or {}).get("video_title")
     title = html_lib.unescape(str(js_title).strip()) if js_title else ""
     if uploader_hint and uploader_hint[0]:
@@ -341,7 +433,37 @@ def _parse_video_html_fields(
             uploader_name, uploader_type = _extract_uploader(tree, vdata, selectors)
     if not title:
         title = f"未知标题_{vkey or os.path.basename(final_url)}"
-    return vdata, title, uploader_name, uploader_type
+    return vdata, title, uploader_name, uploader_type, published_at, duration_seconds
+
+
+async def fetch_video_published_meta(
+    ctx: TaskHttpContext,
+    page_url: str,
+    *,
+    timeout: Optional[float] = None,
+) -> Tuple[str, int, Optional[str]]:
+    """Fetch only the detail HTML (no ``get_media`` call) to read ``(published_at, duration_seconds, error)``."""
+    vkey = extract_viewkey_from_url(page_url) or ""
+    page_timeout = max(5.0, float(timeout or 15.0))
+    res, err = await ctx.fetch_with_pow(
+        page_url, timeout=page_timeout, log_label=f"详情日期 {vkey or page_url}",
+    )
+    if res is None:
+        return "", 0, err or "页面获取失败"
+    if res.status_code == 404:
+        return "", 0, "404 无效/已删除视频"
+    if res.status_code >= 400:
+        return "", 0, f"详情页返回 HTTP {res.status_code}"
+
+    def _parse(body: str = res.text, url: str = res.final_url) -> Tuple[str, int]:
+        vdata = extract_flashvars(body, url, vkey)
+        return extract_detail_published_and_duration(body, vdata)
+
+    if len(res.text) >= _OFFLOAD_HTML_THRESHOLD:
+        pub, dur = await asyncio.to_thread(_parse)
+    else:
+        pub, dur = _parse()
+    return pub, dur, None
 
 
 async def fetch_single_video_detail(
@@ -393,7 +515,7 @@ async def fetch_single_video_detail(
             return VideoDetail(viewkey=vkey, title="", page_url=page_url, referer_url=final_url, error="操作已取消")
 
         if len(html) >= _OFFLOAD_HTML_THRESHOLD:
-            vdata, title, uploader_name, uploader_type = await asyncio.to_thread(
+            vdata, title, uploader_name, uploader_type, published_at, duration_seconds = await asyncio.to_thread(
                 _parse_video_html_fields,
                 html,
                 final_url,
@@ -403,7 +525,7 @@ async def fetch_single_video_detail(
                 skip_dom,
             )
         else:
-            vdata, title, uploader_name, uploader_type = _parse_video_html_fields(
+            vdata, title, uploader_name, uploader_type, published_at, duration_seconds = _parse_video_html_fields(
                 html,
                 final_url,
                 vkey,
@@ -425,6 +547,8 @@ async def fetch_single_video_detail(
                 item_num=item_num,
                 error=kw_reason,
                 filtered_out=True,
+                published_at=published_at,
+                duration_seconds=duration_seconds,
             )
 
         media_defs = (vdata or {}).get("mediaDefinitions")
@@ -485,6 +609,8 @@ async def fetch_single_video_detail(
                         page_num=page_num,
                         item_num=item_num,
                         error=err or "无可用 MP4 源",
+                        published_at=published_at,
+                        duration_seconds=duration_seconds,
                     )
                 continue
             return VideoDetail(
@@ -497,6 +623,8 @@ async def fetch_single_video_detail(
                 page_num=page_num,
                 item_num=item_num,
                 error="媒体接口获取失败" if media_lookup_failed else "无可用 MP4 媒体源",
+                published_at=published_at,
+                duration_seconds=duration_seconds,
             )
 
         dl_url, quality, sel_err = select_best_mp4_option(mp4_options, preferred_qualities)
@@ -512,6 +640,8 @@ async def fetch_single_video_detail(
                 item_num=item_num,
                 error="媒体接口获取失败，无法确认全部可用画质" if media_lookup_failed else sel_err or "筛选后无可用链接",
                 filtered_out=bool(preferred_qualities and not media_lookup_failed),
+                published_at=published_at,
+                duration_seconds=duration_seconds,
             )
 
         return VideoDetail(
@@ -527,6 +657,8 @@ async def fetch_single_video_detail(
             page_num=page_num,
             item_num=item_num,
             mp4_sources=_describe_media_sources(mp4_options) if include_mp4_sources else (),
+            published_at=published_at,
+            duration_seconds=duration_seconds,
         )
 
 

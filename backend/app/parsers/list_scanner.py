@@ -13,8 +13,10 @@ from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from ..cancel import StopRequested, until_stopped
 from ..config import SelectorSettings
+from ..services.filename import extract_date_from_cdn_url
 from .http_session import TaskHttpContext
 from .target import select_many, select_one
+from .video import parse_duration_seconds
 
 PH_BASE_URL = "https://www.pornhub.com"
 _MAX_SCOPE = 10_000
@@ -29,6 +31,8 @@ class ListedVideo:
     page_num: int
     item_num: int
     total_on_page: int
+    published_at: str = ""
+    duration_seconds: int = 0
 
 
 def parse_page_specs(spec_str: Optional[str]) -> Optional[List[int]]:
@@ -87,12 +91,40 @@ def build_target_list_url(username: Optional[str], target_type: str) -> str:
     return f"{PH_BASE_URL}/{t}/{quoted}/videos"
 
 
-def extract_video_links_from_list_page(
+def _extract_card_published_and_duration(li) -> Tuple[str, int]:
+    published_at = ""
+    duration_seconds = 0
+    try:
+        imgs = li.css("img")
+    except Exception:
+        imgs = []
+    # Prefer `data-mediabook` (preview video URL) because it stays anchored to the
+    # original ingest date even if a creator later swaps the custom thumbnail.
+    for attr_name in ("data-mediabook", "data-path", "data-mediumthumb", "data-thumb_url", "data-src", "src"):
+        for img in imgs:
+            img_attrs = getattr(img, "attributes", {}) or {}
+            cand = extract_date_from_cdn_url(img_attrs.get(attr_name))
+            if cand:
+                published_at = cand
+                break
+        if published_at:
+            break
+    if not published_at:
+        raw_html = getattr(li, "html", "") or ""
+        published_at = extract_date_from_cdn_url(raw_html)
+
+    dur_node = select_one(li, ["var.duration", ".duration"])
+    if dur_node is not None:
+        duration_seconds = parse_duration_seconds(dur_node.text() or "")
+    return published_at, duration_seconds
+
+
+def extract_video_cards_from_list_page(
     html: str,
     selectors: SelectorSettings,
     target_type: Optional[str] = None,
-) -> List[Tuple[str, str, str]]:
-    """Extract unique (viewkey, full_url, title) items from a list-page HTML."""
+) -> List[Tuple[str, str, str, str, int]]:
+    """Extract unique ``(viewkey, full_url, title, published_at, duration_seconds)`` items from list HTML."""
     if not html:
         return []
     tree = HTMLParser(html)
@@ -141,7 +173,7 @@ def extract_video_links_from_list_page(
     combined_link_sel = ", ".join(link_sels)
     span_title_sels = selectors.split_list("list_page_video_span_div_for_title")
 
-    results: List[Tuple[str, str, str]] = []
+    results: List[Tuple[str, str, str, str, int]] = []
     seen_vkeys: Set[str] = set()
 
     for li in li_items:
@@ -183,10 +215,23 @@ def extract_video_links_from_list_page(
         if not title:
             title = "未知标题"
 
+        published_at, duration_seconds = _extract_card_published_and_duration(li)
         seen_vkeys.add(vkey)
-        results.append((vkey, urllib.parse.urljoin(PH_BASE_URL, href), title))
+        results.append((vkey, urllib.parse.urljoin(PH_BASE_URL, href), title, published_at, duration_seconds))
 
     return results
+
+
+def extract_video_links_from_list_page(
+    html: str,
+    selectors: SelectorSettings,
+    target_type: Optional[str] = None,
+) -> List[Tuple[str, str, str]]:
+    """Extract unique (viewkey, full_url, title) items from a list-page HTML."""
+    return [
+        (vkey, url, title)
+        for vkey, url, title, _, _ in extract_video_cards_from_list_page(html, selectors, target_type=target_type)
+    ]
 
 
 def _normalize_avatar_name(value: Optional[str]) -> str:
@@ -392,17 +437,17 @@ async def scan_list_pages(
                 def _parse_page_sync(
                     html_body: str = res.text,
                     fetch_profile: bool = want_profile,
-                ) -> Tuple[List[Tuple[str, str, str]], str, str]:
+                ) -> Tuple[List[Tuple[str, str, str, str, int]], str, str]:
                     av = extract_target_avatar(html_body, profile_username) if fetch_profile else ""
                     dn = extract_target_display_name(html_body, profile_username) if fetch_profile else ""
-                    items = extract_video_links_from_list_page(html_body, selectors, target_type=target_type)
+                    items = extract_video_cards_from_list_page(html_body, selectors, target_type=target_type)
                     return items, av, dn
 
                 raw_items, avatar_url, display_name = await asyncio.to_thread(_parse_page_sync)
             else:
                 avatar_url = extract_target_avatar(res.text, profile_username) if want_profile else ""
                 display_name = extract_target_display_name(res.text, profile_username) if want_profile else ""
-                raw_items = extract_video_links_from_list_page(res.text, selectors, target_type=target_type)
+                raw_items = extract_video_cards_from_list_page(res.text, selectors, target_type=target_type)
 
             if want_profile and (avatar_url or display_name):
                 profile_found = True
@@ -427,7 +472,7 @@ async def scan_list_pages(
             if specific_map and any(index >= total_on_page for index in specific_map[current_page]):
                 report_error(current_page, f"部分指定位置超出此页 {total_on_page} 个视频")
             page_videos: List[ListedVideo] = []
-            for idx, (vkey, url, title) in enumerate(raw_items, start=1):
+            for idx, (vkey, url, title, published_at, duration_seconds) in enumerate(raw_items, start=1):
                 if specific_map and current_page in specific_map:
                     if (idx - 1) not in specific_map[current_page]:
                         continue
@@ -445,6 +490,8 @@ async def scan_list_pages(
                         page_num=current_page,
                         item_num=idx,
                         total_on_page=total_on_page,
+                        published_at=published_at,
+                        duration_seconds=duration_seconds,
                     )
                 )
                 added_this_page += 1

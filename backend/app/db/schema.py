@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -143,6 +143,17 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ON videos(LOWER(uploader), COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
             "CREATE INDEX IF NOT EXISTS idx_videos_quality_activity "
             "ON videos(quality, COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
+        ],
+    ),
+    (
+        8,
+        [
+            "ALTER TABLE videos ADD COLUMN published_at TEXT NOT NULL DEFAULT '';",
+            "ALTER TABLE videos ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE job_items ADD COLUMN published_at TEXT NOT NULL DEFAULT '';",
+            "ALTER TABLE job_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0;",
+            "CREATE INDEX IF NOT EXISTS idx_videos_published_sort "
+            "ON videos(published_at DESC, COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
         ],
     ),
 ]

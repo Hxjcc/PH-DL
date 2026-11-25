@@ -26,6 +26,7 @@ class UploadQueuedItem:
     page_url: str = ""
     file_size: int = 0
     enqueued_seq: int = 0
+    published_at: str = ""
 
 
 class AdaptiveDiskScheduler:

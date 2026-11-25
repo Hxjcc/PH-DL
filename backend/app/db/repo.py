@@ -440,6 +440,8 @@ class Repository:
         *,
         quality: str = "",
         file_size: int = 0,
+        published_at: str = "",
+        duration_seconds: int = 0,
     ) -> bool:
         sets: List[str] = []
         params: List[Any] = []
@@ -449,6 +451,12 @@ class Repository:
         if int(file_size or 0) > 0:
             sets.append("file_size = ?")
             params.append(int(file_size))
+        if (published_at or "").strip():
+            sets.append("published_at = ?")
+            params.append(published_at.strip())
+        if int(duration_seconds or 0) > 0:
+            sets.append("duration_seconds = ?")
+            params.append(int(duration_seconds))
         if not sets:
             return False
         params.append(viewkey)
@@ -458,12 +466,72 @@ class Repository:
         )
         return True
 
+    async def backfill_videos_published_meta(
+        self,
+        updates: List[Tuple[str, str, int]],
+    ) -> int:
+        """Fill missing ``published_at`` / ``duration_seconds`` for existing ``videos`` rows."""
+        clean = [
+            (pub.strip(), int(dur or 0), vk.strip())
+            for vk, pub, dur in updates
+            if (vk or "").strip() and ((pub or "").strip() or int(dur or 0) > 0)
+        ]
+        if not clean:
+            return 0
+        await self.db.executemany(
+            """
+            UPDATE videos
+            SET published_at = CASE WHEN published_at = '' AND ? != '' THEN ? ELSE published_at END,
+                duration_seconds = CASE WHEN duration_seconds <= 0 AND ? > 0 THEN ? ELSE duration_seconds END
+            WHERE viewkey = ?
+              AND (
+                  (published_at = '' AND ? != '')
+                  OR (duration_seconds <= 0 AND ? > 0)
+              )
+            """,
+            [(pub, pub, dur, dur, vk, pub, dur) for pub, dur, vk in clean],
+        )
+        return len(clean)
+
+    async def update_video_remote_path(self, viewkey: str, remote_path: str) -> None:
+        if not viewkey or not remote_path:
+            return
+        await self.db.execute(
+            "UPDATE videos SET remote_path = ? WHERE viewkey = ?",
+            (remote_path.strip(), viewkey.strip()),
+        )
+
+    async def list_remote_date_rename_candidates(self, limit: int = 0) -> List[Dict[str, Any]]:
+        from ..services.filename import has_date_prefix
+
+        rows = await self.db.fetch_all(
+            """
+            SELECT viewkey, title, uploader, target_type, quality, file_size,
+                   video_page_url, remote_path, published_at, duration_seconds
+            FROM videos
+            WHERE status = 'uploaded' AND remote_path != ''
+            ORDER BY LOWER(uploader) ASC, COALESCE(uploaded_at, created_at) ASC, viewkey ASC
+            """
+        )
+        filtered = [row for row in rows if not has_date_prefix(row.get("remote_path"))]
+        if limit > 0:
+            return filtered[: int(limit)]
+        return filtered
+
+    async def count_remote_date_rename_candidates(self) -> int:
+        from ..services.filename import has_date_prefix
+
+        rows = await self.db.fetch_all(
+            "SELECT remote_path FROM videos WHERE status = 'uploaded' AND remote_path != ''"
+        )
+        return sum(1 for row in rows if not has_date_prefix(row.get("remote_path")))
+
     _UPSERT_VIDEO_SQL = """
         INSERT INTO videos (
             viewkey, title, uploader, target_type, quality, video_page_url,
             status, local_path, remote_path, file_size, downloaded_at, uploaded_at, created_at,
-            upload_requested
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            upload_requested, published_at, duration_seconds
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(viewkey) DO UPDATE SET
             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE videos.title END,
             uploader = CASE WHEN excluded.uploader != '' THEN excluded.uploader ELSE videos.uploader END,
@@ -501,7 +569,9 @@ class Repository:
                 WHEN ? = 1 AND excluded.status = 'downloaded' THEN NULL
                 ELSE COALESCE(excluded.uploaded_at, videos.uploaded_at)
             END,
-            upload_requested = COALESCE(?, videos.upload_requested)
+            upload_requested = COALESCE(?, videos.upload_requested),
+            published_at = CASE WHEN excluded.published_at != '' THEN excluded.published_at ELSE videos.published_at END,
+            duration_seconds = CASE WHEN excluded.duration_seconds > 0 THEN excluded.duration_seconds ELSE videos.duration_seconds END
     """
 
     @staticmethod
@@ -521,6 +591,8 @@ class Repository:
         uploaded_at: Optional[str] = None,
         force_status: bool = False,
         upload_requested: Optional[bool] = None,
+        published_at: str = "",
+        duration_seconds: int = 0,
         now_iso: Optional[str] = None,
     ) -> tuple[Any, ...]:
         now = now_iso or utc_now_iso()
@@ -544,6 +616,8 @@ class Repository:
             uploaded_at,
             now,
             int(bool(upload_requested)),
+            (published_at or "").strip(),
+            max(0, int(duration_seconds or 0)),
             explicit_type,
             explicit_type,
             explicit_url,
@@ -572,6 +646,8 @@ class Repository:
         uploaded_at: Optional[str] = None,
         force_status: bool = False,
         upload_requested: Optional[bool] = None,
+        published_at: str = "",
+        duration_seconds: int = 0,
     ) -> None:
         if not viewkey:
             return
@@ -590,6 +666,8 @@ class Repository:
             uploaded_at=uploaded_at,
             force_status=force_status,
             upload_requested=upload_requested,
+            published_at=published_at,
+            duration_seconds=duration_seconds,
         )
         await self.db.execute(self._UPSERT_VIDEO_SQL, params)
 
@@ -623,6 +701,8 @@ class Repository:
                     uploaded_at=rec.get("uploaded_at"),
                     force_status=bool(rec.get("force_status", False)),
                     upload_requested=rec.get("upload_requested"),
+                    published_at=str(rec.get("published_at") or ""),
+                    duration_seconds=int(rec.get("duration_seconds") or 0),
                     now_iso=now,
                 )
             )
@@ -716,6 +796,7 @@ class Repository:
         uploader: str = "",
         status: str = "",
         quality: str = "",
+        sort_by: str = "activity",
         page: int = 1,
         page_size: int = 30,
     ) -> Tuple[List[Dict[str, Any]], int]:
@@ -755,14 +836,26 @@ class Repository:
         )
         total = int(total_row["cnt"]) if total_row else 0
 
+        if (sort_by or "").strip().lower() == "published":
+            order_sql = (
+                "(v.published_at = '') ASC, "
+                "v.published_at DESC, "
+                "COALESCE(v.downloaded_at, v.uploaded_at, v.created_at) DESC, "
+                "v.viewkey DESC"
+            )
+        else:
+            order_sql = (
+                "COALESCE(v.downloaded_at, v.uploaded_at, v.created_at) DESC, "
+                "v.viewkey DESC"
+            )
+
         offset = max(0, (page - 1) * page_size)
         rows = await self.db.fetch_all(
             f"""
             SELECT v.*
             FROM videos v
             {where_sql}
-            ORDER BY COALESCE(v.downloaded_at, v.uploaded_at, v.created_at) DESC,
-                     v.viewkey DESC
+            ORDER BY {order_sql}
             LIMIT ? OFFSET ?
             """,
             [*params, page_size, offset],
@@ -809,6 +902,7 @@ class Repository:
             if r["status"] in counts:
                 counts[r["status"]] = c
         counts["baseline_missing_metadata"] = await self.count_baseline_metadata_candidates()
+        counts["pending_remote_date_rename"] = await self.count_remote_date_rename_candidates()
         return counts
 
     # ------------------------------------------------------------------
@@ -987,8 +1081,9 @@ class Repository:
             INSERT INTO job_items (
                 job_id, viewkey, title, uploader, target_type, page_url,
                 download_url, referer_url, quality, status, temp_path, local_path,
-                bytes_downloaded, updated_at, upload_requested, error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                bytes_downloaded, updated_at, upload_requested, error_message,
+                published_at, duration_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
         """
         for start in range(0, len(items), step):
@@ -1013,6 +1108,8 @@ class Repository:
                         now,
                         None if up_req is None else int(bool(up_req)),
                         spec.get("error_message", ""),
+                        str(spec.get("published_at") or "").strip(),
+                        max(0, int(spec.get("duration_seconds") or 0)),
                     )
                     async with conn.execute(sql, params) as cur:
                         row = await cur.fetchone()
@@ -1038,14 +1135,17 @@ class Repository:
         bytes_downloaded: int = 0,
         upload_requested: Optional[bool] = None,
         error_message: str = "",
+        published_at: str = "",
+        duration_seconds: int = 0,
     ) -> Dict[str, Any]:
         item_id = await self.db.execute(
             """
             INSERT INTO job_items (
                 job_id, viewkey, title, uploader, target_type, page_url,
                 download_url, referer_url, quality, status, temp_path, local_path,
-                bytes_downloaded, updated_at, upload_requested, error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                bytes_downloaded, updated_at, upload_requested, error_message,
+                published_at, duration_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -1064,6 +1164,8 @@ class Repository:
                 utc_now_iso(),
                 None if upload_requested is None else int(upload_requested),
                 error_message,
+                (published_at or "").strip(),
+                max(0, int(duration_seconds or 0)),
             ),
         )
         return (await self.get_job_item(item_id)) or {}
@@ -1103,6 +1205,8 @@ class Repository:
             "retry_count",
             "error_message",
             "upload_requested",
+            "published_at",
+            "duration_seconds",
         }
         sets = ["updated_at = ?"]
         params: List[Any] = [utc_now_iso()]
@@ -1132,7 +1236,7 @@ class Repository:
             total += c
             if st == "done":
                 done += c
-                if job_kind != "enrich_metadata":
+                if job_kind not in {"enrich_metadata", "rename_remote_dates"}:
                     uploaded += c
             elif st in {"downloaded", "uploading"}:
                 done += c

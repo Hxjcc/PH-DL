@@ -32,6 +32,7 @@ const selectedJobIds = ref(new Set())
 const focusedJobId = ref(null)
 const changingLimit = ref(false)
 const categoryFilter = ref('all')
+const isRouteActive = ref(true)
 const limitOptions = JOB_LIMITS.map((value) => ({ label: `${value} 条`, value }))
 const allLoadedJobs = computed(() => store.jobs.slice(0, store.jobsLimit))
 
@@ -94,7 +95,7 @@ function syncJobQuery(nextId, { immediate = false } = {}) {
   if (immediate) {
     apply()
   } else {
-    syncQueryTimer = setTimeout(apply, 220)
+    syncQueryTimer = setTimeout(apply, 360)
   }
 }
 
@@ -238,6 +239,7 @@ async function handleBatchDeleteJobs() {
 let activatedOnce = false
 
 onActivated(async () => {
+  isRouteActive.value = true
   const tasks = []
   if (store.targetsCache === null) {
     tasks.push(store.ensureTargets())
@@ -255,6 +257,7 @@ onActivated(async () => {
 })
 
 onDeactivated(() => {
+  isRouteActive.value = false
   clearPendingQuerySync()
 })
 
@@ -290,8 +293,8 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <Card class="overflow-hidden">
-      <div class="px-5 py-3.5 border-b border-border bg-surface-subtle flex flex-wrap items-center justify-between gap-3 min-h-[56px]">
+    <Card>
+      <div class="px-5 py-3.5 border-b border-border bg-surface-subtle rounded-t-[calc(var(--radius-2xl)-1px)] flex flex-wrap items-center justify-between gap-3 min-h-[56px]">
         <div class="flex flex-wrap items-center gap-2">
           <!-- Category Filter Pills -->
           <div class="flex flex-wrap items-center gap-1.5">
@@ -360,14 +363,14 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div v-if="!store.jobsLoaded" class="py-16 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
+      <div v-if="!store.jobsLoaded" class="py-16 rounded-b-[calc(var(--radius-2xl)-1px)] flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
         <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
         <span>任务队列加载中...</span>
       </div>
 
       <div
         v-else-if="visibleJobs.length === 0"
-        class="py-16 px-6 flex flex-col items-center text-center bg-card"
+        class="py-16 px-6 rounded-b-[calc(var(--radius-2xl)-1px)] flex flex-col items-center text-center bg-card"
       >
         <div class="w-11 h-11 rounded-2xl bg-brand/10 text-brand flex items-center justify-center mb-3">
           <Inbox class="w-5 h-5" />
@@ -380,17 +383,18 @@ onBeforeUnmount(() => {
         </p>
       </div>
 
-      <div v-else class="p-4 space-y-3 bg-background">
+      <div v-else class="jobs-list p-4 space-y-3 bg-background rounded-b-[calc(var(--radius-2xl)-1px)]">
         <JobCard
           v-for="job in visibleJobs"
           :id="`job-${job.id}`"
           :key="job.id"
-          v-memo="[job, job.id === runningJobId, job.id === focusedJobId, selectedJobIds.has(job.id)]"
+          v-memo="[job, job.id === runningJobId, job.id === focusedJobId, selectedJobIds.has(job.id), isRouteActive]"
           :job="job"
           :default-expanded="job.id === runningJobId || job.id === focusedJobId"
           :focused="job.id === focusedJobId"
           :selectable="true"
           :selected="selectedJobIds.has(job.id)"
+          :route-active="isRouteActive"
           @toggle-select="toggleSelectJob"
           @activate="handleJobActivate"
           @deleted="handleJobDeleted"
@@ -399,3 +403,9 @@ onBeforeUnmount(() => {
     </Card>
   </div>
 </template>
+
+<style scoped>
+.jobs-list {
+  contain: layout;
+}
+</style>

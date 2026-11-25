@@ -25,6 +25,7 @@ import {
   Link2,
   FileText,
   Heart,
+  CalendarDays,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
@@ -197,6 +198,7 @@ const showTempBanner = computed(
 const legacyTempCount = computed(() => store.tempFiles.filter((file) => !file.verified_checkpoint).length)
 
 const recentJobs = computed(() => store.jobs.slice(0, 5))
+const isRouteActive = ref(true)
 const brokenRecentAvatars = ref(new Set())
 const RECENT_CATEGORY_ICONS = {
   download: Download,
@@ -208,6 +210,7 @@ const RECENT_CATEGORY_ICONS = {
   database: Database,
   rotate: RotateCcw,
   sparkles: Sparkles,
+  calendar: CalendarDays,
 }
 
 function isRecentAvatarValid(entry) {
@@ -221,11 +224,17 @@ function markRecentAvatarBroken(url) {
   brokenRecentAvatars.value = next
 }
 
-const recentJobCards = computed(() =>
-  recentJobs.value.map((job) => {
+const recentJobCards = computed(() => {
+  const trackLive = isRouteActive.value
+  return recentJobs.value.map((job) => {
     const visual = resolveJobVisual(job, store.targetsCache || [])
-    const metrics = computeJobLiveMetrics(job, store.liveProgress, store.jobItems[job.id], store.scanStatus)
     const isActive = ['queued', 'scanning', 'running'].includes(job.status)
+    const metrics = computeJobLiveMetrics(
+      job,
+      trackLive && isActive ? store.liveProgress : null,
+      store.jobItems[job.id],
+      trackLive && isActive ? store.scanStatus : null
+    )
     return {
       job,
       visual,
@@ -234,7 +243,7 @@ const recentJobCards = computed(() =>
       icon: RECENT_CATEGORY_ICONS[visual.category.icon] || Download,
     }
   })
-)
+})
 const quickTargets = computed(() =>
   (store.targetsCache || []).filter((target) => target.enabled)
 )
@@ -442,6 +451,7 @@ watch(quickRailRef, (el, prev) => {
 })
 
 onDeactivated(() => {
+  isRouteActive.value = false
   stopQuickGlide({ immediate: true })
 })
 
@@ -454,6 +464,7 @@ onBeforeUnmount(() => {
 let activatedOnce = false
 
 onActivated(async () => {
+  isRouteActive.value = true
   nextTick(updateQuickScrollState)
   if (!activatedOnce) {
     activatedOnce = true

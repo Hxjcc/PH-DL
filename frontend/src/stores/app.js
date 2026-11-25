@@ -10,6 +10,7 @@ export const DEFAULT_HISTORY_FILTERS = Object.freeze({
   uploader: '',
   status: '',
   quality: '',
+  sort_by: 'activity',
   page: 1,
   page_size: 30,
 })
@@ -17,6 +18,7 @@ export const DEFAULT_HISTORY_FILTERS = Object.freeze({
 const SESSION_CACHE_KEY = 'phdl-session-cache-v1'
 const SESSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
+const LIVE_PROGRESS_FLUSH_MS = 140
 
 const inflight = new Map()
 const latestSeq = new Map()
@@ -24,6 +26,55 @@ let sessionEpoch = 0
 let persistTimer = null
 let persistIdleId = null
 let persistGen = 0
+let pendingLiveProgress = null
+let liveProgressFlushTimer = null
+
+function clearPendingLiveProgress() {
+  if (liveProgressFlushTimer !== null) {
+    clearTimeout(liveProgressFlushTimer)
+    liveProgressFlushTimer = null
+  }
+  pendingLiveProgress = null
+}
+
+function clearLiveProgressForJob(store, jobId) {
+  const jid = Number(jobId)
+  if (!jid) return
+  if (pendingLiveProgress) {
+    for (const [itemId, payload] of pendingLiveProgress) {
+      if (Number(payload?.job_id) === jid) {
+        pendingLiveProgress.delete(itemId)
+      }
+    }
+  }
+  for (const [itemId, payload] of Object.entries(store.liveProgress || {})) {
+    if (Number(payload?.job_id) === jid) {
+      delete store.liveProgress[itemId]
+    }
+  }
+}
+
+function flushPendingLiveProgress(store) {
+  if (liveProgressFlushTimer !== null) {
+    clearTimeout(liveProgressFlushTimer)
+    liveProgressFlushTimer = null
+  }
+  if (!pendingLiveProgress) return
+  const batch = pendingLiveProgress
+  pendingLiveProgress = null
+  for (const [itemId, payload] of batch) {
+    store.liveProgress[itemId] = payload
+  }
+}
+
+function queueLiveProgress(store, payload) {
+  if (!payload || payload.item_id == null) return
+  if (!pendingLiveProgress) pendingLiveProgress = new Map()
+  pendingLiveProgress.set(payload.item_id, payload)
+  if (liveProgressFlushTimer === null) {
+    liveProgressFlushTimer = setTimeout(() => flushPendingLiveProgress(store), LIVE_PROGRESS_FLUSH_MS)
+  }
+}
 
 function cancelScheduledPersist() {
   if (persistTimer !== null) {
@@ -340,6 +391,7 @@ export const useAppStore = defineStore('app', {
         clearTimeout(this._overviewTimer)
         this._overviewTimer = null
       }
+      clearPendingLiveProgress()
       clearSessionCache()
       this.hydratedFromCache = false
       this.authenticated = false
@@ -852,6 +904,7 @@ export const useAppStore = defineStore('app', {
 
     _upsertItem(item) {
       if (item.status !== 'downloading' && item.status !== 'uploading') {
+        pendingLiveProgress?.delete(item.id)
         delete this.liveProgress[item.id]
       }
       const list = this.jobItems[item.job_id]
@@ -899,6 +952,7 @@ export const useAppStore = defineStore('app', {
         },
         onEvent: (msg) => {
           if (msg.type === 'snapshot') {
+            clearPendingLiveProgress()
             this._applyLogsSnapshot(msg.data?.logs || [])
             this.liveProgress = msg.data?.live_progress || {}
             this.schedulerStatus = msg.data?.scheduler_status || {}
@@ -908,13 +962,13 @@ export const useAppStore = defineStore('app', {
             const nextLogs = appendLiveLog(this.logs, entry, 500)
             if (nextLogs !== this.logs) {
               this.logs = nextLogs
-              this.persistCache()
             }
             this.logsLoaded = true
           } else if (msg.type === 'job_updated') {
             this._upsertJob(msg.data)
             this._scheduleOverviewRefresh()
             if (['completed', 'cancelled', 'failed', 'partial_failed'].includes(msg.data?.status)) {
+              clearLiveProgressForJob(this, msg.data.id)
               delete this.schedulerStatus[msg.data.id]
               delete this.scanStatus[msg.data.id]
               this.refreshTempFiles()
@@ -926,7 +980,7 @@ export const useAppStore = defineStore('app', {
           } else if (msg.type === 'item_updated') {
             this._upsertItem(msg.data)
           } else if (msg.type === 'item_progress') {
-            this.liveProgress[msg.data.item_id] = msg.data
+            queueLiveProgress(this, msg.data)
           } else if (msg.type === 'job_scheduler') {
             const jid = Number(msg.data?.job_id)
             if (jid > 0) {
@@ -954,6 +1008,7 @@ export const useAppStore = defineStore('app', {
     },
 
     stopRealtime() {
+      clearPendingLiveProgress()
       if (this._wsGraceTimer) {
         clearTimeout(this._wsGraceTimer)
         this._wsGraceTimer = null

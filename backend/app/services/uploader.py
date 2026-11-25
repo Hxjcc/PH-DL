@@ -47,6 +47,7 @@ class UploadBatchResult:
     remote_dir: str = ""
     error: str = ""
     verified_sources: Dict[str, FileSnapshot] = field(default_factory=dict)
+    remote_paths: Dict[str, str] = field(default_factory=dict)
 
 
 def file_snapshot(path: Path) -> Optional[FileSnapshot]:
@@ -411,9 +412,11 @@ async def _verify_remote_file_detailed(
     snapshot: FileSnapshot,
     settings: RuntimeSettings,
     *,
+    remote_relative: Optional[str] = None,
     cancel_event: Optional[asyncio.Event] = None,
 ) -> Tuple[bool, str]:
     """Verify remote file existence, exact size, and hash (optional download check)."""
+    remote_rel = (remote_relative or relative).strip()
     rc, stdout, stderr = await _run_cmd(
         [
             rclone,
@@ -421,7 +424,7 @@ async def _verify_remote_file_detailed(
             "--stat",
             "--no-mimetype",
             "--no-modtime",
-            f"{remote_dir}/{relative}",
+            f"{remote_dir}/{remote_rel}",
             "--hash",
             f"--log-level={settings.rclone_log_level}",
         ],
@@ -474,19 +477,130 @@ async def _verify_remote_file_detailed(
     if not getattr(settings, "rclone_verify_download", False):
         return True, ""
 
-    with _upload_file_list([relative]) as check_list:
-        rc, matching, stderr_chk = await _run_cmd(
-            [rclone, "check", str(download_dir), remote_dir,
-             "--one-way", "--download", "--match", "-", "--files-from-raw", str(check_list),
-             f"--log-level={settings.rclone_log_level}"],
+    if remote_rel == relative:
+        with _upload_file_list([relative]) as check_list:
+            rc, matching, stderr_chk = await _run_cmd(
+                [rclone, "check", str(download_dir), remote_dir,
+                 "--one-way", "--download", "--match", "-", "--files-from-raw", str(check_list),
+                 f"--log-level={settings.rclone_log_level}"],
+                timeout=settings.rclone_timeout_seconds,
+                cancel_event=cancel_event,
+            )
+        if rc == 0 and relative in matching.splitlines():
+            return True, ""
+        err_lines = [line.strip() for line in (stderr_chk or "").splitlines() if line.strip()]
+        detail = err_lines[-1] if err_lines else f"check exit={rc}"
+        return False, f"远端回下校验未通过 ({detail})"
+
+    with tempfile.TemporaryDirectory(prefix="phdl_verify_") as tmp_dir:
+        verify_copy = Path(tmp_dir) / Path(remote_rel).name
+        rc_dl, _, stderr_dl = await _run_cmd(
+            [
+                rclone,
+                "copyto",
+                f"{remote_dir}/{remote_rel}",
+                str(verify_copy),
+                f"--log-level={settings.rclone_log_level}",
+            ],
             timeout=settings.rclone_timeout_seconds,
             cancel_event=cancel_event,
         )
-    if rc == 0 and relative in matching.splitlines():
-        return True, ""
-    err_lines = [line.strip() for line in (stderr_chk or "").splitlines() if line.strip()]
-    detail = err_lines[-1] if err_lines else f"check exit={rc}"
-    return False, f"远端回下校验未通过 ({detail})"
+        if rc_dl != 0 or not verify_copy.is_file():
+            err_lines = [line.strip() for line in (stderr_dl or "").splitlines() if line.strip()]
+            detail = err_lines[-1] if err_lines else f"copyto exit={rc_dl}"
+            return False, f"远端回下校验未通过 ({detail})"
+
+        def _same_sha256() -> bool:
+            with local_path.open("rb") as a, verify_copy.open("rb") as b:
+                return hashlib.file_digest(a, "sha256").hexdigest() == hashlib.file_digest(b, "sha256").hexdigest()
+
+        try:
+            if await asyncio.to_thread(_same_sha256):
+                return True, ""
+        except OSError:
+            return False, "读取文件计算校验和失败"
+        return False, "远端回下校验内容不一致"
+
+
+async def rename_remote_file(
+    old_remote_path: str,
+    new_remote_path: str,
+    settings: RuntimeSettings,
+    *,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> Tuple[bool, str, bool]:
+    """Server-side rename a remote object with ``rclone moveto``.
+
+    Returns ``(ok, detail, already_done)``.
+    """
+    src = str(old_remote_path or "").strip()
+    dst = str(new_remote_path or "").strip()
+    if not src or not dst:
+        return False, "远端路径为空", False
+    if src == dst:
+        return True, "文件名已包含日期前缀", True
+
+    rclone = (settings.rclone_bin or "rclone").strip()
+    timeout = min(max(30, int(settings.rclone_timeout_seconds)), 120)
+    cmd = [
+        rclone,
+        "moveto",
+        src,
+        dst,
+        "--no-traverse",
+        f"--log-level={settings.rclone_log_level}",
+    ]
+    if settings.rclone_tpslimit > 0:
+        cmd.append(f"--tpslimit={settings.rclone_tpslimit}")
+        if settings.rclone_tpslimit_burst > 0:
+            cmd.append(f"--tpslimit-burst={settings.rclone_tpslimit_burst}")
+
+    rc, _, stderr = await _run_cmd(cmd, timeout=timeout, cancel_event=cancel_event)
+    if rc == 0:
+        return True, "", False
+    if cancel_event is not None and cancel_event.is_set():
+        return False, "已取消", False
+
+    # Idempotent check: if the previous run renamed the file before saving DB state,
+    # dst exists as a valid file while src no longer exists.
+    rc_dst, out_dst, _ = await _run_cmd(
+        [
+            rclone,
+            "lsjson",
+            "--stat",
+            "--no-mimetype",
+            "--no-modtime",
+            dst,
+            f"--log-level={settings.rclone_log_level}",
+        ],
+        timeout=min(timeout, 30),
+        cancel_event=cancel_event,
+    )
+    if rc_dst == 0 and out_dst.strip():
+        try:
+            meta = json.loads(out_dst)
+        except json.JSONDecodeError:
+            meta = None
+        if isinstance(meta, dict) and meta.get("IsDir") is False and int(meta.get("Size") or 0) >= settings.min_file_size_bytes:
+            rc_src, _, _ = await _run_cmd(
+                [
+                    rclone,
+                    "lsjson",
+                    "--stat",
+                    "--no-mimetype",
+                    "--no-modtime",
+                    src,
+                    f"--log-level={settings.rclone_log_level}",
+                ],
+                timeout=min(timeout, 30),
+                cancel_event=cancel_event,
+            )
+            if rc_src != 0:
+                return True, "远端已存在带日期目标文件", True
+
+    err_lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    detail = err_lines[-1] if err_lines else f"rclone moveto 返回 {rc}"
+    return False, detail, False
 
 
 async def verify_remote_file(
@@ -579,6 +693,7 @@ async def upload_file_batch(
     *,
     session_cache: Optional[UploadSessionCache] = None,
     on_progress: Optional[UploadProgressCallback] = None,
+    remote_names_by_viewkey: Optional[Dict[str, str]] = None,
 ) -> UploadBatchResult:
     """Copy and verify the batch. The caller records success before deleting any source."""
     remote_dir = build_remote_dir(settings, uploader_folder)
@@ -587,7 +702,7 @@ async def upload_file_batch(
         return result
 
     root = download_dir.resolve()
-    entries: Dict[str, Tuple[Path, str, FileSnapshot]] = {}
+    entries: Dict[str, Tuple[Path, str, str, FileSnapshot]] = {}
     for vk, path in files_by_viewkey.items():
         try:
             relative = path.resolve(strict=True).relative_to(root).as_posix()
@@ -601,7 +716,13 @@ async def upload_file_batch(
         ):
             result.failed_viewkeys.append(vk)
             continue
-        entries[vk] = (path, relative, snapshot)
+        custom_name = str((remote_names_by_viewkey or {}).get(vk) or "").strip()
+        if custom_name and "/" not in custom_name and "\\" not in custom_name and "\n" not in custom_name and "\r" not in custom_name:
+            parent_rel = Path(relative).parent.as_posix()
+            remote_rel = f"{parent_rel}/{custom_name}" if parent_rel not in {"", "."} else custom_name
+        else:
+            remote_rel = relative
+        entries[vk] = (path, relative, remote_rel, snapshot)
     if not entries:
         result.error = "没有可上传且完整的本地文件"
         return result
@@ -646,97 +767,155 @@ async def upload_file_batch(
             result.error = err_mk.strip() or f"rclone mkdir 失败 (code={rc_mk})"
             return result
 
-    by_relative: Dict[str, Tuple[str, int]] = {
-        relative: (vk, snapshot[2]) for vk, (_, relative, snapshot) in entries.items()
-    }
-    by_name: Dict[str, Tuple[str, int]] = {
-        Path(relative).name: (vk, snapshot[2]) for vk, (_, relative, snapshot) in entries.items()
-    }
-    sole_entry: Optional[Tuple[str, int]] = (
-        next(((vk, snapshot[2]) for vk, (_, _, snapshot) in entries.items()), None)
-        if len(entries) == 1
-        else None
-    )
-    reported_error_lines: List[str] = []
+    def _make_stderr_handler(
+        subset: Dict[str, Tuple[Path, str, str, FileSnapshot]],
+        error_sink: List[str],
+    ) -> Callable[[str], None]:
+        by_relative: Dict[str, Tuple[str, int]] = {}
+        by_name: Dict[str, Tuple[str, int]] = {}
+        for vk_item, (_, loc_rel, rem_rel, snap) in subset.items():
+            by_relative[loc_rel] = (vk_item, snap[2])
+            by_relative[rem_rel] = (vk_item, snap[2])
+            by_name[Path(loc_rel).name] = (vk_item, snap[2])
+            by_name[Path(rem_rel).name] = (vk_item, snap[2])
+        sole_entry: Optional[Tuple[str, int]] = (
+            next(((vk_item, snap[2]) for vk_item, (_, _, _, snap) in subset.items()), None)
+            if len(subset) == 1
+            else None
+        )
 
-    def _on_stderr_line(line: str) -> None:
-        parsed = parse_rclone_json_line(line)
-        if parsed is None:
-            return
-        lvl = str(parsed.get("level") or "").lower()
-        if lvl in {"error", "critical", "fatal"}:
-            msg = str(parsed.get("msg") or "").strip()
-            if msg:
-                reported_error_lines.append(msg)
-        if on_progress is None:
-            return
-        stats = parsed.get("stats")
-        if not isinstance(stats, dict):
-            return
-        transferring = stats.get("transferring")
-        if isinstance(transferring, list) and transferring:
-            fallback_speed = float(stats.get("speed") or 0.0)
-            for item in transferring:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name") or "").strip()
-                matched = by_relative.get(name) or by_name.get(Path(name).name) or sole_entry
-                if matched is None:
-                    continue
-                vk, local_total = matched
-                raw_total = item.get("size")
-                total = int(raw_total) if isinstance(raw_total, (int, float)) and raw_total > 0 else local_total
-                raw_bytes = item.get("bytes")
-                sent = int(raw_bytes) if isinstance(raw_bytes, (int, float)) and raw_bytes >= 0 else 0
-                if total > 0:
-                    sent = min(sent, total)
-                raw_speed = item.get("speed")
-                if isinstance(raw_speed, (int, float)) and raw_speed > 0:
-                    speed = float(raw_speed)
-                else:
-                    avg_speed = item.get("speedAvg")
-                    speed = (
-                        float(avg_speed)
-                        if isinstance(avg_speed, (int, float)) and avg_speed > 0
-                        else max(0.0, fallback_speed)
-                    )
-                on_progress(vk, sent, total, speed, "uploading")
-        elif sole_entry is not None:
-            vk, local_total = sole_entry
-            raw_bytes = stats.get("bytes")
-            if isinstance(raw_bytes, (int, float)) and raw_bytes > 0:
-                sent = min(int(raw_bytes), local_total) if local_total > 0 else int(raw_bytes)
-                speed = float(stats.get("speed") or 0.0)
-                on_progress(vk, sent, local_total, max(0.0, speed), "uploading")
+        def _on_stderr_line(line: str) -> None:
+            parsed = parse_rclone_json_line(line)
+            if parsed is None:
+                return
+            lvl = str(parsed.get("level") or "").lower()
+            if lvl in {"error", "critical", "fatal"}:
+                msg = str(parsed.get("msg") or "").strip()
+                if msg:
+                    error_sink.append(msg)
+            if on_progress is None:
+                return
+            stats = parsed.get("stats")
+            if not isinstance(stats, dict):
+                return
+            transferring = stats.get("transferring")
+            if isinstance(transferring, list) and transferring:
+                fallback_speed = float(stats.get("speed") or 0.0)
+                for item in transferring:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    matched = by_relative.get(name) or by_name.get(Path(name).name) or sole_entry
+                    if matched is None:
+                        continue
+                    vk_m, local_total = matched
+                    raw_total = item.get("size")
+                    total = int(raw_total) if isinstance(raw_total, (int, float)) and raw_total > 0 else local_total
+                    raw_bytes = item.get("bytes")
+                    sent = int(raw_bytes) if isinstance(raw_bytes, (int, float)) and raw_bytes >= 0 else 0
+                    if total > 0:
+                        sent = min(sent, total)
+                    raw_speed = item.get("speed")
+                    if isinstance(raw_speed, (int, float)) and raw_speed > 0:
+                        speed = float(raw_speed)
+                    else:
+                        avg_speed = item.get("speedAvg")
+                        speed = (
+                            float(avg_speed)
+                            if isinstance(avg_speed, (int, float)) and avg_speed > 0
+                            else max(0.0, fallback_speed)
+                        )
+                    on_progress(vk_m, sent, total, speed, "uploading")
+            elif sole_entry is not None:
+                vk_m, local_total = sole_entry
+                raw_bytes = stats.get("bytes")
+                if isinstance(raw_bytes, (int, float)) and raw_bytes > 0:
+                    sent = min(int(raw_bytes), local_total) if local_total > 0 else int(raw_bytes)
+                    speed = float(stats.get("speed") or 0.0)
+                    on_progress(vk_m, sent, local_total, max(0.0, speed), "uploading")
 
-    with _upload_file_list([entry[1] for entry in entries.values()]) as list_file:
-        cmd = [
-            rclone,
-            "copy",
-            str(root),
-            remote_dir,
-            *build_rclone_copy_opts(settings, remote_type=remote_type, stream_stats=on_progress is not None),
-            "--files-from-raw",
-            str(list_file),
-        ]
-        run_kwargs: Dict[str, Any] = {
-            "timeout": settings.rclone_timeout_seconds,
-            "cancel_event": cancel_event,
-        }
-        if on_progress is not None:
-            run_kwargs["on_stderr_line"] = _on_stderr_line
-        rc, _, stderr = await _run_cmd(cmd, **run_kwargs)
-    if rc != 0:
-        if reported_error_lines:
-            result.error = reported_error_lines[-1]
+        return _on_stderr_line
+
+    same_name_entries = {vk: val for vk, val in entries.items() if val[1] == val[2]}
+    renamed_entries = {vk: val for vk, val in entries.items() if val[1] != val[2]}
+    copied_entries: Dict[str, Tuple[Path, str, str, FileSnapshot]] = {}
+    copy_opts = build_rclone_copy_opts(settings, remote_type=remote_type, stream_stats=on_progress is not None)
+
+    if same_name_entries:
+        reported_error_lines: List[str] = []
+        with _upload_file_list([entry[1] for entry in same_name_entries.values()]) as list_file:
+            cmd = [
+                rclone,
+                "copy",
+                str(root),
+                remote_dir,
+                *copy_opts,
+                "--files-from-raw",
+                str(list_file),
+            ]
+            run_kwargs: Dict[str, Any] = {
+                "timeout": settings.rclone_timeout_seconds,
+                "cancel_event": cancel_event,
+            }
+            if on_progress is not None:
+                run_kwargs["on_stderr_line"] = _make_stderr_handler(same_name_entries, reported_error_lines)
+            rc, _, stderr = await _run_cmd(cmd, **run_kwargs)
+        if rc != 0:
+            if reported_error_lines:
+                result.error = result.error or reported_error_lines[-1]
+            else:
+                lines = [line for line in stderr.strip().splitlines() if line.strip()]
+                result.error = result.error or (lines[-1] if lines else f"rclone copy 返回 {rc}")
+            result.failed_viewkeys.extend(same_name_entries)
         else:
-            lines = [line for line in stderr.strip().splitlines() if line.strip()]
-            result.error = lines[-1] if lines else f"rclone copy 返回 {rc}"
-        result.failed_viewkeys.extend(entries)
+            copied_entries.update(same_name_entries)
+
+    if renamed_entries:
+        transfer_sem = asyncio.Semaphore(max(1, int(settings.rclone_transfers)))
+
+        async def _copyto_one(vk_item: str, entry_tuple: Tuple[Path, str, str, FileSnapshot]) -> Tuple[str, bool, str]:
+            local_p, _, rem_rel, _ = entry_tuple
+            async with transfer_sem:
+                if cancel_event is not None and cancel_event.is_set():
+                    return vk_item, False, "rclone 执行已取消"
+                err_lines_one: List[str] = []
+                cmd = [
+                    rclone,
+                    "copyto",
+                    str(local_p),
+                    f"{remote_dir}/{rem_rel}",
+                    *copy_opts,
+                ]
+                run_kwargs: Dict[str, Any] = {
+                    "timeout": settings.rclone_timeout_seconds,
+                    "cancel_event": cancel_event,
+                }
+                if on_progress is not None:
+                    run_kwargs["on_stderr_line"] = _make_stderr_handler({vk_item: entry_tuple}, err_lines_one)
+                rc_one, _, stderr_one = await _run_cmd(cmd, **run_kwargs)
+                if rc_one == 0:
+                    return vk_item, True, ""
+                if err_lines_one:
+                    return vk_item, False, err_lines_one[-1]
+                lines = [line for line in stderr_one.strip().splitlines() if line.strip()]
+                return vk_item, False, lines[-1] if lines else f"rclone copyto 返回 {rc_one}"
+
+        copyto_results = await asyncio.gather(
+            *(_copyto_one(vk_item, entry_tuple) for vk_item, entry_tuple in renamed_entries.items())
+        )
+        for vk_item, ok_one, err_one in copyto_results:
+            if ok_one:
+                copied_entries[vk_item] = renamed_entries[vk_item]
+            else:
+                result.failed_viewkeys.append(vk_item)
+                if err_one and not result.error:
+                    result.error = err_one
+
+    if not copied_entries:
         return result
 
     verify_error = ""
-    for vk, (path, relative, snapshot) in entries.items():
+    for vk, (path, relative, remote_rel, snapshot) in copied_entries.items():
         if cancel_event and cancel_event.is_set():
             result.failed_viewkeys.append(vk)
             continue
@@ -755,16 +934,18 @@ async def upload_file_batch(
             relative,
             snapshot,
             settings,
+            remote_relative=remote_rel,
             cancel_event=cancel_event,
         )
         if verified and file_snapshot(path) == snapshot and not (cancel_event and cancel_event.is_set()):
             result.uploaded_viewkeys.append(vk)
             result.verified_sources[vk] = snapshot
+            result.remote_paths[vk] = f"{remote_dir}/{remote_rel}"
         else:
             result.failed_viewkeys.append(vk)
             if reason and not verify_error:
                 verify_error = reason
-    if result.failed_viewkeys:
+    if result.failed_viewkeys and not result.error:
         result.error = verify_error or "无法确认远端文件与本地内容一致，已保留本地文件"
 
     return result

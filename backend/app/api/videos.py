@@ -43,6 +43,7 @@ async def list_videos(
     uploader: str = Query(default=""),
     status: str = Query(default=""),
     quality: str = Query(default=""),
+    sort_by: str = Query(default="activity"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=30, ge=1, le=100),
     include_meta: bool = Query(default=True),
@@ -53,6 +54,7 @@ async def list_videos(
         uploader=uploader,
         status=status,
         quality=quality,
+        sort_by=sort_by,
         page=page,
         page_size=page_size,
     )
@@ -76,6 +78,22 @@ async def enrich_baseline_metadata(container: AppContainer = Depends(require_aut
     job = await container.tasks.enqueue_job(
         kind="enrich_metadata",
         label=f"补全基线元数据 ({count} 条)",
+        params={},
+    )
+    return {"job": job, "count": count}
+
+
+@router.post("/remote/rename-dates")
+async def rename_remote_dates(container: AppContainer = Depends(require_auth)):
+    settings = await container.repo.get_settings()
+    if not (settings.rclone_remote or "").strip():
+        raise HTTPException(status_code=400, detail="请先在系统设置中配置 rclone 远端名称")
+    count = await container.repo.count_remote_date_rename_candidates()
+    if count == 0:
+        raise HTTPException(status_code=400, detail="所有已上传网盘文件均已包含发布日期")
+    job = await container.tasks.enqueue_job(
+        kind="rename_remote_dates",
+        label=f"网盘文件补全发布日期 ({count} 条)",
         params={},
     )
     return {"job": job, "count": count}
