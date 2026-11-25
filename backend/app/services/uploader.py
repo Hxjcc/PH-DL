@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import shlex
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -222,6 +223,96 @@ def _parse_listremotes_long(output: str) -> Dict[str, str]:
     return mapping
 
 
+_BLOCKED_EXTRA_FLAGS = frozenset(
+    {
+        "--config",
+        "--password-command",
+        "--log-file",
+        "--files-from",
+        "--files-from-raw",
+        "--include-from",
+        "--exclude-from",
+        "--filter-from",
+        "--rc",
+        "--rc-addr",
+        "--rc-user",
+        "--rc-pass",
+        "--rc-no-auth",
+        "--dry-run",
+        "--backup-dir",
+        "--delete-after",
+        "--delete-before",
+        "--delete-during",
+        "--delete-excluded",
+        "--max-delete",
+        "--cache-dir",
+        "--temp-dir",
+    }
+)
+
+
+def parse_safe_rclone_extra_flags(raw: str) -> List[str]:
+    """Parse user-provided extra rclone tuning flags while filtering unsafe/positional arguments."""
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return []
+    safe: List[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if not tok.startswith("--") or tok == "--":
+            idx += 1
+            continue
+        flag_name = tok.split("=", 1)[0].strip().lower()
+        if flag_name in _BLOCKED_EXTRA_FLAGS or flag_name.startswith("--rc-"):
+            # Skip blocked flag and its separate value token if present
+            if "=" not in tok and idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
+                idx += 2
+            else:
+                idx += 1
+            continue
+        safe.append(tok)
+        if "=" not in tok and idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
+            safe.append(tokens[idx + 1])
+            idx += 2
+        else:
+            idx += 1
+    return safe
+
+
+async def list_rclone_remotes(
+    settings: RuntimeSettings,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> List[Dict[str, str]]:
+    """List configured rclone remotes with their backend types."""
+    rclone = (settings.rclone_bin or "rclone").strip()
+    timeout = min(settings.rclone_timeout_seconds, 30)
+    rc, out, _ = await _run_cmd(
+        [rclone, "listremotes", "--long"],
+        timeout=timeout,
+        cancel_event=cancel_event,
+    )
+    if rc == 0 and out.strip():
+        mapping = _parse_listremotes_long(out)
+        return [{"name": name, "type": rtype} for name, rtype in mapping.items()]
+    rc2, out2, _ = await _run_cmd(
+        [rclone, "listremotes"],
+        timeout=timeout,
+        cancel_event=cancel_event,
+    )
+    if rc2 == 0 and out2.strip():
+        return [
+            {"name": line.strip().rstrip(":"), "type": ""}
+            for line in out2.splitlines()
+            if line.strip().rstrip(":")
+        ]
+    return []
+
+
 async def detect_remote_type(
     settings: RuntimeSettings,
     cancel_event: Optional[asyncio.Event] = None,
@@ -255,14 +346,20 @@ def build_rclone_copy_opts(
     remote_type: Optional[str] = None,
     stream_stats: bool = False,
 ) -> List[str]:
+    raw_level = str(settings.rclone_log_level or "ERROR").strip().upper()
+    # rclone suppresses --stats-log-level=NOTICE when --log-level=ERROR, so streaming
+    # progress must run at least at NOTICE (which still omits per-file INFO chatter).
+    effective_log_level = (
+        raw_level if (not stream_stats or raw_level in {"DEBUG", "INFO", "NOTICE"}) else "NOTICE"
+    )
     opts = [
         "--no-traverse",
         f"--transfers={settings.rclone_transfers}",
         f"--checkers={settings.rclone_checkers}",
-        f"--log-level={settings.rclone_log_level}",
+        f"--log-level={effective_log_level}",
     ]
     if stream_stats:
-        opts.extend(["--use-json-log", "--stats=500ms", "--stats-log-level=NOTICE"])
+        opts.extend(["--use-json-log", "--stats=300ms", "--stats-log-level=NOTICE"])
     else:
         opts.append("--stats=0")
     if settings.rclone_ignore_size:
@@ -287,11 +384,21 @@ def build_rclone_copy_opts(
                 f"--pikpak-chunk-size={settings.rclone_pikpak_chunk_size}",
             ]
         )
+    elif effective_type == "drive":
+        drive_chunk = str(getattr(settings, "rclone_drive_chunk_size", "64Mi") or "").strip()
+        if drive_chunk:
+            opts.append(f"--drive-chunk-size={drive_chunk}")
+        if getattr(settings, "rclone_drive_stop_on_upload_limit", True):
+            opts.append("--drive-stop-on-upload-limit")
 
     if settings.rclone_tpslimit > 0:
         opts.append(f"--tpslimit={settings.rclone_tpslimit}")
         if settings.rclone_tpslimit_burst > 0:
             opts.append(f"--tpslimit-burst={settings.rclone_tpslimit_burst}")
+
+    extra_flags = parse_safe_rclone_extra_flags(getattr(settings, "rclone_extra_flags", ""))
+    if extra_flags:
+        opts.extend(extra_flags)
     return opts
 
 
@@ -584,7 +691,15 @@ async def upload_file_batch(
                 if total > 0:
                     sent = min(sent, total)
                 raw_speed = item.get("speed")
-                speed = float(raw_speed) if isinstance(raw_speed, (int, float)) and raw_speed >= 0 else fallback_speed
+                if isinstance(raw_speed, (int, float)) and raw_speed > 0:
+                    speed = float(raw_speed)
+                else:
+                    avg_speed = item.get("speedAvg")
+                    speed = (
+                        float(avg_speed)
+                        if isinstance(avg_speed, (int, float)) and avg_speed > 0
+                        else max(0.0, fallback_speed)
+                    )
                 on_progress(vk, sent, total, speed, "uploading")
         elif sole_entry is not None:
             vk, local_total = sole_entry

@@ -316,10 +316,35 @@ async def test_uploader_copies_and_verifies_without_downloading_by_default(tmp_p
     assert run_options[copy_index]["timeout"] == settings.rclone_timeout_seconds
     assert run_options[copy_index]["cancel_event"] is None
 
-    # Non-PikPak remote should NOT receive PikPak-specific flags
-    gd_settings = RuntimeSettings(rclone_remote="gdrive", rclone_remote_base_dir="Pornhub")
+    # Non-PikPak remote (Google Drive) should receive GD flags and NOT PikPak flags
+    gd_settings = RuntimeSettings(rclone_remote="gd", rclone_remote_base_dir="Pornhub")
     gd_opts = uploader.build_rclone_copy_opts(gd_settings, remote_type="drive")
     assert not any(o.startswith("--pikpak-") for o in gd_opts)
+    assert "--drive-chunk-size=64Mi" in gd_opts
+    assert "--drive-stop-on-upload-limit" in gd_opts
+
+    gd_no_stop = RuntimeSettings(
+        rclone_remote="gd",
+        rclone_drive_chunk_size="128Mi",
+        rclone_drive_stop_on_upload_limit=False,
+    )
+    gd_no_stop_opts = uploader.build_rclone_copy_opts(gd_no_stop, remote_type="drive")
+    assert "--drive-chunk-size=128Mi" in gd_no_stop_opts
+    assert "--drive-stop-on-upload-limit" not in gd_no_stop_opts
+    assert not any(o.startswith("--drive-") for o in copy_cmd)
+
+    # Safe extra flags support arbitrary future backends while blocking unsafe flags
+    extra_parsed = uploader.parse_safe_rclone_extra_flags(
+        "--s3-chunk-size=32Mi --onedrive-chunk-size 60M --config=/etc/shadow --password-command echo positional"
+    )
+    assert extra_parsed == ["--s3-chunk-size=32Mi", "--onedrive-chunk-size", "60M"]
+    s3_settings = RuntimeSettings(rclone_remote="r2", rclone_extra_flags="--s3-chunk-size=32Mi --dry-run")
+    s3_opts = uploader.build_rclone_copy_opts(s3_settings, remote_type="s3")
+    assert "--s3-chunk-size=32Mi" in s3_opts
+    assert "--dry-run" not in s3_opts
+
+    remotes = await uploader.list_rclone_remotes(settings)
+    assert remotes == [{"name": "pikpak", "type": "pikpak"}, {"name": "gdrive", "type": "drive"}]
 
 
 async def test_uploader_strict_download_verify_opt_in(tmp_path: Path, monkeypatch):
@@ -478,7 +503,9 @@ async def test_uploader_streams_json_progress_and_caches_remote_session(tmp_path
             return 0, "", ""
         if action == "copy":
             assert "--use-json-log" in cmd
-            assert "--stats=500ms" in cmd
+            assert "--stats=300ms" in cmd
+            assert "--log-level=NOTICE" in cmd
+            assert "--stats-log-level=NOTICE" in cmd
             cb = kwargs.get("on_stderr_line")
             assert cb is not None
             list_file = Path(cmd[cmd.index("--files-from-raw") + 1])

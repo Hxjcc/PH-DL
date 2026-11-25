@@ -203,6 +203,9 @@ class RuntimeSettings(BaseModel):
     rclone_checkers: int = Field(default=2, ge=1, le=32)
     rclone_pikpak_upload_concurrency: int = Field(default=4, ge=1, le=32)
     rclone_pikpak_chunk_size: str = "32Mi"
+    rclone_drive_chunk_size: str = "64Mi"
+    rclone_drive_stop_on_upload_limit: bool = True
+    rclone_extra_flags: str = ""
     rclone_ignore_checksum: bool = True
     rclone_ignore_size: bool = False
     rclone_verify_download: bool = False

@@ -80,12 +80,13 @@ export const api = {
   clearTempFiles: () => request('/api/jobs/temp-files', { method: 'DELETE' }),
 
   // Videos History
-  listVideos: (params = {}) => {
+  listVideos: (params = {}, options = {}) => {
     const sp = new URLSearchParams()
     for (const [k, v] of Object.entries(params)) {
       if (v !== '' && v !== null && v !== undefined) sp.set(k, String(v))
     }
-    return request(`/api/videos?${sp.toString()}`)
+    const reqOpts = options?.signal ? { signal: options.signal } : {}
+    return request(`/api/videos?${sp.toString()}`, reqOpts)
   },
   videoPlayback: (viewkey, signal) =>
     request(`/api/videos/${encodeURIComponent(viewkey)}/playback?format=mp4`, { signal, cache: 'no-store' }),
@@ -110,6 +111,7 @@ export const api = {
   importCookie: (cookie) => request('/api/settings/cookie/import', { method: 'POST', body: { cookie } }),
   refreshCookie: () => request('/api/settings/cookie/refresh', { method: 'POST' }),
   testYescaptcha: () => request('/api/settings/yescaptcha/test', { method: 'POST' }),
+  listRcloneRemotes: () => request('/api/settings/rclone/remotes'),
   testRclone: () => request('/api/settings/rclone/test', { method: 'POST' }),
   testNotify: () => request('/api/settings/notify/test', { method: 'POST' }),
   getLogs: () => request('/api/settings/logs'),

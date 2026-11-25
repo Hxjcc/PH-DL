@@ -36,6 +36,7 @@ const router = useRouter()
 
 const cached = store.hasRouteCache('history') ? store.historyCache : null
 const loading = ref(false)
+const fetching = ref(false)
 const refreshing = ref(false)
 const enriching = ref(false)
 const batchDeleting = ref(false)
@@ -44,6 +45,8 @@ let playbackTrigger = null
 const selectedViewkeys = ref(new Set())
 const deleteLocalSingle = ref(false)
 const deleteLocalBatch = ref(false)
+const activeDeleteKey = ref('')
+const deletePopoverDefaultOpen = ref(false)
 const items = ref(cached ? [...cached.items] : [])
 const total = ref(cached ? cached.total : 0)
 const facets = ref(
@@ -162,8 +165,67 @@ const qualityOptions = computed(() => [
 
 let debounceTimer = null
 let loadingTimer = null
+let fetchingTimer = null
 let reqSeq = 0
 let activatedOnce = false
+let activeAbortController = null
+
+const QUERY_CACHE_MAX = 24
+const QUERY_CACHE_TTL_MS = 20_000
+const queryCache = new Map()
+
+function buildQueryCacheKey() {
+  return [
+    filters.search.trim(),
+    filters.uploader,
+    filters.status,
+    filters.quality,
+    filters.page,
+    filters.page_size,
+  ].join('\x1f')
+}
+
+function readQueryCache(key) {
+  const entry = queryCache.get(key)
+  if (!entry) return null
+  if (Date.now() - entry.ts > QUERY_CACHE_TTL_MS) {
+    queryCache.delete(key)
+    return null
+  }
+  queryCache.delete(key)
+  queryCache.set(key, entry)
+  return entry
+}
+
+function writeQueryCache(key, itemsList, totalCount) {
+  queryCache.delete(key)
+  queryCache.set(key, { items: itemsList, total: totalCount, ts: Date.now() })
+  if (queryCache.size > QUERY_CACHE_MAX) {
+    const oldestKey = queryCache.keys().next().value
+    if (oldestKey !== undefined) queryCache.delete(oldestKey)
+  }
+}
+
+function invalidateQueryCache() {
+  queryCache.clear()
+}
+
+function hasLoadedMeta() {
+  return (facets.value.uploaders?.length || 0) > 0 || Number(stats.value.total || 0) > 0
+}
+
+function warmDeleteRowPopover(viewkey) {
+  if (activeDeleteKey.value !== viewkey) {
+    deletePopoverDefaultOpen.value = false
+    activeDeleteKey.value = viewkey
+  }
+}
+
+function openDeleteRowPopoverNow(viewkey) {
+  deleteLocalSingle.value = false
+  deletePopoverDefaultOpen.value = true
+  activeDeleteKey.value = viewkey
+}
 
 function isDefaultFilters() {
   return (
@@ -176,24 +238,57 @@ function isDefaultFilters() {
   )
 }
 
-async function loadVideos({ silent = false, includeMeta = true } = {}) {
+function applyVideoList(nextItems, nextTotal) {
+  items.value = nextItems
+  total.value = nextTotal
+  if (selectedViewkeys.value.size > 0) {
+    const visibleKeys = new Set(nextItems.map((video) => video.viewkey))
+    const kept = Array.from(selectedViewkeys.value).filter((key) => visibleKeys.has(key))
+    if (kept.length !== selectedViewkeys.value.size) {
+      selectedViewkeys.value = new Set(kept)
+    }
+  }
+}
+
+async function loadVideos({ silent = false, includeMeta = true, useCache = false } = {}) {
+  const cacheKey = buildQueryCacheKey()
+  if (useCache && !includeMeta) {
+    const hit = readQueryCache(cacheKey)
+    if (hit) {
+      applyVideoList(hit.items, hit.total)
+      loading.value = false
+      fetching.value = false
+      return
+    }
+  }
+
+  if (activeAbortController) {
+    activeAbortController.abort()
+  }
+  const controller = new AbortController()
+  activeAbortController = controller
+
   const seq = ++reqSeq
   clearTimeout(loadingTimer)
+  clearTimeout(fetchingTimer)
   if (!silent && items.value.length === 0) {
     loadingTimer = setTimeout(() => {
       if (seq === reqSeq) loading.value = true
-    }, 120)
+    }, 100)
+  } else if (!silent) {
+    fetchingTimer = setTimeout(() => {
+      if (seq === reqSeq) fetching.value = true
+    }, 100)
   }
   try {
-    const query = includeMeta ? filters : { ...filters, include_meta: false }
-    const res = await api.listVideos(query)
+    const effectiveIncludeMeta = includeMeta || !hasLoadedMeta()
+    const query = effectiveIncludeMeta ? filters : { ...filters, include_meta: false }
+    const res = await api.listVideos(query, { signal: controller.signal })
     if (seq !== reqSeq) return
-    items.value = res.items || []
-    total.value = res.total || 0
-    const visibleKeys = new Set(items.value.map((video) => video.viewkey))
-    selectedViewkeys.value = new Set(
-      Array.from(selectedViewkeys.value).filter((key) => visibleKeys.has(key))
-    )
+    const nextItems = res.items || []
+    const nextTotal = res.total || 0
+    applyVideoList(nextItems, nextTotal)
+    writeQueryCache(cacheKey, nextItems, nextTotal)
     if (res.facets) {
       facets.value = res.facets
     }
@@ -204,13 +299,19 @@ async function loadVideos({ silent = false, includeMeta = true } = {}) {
       store.setHistoryCache(res)
     }
   } catch (err) {
+    if (err?.name === 'AbortError') return
     if (seq === reqSeq) {
       store.notify(err.message, 'error')
     }
   } finally {
+    if (activeAbortController === controller) {
+      activeAbortController = null
+    }
     if (seq === reqSeq) {
       clearTimeout(loadingTimer)
+      clearTimeout(fetchingTimer)
       loading.value = false
+      fetching.value = false
     }
   }
 }
@@ -218,12 +319,13 @@ async function loadVideos({ silent = false, includeMeta = true } = {}) {
 function triggerSearch() {
   filters.page = 1
   clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(() => loadVideos(), 250)
+  debounceTimer = setTimeout(() => loadVideos({ includeMeta: false, useCache: true }), 180)
 }
 
 function changeFilter() {
   filters.page = 1
-  loadVideos()
+  clearTimeout(debounceTimer)
+  loadVideos({ includeMeta: false, useCache: true })
 }
 
 function changePageSize(value) {
@@ -232,7 +334,7 @@ function changePageSize(value) {
   filters.page = 1
   clearSelection()
   clearTimeout(debounceTimer)
-  loadVideos()
+  loadVideos({ includeMeta: false, useCache: true })
 }
 
 function selectStatusCard(statusKey) {
@@ -248,7 +350,7 @@ function selectStatusCard(statusKey) {
 function goPage(p) {
   if (p < 1 || p > totalPages.value) return
   filters.page = p
-  loadVideos({ includeMeta: false })
+  loadVideos({ includeMeta: false, useCache: true })
 }
 
 function openPlayback(video, event) {
@@ -283,10 +385,11 @@ async function handleDelete(v) {
       res?.deleted_local_file ? '已删除去重记录及本地视频文件' : '已从去重库删除记录',
       'info'
     )
-    await loadVideos({ silent: true })
+    invalidateQueryCache()
+    await loadVideos({ silent: true, includeMeta: true })
     if (items.value.length === 0 && filters.page > 1) {
       filters.page -= 1
-      await loadVideos({ silent: true })
+      await loadVideos({ silent: true, includeMeta: false })
     }
   } catch (err) {
     store.notify(err.message, 'error')
@@ -303,10 +406,11 @@ async function handleBatchDelete() {
     const fileNote = res.deleted_files_count > 0 ? `（含 ${res.deleted_files_count} 个本地视频文件）` : ''
     store.notify(`已从去重库删除 ${res.deleted_count} 条记录${fileNote}`, 'info')
     clearSelection()
-    await loadVideos({ silent: true })
+    invalidateQueryCache()
+    await loadVideos({ silent: true, includeMeta: true })
     if (items.value.length === 0 && filters.page > 1) {
       filters.page -= 1
-      await loadVideos({ silent: true })
+      await loadVideos({ silent: true, includeMeta: false })
     }
   } catch (err) {
     store.notify(err.message, 'error')
@@ -318,8 +422,9 @@ async function handleBatchDelete() {
 async function handleRefresh() {
   if (refreshing.value) return
   refreshing.value = true
+  invalidateQueryCache()
   try {
-    await Promise.all([loadVideos({ silent: true }), new Promise((r) => setTimeout(r, 550))])
+    await Promise.all([loadVideos({ silent: true, includeMeta: true }), new Promise((r) => setTimeout(r, 400))])
   } finally {
     refreshing.value = false
   }
@@ -343,6 +448,7 @@ async function handleEnrichMetadata() {
 watch(
   () => store.historyCache,
   (val) => {
+    invalidateQueryCache()
     if (!val || !isDefaultFilters() || Number(val.page_size || 30) !== filters.page_size) return
     items.value = [...(val.items || [])]
     total.value = Number(val.total || 0)
@@ -360,18 +466,21 @@ onActivated(() => {
     activatedOnce = true
     if (store.hydratedFromCache && store.hasRouteCache('history')) return
     if (!store.hasRouteCache('history')) {
-      loadVideos({ silent: false })
+      loadVideos({ silent: false, includeMeta: true })
     } else if (Date.now() - store.historyLoadedAt > 1500) {
-      loadVideos({ silent: true })
+      loadVideos({ silent: true, includeMeta: true })
     }
     return
   }
-  loadVideos({ silent: true })
+  invalidateQueryCache()
+  loadVideos({ silent: true, includeMeta: true })
 })
 
 onUnmounted(() => {
   clearTimeout(debounceTimer)
   clearTimeout(loadingTimer)
+  clearTimeout(fetchingTimer)
+  activeAbortController?.abort()
 })
 
 onDeactivated(() => {
@@ -449,7 +558,8 @@ onDeactivated(() => {
     <div class="space-y-3">
       <div class="flex flex-wrap items-center gap-2">
         <div class="relative flex-1 min-w-[200px]">
-          <Search class="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2" />
+          <Loader2 v-if="fetching" class="w-3.5 h-3.5 text-brand animate-spin absolute left-3 top-1/2 -translate-y-1/2" />
+          <Search v-else class="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2" />
           <Input
             v-model="filters.search"
             placeholder="搜索标题、Viewkey 或上传者..."
@@ -535,7 +645,7 @@ onDeactivated(() => {
                 <th class="h-11 px-5 w-40">操作</th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-border">
+            <tbody :class="['divide-y divide-border transition-opacity duration-150', fetching ? 'opacity-65' : '']">
               <tr v-if="loading && items.length === 0">
                 <td colspan="8" class="py-12 text-center text-xs text-muted-foreground">
                   <Loader2 class="w-4 h-4 animate-spin inline mr-1.5 text-brand" />
@@ -585,19 +695,19 @@ onDeactivated(() => {
                   <span v-else class="text-xs text-muted-foreground">—</span>
                 </td>
                 <td class="px-5 py-3.5 whitespace-nowrap">
-                  <Badge variant="outline" :dot="videoStatusMeta(v.status).dot">
+                  <span class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card/90 text-foreground px-2.5 py-0.5 text-xs font-medium whitespace-nowrap">
+                    <span :class="['w-1.5 h-1.5 rounded-full shrink-0', videoStatusMeta(v.status).dot]" />
                     {{ videoStatusMeta(v.status).label }}
-                  </Badge>
+                  </span>
                 </td>
                 <td class="px-5 py-3.5 text-xs text-muted-foreground tabular-nums whitespace-nowrap">
                   {{ formatDateTime(v.uploaded_at || v.downloaded_at || v.created_at) }}
                 </td>
                 <td class="px-5 py-3.5 whitespace-nowrap">
                   <div class="inline-flex items-center gap-1.5">
-                    <Button
-                      variant="secondary"
-                      size="icon"
-                      class="h-7 w-7 border border-transparent hover:border-brand/35 hover:bg-brand/12 hover:text-brand aria-expanded:border-brand/35 aria-expanded:bg-brand/12 aria-expanded:text-brand"
+                    <button
+                      type="button"
+                      class="inline-flex items-center justify-center h-7 w-7 rounded-lg bg-secondary text-secondary-foreground border border-transparent hover:border-brand/35 hover:bg-brand/12 hover:text-brand aria-expanded:border-brand/35 aria-expanded:bg-brand/12 aria-expanded:text-brand transition-colors cursor-pointer"
                       aria-label="在线播放"
                       aria-haspopup="dialog"
                       :aria-expanded="playingVideo?.viewkey === v.viewkey"
@@ -605,34 +715,32 @@ onDeactivated(() => {
                       @click="openPlayback(v, $event)"
                     >
                       <Play class="w-3.5 h-3.5" />
-                    </Button>
-                    <Button
+                    </button>
+                    <a
                       v-if="v.video_page_url"
-                      as="a"
                       :href="v.video_page_url"
                       target="_blank"
                       rel="noopener noreferrer"
-                      variant="ghost"
-                      size="icon"
-                      class="h-7 w-7 text-muted-foreground hover:text-foreground"
+                      class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
                       title="打开原网页"
                     >
                       <ExternalLink class="w-3.5 h-3.5" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      class="h-7 w-7 text-muted-foreground hover:text-brand hover:bg-brand/10"
+                    </a>
+                    <button
+                      type="button"
+                      class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:text-brand hover:bg-brand/10 transition-colors cursor-pointer"
                       title="强制重新下载"
                       @click="handleRedownload(v)"
                     >
                       <RotateCcw class="w-3.5 h-3.5" />
-                    </Button>
+                    </button>
                     <ConfirmPopover
+                      v-if="activeDeleteKey === v.viewkey"
                       :title="`从去重库删除 [${v.viewkey}]？`"
                       description="删除后自动追更将重新视该视频为未下载。"
                       confirm-text="删除"
-                      @open-change="(val) => { if (val) deleteLocalSingle = false }"
+                      :default-open="deletePopoverDefaultOpen"
+                      @open-change="(val) => { if (val) deleteLocalSingle = false; else deletePopoverDefaultOpen = false }"
                       @confirm="handleDelete(v)"
                     >
                       <template v-if="v.status === 'downloaded' || v.local_path" #extra>
@@ -641,15 +749,25 @@ onDeactivated(() => {
                           <span>同时删除本地已下载的视频文件</span>
                         </label>
                       </template>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        class="h-7 w-7 text-muted-foreground hover:text-red-500 hover:bg-red-500/10"
+                      <button
+                        type="button"
+                        class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors cursor-pointer"
                         title="删除去重记录"
                       >
                         <Trash2 class="w-3.5 h-3.5" />
-                      </Button>
+                      </button>
                     </ConfirmPopover>
+                    <button
+                      v-else
+                      type="button"
+                      class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors cursor-pointer"
+                      title="删除去重记录"
+                      @pointerenter="warmDeleteRowPopover(v.viewkey)"
+                      @focus="warmDeleteRowPopover(v.viewkey)"
+                      @click="openDeleteRowPopoverNow(v.viewkey)"
+                    >
+                      <Trash2 class="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 </td>
               </tr>

@@ -1,5 +1,5 @@
 <script setup>
-import { onActivated, ref, watch } from 'vue'
+import { computed, onActivated, ref, watch } from 'vue'
 import {
   Save,
   Cookie,
@@ -95,6 +95,79 @@ const saving = ref(false)
 const busyTool = ref('')
 const form = ref(cloneSettings(store.settingsCache))
 const pasteCookie = ref('')
+const rcloneRemotes = ref([])
+const loadingRemotes = ref(false)
+const remotesLoadedOnce = ref(false)
+const providerTab = ref('pikpak')
+
+const REMOTE_TYPE_LABELS = {
+  pikpak: 'PikPak',
+  drive: 'Google Drive',
+  onedrive: 'OneDrive',
+  s3: 'S3 / R2',
+  webdav: 'WebDAV',
+  dropbox: 'Dropbox',
+  sftp: 'SFTP',
+}
+
+const PROVIDER_TABS = [
+  { value: 'pikpak', label: 'PikPak' },
+  { value: 'drive', label: 'Google Drive' },
+  { value: 'custom', label: '其他网盘 / 自定义参数' },
+]
+
+function formatRemoteType(type) {
+  const key = String(type || '').trim().toLowerCase()
+  return REMOTE_TYPE_LABELS[key] || (key ? key.toUpperCase() : '未知类型')
+}
+
+const activeRemoteType = computed(() => {
+  const name = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '')
+  if (!name) return ''
+  const matched = rcloneRemotes.value.find((r) => r.name.toLowerCase() === name.toLowerCase())
+  if (matched?.type) return matched.type.toLowerCase()
+  const lower = name.toLowerCase()
+  if (lower === 'pikpak') return 'pikpak'
+  if (['gd', 'gdrive', 'drive', 'google', 'googledrive'].includes(lower)) return 'drive'
+  return ''
+})
+
+function syncProviderTabFromType(rtype) {
+  if (rtype === 'pikpak') providerTab.value = 'pikpak'
+  else if (rtype === 'drive') providerTab.value = 'drive'
+  else if (rtype) providerTab.value = 'custom'
+}
+
+async function loadRcloneRemotes({ force = false } = {}) {
+  if (loadingRemotes.value || (remotesLoadedOnce.value && !force)) return
+  loadingRemotes.value = true
+  try {
+    const res = await api.listRcloneRemotes()
+    rcloneRemotes.value = Array.isArray(res?.remotes) ? res.remotes : []
+    remotesLoadedOnce.value = true
+    syncProviderTabFromType(activeRemoteType.value)
+  } catch {
+    // Keep manual remote input usable if rclone binary is not present locally
+  } finally {
+    loadingRemotes.value = false
+  }
+}
+
+function selectRcloneRemote(remote) {
+  if (!form.value || !remote?.name) return
+  form.value.rclone_remote = remote.name
+  syncProviderTabFromType(String(remote.type || '').toLowerCase() || activeRemoteType.value)
+}
+
+watch(activeTab, (tab) => {
+  if (tab === 'rclone') {
+    loadRcloneRemotes()
+  }
+})
+
+watch(activeRemoteType, (rtype) => {
+  syncProviderTabFromType(rtype)
+}, { immediate: true })
 
 const tabs = [
   { value: 'cookie', label: 'Cookie 与账号', icon: Cookie },
@@ -236,6 +309,7 @@ async function handleTestRclone() {
     }
     const res = await api.testRclone()
     store.notify(res.message, res.ok ? 'success' : 'error')
+    loadRcloneRemotes({ force: true })
   } catch (err) {
     store.notify(err.message, 'error')
   } finally {
@@ -517,77 +591,215 @@ async function handleTestNotify() {
           </Button>
         </div>
 
-        <div class="p-6 space-y-5">
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">Remote 名称</label>
-              <Input v-model="form.rclone_remote" placeholder="pikpak" />
+        <div class="p-6 space-y-6">
+          <!-- Detected Remotes Quick Switcher -->
+          <div class="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/80 bg-surface-subtle/60 px-3.5 py-2.5">
+            <div class="flex flex-wrap items-center gap-1.5 min-w-0">
+              <span class="text-xs font-medium text-muted-foreground mr-1">已检测 Remote：</span>
+              <template v-if="rcloneRemotes.length > 0">
+                <button
+                  v-for="r in rcloneRemotes"
+                  :key="r.name"
+                  type="button"
+                  :class="[
+                    'inline-flex items-center gap-1.5 h-7 px-2.5 rounded-full border text-xs font-medium transition-colors cursor-pointer select-none',
+                    String(form.rclone_remote || '').trim().toLowerCase() === r.name.toLowerCase()
+                      ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand'
+                      : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-foreground/20',
+                  ]"
+                  @click="selectRcloneRemote(r)"
+                >
+                  <span class="font-mono">{{ r.name }}</span>
+                  <span class="text-[10px] opacity-75">{{ formatRemoteType(r.type) }}</span>
+                </button>
+              </template>
+              <span v-else class="text-xs text-muted-foreground">
+                {{ loadingRemotes ? '读取 rclone.conf 中...' : '未检测到本地 rclone Remote，可直接在下方手动填写' }}
+              </span>
             </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">远端基础目录</label>
-              <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
+            <Button
+              variant="ghost"
+              size="xs"
+              class="text-muted-foreground shrink-0"
+              :disabled="loadingRemotes"
+              @click="loadRcloneRemotes({ force: true })"
+            >
+              <RefreshCw :class="['w-3 h-3', loadingRemotes ? 'animate-spin' : '']" />
+              重新扫描
+            </Button>
+          </div>
+
+          <!-- Section 1: Common Upload Settings -->
+          <div class="space-y-4">
+            <div>
+              <h4 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">通用上传配置（所有网盘生效）</h4>
             </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">rclone 命令路径</label>
-              <Input v-model="form.rclone_bin" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">并行上传 Worker 数（独立并发文件数）</label>
-              <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">单批触发上传文件数（1 = 下完即传）</label>
-              <Input v-model="form.upload_batch_size" type="number" :min="1" :max="100" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">单 Worker 内并发 (transfers，多 Worker 建议 1)</label>
-              <Input v-model="form.rclone_transfers" type="number" :min="1" :max="16" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">检查并发 (checkers)</label>
-              <Input v-model="form.rclone_checkers" type="number" :min="1" :max="32" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">PikPak 分块并发（仅 PikPak 生效）</label>
-              <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">PikPak 分块大小（如 16Mi / 32Mi）</label>
-              <Input v-model="form.rclone_pikpak_chunk_size" placeholder="16Mi" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">rclone 单次执行超时（秒）</label>
-              <Input v-model="form.rclone_timeout_seconds" type="number" :min="30" :max="86400" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">rclone 日志级别</label>
-              <Input v-model="form.rclone_log_level" placeholder="ERROR" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">rclone TPS 限制（0 不限制）</label>
-              <div class="grid grid-cols-2 gap-2">
-                <Input v-model="form.rclone_tpslimit" type="number" :min="0" :max="100" placeholder="0" />
-                <Input v-model="form.rclone_tpslimit_burst" type="number" :min="0" :max="100" placeholder="突发" />
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">Remote 名称</label>
+                <Input v-model="form.rclone_remote" placeholder="pikpak 或 gd" />
               </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">远端基础目录</label>
+                <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">rclone 命令路径</label>
+                <Input v-model="form.rclone_bin" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">并行上传 Worker 数（独立并发文件数）</label>
+                <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">单批触发上传文件数（1 = 下完即传）</label>
+                <Input v-model="form.upload_batch_size" type="number" :min="1" :max="100" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">单 Worker 内并发 (transfers，多 Worker 建议 1)</label>
+                <Input v-model="form.rclone_transfers" type="number" :min="1" :max="16" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">检查并发 (checkers)</label>
+                <Input v-model="form.rclone_checkers" type="number" :min="1" :max="32" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">rclone 单次执行超时（秒）</label>
+                <Input v-model="form.rclone_timeout_seconds" type="number" :min="30" :max="86400" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">rclone 日志级别</label>
+                <Input v-model="form.rclone_log_level" placeholder="ERROR" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">rclone TPS 限制（0 不限制）</label>
+                <div class="grid grid-cols-2 gap-2">
+                  <Input v-model="form.rclone_tpslimit" type="number" :min="0" :max="100" placeholder="0" />
+                  <Input v-model="form.rclone_tpslimit_burst" type="number" :min="0" :max="100" placeholder="突发" />
+                </div>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap gap-6 pt-1">
+              <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
+                <Switch v-model="form.rclone_ignore_checksum" />
+                <span>上传时跳过 rclone 自带的校验和检查</span>
+              </label>
+              <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
+                <Switch v-model="form.rclone_ignore_size" />
+                <span>上传时跳过 rclone 自带的大小检查</span>
+              </label>
+              <label
+                class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer"
+                title="部分网盘（如 PikPak）不返回 MD5；开启后会在上传完成时重新从网盘下载整部视频做逐字节校验，耗时翻倍，通常应保持关闭"
+              >
+                <Switch v-model="form.rclone_verify_download" />
+                <span>远端无校验和时回下比对（PikPak 建议关闭）</span>
+              </label>
             </div>
           </div>
 
-          <div class="flex flex-wrap gap-6 pt-1">
-            <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
-              <Switch v-model="form.rclone_ignore_checksum" />
-              <span>上传时跳过 rclone 自带的校验和检查</span>
-            </label>
-            <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
-              <Switch v-model="form.rclone_ignore_size" />
-              <span>上传时跳过 rclone 自带的大小检查</span>
-            </label>
-            <label
-              class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer"
-              title="部分网盘（如 PikPak）不返回 MD5；开启后会在上传完成时重新从网盘下载整部视频做逐字节校验，耗时翻倍，通常应保持关闭"
-            >
-              <Switch v-model="form.rclone_verify_download" />
-              <span>远端无校验和时回下比对（PikPak 建议关闭）</span>
-            </label>
+          <!-- Section 2: Provider-Specific Tuning -->
+          <div class="rounded-xl border border-border bg-surface-subtle/40 overflow-hidden">
+            <div class="px-4 py-3 border-b border-border/80 flex flex-wrap items-center justify-between gap-2 bg-surface-subtle/70">
+              <div>
+                <h4 class="text-xs font-semibold text-foreground">网盘专属调优参数</h4>
+                <p class="text-[11px] text-muted-foreground mt-0.5">
+                  各网盘参数独立保存，执行上传时自动按当前 Remote 的网盘类型匹配对应参数
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <button
+                  v-for="pt in PROVIDER_TABS"
+                  :key="pt.value"
+                  type="button"
+                  :class="[
+                    'inline-flex items-center gap-1.5 h-7 px-3 rounded-full border text-xs font-medium transition-colors cursor-pointer select-none',
+                    providerTab === pt.value
+                      ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand'
+                      : 'border-border bg-card text-muted-foreground hover:text-foreground',
+                  ]"
+                  @click="providerTab = pt.value"
+                >
+                  <span>{{ pt.label }}</span>
+                  <span
+                    v-if="(pt.value === 'pikpak' && activeRemoteType === 'pikpak') || (pt.value === 'drive' && activeRemoteType === 'drive')"
+                    class="rounded-full bg-emerald-500/15 px-1.5 py-0.2 text-[10px] text-emerald-700 dark:text-emerald-300"
+                  >
+                    当前生效
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <!-- PikPak -->
+            <div v-if="providerTab === 'pikpak'" class="p-4 space-y-3">
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="space-y-1.5">
+                  <label class="text-xs font-medium text-foreground">PikPak 分块并发（--pikpak-upload-concurrency）</label>
+                  <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
+                </div>
+                <div class="space-y-1.5">
+                  <label class="text-xs font-medium text-foreground">PikPak 分块大小（--pikpak-chunk-size）</label>
+                  <Input v-model="form.rclone_pikpak_chunk_size" placeholder="16Mi" />
+                </div>
+              </div>
+              <p class="text-[11px] text-muted-foreground">
+                建议策略（多 Worker + 小分块）：千兆 VPS / 4G 内存推荐 <span class="font-mono text-foreground">Worker = 6</span>、<span class="font-mono text-foreground">分块并发 = 3</span>、<span class="font-mono text-foreground">分块大小 = 16Mi</span>。
+              </p>
+            </div>
+
+            <!-- Google Drive -->
+            <div v-else-if="providerTab === 'drive'" class="p-4 space-y-3.5">
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
+                <div class="space-y-1.5">
+                  <label class="text-xs font-medium text-foreground">Google Drive 分块大小（--drive-chunk-size，须为 2 的幂）</label>
+                  <Input v-model="form.rclone_drive_chunk_size" placeholder="64Mi" />
+                </div>
+                <div class="flex items-center gap-1.5 pb-0.5">
+                  <span class="text-[11px] text-muted-foreground mr-1">快捷：</span>
+                  <button
+                    v-for="sz in ['32Mi', '64Mi', '128Mi']"
+                    :key="sz"
+                    type="button"
+                    :class="[
+                      'h-7 px-2.5 rounded-md border font-mono text-[11px] transition-colors cursor-pointer',
+                      form.rclone_drive_chunk_size === sz
+                        ? 'border-brand/40 bg-brand/10 text-brand'
+                        : 'border-border bg-card text-muted-foreground hover:text-foreground',
+                    ]"
+                    @click="form.rclone_drive_chunk_size = sz"
+                  >
+                    {{ sz }}
+                  </button>
+                </div>
+              </div>
+              <label
+                class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer"
+                title="Google Drive 单号每日 750GB 上传上限触发时立即终止本次上传并保留本地文件，避免干等超时"
+              >
+                <Switch v-model="form.rclone_drive_stop_on_upload_limit" />
+                <span>达每日 750GB 上传上限时立即停止重试（--drive-stop-on-upload-limit）</span>
+              </label>
+              <p class="text-[11px] text-muted-foreground">
+                建议策略（少 Worker + 大分块）：切到 GD 时建议将上方 <span class="font-mono text-foreground">并行上传 Worker</span> 调为 <span class="font-mono text-foreground">2~3</span>、分块 <span class="font-mono text-foreground">64Mi / 128Mi</span>，并在 <span class="font-mono">rclone.conf</span> 自建 OAuth Client ID。
+              </p>
+            </div>
+
+            <!-- Other / Custom -->
+            <div v-else class="p-4 space-y-3">
+              <div class="space-y-1.5">
+                <label class="text-xs font-medium text-foreground">附加 rclone copy 调优参数（对任意网盘生效）</label>
+                <Input
+                  v-model="form.rclone_extra_flags"
+                  placeholder="如 --onedrive-chunk-size=60M 或 --s3-chunk-size=32Mi --s3-upload-concurrency=4"
+                  class="font-mono text-xs"
+                />
+              </div>
+              <p class="text-[11px] text-muted-foreground">
+                以后接入 OneDrive、S3/R2、WebDAV、Alist 等任意 rclone 支持的网盘时，可直接在此填写该网盘的官方调优参数（仅允许安全的 <span class="font-mono">--*</span> 选项，系统会自动过滤路径/危险参数）。
+              </p>
+            </div>
           </div>
         </div>
       </Card>

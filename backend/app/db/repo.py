@@ -619,6 +619,22 @@ class Repository:
             )
         return deleted
 
+    async def _get_target_display_map(self) -> Dict[str, str]:
+        rows = await self.db.fetch_all(
+            """
+            SELECT LOWER(username) AS uname, display_name
+            FROM targets
+            WHERE display_name != ''
+            ORDER BY id ASC
+            """
+        )
+        mapping: Dict[str, str] = {}
+        for r in rows:
+            uname = r["uname"]
+            if uname and uname not in mapping:
+                mapping[uname] = r["display_name"]
+        return mapping
+
     async def query_videos(
         self,
         *,
@@ -631,21 +647,23 @@ class Repository:
     ) -> Tuple[List[Dict[str, Any]], int]:
         clauses = []
         params: List[Any] = []
-        if search.strip():
-            like = f"%{search.strip()}%"
-            clauses.append(
-                """
-                (
-                    v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ?
-                    OR EXISTS (
-                        SELECT 1 FROM targets t
-                        WHERE LOWER(t.username) = LOWER(v.uploader)
-                          AND t.display_name LIKE ?
-                    )
-                )
-                """
+        search_clean = search.strip()
+        if search_clean:
+            like = f"%{search_clean}%"
+            matched_targets = await self.db.fetch_all(
+                "SELECT DISTINCT LOWER(username) AS uname FROM targets WHERE display_name LIKE ?",
+                (like,),
             )
-            params.extend([like, like, like, like])
+            matched_unames = [r["uname"] for r in matched_targets if r["uname"]]
+            if matched_unames:
+                placeholders = ",".join("?" for _ in matched_unames)
+                clauses.append(
+                    f"(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR LOWER(v.uploader) IN ({placeholders}))"
+                )
+                params.extend([like, like, like, *matched_unames])
+            else:
+                clauses.append("(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ?)")
+                params.extend([like, like, like])
         if uploader.strip():
             clauses.append("LOWER(v.uploader) = LOWER(?)")
             params.append(uploader.strip())
@@ -666,14 +684,7 @@ class Repository:
         offset = max(0, (page - 1) * page_size)
         rows = await self.db.fetch_all(
             f"""
-            SELECT v.*,
-                (
-                    SELECT t.display_name FROM targets t
-                    WHERE LOWER(t.username) = LOWER(v.uploader)
-                      AND t.display_name != ''
-                    ORDER BY t.id
-                    LIMIT 1
-                ) AS uploader_display_name
+            SELECT v.*
             FROM videos v
             {where_sql}
             ORDER BY COALESCE(v.downloaded_at, v.uploaded_at, v.created_at) DESC,
@@ -682,20 +693,22 @@ class Repository:
             """,
             [*params, page_size, offset],
         )
+        display_map = await self._get_target_display_map() if rows else {}
+        for row in rows:
+            uname = str(row.get("uploader") or "").strip().lower()
+            row["uploader_display_name"] = display_map.get(uname, "")
         return rows, total
 
     async def get_video_filter_facets(self) -> Dict[str, Any]:
-        uploaders = await self.db.fetch_all(
+        uploader_rows = await self.db.fetch_all(
             """
-            SELECT v.uploader AS uploader,
-                   MIN(CASE WHEN t.display_name != '' THEN t.display_name ELSE NULL END) AS display_name
-            FROM videos v
-            LEFT JOIN targets t ON LOWER(t.username) = LOWER(v.uploader)
-            WHERE v.uploader != ''
-            GROUP BY v.uploader
-            ORDER BY LOWER(v.uploader) ASC
+            SELECT DISTINCT uploader
+            FROM videos
+            WHERE uploader != ''
+            ORDER BY LOWER(uploader) ASC
             """
         )
+        display_map = await self._get_target_display_map()
         qualities = await self.db.fetch_all(
             """
             SELECT DISTINCT quality FROM videos
@@ -704,10 +717,11 @@ class Repository:
                      quality DESC
             """
         )
+        uploaders = [r["uploader"] for r in uploader_rows]
         return {
-            "uploaders": [r["uploader"] for r in uploaders],
+            "uploaders": uploaders,
             "uploader_labels": {
-                r["uploader"]: (r["display_name"] or r["uploader"]) for r in uploaders
+                u: (display_map.get(u.strip().lower()) or u) for u in uploaders
             },
             "qualities": [r["quality"] for r in qualities],
         }

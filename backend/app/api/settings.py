@@ -11,7 +11,7 @@ from ..engine.scheduler import parse_hhmm
 from ..services.captcha import CaptchaError, get_yescaptcha_balance
 from ..services.cookie import check_cookie_valid, login_and_get_cookies
 from ..services.notifier import send_serverchan
-from ..services.uploader import test_rclone_connection
+from ..services.uploader import list_rclone_remotes, test_rclone_connection
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -133,6 +133,13 @@ async def test_yescaptcha(container: AppContainer = Depends(require_auth)):
         "balance": balance,
         "message": f"YesCaptcha 连接成功，账户余额 {balance} 点",
     }
+
+
+@router.get("/rclone/remotes")
+async def get_rclone_remotes(container: AppContainer = Depends(require_auth)):
+    settings = await container.repo.get_settings()
+    remotes = await list_rclone_remotes(settings)
+    return {"remotes": remotes}
 
 
 @router.post("/rclone/test")
