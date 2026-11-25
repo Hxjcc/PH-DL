@@ -1093,3 +1093,151 @@ async def test_retry_items_broadcasts_all_pending_items_and_prioritizes_partial_
     finally:
         await tm.stop()
         await db.close()
+
+
+async def test_upload_streams_per_file_and_cancel_marks_remaining_without_spurious_batches(
+    tmp_path: Path, monkeypatch
+):
+    """Per-file upload commits immediately, and cancelling stops new batches and marks leftovers cancelled."""
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": True,
+                "rclone_transfers": 1,
+                "upload_batch_size": 3,
+                "max_pending_upload_files": 20,
+                "min_free_disk_gb": 0.0,
+                "min_file_size_bytes": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        dl_dir = env.downloads_dir / "eve"
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        local_files = {}
+        for idx in range(1, 6):
+            vk = f"vk{idx}"
+            fp = dl_dir / f"Clip {idx} [{vk}].mp4"
+            fp.write_bytes(mp4_payload())
+            local_files[vk] = fp
+            await repo.upsert_video(
+                vk,
+                title=f"Clip {idx}",
+                uploader="eve",
+                target_type="model",
+                quality="1080p",
+                video_page_url=f"https://www.pornhub.com/view_video.php?viewkey={vk}",
+                status="downloaded",
+                local_path=str(fp),
+                file_size=fp.stat().st_size,
+                upload_requested=True,
+                downloaded_at=f"2026-11-25T00:00:0{idx}+00:00",
+            )
+
+        from app.engine import task_manager as tm_mod
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        upload_calls = []
+
+        async def fake_upload(download_dir, uploader_folder, files_by_viewkey, settings, cancel_event=None):
+            vkeys = list(files_by_viewkey.keys())
+            upload_calls.append(vkeys)
+            # First file succeeds immediately; second file sees cancel signal mid-upload.
+            if len(upload_calls) == 1:
+                return UploadBatchResult(
+                    uploaded_viewkeys=vkeys,
+                    failed_viewkeys=[],
+                    verified_sources={vk: file_snapshot(p) for vk, p in files_by_viewkey.items()},
+                    remote_dir=f"pikpak:Pornhub/{uploader_folder}",
+                )
+            if cancel_event is not None:
+                cancel_event.set()
+            return UploadBatchResult(
+                uploaded_viewkeys=[],
+                failed_viewkeys=vkeys,
+                remote_dir=f"pikpak:Pornhub/{uploader_folder}",
+                error="rclone 执行已取消",
+            )
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "upload_file_batch", fake_upload)
+
+        tm.start()
+        job = await tm.enqueue_job("auto_update", "全量自动追更", {})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+
+        assert done is not None
+        assert done["status"] == "cancelled"
+        # File 1 uploaded & committed before cancel; files 2..5 must ALL be cancelled (NOT left as 'downloaded'!)
+        assert upload_calls == [["vk1"], ["vk2"]]
+        assert done["total_items"] == 5
+        assert done["uploaded_items"] == 1
+        assert done["done_items"] == 1
+        assert done["failed_items"] == 0
+
+        items = await repo.list_job_items(job["id"])
+        statuses = {it["viewkey"]: it["status"] for it in items}
+        assert statuses == {
+            "vk1": "done",
+            "vk2": "cancelled",
+            "vk3": "cancelled",
+            "vk4": "cancelled",
+            "vk5": "cancelled",
+        }
+        # File 1 was cleaned up locally; files 2..5 remain untouched on disk.
+        assert not local_files["vk1"].exists()
+        assert all(local_files[f"vk{i}"].exists() for i in range(2, 6))
+    finally:
+        await tm.stop()
+        await db.close()
+
+
+async def test_page1_only_error_keeps_catch_up_enabled_on_next_update(tmp_path: Path, monkeypatch):
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {"ph_cookie": "sess=valid", "uploader_enabled": False, "page_delay_min": 0.0, "page_delay_max": 0.0}
+        )
+        target = await repo.upsert_target("miuzxc", "model", enabled=True)
+        await repo.mark_target_checked(target["id"], 0, error="列表第 1 页: HTTP 403")
+
+        from app.engine import task_manager as tm_mod
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        seen_catch_up = []
+
+        async def fake_scan(ctx, initial_url, selectors, *, catch_up=False, **kwargs):
+            seen_catch_up.append(catch_up)
+            return []
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "scan_list_pages", fake_scan)
+
+        tm.start()
+        job = await tm.enqueue_job("auto_update", "指定追更: Miuzxc", {"target_ids": [target["id"]]})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+        assert done is not None and done["status"] == "completed"
+        assert seen_catch_up == [True]
+    finally:
+        await tm.stop()
+        await db.close()

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
+from weakref import WeakKeyDictionary
 
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
@@ -18,6 +20,12 @@ PORNHUB_LOGIN_URL = "https://www.pornhub.com/login"
 PORNHUB_DEFAULT_SITEKEY = "6LfyQRoUAAAAAApqS-inJxUwCOtvOHwKxJuZCsuv"
 
 LogCallback = Callable[[str, str], None]
+
+# Coalesce concurrent auto-login calls per event loop + (account, proxy) to avoid
+# firing duplicate YesCaptcha solves or triggering PornHub's 1-hour account lock.
+_INFLIGHT_LOGINS: "WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[Tuple[str, str], asyncio.Task[CookieLoginResult]]]" = (
+    WeakKeyDictionary()
+)
 
 
 @dataclass(frozen=True)
@@ -377,15 +385,15 @@ async def check_cookie_valid(
             proxy_url=proxy_url,
             concurrency=1,
             timeout=timeout,
-            max_retries=1,
-            retry_delay_base=1.0,
-            retry_delay_max=2.0,
+            max_retries=2,
+            retry_delay_base=1.5,
+            retry_delay_max=6.0,
         )
         async with ctx:
             res, err = await ctx.fetch_with_pow(
                 "https://www.pornhub.com/settings/security",
                 timeout=timeout,
-                max_retries=1,
+                max_retries=2,
                 log_label="Cookie 校验",
             )
             if res is None:
@@ -527,6 +535,53 @@ async def login_and_get_cookies(
 ) -> CookieLoginResult:
     if not (username or "").strip() or not (password or "").strip():
         return CookieLoginResult(success=False, message="未配置 PornHub 账号或密码")
+
+    loop = asyncio.get_running_loop()
+    inflight = _INFLIGHT_LOGINS.setdefault(loop, {})
+    dedup_key = (username.strip().lower(), (proxy_url or "").strip())
+    existing = inflight.get(dedup_key)
+    if existing is not None and not existing.done():
+        if on_log:
+            on_log("INFO", "检测到已有正在进行的自动登录任务，复用本次登录结果...")
+        return await asyncio.shield(existing)
+
+    task = asyncio.create_task(
+        _login_and_get_cookies_once(
+            username,
+            password,
+            proxy_url=proxy_url,
+            timeout=timeout,
+            yescaptcha_enabled=yescaptcha_enabled,
+            yescaptcha_client_key=yescaptcha_client_key,
+            yescaptcha_api_base=yescaptcha_api_base,
+            yescaptcha_task_type=yescaptcha_task_type,
+            yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
+            on_log=on_log,
+        )
+    )
+    inflight[dedup_key] = task
+
+    def _cleanup(finished: asyncio.Task[CookieLoginResult]) -> None:
+        if inflight.get(dedup_key) is finished:
+            inflight.pop(dedup_key, None)
+
+    task.add_done_callback(_cleanup)
+    return await asyncio.shield(task)
+
+
+async def _login_and_get_cookies_once(
+    username: str,
+    password: str,
+    proxy_url: Optional[str] = None,
+    timeout: float = 20.0,
+    *,
+    yescaptcha_enabled: bool = False,
+    yescaptcha_client_key: str = "",
+    yescaptcha_api_base: str = "https://api.yescaptcha.com",
+    yescaptcha_task_type: str = "RecaptchaV2EnterpriseTaskProxyless",
+    yescaptcha_timeout_seconds: float = 180.0,
+    on_log: Optional[LogCallback] = None,
+) -> CookieLoginResult:
 
     def emit(level: str, message: str) -> None:
         if on_log:

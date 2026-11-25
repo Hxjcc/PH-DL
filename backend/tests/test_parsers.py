@@ -157,6 +157,44 @@ async def test_concurrent_pow_challenges_use_single_flight_solver(monkeypatch):
     assert ctx.pow_cookies["KEY"] == "2*55:5:424242:1"
 
 
+async def test_task_http_context_retries_transient_403_and_includes_conn_error_detail(monkeypatch):
+    logs = []
+    ctx = TaskHttpContext(
+        cookie_str="sess=base",
+        max_retries=2,
+        retry_delay_base=0.0,
+        retry_delay_max=0.0,
+        on_log=lambda lvl, msg: logs.append((lvl, msg)),
+    )
+    ctx.pow_cookies["KEY"] = "stale-key"
+    attempts = 0
+
+    async def fake_raw_get(url, cookies, headers=None, timeout=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            return "<html>forbidden</html>", url, [], 403
+        return "<html>recovered</html>", url, [], 200
+
+    monkeypatch.setattr(ctx, "_raw_get", fake_raw_get)
+    res, err = await ctx.fetch_with_pow("https://www.pornhub.com/model/alice/videos", log_label="列表第 1 页")
+    assert err is None and res is not None
+    assert res.status_code == 200 and res.retried is True
+    assert attempts == 3
+    # Consecutive 403s clear stale PoW cookies so the session can recover cleanly.
+    assert "KEY" not in ctx.pow_cookies
+    assert any("HTTP 403" in msg for _, msg in logs)
+
+    # ConnectionError logs and returned reason include underlying detail.
+    async def broken_raw_get(url, cookies, headers=None, timeout=None):
+        raise ConnectionError("curl: (56) Recv failure: Connection reset by peer")
+
+    monkeypatch.setattr(ctx, "_raw_get", broken_raw_get)
+    res2, err2 = await ctx.fetch_with_pow("https://www.pornhub.com/view_video.php?viewkey=vk1", max_retries=0)
+    assert res2 is None and err2 is not None
+    assert "Connection reset by peer" in err2
+
+
 def test_list_page_extraction_chrome_fallback_and_dedup():
     selectors = SelectorSettings()
     items_html = "".join(

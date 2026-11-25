@@ -18,19 +18,43 @@ warnings.filterwarnings(
 
 from curl_cffi.requests import AsyncSession as CffiSession
 
+try:
+    from curl_cffi import CurlHttpVersion
+except ImportError:  # pragma: no cover - compatibility with older curl_cffi
+    try:
+        from curl_cffi.const import CurlHttpVersion
+    except ImportError:  # pragma: no cover
+        CurlHttpVersion = None  # type: ignore[assignment]
+
+try:
+    from curl_cffi.requests import BrowserType
+
+    _AVAILABLE_BROWSERS = {member.value for member in BrowserType}
+except Exception:  # pragma: no cover
+    _AVAILABLE_BROWSERS = set()
+
 from ..cancel import StopRequested, until_stopped
 from . import challenge
 
 # Only Chrome fingerprints: Safari fingerprints trigger a stripped-down PornHub HTML layout
-# that omits videos and breaks primary container selectors.
-CHROME_FINGERPRINTS: Tuple[str, ...] = (
-    "chrome110",
-    "chrome116",
-    "chrome119",
-    "chrome120",
-    "chrome123",
+# that omits videos and breaks primary container selectors. Prefer modern desktop Chrome
+# fingerprints supported by the installed curl_cffi version.
+_PREFERRED_CHROME_FINGERPRINTS: Tuple[str, ...] = (
+    "chrome136",
+    "chrome131",
     "chrome124",
+    "chrome123",
+    "chrome120",
+    "chrome119",
 )
+CHROME_FINGERPRINTS: Tuple[str, ...] = tuple(
+    fp for fp in _PREFERRED_CHROME_FINGERPRINTS
+    if not _AVAILABLE_BROWSERS or fp in _AVAILABLE_BROWSERS
+) or ("chrome124", "chrome123", "chrome120")
+
+# Force HTTP/1.1 by default so concurrent requests to www.pornhub.com do not multiplex
+# onto a single HTTP/2 TCP socket where one WAF reset or timeout kills every in-flight stream.
+_HTTP_V1_1 = getattr(CurlHttpVersion, "V1_1", None)
 
 DEFAULT_HEADERS: Dict[str, str] = {
     "Referer": "https://www.pornhub.com/",
@@ -124,6 +148,8 @@ class TaskHttpContext:
         retry_delay_base: float = 2.0,
         retry_delay_max: float = 10.0,
         impersonate: Optional[str] = None,
+        http_version: Any = _HTTP_V1_1,
+        min_request_interval: Optional[float] = None,
         cancel_event: Optional[asyncio.Event] = None,
         on_log: Optional[LogCallback] = None,
         allow_url: Optional[Callable[[str], bool]] = None,
@@ -137,6 +163,11 @@ class TaskHttpContext:
         self.retry_delay_base = float(retry_delay_base)
         self.retry_delay_max = float(retry_delay_max)
         self.impersonate: str = impersonate or random.choice(CHROME_FINGERPRINTS)
+        self.http_version = http_version
+        if min_request_interval is None:
+            self.min_request_interval = 0.15 if (self.retry_delay_base > 0 and int(concurrency) > 1) else 0.0
+        else:
+            self.min_request_interval = max(0.0, float(min_request_interval))
         self.session_cookies: Dict[str, str] = {}
         self.pow_cookies: Dict[str, str] = {}
         self.cancel_event = cancel_event or asyncio.Event()
@@ -146,13 +177,26 @@ class TaskHttpContext:
         self._session: Optional[CffiSession] = None
         self._cookie_lock = asyncio.Lock()
         self._challenge_lock = asyncio.Lock()
+        self._pacing_lock = asyncio.Lock()
+        self._cooldown_lock = asyncio.Lock()
+        self._next_dispatch_at = 0.0
+        self._cooldown_until = 0.0
+        self._pow_ready_at = 0.0
+        self._consecutive_403 = 0
+        self._consecutive_conn_errors = 0
         self._challenge_generation = 0
         self.challenge_solve_count = 0
         self.challenge_reuse_count = 0
         self.challenge_solve_seconds = 0.0
 
+    def _session_kwargs(self, max_clients: int) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"proxy": self.proxy_url, "max_clients": max_clients}
+        if self.http_version is not None:
+            kwargs["http_version"] = self.http_version
+        return kwargs
+
     async def __aenter__(self) -> "TaskHttpContext":
-        self._session = CffiSession(proxy=self.proxy_url, max_clients=self.pool_size)
+        self._session = CffiSession(**self._session_kwargs(self.pool_size))
         await self._session.__aenter__()
         return self
 
@@ -164,6 +208,74 @@ class TaskHttpContext:
     def _emit(self, level: str, msg: str) -> None:
         if self.on_log:
             self.on_log(level, msg)
+
+    async def _wait_for_pacing_and_cooldown(self) -> None:
+        """Honor task-wide rate-limit cooldowns and smooth concurrent request bursts."""
+        while True:
+            remaining = self._cooldown_until - time.monotonic()
+            if remaining <= 0:
+                break
+            stagger = random.uniform(0.05, 0.45) if self.retry_delay_base > 0 else 0.0
+            await until_stopped(asyncio.sleep(remaining + stagger), self.cancel_event)
+
+        if self.min_request_interval > 0:
+            async with self._pacing_lock:
+                now = time.monotonic()
+                wait_s = max(0.0, self._next_dispatch_at - now)
+                step = self.min_request_interval * random.uniform(0.75, 1.25)
+                self._next_dispatch_at = max(now, self._next_dispatch_at) + step
+            if wait_s > 0:
+                await until_stopped(asyncio.sleep(wait_s), self.cancel_event)
+
+    async def _extend_cooldown(
+        self,
+        *,
+        kind: str,
+        retry_num: int,
+        base: float,
+        cap: float,
+    ) -> Tuple[float, int]:
+        """Extend the shared task cooldown window to prevent synchronized retry storms."""
+        async with self._cooldown_lock:
+            now = time.monotonic()
+            if kind == "403":
+                self._consecutive_403 += 1
+                streak = self._consecutive_403
+                if base <= 0:
+                    delay = 0.0
+                else:
+                    level = max(retry_num, min(streak - 1, 3))
+                    step = max(base * (2 ** (level + 1)), 4.0)
+                    delay = min(step, max(cap, 30.0))
+                    delay += random.uniform(0.0, delay * 0.25)
+            else:
+                if kind == "conn":
+                    self._consecutive_conn_errors += 1
+                streak = self._consecutive_conn_errors
+                if base <= 0:
+                    delay = 0.0
+                else:
+                    delay = min(base * (2 ** retry_num), cap)
+                    if kind == "conn" and streak >= 3:
+                        delay = max(delay, min(max(base * 2.0, 4.0), max(cap, 15.0)))
+                    delay += random.uniform(0.0, delay * 0.25)
+
+            target = now + delay
+            if target > self._cooldown_until:
+                self._cooldown_until = target
+            wait_s = max(0.0, self._cooldown_until - now)
+            return wait_s, streak
+
+    def _mark_request_healthy(self) -> None:
+        self._consecutive_403 = 0
+        self._consecutive_conn_errors = 0
+
+    @staticmethod
+    def _format_error(err: BaseException) -> str:
+        raw = str(err).strip().splitlines()[0].strip() if str(err).strip() else ""
+        if raw:
+            return f"{type(err).__name__}: {raw[:120]}"
+        return type(err).__name__
 
     async def _absorb_set_cookies(self, set_cookie_headers: List[str]) -> None:
         parsed = parse_set_cookie_headers(set_cookie_headers)
@@ -216,6 +328,8 @@ class TaskHttpContext:
                     "impersonate": self.impersonate,
                     "discard_cookies": True,
                 }
+                if self.http_version is not None:
+                    request_kwargs["http_version"] = self.http_version
                 if verb == "POST":
                     resp = await sess.post(current_url, data=data, **request_kwargs)
                 else:
@@ -232,7 +346,7 @@ class TaskHttpContext:
 
         if self._session is not None:
             return await _do(self._session)
-        async with CffiSession(proxy=self.proxy_url, max_clients=2) as temp_session:
+        async with CffiSession(**self._session_kwargs(2)) as temp_session:
             return await _do(temp_session)
 
     async def _raw_get(
@@ -284,6 +398,11 @@ class TaskHttpContext:
             if self.cancel_event.is_set():
                 return None, "操作已取消"
 
+            try:
+                await self._wait_for_pacing_and_cooldown()
+            except StopRequested:
+                return None, "操作已取消"
+
             merged_cookies = self.merged_cookies(extra_cookies)
 
             try:
@@ -308,24 +427,32 @@ class TaskHttpContext:
             except (ConnectionError, TimeoutError, OSError, asyncio.TimeoutError) as err:
                 if self.cancel_event.is_set():
                     return None, "操作已取消"
+                err_summary = self._format_error(err)
                 if retries_left == 0:
-                    self._emit("WARNING", f"{log_label}多次重试仍失败 ({type(err).__name__}): {url}")
-                    return None, f"网络错误 ({type(err).__name__})"
+                    self._emit("WARNING", f"{log_label}多次重试仍失败 ({err_summary}): {url}")
+                    return None, f"网络错误 ({err_summary})"
 
                 retry_num = initial_retries - retries_left
                 base = self.retry_delay_base if retry_delay_base is None else float(retry_delay_base)
                 cap = self.retry_delay_max if retry_delay_max is None else float(retry_delay_max)
-                delay = min(base * (2 ** retry_num), cap)
-                delay += random.uniform(0, delay * 0.2)
-                self._emit("WARNING", f"{log_label}发生可重试错误 ({type(err).__name__})，{delay:.1f}s 后重试...")
+                delay, _ = await self._extend_cooldown(
+                    kind="conn",
+                    retry_num=retry_num,
+                    base=base,
+                    cap=cap,
+                )
+                stagger = random.uniform(0.0, min(1.0, base)) if base > 0 else 0.0
+                wait_total = delay + stagger
+                self._emit("WARNING", f"{log_label}发生可重试错误 ({err_summary})，{wait_total:.1f}s 后重试...")
                 try:
-                    await until_stopped(asyncio.sleep(delay), self.cancel_event)
+                    if wait_total > 0:
+                        await until_stopped(asyncio.sleep(wait_total), self.cancel_event)
                 except StopRequested:
                     return None, "操作已取消"
                 retries_left -= 1
                 continue
             except Exception as err:
-                self._emit("ERROR", f"{log_label}发生异常 ({type(err).__name__}): {err}")
+                self._emit("ERROR", f"{log_label}发生异常 ({self._format_error(err)})")
                 return None, f"请求异常 ({type(err).__name__})"
 
             if challenge.is_challenge(text):
@@ -363,31 +490,56 @@ class TaskHttpContext:
                         self.challenge_solve_count += 1
                         self.challenge_solve_seconds += solve_elapsed
                         solved_here = True
+                        if self.retry_delay_base > 0:
+                            self._pow_ready_at = time.monotonic() + 0.6 + random.uniform(0.0, 0.4)
                         self._emit(
                             "INFO",
                             f"{log_label} PoW 质询求解完成，耗时 {solve_elapsed * 1000:.1f}ms",
                         )
 
                 challenge_solves += 1
-                if solved_here:
+                # Ensure BOTH the solver and reusing workers wait until the PoW cookie
+                # settles, with random stagger so waiters don't slam the edge at once.
+                pow_wait = max(0.0, self._pow_ready_at - time.monotonic())
+                if not solved_here and self.retry_delay_base > 0:
+                    pow_wait += random.uniform(0.15, 0.85)
+                if pow_wait > 0:
                     try:
-                        await until_stopped(asyncio.sleep(0.5 + random.uniform(0, 0.5)), self.cancel_event)
+                        await until_stopped(asyncio.sleep(pow_wait), self.cancel_event)
                     except StopRequested:
                         return None, "操作已取消"
                 continue
 
-            if verb == "GET" and (status_code == 429 or 500 <= status_code < 600) and retries_left:
+            if verb == "GET" and (status_code in {403, 429} or 500 <= status_code < 600) and retries_left:
                 retry_num = initial_retries - retries_left
                 base = self.retry_delay_base if retry_delay_base is None else float(retry_delay_base)
                 cap = self.retry_delay_max if retry_delay_max is None else float(retry_delay_max)
-                delay = min(base * (2 ** retry_num), cap)
-                self._emit("WARNING", f"{log_label}返回 HTTP {status_code}，{delay:.1f}s 后重试...")
+                kind = "403" if status_code == 403 else ("429" if status_code == 429 else "5xx")
+                delay, streak = await self._extend_cooldown(
+                    kind=kind,
+                    retry_num=retry_num,
+                    base=base,
+                    cap=cap,
+                )
+                if status_code == 403 and streak >= 2:
+                    async with self._cookie_lock:
+                        self.pow_cookies.clear()
+                    extra_cookies.pop("KEY", None)
+                    extra_cookies.pop("htjschalref", None)
+                stagger = random.uniform(0.0, min(1.0, base)) if base > 0 else 0.0
+                wait_total = delay + stagger
+                hint = "（触发频控冷却）" if status_code == 403 else ""
+                self._emit("WARNING", f"{log_label}返回 HTTP {status_code}{hint}，{wait_total:.1f}s 后重试...")
                 try:
-                    await until_stopped(asyncio.sleep(delay), self.cancel_event)
+                    if wait_total > 0:
+                        await until_stopped(asyncio.sleep(wait_total), self.cancel_event)
                 except StopRequested:
                     return None, "操作已取消"
                 retries_left -= 1
                 continue
+
+            if status_code < 400:
+                self._mark_request_healthy()
 
             if challenge_solves > 0:
                 self._emit(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import random
 import shutil
 import time
 from collections import defaultdict
@@ -411,6 +412,30 @@ class TaskManager:
         space_freed_event = asyncio.Event()
         space_freed_event.set()
 
+        async def _mark_entries_cancelled(entries: List[_UploadQueuedItem]) -> None:
+            nonlocal pending_local_count
+            if not entries:
+                return
+            for entry in entries:
+                it = await self.repo.update_job_item(
+                    entry.item_id,
+                    status="cancelled",
+                    error_message="上传已取消，保留本地文件",
+                )
+                if it:
+                    self.events.broadcast("item_updated", it)
+                self.events.emit_log(
+                    "WARNING",
+                    f"[上传失败] {entry.local_path.name}: 上传已取消，保留本地文件",
+                    job_id=job_id,
+                )
+            async with pending_lock:
+                pending_local_count = max(0, pending_local_count - len(entries))
+                space_freed_event.set()
+            refreshed = await self.repo.recalculate_job_counts(job_id)
+            if refreshed:
+                self.events.broadcast("job_updated", refreshed)
+
         async def _flush_uploader_group(
             uploader_folder: str,
             download_dir: Path,
@@ -419,84 +444,132 @@ class TaskManager:
             nonlocal pending_local_count
             if not batch_entries:
                 return
-            for entry in batch_entries:
-                it = await self.repo.update_job_item(entry.item_id, status="uploading")
-                if it:
-                    self.events.broadcast("item_updated", it)
+            if ctx.cancel_event.is_set():
+                await _mark_entries_cancelled(batch_entries)
+                return
 
-            files_map = {e.viewkey: e.local_path for e in batch_entries}
-            self.events.emit_log(
-                "INFO",
-                f"[上传] 开始向 {settings.rclone_remote}:{settings.rclone_remote_base_dir}/{uploader_folder} "
-                f"上传 {len(batch_entries)} 个视频...",
-                job_id=job_id,
+            chunk_size = max(1, int(settings.rclone_transfers))
+            batch_total = len(batch_entries)
+            batch_verified = 0
+            batch_deleted = 0
+            remote_target = (
+                f"{settings.rclone_remote}:{settings.rclone_remote_base_dir}/{uploader_folder}"
+                if settings.rclone_remote_base_dir
+                else f"{settings.rclone_remote}:{uploader_folder}"
             )
-            up_res = await upload_file_batch(
-                download_dir=download_dir,
-                uploader_folder=uploader_folder,
-                files_by_viewkey=files_map,
-                settings=settings,
-                cancel_event=ctx.cancel_event,
-            )
-            uploaded_set = set(up_res.uploaded_viewkeys)
-            verified_count = 0
-            deleted_local = 0
-            for entry in batch_entries:
-                snapshot = up_res.verified_sources.get(entry.viewkey)
-                if (
-                    entry.viewkey in uploaded_set and snapshot is not None
-                    and not ctx.cancel_event.is_set() and file_snapshot(entry.local_path) == snapshot
-                    and await self.repo.record_verified_upload(
-                        entry.viewkey,
-                        str(entry.local_path),
-                        f"{up_res.remote_dir}/{entry.local_path.relative_to(download_dir).as_posix()}",
-                    )
-                ):
-                    local_path = str(entry.local_path)
-                    if not ctx.cancel_event.is_set() and delete_verified_source(entry.local_path, snapshot):
-                        await self.repo.clear_uploaded_local_path(entry.viewkey, local_path)
-                        local_path = ""
-                        deleted_local += 1
-                    elif not ctx.cancel_event.is_set():
-                        self.events.emit_log("WARNING", f"[上传] 本地副本未移除: {entry.local_path.name}", job_id=job_id)
-                    it = await self.repo.update_job_item(
-                        entry.item_id,
-                        status="done",
-                        local_path=local_path,
-                        upload_requested=0,
-                        error_message="",
-                    )
+
+            for offset in range(0, batch_total, chunk_size):
+                if ctx.cancel_event.is_set():
+                    await _mark_entries_cancelled(batch_entries[offset:])
+                    break
+
+                chunk = batch_entries[offset : offset + chunk_size]
+                for entry in chunk:
+                    it = await self.repo.update_job_item(entry.item_id, status="uploading")
                     if it:
                         self.events.broadcast("item_updated", it)
-                    uploaded_by_uploader[uploader_folder] += 1
-                    verified_count += 1
+
+                files_map = {e.viewkey: e.local_path for e in chunk}
+                if len(chunk) == 1:
+                    try:
+                        size_mb = chunk[0].local_path.stat().st_size / (1024 * 1024)
+                        size_tag = f" ({size_mb:.1f} MB)"
+                    except OSError:
+                        size_tag = ""
+                    self.events.emit_log(
+                        "INFO",
+                        f"[上传] ({offset + 1}/{batch_total}) 开始上传至 {remote_target}: "
+                        f"{chunk[0].local_path.name}{size_tag}",
+                        job_id=job_id,
+                    )
                 else:
-                    cancelled = ctx.cancel_event.is_set()
-                    err_txt = "上传已取消，保留本地文件" if cancelled else up_res.error or "未能确认上传结果"
-                    it = await self.repo.update_job_item(
-                        entry.item_id,
-                        status="cancelled" if cancelled else "failed",
-                        error_message=err_txt if cancelled else f"上传失败: {err_txt}",
+                    self.events.emit_log(
+                        "INFO",
+                        f"[上传] ({offset + 1}-{offset + len(chunk)}/{batch_total}) "
+                        f"开始向 {remote_target} 上传 {len(chunk)} 个视频...",
+                        job_id=job_id,
                     )
-                    if it:
-                        self.events.broadcast("item_updated", it)
-                    if not cancelled:
-                        _record_failed_url(uploader_folder, entry.page_url)
-                    self.events.emit_log("WARNING", f"[上传失败] {entry.local_path.name}: {err_txt}", job_id=job_id)
 
-            async with pending_lock:
-                # All entries in this batch have exited the upload queue (uploaded or marked failed)
-                pending_local_count = max(0, pending_local_count - len(batch_entries))
-                space_freed_event.set()
+                upload_started = time.monotonic()
+                up_res = await upload_file_batch(
+                    download_dir=download_dir,
+                    uploader_folder=uploader_folder,
+                    files_by_viewkey=files_map,
+                    settings=settings,
+                    cancel_event=ctx.cancel_event,
+                )
+                elapsed = max(0.0, time.monotonic() - upload_started)
+                uploaded_set = set(up_res.uploaded_viewkeys)
 
-            refreshed = await self.repo.recalculate_job_counts(job_id)
-            if refreshed:
-                self.events.broadcast("job_updated", refreshed)
+                for entry in chunk:
+                    snapshot = up_res.verified_sources.get(entry.viewkey)
+                    if (
+                        entry.viewkey in uploaded_set and snapshot is not None
+                        and not ctx.cancel_event.is_set() and file_snapshot(entry.local_path) == snapshot
+                        and await self.repo.record_verified_upload(
+                            entry.viewkey,
+                            str(entry.local_path),
+                            f"{up_res.remote_dir}/{entry.local_path.relative_to(download_dir).as_posix()}",
+                        )
+                    ):
+                        local_path = str(entry.local_path)
+                        removed_local = False
+                        if not ctx.cancel_event.is_set() and delete_verified_source(entry.local_path, snapshot):
+                            await self.repo.clear_uploaded_local_path(entry.viewkey, local_path)
+                            local_path = ""
+                            removed_local = True
+                            batch_deleted += 1
+                        elif not ctx.cancel_event.is_set():
+                            self.events.emit_log(
+                                "WARNING",
+                                f"[上传] 本地副本未移除: {entry.local_path.name}",
+                                job_id=job_id,
+                            )
+                        it = await self.repo.update_job_item(
+                            entry.item_id,
+                            status="done",
+                            local_path=local_path,
+                            upload_requested=0,
+                            error_message="",
+                        )
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        uploaded_by_uploader[uploader_folder] += 1
+                        batch_verified += 1
+                        cleanup_note = "，已删除本地文件" if removed_local else "，保留本地副本"
+                        self.events.emit_log(
+                            "INFO",
+                            f"[上传成功] {entry.local_path.name} -> {up_res.remote_dir} "
+                            f"(耗时 {elapsed:.1f}s{cleanup_note})",
+                            job_id=job_id,
+                        )
+                    else:
+                        cancelled = ctx.cancel_event.is_set()
+                        err_txt = "上传已取消，保留本地文件" if cancelled else up_res.error or "未能确认上传结果"
+                        it = await self.repo.update_job_item(
+                            entry.item_id,
+                            status="cancelled" if cancelled else "failed",
+                            error_message=err_txt if cancelled else f"上传失败: {err_txt}",
+                        )
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        if not cancelled:
+                            _record_failed_url(uploader_folder, entry.page_url)
+                        self.events.emit_log("WARNING", f"[上传失败] {entry.local_path.name}: {err_txt}", job_id=job_id)
+
+                async with pending_lock:
+                    # Release backpressure immediately after each uploaded file/chunk.
+                    pending_local_count = max(0, pending_local_count - len(chunk))
+                    space_freed_event.set()
+
+                refreshed = await self.repo.recalculate_job_counts(job_id)
+                if refreshed:
+                    self.events.broadcast("job_updated", refreshed)
 
             self.events.emit_log(
                 "INFO",
-                f"[上传完成] {uploader_folder}: 成功 {verified_count}，删除本地 {deleted_local}，"
-                f"未完成 {len(batch_entries) - verified_count}",
+                f"[上传完成] {uploader_folder}: 成功 {batch_verified}，删除本地 {batch_deleted}，"
+                f"未完成 {batch_total - batch_verified}",
                 job_id=job_id,
             )
 
@@ -504,10 +577,23 @@ class TaskManager:
             nonlocal flush_pending, pending_local_count
             buffers: Dict[Tuple[str, Path], List[_UploadQueuedItem]] = defaultdict(list)
 
+            async def _cancel_all_buffered() -> None:
+                leftovers: List[_UploadQueuedItem] = []
+                for key in list(buffers.keys()):
+                    entries = buffers.pop(key, [])
+                    if entries:
+                        leftovers.extend(entries)
+                if leftovers:
+                    await _mark_entries_cancelled(leftovers)
+
             async def _flush_all() -> None:
-                for (folder, dl_dir), entries in list(buffers.items()):
-                    if entries and not ctx.cancel_event.is_set():
-                        buffers[(folder, dl_dir)] = []
+                for (folder, dl_dir) in list(buffers.keys()):
+                    entries = buffers.pop((folder, dl_dir), [])
+                    if not entries:
+                        continue
+                    if ctx.cancel_event.is_set():
+                        await _mark_entries_cancelled(entries)
+                    else:
                         await _flush_uploader_group(folder, dl_dir, entries)
 
             try:
@@ -515,24 +601,38 @@ class TaskManager:
                     item = await upload_queue.get()
                     try:
                         if item is None:
-                            await _flush_all()
+                            if ctx.cancel_event.is_set():
+                                await _cancel_all_buffered()
+                            else:
+                                await _flush_all()
                             return
                         if item is _FLUSH_SENTINEL:
                             async with pending_lock:
                                 flush_pending = False
-                            await _flush_all()
+                            if ctx.cancel_event.is_set():
+                                await _cancel_all_buffered()
+                            else:
+                                await _flush_all()
                             async with pending_lock:
                                 space_freed_event.set()
+                            continue
+                        if ctx.cancel_event.is_set():
+                            await _cancel_all_buffered()
+                            await _mark_entries_cancelled([item])
                             continue
                         key = (item.uploader_folder, item.download_dir)
                         buffers[key].append(item)
                         if len(buffers[key]) >= settings.upload_batch_size:
-                            batch = buffers[key]
-                            buffers[key] = []
+                            batch = buffers.pop(key)
                             await _flush_uploader_group(item.uploader_folder, item.download_dir, batch)
+                            if ctx.cancel_event.is_set():
+                                await _cancel_all_buffered()
                     finally:
                         upload_queue.task_done()
             finally:
+                if buffers and ctx.cancel_event.is_set():
+                    with contextlib.suppress(Exception):
+                        await _cancel_all_buffered()
                 async with pending_lock:
                     flush_pending = False
                     pending_local_count = 0
@@ -1458,9 +1558,19 @@ class TaskManager:
         if targets:
             self.events.emit_log("INFO", f"开始检查 {len(targets)} 个追更目标的更新...", job_id=job_id)
 
-        for target in targets:
+        for target_idx, target in enumerate(targets):
             if ctx.cancel_event.is_set():
                 break
+            if target_idx > 0 and settings.page_delay_max > 0:
+                delay_lo = max(0.0, float(settings.page_delay_min))
+                delay_hi = max(delay_lo, float(settings.page_delay_max))
+                try:
+                    await until_stopped(
+                        asyncio.sleep(random.uniform(delay_lo, delay_hi)),
+                        ctx.cancel_event,
+                    )
+                except StopRequested:
+                    break
             tid = int(target["id"])
             uname = target["username"]
             utype = target["target_type"]
@@ -1483,7 +1593,19 @@ class TaskManager:
             previous_error = str(target.get("last_error") or "")
             # A prior pass may have saved videos before and after a failed page.
             # That new overlap must not cause us to stop before the gap next time.
-            needs_rescan = bool(previous_error) and "基线" not in previous_error
+            # However, if page 1 itself failed with 0 new videos saved (e.g. a transient
+            # 403), there is no gap behind a saved head — keep catch_up enabled so we
+            # don't trigger a full historical rescan across every affected target.
+            only_page1_failed = (
+                previous_error.startswith("列表第 1 页:")
+                and "；" not in previous_error
+                and int(target.get("last_new_count") or 0) == 0
+            )
+            needs_rescan = (
+                bool(previous_error)
+                and "基线" not in previous_error
+                and not only_page1_failed
+            )
             try:
                 listed, details = await self._scan_target_with_details(
                     job_id,

@@ -191,16 +191,20 @@ def build_rclone_copy_opts(
 ) -> List[str]:
     opts = [
         "--no-traverse",
-        "--ignore-times",
         f"--transfers={settings.rclone_transfers}",
         f"--checkers={settings.rclone_checkers}",
         f"--log-level={settings.rclone_log_level}",
         "--stats=0",
     ]
-    if settings.rclone_ignore_checksum:
-        opts.append("--ignore-checksum")
     if settings.rclone_ignore_size:
         opts.append("--ignore-size")
+    else:
+        # Skip re-uploading files already present on the remote with matching exact size
+        # (common during compensation retries after a cancelled run), while still
+        # overwriting partial or different-quality files whose byte size differs.
+        opts.append("--size-only")
+    if settings.rclone_ignore_checksum:
+        opts.append("--ignore-checksum")
 
     effective_type = (
         remote_type.strip().lower()
@@ -222,7 +226,7 @@ def build_rclone_copy_opts(
     return opts
 
 
-async def verify_remote_file(
+async def _verify_remote_file_detailed(
     rclone: str,
     remote_dir: str,
     download_dir: Path,
@@ -232,9 +236,9 @@ async def verify_remote_file(
     settings: RuntimeSettings,
     *,
     cancel_event: Optional[asyncio.Event] = None,
-) -> bool:
-    """Require matching content from a remote hash or a streamed comparison."""
-    rc, stdout, _ = await _run_cmd(
+) -> Tuple[bool, str]:
+    """Verify remote file existence, exact size, and hash (optional download check)."""
+    rc, stdout, stderr = await _run_cmd(
         [
             rclone,
             "lsjson",
@@ -249,17 +253,20 @@ async def verify_remote_file(
         cancel_event=cancel_event,
     )
     if rc != 0 or not stdout.strip():
-        return False
+        err_lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+        detail = err_lines[-1] if err_lines else f"lsjson exit={rc}"
+        return False, f"远端文件校验失败 ({detail})"
     try:
         meta = json.loads(stdout)
     except json.JSONDecodeError:
-        return False
+        return False, "远端文件元数据解析失败"
     if not isinstance(meta, dict) or meta.get("IsDir") is not False:
-        return False
+        return False, "远端目标不是有效文件"
 
     local_size = snapshot[2]
-    if type(meta.get("Size")) is not int or meta["Size"] != local_size or local_size < settings.min_file_size_bytes:
-        return False
+    remote_size = meta.get("Size")
+    if type(remote_size) is not int or remote_size != local_size or local_size < settings.min_file_size_bytes:
+        return False, f"远端文件大小不匹配（远端 {remote_size} != 本地 {local_size}）"
 
     hashes = meta.get("Hashes")
     if isinstance(hashes, dict):
@@ -275,24 +282,60 @@ async def verify_remote_file(
                     return hashlib.file_digest(stream, name).hexdigest()
 
             try:
-                return (await asyncio.to_thread(hash_local)).lower() == digest.lower()
+                if (await asyncio.to_thread(hash_local)).lower() == digest.lower():
+                    return True, ""
+                return False, f"远端 {name.upper()} 校验和不匹配"
             except OSError:
-                return False
+                return False, "读取本地文件计算校验和失败"
             except ValueError:
                 # The local hashing provider may disable a specific algorithm.
                 continue
 
-    # Some providers report a length but no hash. A matching name and size
-    # still do not establish that it is our file.
+    # Per rclone docs, some backends (notably PikPak) omit MD5/SHA hashes on uploaded
+    # files because they use proprietary piece hashes (e.g. GCID) during upload.
+    # Only fall back to `rclone check --download` (which re-downloads the entire file)
+    # when explicitly opted in via `rclone_verify_download`.
+    if not getattr(settings, "rclone_verify_download", False):
+        return True, ""
+
     with _upload_file_list([relative]) as check_list:
-        rc, matching, _ = await _run_cmd(
+        rc, matching, stderr_chk = await _run_cmd(
             [rclone, "check", str(download_dir), remote_dir,
              "--one-way", "--download", "--match", "-", "--files-from-raw", str(check_list),
              f"--log-level={settings.rclone_log_level}"],
             timeout=settings.rclone_timeout_seconds,
             cancel_event=cancel_event,
         )
-    return rc == 0 and relative in matching.splitlines()
+    if rc == 0 and relative in matching.splitlines():
+        return True, ""
+    err_lines = [line.strip() for line in (stderr_chk or "").splitlines() if line.strip()]
+    detail = err_lines[-1] if err_lines else f"check exit={rc}"
+    return False, f"远端回下校验未通过 ({detail})"
+
+
+async def verify_remote_file(
+    rclone: str,
+    remote_dir: str,
+    download_dir: Path,
+    local_path: Path,
+    relative: str,
+    snapshot: FileSnapshot,
+    settings: RuntimeSettings,
+    *,
+    cancel_event: Optional[asyncio.Event] = None,
+) -> bool:
+    """Require matching remote existence, exact size, and hash when available."""
+    ok, _ = await _verify_remote_file_detailed(
+        rclone,
+        remote_dir,
+        download_dir,
+        local_path,
+        relative,
+        snapshot,
+        settings,
+        cancel_event=cancel_event,
+    )
+    return ok
 
 
 @contextlib.contextmanager
@@ -418,20 +461,33 @@ async def upload_file_batch(
         result.failed_viewkeys.extend(entries)
         return result
 
+    verify_error = ""
     for vk, (path, relative, snapshot) in entries.items():
-        if (
-            not (cancel_event and cancel_event.is_set())
-            and file_snapshot(path) == snapshot
-            and await verify_remote_file(rclone, remote_dir, root, path, relative, snapshot, settings,
-                                         cancel_event=cancel_event)
-            and file_snapshot(path) == snapshot
-            and not (cancel_event and cancel_event.is_set())
-        ):
+        if cancel_event and cancel_event.is_set():
+            result.failed_viewkeys.append(vk)
+            continue
+        if file_snapshot(path) != snapshot:
+            result.failed_viewkeys.append(vk)
+            verify_error = verify_error or "本地文件在上传期间发生变化，已保留本地文件"
+            continue
+        verified, reason = await _verify_remote_file_detailed(
+            rclone,
+            remote_dir,
+            root,
+            path,
+            relative,
+            snapshot,
+            settings,
+            cancel_event=cancel_event,
+        )
+        if verified and file_snapshot(path) == snapshot and not (cancel_event and cancel_event.is_set()):
             result.uploaded_viewkeys.append(vk)
             result.verified_sources[vk] = snapshot
         else:
             result.failed_viewkeys.append(vk)
+            if reason and not verify_error:
+                verify_error = reason
     if result.failed_viewkeys:
-        result.error = "无法确认远端文件与本地内容一致，已保留本地文件"
+        result.error = verify_error or "无法确认远端文件与本地内容一致，已保留本地文件"
 
     return result

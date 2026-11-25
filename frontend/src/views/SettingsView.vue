@@ -577,6 +577,13 @@ async function handleTestNotify() {
               <Switch v-model="form.rclone_ignore_size" />
               <span>上传时跳过 rclone 自带的大小检查</span>
             </label>
+            <label
+              class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer"
+              title="部分网盘（如 PikPak）不返回 MD5；开启后会在上传完成时重新从网盘下载整部视频做逐字节校验，耗时翻倍，通常应保持关闭"
+            >
+              <Switch v-model="form.rclone_verify_download" />
+              <span>远端无校验和时回下比对（PikPak 建议关闭）</span>
+            </label>
           </div>
         </div>
       </Card>

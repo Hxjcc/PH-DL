@@ -222,6 +222,7 @@ def page_html(keys):
 
 async def test_paginated_failure_keeps_later_pages_and_marks_baseline_incomplete(job_engine, monkeypatch):
     manager, repo, _ = job_engine
+    await repo.update_settings_patch({"max_concurrent_list_pages": 4})
     requested = []
 
     async def fetch(_ctx, url, **kwargs):

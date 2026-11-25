@@ -446,12 +446,14 @@ async def fetch_single_video_detail(
 
         media_lookup_failed = False
         if remote_url:
+            gm_base = min(1.0, ctx.retry_delay_base) if ctx.retry_delay_base >= 0 else 1.0
+            gm_cap = max(gm_base, min(6.0, ctx.retry_delay_max)) if ctx.retry_delay_max >= 0 else 6.0
             gm_res, gm_err = await ctx.fetch_with_pow(
                 remote_url,
                 timeout=media_timeout,
                 max_retries=5,
-                retry_delay_base=1.0,
-                retry_delay_max=1.5,
+                retry_delay_base=gm_base,
+                retry_delay_max=gm_cap,
                 log_label=f"get_media {vkey}",
             )
             if gm_res is not None and gm_res.status_code < 400:

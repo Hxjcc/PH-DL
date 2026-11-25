@@ -179,3 +179,47 @@ async def test_login_captcha_solved_but_password_wrong(monkeypatch):
     assert "验证码已通过" in result.message
     assert "账号或密码错误" in result.message
     assert len(solver_calls) == 1
+
+
+async def test_concurrent_login_calls_coalesce_single_captcha_solve(monkeypatch):
+    FakeLoginContext.instances = []
+    FakeLoginContext.responses = [
+        {"success": "0", "message": "Captcha required", "requireCaptcha": True},
+        {"success": "1", "username": "Hxiay"},
+    ]
+    monkeypatch.setattr(cookie_mod, "TaskHttpContext", FakeLoginContext)
+
+    async def fake_check(cookie_str, proxy_url=None, timeout=20.0):
+        return cookie_mod.CookieCheckResult(valid=True, message="Cookie 有效")
+
+    monkeypatch.setattr(cookie_mod, "check_cookie_valid", fake_check)
+
+    solver_calls = 0
+
+    async def slow_solver(*args, **kwargs):
+        nonlocal solver_calls
+        solver_calls += 1
+        await asyncio.sleep(0.05)
+        return CaptchaSolution(token="03A-shared", task_id="t1", task_type="type")
+
+    monkeypatch.setattr(cookie_mod, "solve_recaptcha_v2", slow_solver)
+
+    r1, r2 = await asyncio.gather(
+        cookie_mod.login_and_get_cookies(
+            "user@example.com",
+            "password",
+            yescaptcha_enabled=True,
+            yescaptcha_client_key="client-key",
+        ),
+        cookie_mod.login_and_get_cookies(
+            "user@example.com",
+            "password",
+            yescaptcha_enabled=True,
+            yescaptcha_client_key="client-key",
+        ),
+    )
+
+    assert r1.success is True and r2.success is True
+    assert r1.cookie_str == r2.cookie_str
+    assert solver_calls == 1
+    assert len(FakeLoginContext.instances) == 1

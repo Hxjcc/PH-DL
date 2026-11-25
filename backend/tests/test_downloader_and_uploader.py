@@ -240,7 +240,7 @@ async def test_downloader_refreshes_expired_403_link_and_applies_new_referer(tmp
     assert session.recorded_calls[1][1]["headers"]["Referer"] == "https://www.pornhub.com/refreshed-referer"
 
 
-async def test_uploader_copies_and_checks_remote_content_without_deleting(tmp_path: Path, monkeypatch):
+async def test_uploader_copies_and_verifies_without_downloading_by_default(tmp_path: Path, monkeypatch):
     dl_dir = tmp_path / "alice"
     dl_dir.mkdir()
     f1 = dl_dir / "Video One [vk1].mp4"
@@ -249,12 +249,8 @@ async def test_uploader_copies_and_checks_remote_content_without_deleting(tmp_pa
     f4 = dl_dir / "Video Four [vk4].mp4"
     f5 = dl_dir / "Video Five [vk5].mp4"
     f6 = dl_dir / "Video Six [vk6].mp4"
-    f1.write_bytes(VALID_MP4)
-    f2.write_bytes(VALID_MP4)
-    f3.write_bytes(VALID_MP4)
-    f4.write_bytes(VALID_MP4)
-    f5.write_bytes(VALID_MP4)
-    f6.write_bytes(VALID_MP4)
+    for f in (f1, f2, f3, f4, f5, f6):
+        f.write_bytes(VALID_MP4)
 
     cmds_seen = []
     run_options = []
@@ -280,12 +276,11 @@ async def test_uploader_copies_and_checks_remote_content_without_deleting(tmp_pa
                 meta["Size"] = 12
             elif "vk5" in target:
                 meta["Hashes"] = {"md5": hashlib.md5(mp4_payload(b"b")).hexdigest()}
+            elif "vk6" in target:
+                return 1, "", "object not found"
             return 0, json.dumps(meta), ""
         if action == "check":
-            name = Path(cmd[cmd.index("--files-from-raw") + 1]).read_text(encoding="utf-8").strip()
-            assert "--download" in cmd
-            # rclone may exit zero with no files selected; an explicit match is required.
-            return 0, name + "\n" if name == f2.name else "", ""
+            raise AssertionError("Default verification must not re-download files via rclone check --download")
         return 1, "", "not found"
 
     monkeypatch.setattr(uploader, "_run_cmd", fake_run_cmd)
@@ -302,6 +297,8 @@ async def test_uploader_copies_and_checks_remote_content_without_deleting(tmp_pa
         settings=settings,
     )
 
+    # vk1 (matching md5) and vk2 (exact Size, empty hash like PikPak) both verify without --download.
+    # vk3 (Size=-1), vk4 (Size mismatch), vk5 (md5 mismatch), vk6 (lsjson missing) all fail safely.
     assert set(res.uploaded_viewkeys) == {"vk1", "vk2"}
     assert set(res.failed_viewkeys) == {"vk3", "vk4", "vk5", "vk6"}
     assert set(res.verified_sources) == {"vk1", "vk2"}
@@ -310,6 +307,8 @@ async def test_uploader_copies_and_checks_remote_content_without_deleting(tmp_pa
     mkdir_cmd = next(c for c in cmds_seen if c[1] == "mkdir")
     copy_cmd = next(c for c in cmds_seen if c[1] == "copy")
     assert "--transfers=1" not in mkdir_cmd
+    assert "--size-only" in copy_cmd
+    assert "--ignore-times" not in copy_cmd
     assert "--ignore-checksum" in copy_cmd
     assert "--ignore-size" not in copy_cmd
     assert "--pikpak-upload-concurrency=4" in copy_cmd
@@ -321,6 +320,49 @@ async def test_uploader_copies_and_checks_remote_content_without_deleting(tmp_pa
     gd_settings = RuntimeSettings(rclone_remote="gdrive", rclone_remote_base_dir="Pornhub")
     gd_opts = uploader.build_rclone_copy_opts(gd_settings, remote_type="drive")
     assert not any(o.startswith("--pikpak-") for o in gd_opts)
+
+
+async def test_uploader_strict_download_verify_opt_in(tmp_path: Path, monkeypatch):
+    dl_dir = tmp_path / "alice"
+    dl_dir.mkdir()
+    f_ok = dl_dir / "Match [vkok].mp4"
+    f_bad = dl_dir / "Mismatch [vkbad].mp4"
+    f_ok.write_bytes(VALID_MP4)
+    f_bad.write_bytes(VALID_MP4)
+
+    check_calls = []
+
+    async def fake_run_cmd(cmd: List[str], **kwargs):
+        action = cmd[1]
+        if action == "listremotes":
+            return 0, "pikpak: pikpak\n", ""
+        if action in {"mkdir", "copy"}:
+            return 0, "", ""
+        if action == "lsjson":
+            return 0, json.dumps({"Size": len(VALID_MP4), "IsDir": False}), ""
+        if action == "check":
+            name = Path(cmd[cmd.index("--files-from-raw") + 1]).read_text(encoding="utf-8").strip()
+            check_calls.append(name)
+            assert "--download" in cmd
+            return 0, name + "\n" if name == f_ok.name else "", ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(uploader, "_run_cmd", fake_run_cmd)
+    settings = RuntimeSettings(
+        rclone_remote="pikpak",
+        rclone_remote_base_dir="Pornhub",
+        min_file_size_bytes=64,
+        rclone_verify_download=True,
+    )
+    res = await uploader.upload_file_batch(
+        download_dir=dl_dir,
+        uploader_folder="alice",
+        files_by_viewkey={"vkok": f_ok, "vkbad": f_bad},
+        settings=settings,
+    )
+    assert res.uploaded_viewkeys == ["vkok"]
+    assert res.failed_viewkeys == ["vkbad"]
+    assert set(check_calls) == {f_ok.name, f_bad.name}
 
 
 async def test_failed_copy_keeps_source_and_never_trusts_an_old_remote_object(tmp_path, monkeypatch):

@@ -184,8 +184,8 @@ class RuntimeSettings(BaseModel):
 
     # Download & Backpressure
     max_concurrent_downloads: int = Field(default=3, ge=1, le=16)
-    max_concurrent_video_details: int = Field(default=40, ge=1, le=40)
-    max_concurrent_list_pages: int = Field(default=4, ge=1, le=10)
+    max_concurrent_video_details: int = Field(default=6, ge=1, le=40)
+    max_concurrent_list_pages: int = Field(default=2, ge=1, le=10)
     download_attempts: int = Field(default=3, ge=1, le=10)
     min_file_size_bytes: int = Field(default=10240, ge=1)
     preferred_quality: str = ""  # e.g. "2160,1440,1080" or empty for best
@@ -204,6 +204,7 @@ class RuntimeSettings(BaseModel):
     rclone_pikpak_chunk_size: str = "32Mi"
     rclone_ignore_checksum: bool = True
     rclone_ignore_size: bool = False
+    rclone_verify_download: bool = False
     rclone_tpslimit: int = Field(default=0, ge=0, le=100)
     rclone_tpslimit_burst: int = Field(default=0, ge=0, le=100)
     rclone_log_level: str = "ERROR"
