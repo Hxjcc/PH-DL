@@ -6,11 +6,16 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import secrets
 import shlex
+import socket
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+import aiohttp
 
 from ..config import RuntimeSettings
 from .filename import is_valid_video_file
@@ -601,6 +606,202 @@ async def rename_remote_file(
     err_lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
     detail = err_lines[-1] if err_lines else f"rclone moveto 返回 {rc}"
     return False, detail, False
+
+
+def _split_rclone_fs_and_remote(full_remote_path: str) -> Tuple[str, str]:
+    raw = str(full_remote_path or "").strip()
+    if ":" not in raw:
+        return "", raw
+    remote_name, rel = raw.split(":", 1)
+    return f"{remote_name}:", rel.lstrip("/")
+
+
+def _pick_free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+class RemoteRenameSession:
+    """Keep a single ephemeral ``rclone rcd`` process alive for fast cached batch renames.
+
+    Avoids cold-starting ``rclone`` and throwing away Google Drive / PikPak folder ID caches
+    on every file. Automatically falls back to ``rename_remote_file`` if ``rcd`` cannot start.
+    """
+
+    def __init__(
+        self,
+        settings: RuntimeSettings,
+        *,
+        cancel_event: Optional[asyncio.Event] = None,
+        fallback_fn: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self.settings = settings
+        self.cancel_event = cancel_event
+        self._fallback_fn = fallback_fn or rename_remote_file
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._base_url: str = ""
+        self._auth: Optional[aiohttp.BasicAuth] = None
+        self.using_rcd: bool = False
+
+    async def __aenter__(self) -> "RemoteRenameSession":
+        await self._start_rcd()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    async def _start_rcd(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            return
+        rclone = (self.settings.rclone_bin or "rclone").strip()
+        try:
+            port = _pick_free_loopback_port()
+        except OSError:
+            return
+        token = secrets.token_urlsafe(18)
+        cmd = [
+            rclone,
+            "rcd",
+            f"--rc-addr=127.0.0.1:{port}",
+            "--rc-user=phdl",
+            f"--rc-pass={token}",
+            "--low-level-retries=10",
+            f"--log-level={self.settings.rclone_log_level}",
+        ]
+        if self.settings.rclone_tpslimit > 0:
+            cmd.append(f"--tpslimit={self.settings.rclone_tpslimit}")
+            if self.settings.rclone_tpslimit_burst > 0:
+                cmd.append(f"--tpslimit-burst={self.settings.rclone_tpslimit_burst}")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except Exception:
+            return
+
+        self._proc = proc
+        self._base_url = f"http://127.0.0.1:{port}"
+        self._auth = aiohttp.BasicAuth("phdl", token)
+        timeout = aiohttp.ClientTimeout(
+            total=min(max(30.0, float(self.settings.rclone_timeout_seconds)), 120.0),
+            connect=5.0,
+        )
+        # Never route loopback 127.0.0.1 RPC traffic through system HTTP_PROXY/ALL_PROXY.
+        self._session = aiohttp.ClientSession(
+            timeout=timeout,
+            auth=self._auth,
+            trust_env=False,
+        )
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                await self.close()
+                return
+            if proc.returncode is not None:
+                await self.close()
+                return
+            try:
+                async with self._session.post(f"{self._base_url}/rc/noop", json={}) as resp:
+                    if resp.status == 200:
+                        self.using_rcd = True
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+
+        await self.close()
+
+    async def close(self) -> None:
+        self.using_rcd = False
+        session = self._session
+        self._session = None
+        if session is not None:
+            with contextlib.suppress(Exception):
+                await session.close()
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                await _terminate_process(proc)
+
+    async def _rc_post(self, endpoint: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        if self._session is None or not self._base_url:
+            return 0, {"error": "rcd session unavailable"}
+        try:
+            async with self._session.post(f"{self._base_url}/{endpoint.lstrip('/')}", json=payload) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    text = await resp.text()
+                    data = {"error": text.strip() or f"HTTP {resp.status}"}
+                return resp.status, data if isinstance(data, dict) else {"result": data}
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            return 0, {"error": str(err)}
+
+    async def rename(self, old_remote_path: str, new_remote_path: str) -> Tuple[bool, str, bool]:
+        """Server-side rename ``old_remote_path`` -> ``new_remote_path`` using cached ``rcd``."""
+        src = str(old_remote_path or "").strip()
+        dst = str(new_remote_path or "").strip()
+        if not src or not dst:
+            return False, "远端路径为空", False
+        if src == dst:
+            return True, "文件名已包含日期前缀", True
+
+        if not self.using_rcd or self._session is None or (self._proc is not None and self._proc.returncode is not None):
+            return await self._fallback_fn(src, dst, self.settings, cancel_event=self.cancel_event)
+
+        src_fs, src_remote = _split_rclone_fs_and_remote(src)
+        dst_fs, dst_remote = _split_rclone_fs_and_remote(dst)
+        if not src_fs or not dst_fs or not src_remote or not dst_remote:
+            return await self._fallback_fn(src, dst, self.settings, cancel_event=self.cancel_event)
+
+        status, data = await self._rc_post(
+            "operations/movefile",
+            {
+                "srcFs": src_fs,
+                "srcRemote": src_remote,
+                "dstFs": dst_fs,
+                "dstRemote": dst_remote,
+            },
+        )
+        if status == 200:
+            return True, "", False
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            return False, "已取消", False
+
+        # If the daemon died unexpectedly, fall back cleanly to one-shot rclone moveto.
+        if status == 0 and (self._proc is None or self._proc.returncode is not None):
+            self.using_rcd = False
+            return await self._fallback_fn(src, dst, self.settings, cancel_event=self.cancel_event)
+
+        # Idempotent check via cached stat: dst already exists cleanly while src is gone.
+        st_dst, data_dst = await self._rc_post(
+            "operations/stat",
+            {"fs": dst_fs, "remote": dst_remote, "opt": {"noMimeType": True, "noModTime": True}},
+        )
+        dst_item = data_dst.get("item") if st_dst == 200 and isinstance(data_dst, dict) else None
+        if (
+            isinstance(dst_item, dict)
+            and dst_item.get("IsDir") is False
+            and int(dst_item.get("Size") or 0) >= self.settings.min_file_size_bytes
+        ):
+            st_src, data_src = await self._rc_post(
+                "operations/stat",
+                {"fs": src_fs, "remote": src_remote, "opt": {"noMimeType": True, "noModTime": True}},
+            )
+            src_item = data_src.get("item") if st_src == 200 and isinstance(data_src, dict) else None
+            if not isinstance(src_item, dict):
+                return True, "远端已存在带日期目标文件", True
+
+        detail = str(data.get("error") or "").strip() or f"rclone movefile 返回 HTTP {status}"
+        return False, detail, False
 
 
 async def verify_remote_file(

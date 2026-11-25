@@ -493,7 +493,17 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
   } else if (job?.status === 'scanning' && total === 0) {
     phaseText = '正在扫描页面并解析视频信息...'
   } else if (isActive) {
-    if (downloadingCount > 0 && uploadingCount > 0) {
+    if (job?.kind === 'rename_remote_dates') {
+      phaseText =
+        total > 0
+          ? `正在云端重命名网盘文件 (${finishedCount}/${total})...`
+          : '正在准备云端改名队列...'
+    } else if (job?.kind === 'enrich_metadata') {
+      phaseText =
+        total > 0
+          ? `正在补全基线元数据 (${finishedCount}/${total})...`
+          : '正在解析基线视频元数据...'
+    } else if (downloadingCount > 0 && uploadingCount > 0) {
       phaseText = `正在并发下载 (${downloadingCount}) · 云端上传 (${uploadingCount})`
     } else if (downloadingCount > 0) {
       phaseText = `正在下载 ${downloadingCount} 个视频`

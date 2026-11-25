@@ -47,6 +47,7 @@ from ..services.filename import (
 )
 from ..services.notifier import build_auto_update_report, send_serverchan
 from ..services.uploader import (
+    RemoteRenameSession,
     UploadSessionCache,
     delete_verified_source,
     file_snapshot,
@@ -55,6 +56,8 @@ from ..services.uploader import (
 )
 from .events import EventBus
 from .disk_scheduler import AdaptiveDiskScheduler, SmartUploadPool, UploadQueuedItem
+
+_DEFAULT_RENAME_REMOTE_FILE = rename_remote_file
 
 
 def _split_csv_set(raw: Optional[str], lower: bool = False) -> Optional[Set[str]]:
@@ -2603,114 +2606,141 @@ class TaskManager:
                     self.events.broadcast("item_updated", it)
             return
 
-        # Phase 3: Server-side zero-bandwidth rclone moveto rename.
+        # Phase 3: Server-side zero-bandwidth rename via persistent `rclone rcd` (cached dir IDs).
         running_job = await self.repo.update_job(job_id, status="running")
         if running_job:
             self.events.broadcast("job_updated", running_job)
 
-        rename_concurrency = max(1, min(4, int(settings.rclone_transfers or 2)))
+        rename_concurrency = max(4, min(6, int(getattr(settings, "upload_workers", 4) or 4)))
         rename_sem = asyncio.Semaphore(rename_concurrency)
         refresh_lock = asyncio.Lock()
+        last_refresh_at = 0.0
         renamed_count = 0
         skipped_count = 0
         failed_count = 0
         processed = 0
 
-        async def _rename_one(cand: Dict[str, Any]) -> None:
-            nonlocal renamed_count, skipped_count, failed_count, processed
-            vk = cand["viewkey"]
-            iid = item_ids[vk]
-            old_remote = str(cand.get("remote_path") or "").strip()
-            pub_date = pub_by_vk.get(vk, "")
-            file_size = int(cand.get("file_size") or 0)
-
-            async with rename_sem:
-                if ctx.cancel_event.is_set():
-                    it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                    if it:
-                        self.events.broadcast("item_updated", it)
-                    return
-
-                if not pub_date:
-                    skipped_count += 1
-                    it = await self.repo.update_job_item(
-                        iid,
-                        status="skipped",
-                        bytes_total=file_size,
-                        error_message="未能获取发布日期（可能原视频已删除），保留原文件名",
+        use_rcd = rename_remote_file is _DEFAULT_RENAME_REMOTE_FILE
+        async with contextlib.AsyncExitStack() as stack:
+            renamer: Optional[RemoteRenameSession] = None
+            if use_rcd:
+                renamer = await stack.enter_async_context(
+                    RemoteRenameSession(
+                        settings,
+                        cancel_event=ctx.cancel_event,
+                        fallback_fn=rename_remote_file,
                     )
-                    if it:
-                        self.events.broadcast("item_updated", it)
+                )
+                if renamer.using_rcd:
+                    self.events.emit_log(
+                        "INFO",
+                        f"第 3 阶段：已启用常驻 rclone rcd 目录缓存模式（并发 {rename_concurrency}）批量云端改名...",
+                        job_id=job_id,
+                    )
                 else:
-                    new_remote = build_dated_remote_path(old_remote, pub_date)
-                    if not new_remote or new_remote == old_remote:
+                    self.events.emit_log(
+                        "INFO",
+                        f"第 3 阶段：使用标准 rclone moveto 模式（并发 {rename_concurrency}）执行云端改名...",
+                        job_id=job_id,
+                    )
+
+            async def _do_rename(old_p: str, new_p: str) -> Tuple[bool, str, bool]:
+                if renamer is not None:
+                    return await renamer.rename(old_p, new_p)
+                return await rename_remote_file(old_p, new_p, settings, cancel_event=ctx.cancel_event)
+
+            async def _rename_one(cand: Dict[str, Any]) -> None:
+                nonlocal renamed_count, skipped_count, failed_count, processed, last_refresh_at
+                vk = cand["viewkey"]
+                iid = item_ids[vk]
+                old_remote = str(cand.get("remote_path") or "").strip()
+                pub_date = pub_by_vk.get(vk, "")
+                file_size = int(cand.get("file_size") or 0)
+
+                async with rename_sem:
+                    if ctx.cancel_event.is_set():
+                        it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        return
+
+                    if not pub_date:
                         skipped_count += 1
                         it = await self.repo.update_job_item(
                             iid,
                             status="skipped",
                             bytes_total=file_size,
-                            published_at=pub_date,
-                            error_message="远端文件名已包含日期前缀",
+                            error_message="未能获取发布日期（可能原视频已删除），保留原文件名",
                         )
                         if it:
                             self.events.broadcast("item_updated", it)
                     else:
-                        ok, detail, already_done = await rename_remote_file(
-                            old_remote,
-                            new_remote,
-                            settings,
-                            cancel_event=ctx.cancel_event,
-                        )
-                        if ctx.cancel_event.is_set() and not ok:
-                            it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            return
-                        if ok:
-                            await self.repo.update_video_remote_path(vk, new_remote)
-                            renamed_count += 1
+                        new_remote = build_dated_remote_path(old_remote, pub_date)
+                        if not new_remote or new_remote == old_remote:
+                            skipped_count += 1
                             it = await self.repo.update_job_item(
                                 iid,
-                                status="done",
+                                status="skipped",
                                 bytes_total=file_size,
                                 published_at=pub_date,
-                                error_message="",
+                                error_message="远端文件名已包含日期前缀",
                             )
                             if it:
                                 self.events.broadcast("item_updated", it)
-                            old_name = old_remote.rsplit("/", 1)[-1]
-                            new_name = new_remote.rsplit("/", 1)[-1]
-                            note = "（已存在目标文件）" if already_done else ""
-                            self.events.emit_log(
-                                "INFO",
-                                f"[云端改名] {old_name} -> {new_name}{note}",
-                                job_id=job_id,
-                            )
                         else:
-                            failed_count += 1
-                            it = await self.repo.update_job_item(
-                                iid,
-                                status="failed",
-                                bytes_total=file_size,
-                                published_at=pub_date,
-                                error_message=f"云端改名失败: {detail}",
-                            )
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            self.events.emit_log(
-                                "WARNING",
-                                f"[云端改名失败] {old_remote}: {detail}",
-                                job_id=job_id,
-                            )
+                            ok, detail, already_done = await _do_rename(old_remote, new_remote)
+                            if ctx.cancel_event.is_set() and not ok:
+                                it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                                if it:
+                                    self.events.broadcast("item_updated", it)
+                                return
+                            if ok:
+                                await self.repo.update_video_remote_path(vk, new_remote)
+                                renamed_count += 1
+                                it = await self.repo.update_job_item(
+                                    iid,
+                                    status="done",
+                                    bytes_total=file_size,
+                                    published_at=pub_date,
+                                    error_message="",
+                                )
+                                if it:
+                                    self.events.broadcast("item_updated", it)
+                                old_name = old_remote.rsplit("/", 1)[-1]
+                                new_name = new_remote.rsplit("/", 1)[-1]
+                                note = "（已存在目标文件）" if already_done else ""
+                                self.events.emit_log(
+                                    "INFO",
+                                    f"[云端改名] {old_name} -> {new_name}{note}",
+                                    job_id=job_id,
+                                )
+                            else:
+                                failed_count += 1
+                                it = await self.repo.update_job_item(
+                                    iid,
+                                    status="failed",
+                                    bytes_total=file_size,
+                                    published_at=pub_date,
+                                    error_message=f"云端改名失败: {detail}",
+                                )
+                                if it:
+                                    self.events.broadcast("item_updated", it)
+                                self.events.emit_log(
+                                    "WARNING",
+                                    f"[云端改名失败] {old_remote}: {detail}",
+                                    job_id=job_id,
+                                )
 
-                async with refresh_lock:
-                    processed += 1
-                    if processed % 10 == 0 or processed == len(candidates):
-                        refreshed = await self.repo.recalculate_job_counts(job_id)
-                        if refreshed:
-                            self.events.broadcast("job_updated", refreshed)
+                    async with refresh_lock:
+                        processed += 1
+                        now_m = time.monotonic()
+                        if processed == len(candidates) or processed % 5 == 0 or (now_m - last_refresh_at) >= 1.0:
+                            last_refresh_at = now_m
+                            refreshed = await self.repo.recalculate_job_counts(job_id)
+                            if refreshed:
+                                self.events.broadcast("job_updated", refreshed)
 
-        await asyncio.gather(*(_rename_one(c) for c in candidates))
+            await asyncio.gather(*(_rename_one(c) for c in candidates))
         self.events.broadcast("overview_changed", {})
         self.events.emit_log(
             "INFO",

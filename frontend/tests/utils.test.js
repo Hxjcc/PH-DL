@@ -377,4 +377,11 @@ test('formatPublishedDate, formatVideoDuration, and rename_remote_dates job meta
   const metrics = computeJobLiveMetrics(job, {}, [{ status: 'done' }, { status: 'done' }, { status: 'skipped' }])
   assert.equal(metrics.done, 2)
   assert.equal(metrics.uploaded, 0)
+
+  const runningRename = computeJobLiveMetrics(
+    { id: 89, kind: 'rename_remote_dates', status: 'running', total_items: 100, done_items: 12 },
+    {},
+    null
+  )
+  assert.equal(runningRename.phaseText, '正在云端重命名网盘文件 (12/100)...')
 })

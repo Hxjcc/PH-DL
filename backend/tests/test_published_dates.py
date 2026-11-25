@@ -173,6 +173,47 @@ async def test_upload_file_batch_uses_copyto_for_dated_remote_name_and_rename_re
     assert (ok, err, already) == (True, "", False)
 
 
+async def test_remote_rename_session_uses_rcd_and_handles_idempotent_stat():
+    settings = RuntimeSettings(rclone_remote="gd", rclone_remote_base_dir="Pornhub", min_file_size_bytes=10)
+    session = uploader.RemoteRenameSession(settings)
+    session.using_rcd = True
+    session._session = object()  # type: ignore[assignment]
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_rc_post(endpoint: str, payload: dict[str, Any]):
+        calls.append((endpoint, payload))
+        if endpoint == "operations/movefile" and payload["srcRemote"].endswith("ok.mp4"):
+            return 200, {}
+        if endpoint == "operations/movefile":
+            return 500, {"error": "object not found"}
+        if endpoint == "operations/stat" and payload["remote"].endswith("2026-10-05_already.mp4"):
+            return 200, {"item": {"IsDir": False, "Size": 1024}}
+        if endpoint == "operations/stat":
+            return 200, {"item": None}
+        return 500, {"error": "unexpected"}
+
+    session._rc_post = fake_rc_post  # type: ignore[method-assign]
+
+    ok1, err1, already1 = await session.rename("gd:Pornhub/alice/ok.mp4", "gd:Pornhub/alice/2026-10-05_ok.mp4")
+    assert (ok1, err1, already1) == (True, "", False)
+    assert calls[0] == (
+        "operations/movefile",
+        {
+            "srcFs": "gd:",
+            "srcRemote": "Pornhub/alice/ok.mp4",
+            "dstFs": "gd:",
+            "dstRemote": "Pornhub/alice/2026-10-05_ok.mp4",
+        },
+    )
+
+    ok2, err2, already2 = await session.rename(
+        "gd:Pornhub/alice/already.mp4",
+        "gd:Pornhub/alice/2026-10-05_already.mp4",
+    )
+    assert ok2 is True and already2 is True and "已存在" in err2
+
+
 async def test_rename_remote_dates_job_backfills_from_list_and_detail_then_renames(tmp_path: Path, monkeypatch):
     env = EnvSettings(data_dir=tmp_path)
     env.ensure_dirs()
