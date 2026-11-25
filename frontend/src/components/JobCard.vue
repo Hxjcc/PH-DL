@@ -142,14 +142,12 @@ const canRetry = computed(
   )
 )
 const isMetadataJob = computed(() => props.job.kind === 'enrich_metadata')
-const isBackfillDatesJob = computed(() => props.job.kind === 'backfill_dates')
 const isExportJob = computed(() => Boolean(props.job.params?.export_only || props.job.export_text))
 const hasNoJobItems = computed(
   () =>
     isExportJob.value ||
     props.job.kind === 'check_updates' ||
-    props.job.kind === 'baseline_sync' ||
-    props.job.kind === 'backfill_dates'
+    props.job.kind === 'baseline_sync'
 )
 const detailsOpen = computed(() => expanded.value)
 const detailsContentKey = computed(() => {
@@ -180,7 +178,6 @@ function openDeletePopoverNow() {
 const retryButtonText = computed(() => {
   if (isExportJob.value) return '重试导出'
   if (isMetadataJob.value) return '重试补全'
-  if (isBackfillDatesJob.value) return '继续补全'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成'
   }
@@ -194,7 +191,6 @@ const retryButtonText = computed(() => {
 const retryButtonTitle = computed(() => {
   if (isExportJob.value) return '按原筛选条件重新导出链接'
   if (isMetadataJob.value) return '重新补全仍缺少画质或文件大小的基线视频'
-  if (isBackfillDatesJob.value) return '继续补全仍缺少发布日期或时长的历史视频'
   if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
     return '继续未完成条目；如果之前还没有生成明细，将按原设置重试'
   }
@@ -851,13 +847,6 @@ function downloadExportTxt() {
                 : Number(job.done_items || job.total_items || 0) > 0
                   ? `基线初始化完成：已登记 ${job.done_items || job.total_items} 个已有视频用于去重（不下载文件，可在「历史记录」筛选查看）`
                   : '基线初始化完成：未发现可登记的视频'
-            }}
-          </template>
-          <template v-else-if="job.kind === 'backfill_dates'">
-            {{
-              isActive
-                ? liveMetrics.phaseText || '正在补全历史视频的发布日期与时长...'
-                : `发布日期与时长补全结束：已更新 ${Number(job.done_items || 0)} / ${Number(job.total_items || 0)} 条历史记录`
             }}
           </template>
           <template v-else>

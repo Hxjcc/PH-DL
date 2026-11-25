@@ -814,7 +814,7 @@ export const useAppStore = defineStore('app', {
         items: data.items || [],
         total: Number(data.total || 0),
         facets: data.facets || { uploaders: [], qualities: [] },
-        stats: data.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0, missing_date_duration: 0 },
+        stats: data.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0 },
         page_size: pageSize,
       }
       this.historyLoadedAt = Date.now()

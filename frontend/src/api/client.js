@@ -103,7 +103,6 @@ export const api = {
   redownloadVideo: (viewkey) =>
     request(`/api/videos/${encodeURIComponent(viewkey)}/redownload`, { method: 'POST' }),
   enrichBaselineMetadata: () => request('/api/videos/metadata/enrich', { method: 'POST' }),
-  backfillVideoDates: () => request('/api/videos/metadata/backfill-dates', { method: 'POST' }),
 
   // Settings & Tools
   getSettings: () => request('/api/settings'),

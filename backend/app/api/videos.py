@@ -85,19 +85,6 @@ async def enrich_baseline_metadata(container: AppContainer = Depends(require_aut
     return {"job": job, "count": count}
 
 
-@router.post("/metadata/backfill-dates")
-async def backfill_video_dates_and_durations(container: AppContainer = Depends(require_auth)):
-    count = await container.repo.count_missing_date_duration_candidates()
-    if count == 0:
-        raise HTTPException(status_code=400, detail="所有视频的发布日期与时长均已完整")
-    job = await container.tasks.enqueue_job(
-        kind="backfill_dates",
-        label=f"补全日期与时长 ({count} 条)",
-        params={},
-    )
-    return {"job": job, "count": count}
-
-
 class BatchDeleteVideosRequest(BaseModel):
     viewkeys: List[str] = Field(default_factory=list)
     delete_local_files: bool = False

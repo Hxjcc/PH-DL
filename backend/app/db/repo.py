@@ -538,62 +538,6 @@ class Repository:
             params.append(int(limit))
         return await self.db.fetch_all(sql, params)
 
-    async def count_missing_date_duration_candidates(self) -> int:
-        row = await self.db.fetch_one(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM videos
-            WHERE (published_at = '' OR duration_seconds <= 0)
-              AND (video_page_url != '' OR viewkey != '')
-            """
-        )
-        return int(row["cnt"]) if row else 0
-
-    async def list_missing_date_duration_candidates(
-        self,
-        limit: int = 0,
-    ) -> List[Dict[str, Any]]:
-        sql = """
-            SELECT viewkey, title, uploader, target_type, video_page_url,
-                   published_at, duration_seconds
-            FROM videos
-            WHERE (published_at = '' OR duration_seconds <= 0)
-              AND (video_page_url != '' OR viewkey != '')
-            ORDER BY created_at DESC, viewkey ASC
-        """
-        params: List[Any] = []
-        if limit > 0:
-            sql += " LIMIT ?"
-            params.append(int(limit))
-        return await self.db.fetch_all(sql, params)
-
-    async def bulk_update_video_dates_and_durations(
-        self,
-        updates: List[Tuple[str, str, int]],
-        *,
-        chunk_size: int = 200,
-    ) -> int:
-        clean_rows = []
-        for vk, pub, dur in updates:
-            key = str(vk or "").strip()
-            clean_pub = str(pub or "").strip()
-            clean_dur = max(0, int(dur or 0))
-            if not key or (not clean_pub and clean_dur <= 0):
-                continue
-            clean_rows.append((clean_pub, clean_pub, clean_dur, clean_dur, key))
-        if not clean_rows:
-            return 0
-        sql = """
-            UPDATE videos
-            SET published_at = CASE WHEN published_at = '' AND ? != '' THEN ? ELSE published_at END,
-                duration_seconds = CASE WHEN duration_seconds <= 0 AND ? > 0 THEN ? ELSE duration_seconds END
-            WHERE viewkey = ?
-        """
-        step = max(1, int(chunk_size))
-        for start in range(0, len(clean_rows), step):
-            await self.db.executemany(sql, clean_rows[start : start + step])
-        return len(clean_rows)
-
     async def update_video_metadata(
         self,
         viewkey: str,
@@ -1055,7 +999,6 @@ class Repository:
         )
         counts["published_7d"] = int(recent_row["cnt"]) if recent_row else 0
         counts["baseline_missing_metadata"] = await self.count_baseline_metadata_candidates()
-        counts["missing_date_duration"] = await self.count_missing_date_duration_candidates()
         return counts
 
     # ------------------------------------------------------------------

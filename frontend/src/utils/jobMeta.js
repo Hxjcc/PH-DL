@@ -169,7 +169,7 @@ export function resolveJobCategory(job) {
     const label = String(job?.label || '')
     return label.startsWith('续传') ? CATEGORY_MAP.resume : CATEGORY_MAP.retry
   }
-  if (kind === 'enrich_metadata' || kind === 'backfill_dates') return CATEGORY_MAP.metadata
+  if (kind === 'enrich_metadata') return CATEGORY_MAP.metadata
   return CATEGORY_MAP.target_download
 }
 
@@ -296,8 +296,6 @@ export function resolveJobVisual(job, targetsList = []) {
     title = avatars[0]?.name || baseLabel || category.label
   } else if (kind === 'enrich_metadata') {
     title = '基线画质与大小补全'
-  } else if (kind === 'backfill_dates') {
-    title = '发布日期与时长补全'
   } else {
     title = stripKnownPrefix(job?.label) || job?.kind || '任务'
   }
@@ -424,20 +422,11 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
       : null
   const useScanOverlay =
     Boolean(scanState) &&
-    (job?.status === 'scanning' ||
-      scanState.mode === 'backfill_dates' ||
-      (total === 0 && downloadingCount === 0 && uploadingCount === 0))
+    (job?.status === 'scanning' || (total === 0 && downloadingCount === 0 && uploadingCount === 0))
 
   let percent = 0
   let hasScanProgress = false
-  if (useScanOverlay && scanState.mode === 'backfill_dates') {
-    const bTotal = Math.max(total, Number(scanState.total || 0))
-    const bDone = Math.max(finishedCount, Number(scanState.done || 0))
-    if (bTotal > 0) {
-      percent = Math.min(100, Math.round((bDone / bTotal) * 1000) / 10)
-      hasScanProgress = true
-    }
-  } else if (useScanOverlay && scanState.mode === 'targets' && Number(scanState.total || 0) > 0) {
+  if (useScanOverlay && scanState.mode === 'targets' && Number(scanState.total || 0) > 0) {
     const scanTotal = Number(scanState.total)
     const scanned = Math.min(scanTotal, Math.max(0, Number(scanState.scanned || 0)))
     percent = Math.min(100, Math.round((scanned / scanTotal) * 100))
@@ -462,18 +451,6 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
   let phaseText = ''
   if (job?.status === 'queued') {
     phaseText = '排队等待执行...'
-  } else if (useScanOverlay && scanState.mode === 'backfill_dates') {
-    const bTotal = Math.max(total, Number(scanState.total || 0))
-    const bDone = Math.max(done, Number(scanState.done || 0))
-    if (scanState.stage === 'list') {
-      const sTargets = Math.max(0, Number(scanState.scanned_targets || 0))
-      const tTargets = Math.max(0, Number(scanState.total_targets || 0))
-      const currentName = String(scanState.current_target || '').trim()
-      const targetPart = tTargets > 0 ? ` (${sTargets}/${tTargets})` : ''
-      phaseText = `列表快扫${targetPart}${currentName ? ` · ${currentName}` : ''} · 已补全 ${bDone}/${bTotal}`
-    } else {
-      phaseText = `详情页轻量补全 · 已补全 ${bDone}/${bTotal}`
-    }
   } else if (useScanOverlay && scanState.mode === 'targets' && Number(scanState.total || 0) > 0) {
     const scanTotal = Number(scanState.total)
     const scanned = Math.min(scanTotal, Math.max(0, Number(scanState.scanned || 0)))
@@ -506,11 +483,6 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
         total > 0
           ? `正在补全基线元数据 (${finishedCount}/${total})...`
           : '正在解析基线视频元数据...'
-    } else if (job?.kind === 'backfill_dates') {
-      phaseText =
-        total > 0
-          ? `正在补全发布日期与时长 (${finishedCount}/${total})...`
-          : '正在扫描待补全历史视频...'
     } else if (downloadingCount > 0 && uploadingCount > 0) {
       phaseText = `正在并发下载 (${downloadingCount}) · 云端上传 (${uploadingCount})`
     } else if (downloadingCount > 0) {
