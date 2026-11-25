@@ -743,8 +743,8 @@ function downloadExportTxt() {
         class="job-details border-t border-border bg-surface-subtle/50 dark:bg-surface-subtle/25 px-4 sm:px-5 py-3.5"
         @click="!focused && emit('activate', job.id, true)"
       >
-        <div v-if="loadingItems && items.length === 0" class="py-5 flex items-center justify-center gap-2 text-xs text-muted-foreground">
-          <Loader2 class="w-3.5 h-3.5 animate-spin text-brand" />
+        <div v-if="loadingItems && items.length === 0" class="py-5 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
+          <Loader2 class="w-3.5 h-3.5 animate-spin shrink-0 text-brand" />
           <span>加载视频明细...</span>
         </div>
 
@@ -754,7 +754,21 @@ function downloadExportTxt() {
         </div>
 
         <div v-else-if="items.length === 0" class="py-4 text-center text-xs text-muted-foreground">
-          {{ isExportJob ? (job.export_text ? '页面链接导出任务（点击右上角“导出 TXT”下载）' : isActive ? '正在筛选并整理页面链接...' : '没有可导出的符合条件的视频页面链接。') : '暂无视频条目（可能仍在扫描列表或无新视频）' }}
+          <template v-if="isExportJob">
+            {{ job.export_text ? '页面链接导出任务（点击右上角“导出 TXT”下载）' : isActive ? '正在筛选并整理页面链接...' : '没有可导出的符合条件的视频页面链接。' }}
+          </template>
+          <template v-else-if="job.kind === 'check_updates'">
+            {{
+              isActive
+                ? '正在扫描目标列表检查更新（仅检查，不下载）...'
+                : Number(job.done_items || job.total_items || 0) > 0
+                  ? `仅检查更新模式：发现 ${job.done_items || job.total_items} 个新视频，不会自动下载或上传（如需下载请在「自动追更」点击「立即全量追更」，或在「实时日志」查看明细）`
+                  : '仅检查更新模式：本次未发现新视频'
+            }}
+          </template>
+          <template v-else>
+            暂无视频条目（可能仍在扫描列表或无新视频）
+          </template>
         </div>
 
         <div v-else class="space-y-2.5">

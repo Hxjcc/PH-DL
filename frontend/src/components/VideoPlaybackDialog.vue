@@ -241,35 +241,44 @@ onBeforeUnmount(() => {
     class="max-w-5xl max-h-[calc(100dvh-1.5rem)] overflow-y-auto p-4 sm:p-5"
     @close="emit('close')"
   >
-    <div class="playback-stage relative overflow-hidden rounded-xl bg-zinc-950">
-      <div
-        ref="mountPoint"
-        class="absolute inset-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-zinc-200"
-        :inert="phase !== 'ready'"
-        tabindex="0"
-        role="group"
-        aria-label="视频播放器"
-        aria-keyshortcuts="Space ArrowLeft ArrowRight"
-        @keydown.self="handlePlayerKey"
-      />
-      <Teleport :to="fullscreenTarget || 'body'" :disabled="!fullscreenTarget">
+    <div class="playback-frame">
+      <div class="playback-stage relative overflow-hidden bg-black">
         <div
-          v-if="showLoading || error"
-          :role="error ? 'alert' : 'status'"
-          class="absolute inset-0 z-[71] grid place-items-center p-4 text-center text-zinc-100"
-          :class="error || busy ? 'bg-zinc-950/90' : 'pointer-events-none'"
-        >
-          <div class="flex max-w-sm flex-col items-center gap-2.5">
-            <CircleAlert v-if="error" class="h-6 w-6 text-zinc-400" />
-            <Spinner v-else class="h-6 w-6 text-zinc-300" />
-            <p class="text-sm leading-5">{{ error || '正在加载视频…' }}</p>
-            <Button v-if="error" size="sm" variant="secondary" @click="loadSources()">
-              <RefreshCw class="h-3.5 w-3.5" />
-              重试播放
-            </Button>
+          ref="mountPoint"
+          class="absolute inset-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-zinc-200"
+          :inert="phase !== 'ready'"
+          tabindex="0"
+          role="group"
+          aria-label="视频播放器"
+          aria-keyshortcuts="Space ArrowLeft ArrowRight"
+          @keydown.self="handlePlayerKey"
+        />
+        <Teleport :to="fullscreenTarget || 'body'" :disabled="!fullscreenTarget">
+          <div
+            v-if="showLoading || error"
+            :role="error ? 'alert' : 'status'"
+            class="absolute inset-0 z-[71] grid place-items-center p-4 text-center text-zinc-100"
+            :class="error || busy ? 'bg-zinc-950/90' : 'pointer-events-none'"
+          >
+            <div
+              :class="[
+                'flex max-w-sm flex-col items-center gap-2.5',
+                !error && !busy
+                  ? 'rounded-xl bg-zinc-950/75 px-4 py-3 backdrop-blur-xs shadow-lg ring-1 ring-white/10'
+                  : '',
+              ]"
+            >
+              <CircleAlert v-if="error" class="h-6 w-6 shrink-0 text-zinc-400" />
+              <Spinner v-else class="h-6 w-6 shrink-0 text-zinc-200" />
+              <p class="text-sm leading-5">{{ error || '正在加载视频…' }}</p>
+              <Button v-if="error" size="sm" variant="secondary" @click="loadSources()">
+                <RefreshCw class="h-3.5 w-3.5" />
+                重试播放
+              </Button>
+            </div>
           </div>
-        </div>
-      </Teleport>
+        </Teleport>
+      </div>
     </div>
 
     <div class="mt-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
@@ -314,9 +323,52 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.playback-frame {
+  position: relative;
+  border-radius: 0.75rem;
+}
+
+.playback-frame::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 72;
+  box-shadow:
+    0 0 0 1.5px var(--card),
+    inset 0 0 0 1px rgba(9, 9, 11, 0.12);
+}
+
+:global(.dark) .playback-frame::after {
+  box-shadow:
+    0 0 0 1.5px var(--card),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+}
+
 .playback-stage {
   aspect-ratio: 16 / 9;
   max-height: 66dvh;
+  border-radius: inherit;
+  isolation: isolate;
+  transform: translateZ(0);
+}
+
+.playback-stage :deep(.art-video-player),
+.playback-stage :deep(.art-video-player .art-video) {
+  border-radius: inherit;
+  overflow: hidden;
+}
+
+.playback-stage :deep(.art-video-player:fullscreen),
+.playback-stage :deep(.art-video-player:fullscreen .art-video),
+.playback-stage :deep(.art-video-player:-webkit-full-screen),
+.playback-stage :deep(.art-video-player:-webkit-full-screen .art-video),
+.playback-stage :deep(.art-video-player.art-fullscreen),
+.playback-stage :deep(.art-video-player.art-fullscreen .art-video),
+.playback-stage :deep(.art-video-player.art-fullscreen-web),
+.playback-stage :deep(.art-video-player.art-fullscreen-web .art-video) {
+  border-radius: 0;
 }
 
 .playback-stage :deep(.art-video-player .art-loading) {

@@ -21,9 +21,9 @@ const message = computed(() => {
       <div class="flex flex-col items-center gap-4 text-center">
         <BrandMark class="w-14 h-14" />
         <div class="text-lg font-semibold tracking-tight">{{ message.heading }}</div>
-        <div class="flex items-center gap-2 text-sm text-muted-foreground">
-          <Spinner class="w-4 h-4" />
-          {{ message.detail }}
+        <div class="flex items-center justify-center gap-2 text-sm text-muted-foreground leading-none">
+          <Spinner class="w-4 h-4 shrink-0" />
+          <span>{{ message.detail }}</span>
         </div>
       </div>
     </div>

@@ -521,3 +521,91 @@ def test_delete_video_optionally_removes_local_file_inside_downloads_only(tmp_pa
         assert del_out.json()["deleted_count"] == 1
         assert del_out.json()["deleted_files_count"] == 0
         assert outside_file.exists()
+
+
+def test_list_targets_tracks_today_new_count_across_downloads_and_rechecks(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+    from app.db.repo import utc_now_iso
+
+    with _make_client(tmp_path) as client:
+        assert client.post("/api/auth/login", json={"password": "super-secret-password"}).status_code == 200
+        container = client.app.state.container
+
+        alice = client.post("/api/targets", json={"username": "alice", "target_type": "model"}).json()["target"]
+        bob = client.post("/api/targets", json={"username": "bob", "target_type": "model"}).json()["target"]
+        carol = client.post("/api/targets", json={"username": "carol", "target_type": "model"}).json()["target"]
+        liked = client.post("/api/targets", json={"username": "_currentUser_", "target_type": "liked"}).json()["target"]
+
+        now_iso = utc_now_iso()
+        old_iso = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds")
+
+        async def _seed():
+            # Alice downloaded 2 videos today, then later re-checked with 0 new
+            await container.repo.upsert_video(
+                "vk_a1",
+                title="Alice 1",
+                uploader="alice",
+                target_type="model",
+                status="uploaded",
+                downloaded_at=now_iso,
+                uploaded_at=now_iso,
+            )
+            await container.repo.upsert_video(
+                "vk_a2",
+                title="Alice 2",
+                uploader="alice",
+                target_type="model",
+                status="downloaded",
+                downloaded_at=now_iso,
+            )
+            await container.repo.mark_target_checked(alice["id"], 0)
+
+            # Bob had check_updates today finding 3 new videos (not downloaded yet)
+            await container.repo.mark_target_checked(bob["id"], 3)
+
+            # Carol only had activity 2 days ago
+            await container.repo.upsert_video(
+                "vk_c1",
+                title="Carol Old",
+                uploader="carol",
+                target_type="model",
+                status="uploaded",
+                downloaded_at=old_iso,
+                uploaded_at=old_iso,
+            )
+            await container.db.execute(
+                "UPDATE targets SET last_checked_at = ?, last_new_count = 4 WHERE id = ?",
+                (old_iso, carol["id"]),
+            )
+
+            # Liked target received 1 video today
+            await container.repo.upsert_video(
+                "vk_l1",
+                title="Liked Today",
+                uploader="My_Liked",
+                target_type="liked",
+                status="uploaded",
+                downloaded_at=now_iso,
+                uploaded_at=now_iso,
+            )
+            await container.repo.mark_target_checked(liked["id"], 0)
+
+        client.portal.call(_seed)
+
+        items = client.get("/api/targets").json()["items"]
+        by_user = {(item["username"], item["target_type"]): item for item in items}
+
+        assert by_user[("alice", "model")]["today_downloaded_count"] == 2
+        assert by_user[("alice", "model")]["today_new_count"] == 2
+        assert by_user[("alice", "model")]["last_new_count"] == 0
+
+        assert by_user[("bob", "model")]["today_downloaded_count"] == 0
+        assert by_user[("bob", "model")]["today_new_count"] == 3
+        assert by_user[("bob", "model")]["last_new_count"] == 3
+
+        assert by_user[("carol", "model")]["today_downloaded_count"] == 0
+        assert by_user[("carol", "model")]["today_new_count"] == 0
+        assert by_user[("carol", "model")]["last_new_count"] == 4
+
+        assert by_user[("_currentUser_", "liked")]["today_downloaded_count"] == 1
+        assert by_user[("_currentUser_", "liked")]["today_new_count"] == 1

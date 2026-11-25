@@ -360,8 +360,8 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div v-if="!store.jobsLoaded" class="py-16 flex items-center justify-center gap-2 text-xs text-muted-foreground">
-        <Loader2 class="w-4 h-4 animate-spin text-brand" />
+      <div v-if="!store.jobsLoaded" class="py-16 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
+        <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
         <span>任务队列加载中...</span>
       </div>
 

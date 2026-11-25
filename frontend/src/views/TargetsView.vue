@@ -107,12 +107,49 @@ const targetTypeOptions = [
   { label: 'Liked (我的点赞)', value: 'liked' },
 ]
 
+function isLocalToday(iso) {
+  if (!iso) return false
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return false
+  const now = new Date()
+  return (
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  )
+}
+
+function targetTodayNewCount(t) {
+  if (typeof t?.today_new_count === 'number') {
+    return Math.max(0, t.today_new_count)
+  }
+  return Number(t?.last_new_count || 0) > 0 && isLocalToday(t?.last_checked_at)
+    ? Number(t.last_new_count)
+    : 0
+}
+
+function isUpdatedToday(t) {
+  return targetTodayNewCount(t) > 0
+}
+
+function targetNewBadgeTitle(t) {
+  const today = targetTodayNewCount(t)
+  const downloaded = Number(t?.today_downloaded_count || 0)
+  const lastNew = Number(t?.last_new_count || 0)
+  const parts = [`今日新增 ${today} 个视频（按当天统计，次日自动重置）`]
+  if (downloaded > 0) parts.push(`今日已入库 ${downloaded} 个`)
+  if (lastNew > 0) parts.push(`上次检查发现 ${lastNew} 个`)
+  return parts.join(' · ')
+}
+
 const enabledCount = computed(() => targets.value.filter((t) => t.enabled).length)
 const disabledCount = computed(() => targets.value.filter((t) => !t.enabled).length)
+const updatedTodayCount = computed(() => targets.value.filter((t) => isUpdatedToday(t)).length)
 const errorCount = computed(() => targets.value.filter((t) => Boolean(t.last_error)).length)
 
 const statusPills = computed(() => [
   { value: 'all', label: '全部', count: targets.value.length, icon: Users },
+  { value: 'updated_today', label: '今日更新', count: updatedTodayCount.value, icon: Sparkles },
   { value: 'enabled', label: '已启用', count: enabledCount.value, icon: CheckCircle2 },
   { value: 'disabled', label: '已暂停', count: disabledCount.value, icon: PauseCircle },
   ...(errorCount.value > 0
@@ -122,7 +159,8 @@ const statusPills = computed(() => [
 
 const filteredTargets = computed(() => {
   const q = search.value.trim().toLowerCase()
-  return targets.value.filter((t) => {
+  const list = targets.value.filter((t) => {
+    if (statusFilter.value === 'updated_today' && !isUpdatedToday(t)) return false
     if (statusFilter.value === 'enabled' && !t.enabled) return false
     if (statusFilter.value === 'disabled' && t.enabled) return false
     if (statusFilter.value === 'error' && !t.last_error) return false
@@ -134,6 +172,14 @@ const filteredTargets = computed(() => {
     }
     return true
   })
+  if (statusFilter.value === 'updated_today') {
+    return [...list].sort((a, b) => {
+      const diff = targetTodayNewCount(b) - targetTodayNewCount(a)
+      if (diff !== 0) return diff
+      return String(b.last_checked_at || '').localeCompare(String(a.last_checked_at || ''))
+    })
+  }
+  return list
 })
 
 function setViewMode(mode) {
@@ -496,7 +542,9 @@ async function handleDelete(t) {
                 'tabular-nums text-[11px] px-1.5 py-0 rounded-full',
                 statusFilter === pill.value
                   ? 'bg-brand/15 text-brand'
-                  : 'bg-secondary text-muted-foreground',
+                  : pill.value === 'updated_today' && pill.count > 0
+                    ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold'
+                    : 'bg-secondary text-muted-foreground',
               ]"
             >
               {{ pill.count }}
@@ -547,9 +595,12 @@ async function handleDelete(t) {
       </div>
 
       <!-- Loading / Empty State -->
-      <Card v-if="loading && targets.length === 0" class="py-16 text-center text-xs text-muted-foreground">
-        <Loader2 class="w-4 h-4 animate-spin inline mr-1.5 text-brand" />
-        加载中...
+      <Card
+        v-if="loading && targets.length === 0"
+        class="py-16 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none"
+      >
+        <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
+        <span>加载中...</span>
       </Card>
 
       <Card v-else-if="filteredTargets.length === 0" class="py-16 px-6 flex flex-col items-center text-center">
@@ -557,13 +608,21 @@ async function handleDelete(t) {
           <Sparkles class="w-5 h-5" />
         </div>
         <div class="text-sm font-medium text-foreground">
-          {{ targets.length === 0 ? '暂无追更目标' : '没有匹配的目标' }}
+          {{
+            targets.length === 0
+              ? '暂无追更目标'
+              : statusFilter === 'updated_today' && !search.trim()
+                ? '今天暂无目标更新'
+                : '没有匹配的目标'
+          }}
         </div>
         <p class="text-xs text-muted-foreground mt-1 max-w-sm">
           {{
             targets.length === 0
               ? '点击上方“添加目标”或“从订阅导入”即可开启每日自动追更'
-              : '尝试调整筛选条件或清空搜索关键词'
+              : statusFilter === 'updated_today' && !search.trim()
+                ? '点击右上角“仅检查更新”或“立即全量追更”检查今日新视频'
+                : '尝试调整筛选条件或清空搜索关键词'
           }}
         </p>
       </Card>
@@ -663,10 +722,18 @@ async function handleDelete(t) {
                 {{ formatDateTime(t.last_checked_at) }}
               </span>
               <span
-                v-if="t.last_new_count > 0"
+                v-if="targetTodayNewCount(t) > 0"
                 class="inline-flex items-center rounded-full bg-emerald-500/12 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 shrink-0"
+                :title="targetNewBadgeTitle(t)"
               >
-                +{{ t.last_new_count }} 新
+                今日 +{{ targetTodayNewCount(t) }}
+              </span>
+              <span
+                v-else-if="t.last_new_count > 0"
+                class="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-muted-foreground shrink-0"
+                :title="`上次检查发现 ${t.last_new_count} 个新视频（非今日）`"
+              >
+                上次 +{{ t.last_new_count }}
               </span>
             </div>
 
@@ -728,7 +795,7 @@ async function handleDelete(t) {
                 <th class="h-11 px-5">目标用户名</th>
                 <th class="h-11 px-5 w-32">类型</th>
                 <th class="h-11 px-5 w-48">上次检查</th>
-                <th class="h-11 px-5 w-28">上次新增</th>
+                <th class="h-11 px-5 w-32">今日 / 上次新增</th>
                 <th class="h-11 px-5 w-36 text-right">操作</th>
               </tr>
             </thead>
@@ -778,9 +845,21 @@ async function handleDelete(t) {
                   {{ formatDateTime(t.last_checked_at) }}
                 </td>
                 <td class="px-5 py-3.5 text-xs tabular-nums whitespace-nowrap">
-                  <Badge v-if="t.last_new_count > 0" variant="outline" dot="bg-emerald-500">
-                    +{{ t.last_new_count }}
+                  <Badge
+                    v-if="targetTodayNewCount(t) > 0"
+                    variant="outline"
+                    dot="bg-emerald-500"
+                    :title="targetNewBadgeTitle(t)"
+                  >
+                    今日 +{{ targetTodayNewCount(t) }}
                   </Badge>
+                  <span
+                    v-else-if="t.last_new_count > 0"
+                    class="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-[11px] text-muted-foreground"
+                    :title="`上次检查发现 ${t.last_new_count} 个新视频（非今日）`"
+                  >
+                    上次 +{{ t.last_new_count }}
+                  </span>
                   <span v-else class="text-muted-foreground">0</span>
                 </td>
                 <td class="px-5 py-3.5 text-right whitespace-nowrap">

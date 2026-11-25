@@ -17,6 +17,27 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def local_day_start_utc(now: Optional[datetime] = None) -> datetime:
+    local_now = (now or datetime.now().astimezone()).astimezone()
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_midnight.astimezone(timezone.utc)
+
+
+def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 class Repository:
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -97,8 +118,61 @@ class Repository:
     async def list_targets(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
         where = "WHERE enabled = 1" if enabled_only else ""
         rows = await self.db.fetch_all(f"SELECT * FROM targets {where} ORDER BY LOWER(username) ASC, id ASC")
+        if not rows:
+            return rows
+
+        today_start_dt = local_day_start_utc()
+        today_start_iso = today_start_dt.isoformat(timespec="seconds")
+        today_rows = await self.db.fetch_all(
+            """
+            SELECT LOWER(uploader) AS uploader_lower,
+                   LOWER(target_type) AS target_type_lower,
+                   COUNT(*) AS cnt
+            FROM videos
+            WHERE status IN ('downloaded', 'uploaded')
+              AND COALESCE(downloaded_at, uploaded_at, created_at) >= ?
+            GROUP BY LOWER(uploader), LOWER(target_type)
+            """,
+            (today_start_iso,),
+        )
+        counts_by_pair: Dict[Tuple[str, str], int] = {}
+        non_special_counts_by_uploader: Dict[str, int] = {}
+        liked_today_count = 0
+        for item in today_rows:
+            u_low = str(item.get("uploader_lower") or "").strip()
+            t_low = str(item.get("target_type_lower") or "").strip()
+            cnt = int(item.get("cnt") or 0)
+            counts_by_pair[(u_low, t_low)] = cnt
+            if t_low == "liked" or u_low == "my_liked":
+                liked_today_count += cnt
+            elif t_low != "favorites" and u_low:
+                non_special_counts_by_uploader[u_low] = non_special_counts_by_uploader.get(u_low, 0) + cnt
+
+        non_special_targets_per_user: Dict[str, int] = {}
+        for r in rows:
+            u_low = str(r.get("username") or "").strip().lower()
+            t_low = str(r.get("target_type") or "model").strip().lower()
+            if t_low not in ("liked", "favorites") and u_low:
+                non_special_targets_per_user[u_low] = non_special_targets_per_user.get(u_low, 0) + 1
+
         for r in rows:
             r["enabled"] = bool(r["enabled"])
+            u_low = str(r.get("username") or "").strip().lower()
+            t_low = str(r.get("target_type") or "model").strip().lower()
+            if t_low == "liked":
+                downloaded_today = liked_today_count
+            elif t_low == "favorites":
+                downloaded_today = counts_by_pair.get((u_low, "favorites"), 0)
+            elif non_special_targets_per_user.get(u_low, 0) == 1:
+                downloaded_today = non_special_counts_by_uploader.get(u_low, 0)
+            else:
+                downloaded_today = counts_by_pair.get((u_low, t_low), 0)
+
+            checked_dt = _parse_iso_utc(r.get("last_checked_at"))
+            checked_today = bool(checked_dt and checked_dt >= today_start_dt)
+            last_new_today = int(r.get("last_new_count") or 0) if checked_today else 0
+            r["today_downloaded_count"] = downloaded_today
+            r["today_new_count"] = max(downloaded_today, last_new_today)
         return rows
 
     async def get_target(self, target_id: int) -> Optional[Dict[str, Any]]:

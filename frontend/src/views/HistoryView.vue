@@ -3,8 +3,6 @@ import { computed, nextTick, onActivated, onDeactivated, onUnmounted, reactive, 
 import { useRouter } from 'vue-router'
 import {
   Search,
-  ExternalLink,
-  RotateCcw,
   Trash2,
   ChevronLeft,
   ChevronRight,
@@ -16,7 +14,6 @@ import {
   Bookmark,
   Layers,
   Sparkles,
-  Play,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
@@ -47,7 +44,7 @@ const deleteLocalSingle = ref(false)
 const deleteLocalBatch = ref(false)
 const activeDeleteKey = ref('')
 const deletePopoverDefaultOpen = ref(false)
-const items = ref(cached ? [...cached.items] : [])
+const items = shallowRef(cached ? [...cached.items] : [])
 const total = ref(cached ? cached.total : 0)
 const facets = ref(
   cached
@@ -166,21 +163,23 @@ const qualityOptions = computed(() => [
 let debounceTimer = null
 let loadingTimer = null
 let fetchingTimer = null
+let prefetchTimer = null
 let reqSeq = 0
 let activatedOnce = false
 let activeAbortController = null
 
-const QUERY_CACHE_MAX = 24
-const QUERY_CACHE_TTL_MS = 20_000
+const QUERY_CACHE_MAX = 48
+const QUERY_CACHE_TTL_MS = 45_000
 const queryCache = new Map()
+const inflightPrefetches = new Map()
 
-function buildQueryCacheKey() {
+function buildQueryCacheKey(page = filters.page) {
   return [
     filters.search.trim(),
     filters.uploader,
     filters.status,
     filters.quality,
-    filters.page,
+    page,
     filters.page_size,
   ].join('\x1f')
 }
@@ -206,8 +205,64 @@ function writeQueryCache(key, itemsList, totalCount) {
   }
 }
 
+function cancelAllPrefetches() {
+  clearTimeout(prefetchTimer)
+  prefetchTimer = null
+  for (const entry of inflightPrefetches.values()) {
+    entry.controller.abort()
+  }
+  inflightPrefetches.clear()
+}
+
 function invalidateQueryCache() {
   queryCache.clear()
+  cancelAllPrefetches()
+}
+
+function prefetchPage(targetPage) {
+  if (targetPage < 1 || targetPage > totalPages.value || targetPage === filters.page) return
+  const key = buildQueryCacheKey(targetPage)
+  if (readQueryCache(key) || inflightPrefetches.has(key)) return
+
+  const controller = new AbortController()
+  const query = {
+    search: filters.search,
+    uploader: filters.uploader,
+    status: filters.status,
+    quality: filters.quality,
+    page: targetPage,
+    page_size: filters.page_size,
+    include_meta: false,
+  }
+  const promise = api
+    .listVideos(query, { signal: controller.signal })
+    .then((res) => {
+      const nextItems = res.items || []
+      const nextTotal = res.total || 0
+      writeQueryCache(key, nextItems, nextTotal)
+      return { items: nextItems, total: nextTotal }
+    })
+    .catch(() => null)
+    .finally(() => {
+      if (inflightPrefetches.get(key)?.controller === controller) {
+        inflightPrefetches.delete(key)
+      }
+    })
+
+  inflightPrefetches.set(key, { promise, controller })
+}
+
+function scheduleAdjacentPrefetch() {
+  clearTimeout(prefetchTimer)
+  prefetchTimer = setTimeout(() => {
+    prefetchTimer = null
+    if (filters.page < totalPages.value) {
+      prefetchPage(filters.page + 1)
+    }
+    if (filters.page > 1) {
+      prefetchPage(filters.page - 1)
+    }
+  }, 45)
 }
 
 function hasLoadedMeta() {
@@ -255,10 +310,46 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
   if (useCache && !includeMeta) {
     const hit = readQueryCache(cacheKey)
     if (hit) {
+      if (activeAbortController) {
+        activeAbortController.abort()
+        activeAbortController = null
+      }
+      ++reqSeq
+      clearTimeout(loadingTimer)
+      clearTimeout(fetchingTimer)
       applyVideoList(hit.items, hit.total)
       loading.value = false
       fetching.value = false
+      scheduleAdjacentPrefetch()
       return
+    }
+
+    const pending = inflightPrefetches.get(cacheKey)
+    if (pending) {
+      if (activeAbortController) {
+        activeAbortController.abort()
+        activeAbortController = null
+      }
+      const seq = ++reqSeq
+      clearTimeout(loadingTimer)
+      clearTimeout(fetchingTimer)
+      if (!silent) {
+        fetchingTimer = setTimeout(() => {
+          if (seq === reqSeq) fetching.value = true
+        }, 120)
+      }
+      const prefetched = await pending.promise
+      if (seq !== reqSeq) return
+      clearTimeout(loadingTimer)
+      clearTimeout(fetchingTimer)
+      if (prefetched) {
+        applyVideoList(prefetched.items, prefetched.total)
+        loading.value = false
+        fetching.value = false
+        scheduleAdjacentPrefetch()
+        return
+      }
+      fetching.value = false
     }
   }
 
@@ -298,6 +389,7 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
     if (isDefaultFilters() && res.facets && res.stats) {
       store.setHistoryCache(res)
     }
+    scheduleAdjacentPrefetch()
   } catch (err) {
     if (err?.name === 'AbortError') return
     if (seq === reqSeq) {
@@ -318,12 +410,14 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
 
 function triggerSearch() {
   filters.page = 1
+  cancelAllPrefetches()
   clearTimeout(debounceTimer)
   debounceTimer = setTimeout(() => loadVideos({ includeMeta: false, useCache: true }), 180)
 }
 
 function changeFilter() {
   filters.page = 1
+  cancelAllPrefetches()
   clearTimeout(debounceTimer)
   loadVideos({ includeMeta: false, useCache: true })
 }
@@ -333,6 +427,7 @@ function changePageSize(value) {
   filters.page_size = store.historyPageSize
   filters.page = 1
   clearSelection()
+  cancelAllPrefetches()
   clearTimeout(debounceTimer)
   loadVideos({ includeMeta: false, useCache: true })
 }
@@ -348,7 +443,9 @@ function selectStatusCard(statusKey) {
 }
 
 function goPage(p) {
-  if (p < 1 || p > totalPages.value) return
+  if (p < 1 || p > totalPages.value || p === filters.page) return
+  activeDeleteKey.value = ''
+  deletePopoverDefaultOpen.value = false
   filters.page = p
   loadVideos({ includeMeta: false, useCache: true })
 }
@@ -464,11 +561,16 @@ watch(
 onActivated(() => {
   if (!activatedOnce) {
     activatedOnce = true
-    if (store.hydratedFromCache && store.hasRouteCache('history')) return
+    if (store.hydratedFromCache && store.hasRouteCache('history')) {
+      scheduleAdjacentPrefetch()
+      return
+    }
     if (!store.hasRouteCache('history')) {
       loadVideos({ silent: false, includeMeta: true })
     } else if (Date.now() - store.historyLoadedAt > 1500) {
       loadVideos({ silent: true, includeMeta: true })
+    } else {
+      scheduleAdjacentPrefetch()
     }
     return
   }
@@ -480,10 +582,12 @@ onUnmounted(() => {
   clearTimeout(debounceTimer)
   clearTimeout(loadingTimer)
   clearTimeout(fetchingTimer)
+  cancelAllPrefetches()
   activeAbortController?.abort()
 })
 
 onDeactivated(() => {
+  cancelAllPrefetches()
   playingVideo.value = null
   playbackTrigger = null
 })
@@ -558,8 +662,10 @@ onDeactivated(() => {
     <div class="space-y-3">
       <div class="flex flex-wrap items-center gap-2">
         <div class="relative flex-1 min-w-[200px]">
-          <Loader2 v-if="fetching" class="w-3.5 h-3.5 text-brand animate-spin absolute left-3 top-1/2 -translate-y-1/2" />
-          <Search v-else class="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2" />
+          <span class="pointer-events-none absolute inset-y-0 left-3 flex items-center">
+            <Loader2 v-if="fetching" class="w-3.5 h-3.5 text-brand animate-spin" />
+            <Search v-else class="w-3.5 h-3.5 text-muted-foreground" />
+          </span>
           <Input
             v-model="filters.search"
             placeholder="搜索标题、Viewkey 或上传者..."
@@ -648,8 +754,10 @@ onDeactivated(() => {
             <tbody :class="['divide-y divide-border transition-opacity duration-150', fetching ? 'opacity-65' : '']">
               <tr v-if="loading && items.length === 0">
                 <td colspan="8" class="py-12 text-center text-xs text-muted-foreground">
-                  <Loader2 class="w-4 h-4 animate-spin inline mr-1.5 text-brand" />
-                  加载中...
+                  <div class="inline-flex items-center justify-center gap-2 leading-none">
+                    <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
+                    <span>加载中...</span>
+                  </div>
                 </td>
               </tr>
               <tr v-else-if="items.length === 0">
@@ -659,11 +767,33 @@ onDeactivated(() => {
               </tr>
               <tr v-for="v in items" :key="v.viewkey" class="hover:bg-accent/50 transition-colors">
                 <td class="pl-5 pr-2 py-3.5 w-12">
-                  <Checkbox
-                    :model-value="selectedViewkeys.has(v.viewkey)"
+                  <button
+                    type="button"
+                    role="checkbox"
+                    :aria-checked="selectedViewkeys.has(v.viewkey)"
                     :title="`选择 ${v.viewkey}`"
-                    @update:model-value="toggleSelectVideo(v.viewkey)"
-                  />
+                    :class="[
+                      'inline-flex h-4 w-4 shrink-0 align-middle items-center justify-center rounded-[5px] border transition-colors cursor-pointer active:scale-90 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-foreground/15',
+                      selectedViewkeys.has(v.viewkey)
+                        ? 'border-primary bg-primary text-primary-foreground shadow-xs'
+                        : 'border-input bg-card hover:border-foreground/40',
+                    ]"
+                    @click="toggleSelectVideo(v.viewkey)"
+                  >
+                    <svg
+                      v-if="selectedViewkeys.has(v.viewkey)"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-3 w-3"
+                      aria-hidden="true"
+                    >
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                  </button>
                 </td>
                 <td class="px-5 py-3.5 max-w-0 w-full">
                   <div class="font-medium text-foreground truncate" :title="v.title">
@@ -714,7 +844,9 @@ onDeactivated(() => {
                       title="在线播放"
                       @click="openPlayback(v, $event)"
                     >
-                      <Play class="w-3.5 h-3.5" />
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                        <polygon points="6 3 20 12 6 21 6 3" />
+                      </svg>
                     </button>
                     <a
                       v-if="v.video_page_url"
@@ -724,7 +856,9 @@ onDeactivated(() => {
                       class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
                       title="打开原网页"
                     >
-                      <ExternalLink class="w-3.5 h-3.5" />
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                        <path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                      </svg>
                     </a>
                     <button
                       type="button"
@@ -732,7 +866,9 @@ onDeactivated(() => {
                       title="强制重新下载"
                       @click="handleRedownload(v)"
                     >
-                      <RotateCcw class="w-3.5 h-3.5" />
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" />
+                      </svg>
                     </button>
                     <ConfirmPopover
                       v-if="activeDeleteKey === v.viewkey"
@@ -754,7 +890,9 @@ onDeactivated(() => {
                         class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors cursor-pointer"
                         title="删除去重记录"
                       >
-                        <Trash2 class="w-3.5 h-3.5" />
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                          <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" />
+                        </svg>
                       </button>
                     </ConfirmPopover>
                     <button
@@ -766,7 +904,9 @@ onDeactivated(() => {
                       @focus="warmDeleteRowPopover(v.viewkey)"
                       @click="openDeleteRowPopoverNow(v.viewkey)"
                     >
-                      <Trash2 class="w-3.5 h-3.5" />
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5" aria-hidden="true">
+                        <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" />
+                      </svg>
                     </button>
                   </div>
                 </td>
@@ -783,6 +923,8 @@ onDeactivated(() => {
               variant="outline"
               size="xs"
               :disabled="filters.page <= 1"
+              @pointerenter="prefetchPage(filters.page - 1)"
+              @focus="prefetchPage(filters.page - 1)"
               @click="goPage(filters.page - 1)"
             >
               <ChevronLeft class="w-3.5 h-3.5" />
@@ -792,6 +934,8 @@ onDeactivated(() => {
               variant="outline"
               size="xs"
               :disabled="filters.page >= totalPages"
+              @pointerenter="prefetchPage(filters.page + 1)"
+              @focus="prefetchPage(filters.page + 1)"
               @click="goPage(filters.page + 1)"
             >
               下一页

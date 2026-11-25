@@ -1940,7 +1940,13 @@ class TaskManager:
             elif valid_new:
                 lines = [f"**{display}** 发现 {len(valid_new)} 个新视频："]
                 for i, d in enumerate(valid_new, start=1):
-                    lines.append(f"{i}. {d.title} ({d.quality}) - {d.page_url}")
+                    qual_tag = f" ({d.quality})" if d.quality else ""
+                    lines.append(f"{i}. {d.title}{qual_tag} - {d.page_url}")
+                    self.events.emit_log(
+                        "INFO",
+                        f"[发现更新] {display} #{i}: {d.title}{qual_tag} - {d.page_url}",
+                        job_id=job_id,
+                    )
                 check_notes.append("\n".join(lines))
 
         self.events.broadcast("overview_changed", {})
@@ -1989,6 +1995,18 @@ class TaskManager:
         else:
             total_found = sum(new_by_target.values())
             await self.repo.update_job(job_id, total_items=total_found, done_items=total_found)
+            if total_found > 0:
+                self.events.emit_log(
+                    "INFO",
+                    f"仅检查更新完成：共发现 {total_found} 个新视频（未下载，如需下载请在「自动追更」执行全量追更）。",
+                    job_id=job_id,
+                )
+            elif target_error_count == 0:
+                self.events.emit_log(
+                    "INFO",
+                    f"仅检查更新完成：共检查 {len(targets)} 个目标，暂未发现新视频。",
+                    job_id=job_id,
+                )
             if check_notes:
                 await send_serverchan("PH-DL 更新检查汇总", "\n\n---\n\n".join(check_notes), settings)
             elif settings.notify_if_no_updates and target_error_count == 0:
