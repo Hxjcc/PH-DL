@@ -114,6 +114,32 @@ test('resolveJobVisual extracts category, display title, avatars, and capsules',
   assert.equal(updVisual.category.label, '指定追更')
   assert.equal(updVisual.category.group, 'update')
   assert.equal(updVisual.title, 'KKFox baby')
+  assert.ok(updVisual.capsules.some((c) => c.text === '@kkfox-baby' && c.handle === true))
+
+  // Also shows @username uniformly even when display_name only differs by case
+  const sameCaseVisual = resolveJobVisual(
+    {
+      id: 49,
+      kind: 'manual_target',
+      label: '下载目标: ariavix',
+      params: { usernames: ['ariavix'], target_type: 'model', auto_upload: true },
+    },
+    [{ id: 9, username: 'ariavix', display_name: 'AriaVix', target_type: 'model', avatar_url: '', enabled: true }]
+  )
+  assert.equal(sameCaseVisual.title, 'AriaVix')
+  assert.ok(sameCaseVisual.capsules.some((c) => c.text === '@ariavix' && c.handle === true))
+
+  // Baseline sync single-target also shows @username uniformly
+  const baseVisual = resolveJobVisual(
+    {
+      id: 48,
+      kind: 'baseline_sync',
+      label: '初始化基线: AriaVix (model)',
+      params: { target_id: 9, pages: 'all' },
+    },
+    [{ id: 9, username: 'ariavix', display_name: 'AriaVix', target_type: 'model', avatar_url: '', enabled: true }]
+  )
+  assert.ok(baseVisual.capsules.some((c) => c.text === '@ariavix' && c.handle === true))
 })
 
 test('computeJobLiveMetrics includes fractional byte progress and speed while done_items is 0', () => {

@@ -527,12 +527,12 @@ function downloadExportTxt() {
             <div class="flex flex-wrap items-center gap-1.5 min-w-0">
               <span
                 :class="[
-                  'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium shrink-0',
+                  'inline-flex h-[22px] items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium leading-none shrink-0',
                   visual.category.pillClass,
                 ]"
               >
-                <component :is="categoryIcon" class="w-3 h-3" />
-                {{ visual.category.label }}
+                <component :is="categoryIcon" class="w-3 h-3 shrink-0" />
+                <span>{{ visual.category.label }}</span>
               </span>
 
               <span
@@ -546,15 +546,19 @@ function downloadExportTxt() {
                 v-for="(cap, cIdx) in visual.capsules"
                 :key="cIdx"
                 :class="[
-                  'inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] leading-4 shrink-0',
-                  cap.mono ? 'font-mono tabular-nums' : 'font-medium',
+                  'inline-flex h-[22px] items-center rounded-full border px-2.5 text-[11px] leading-none shrink-0',
+                  cap.handle ? 'font-normal tracking-normal' : cap.mono ? 'font-mono tabular-nums' : 'font-medium',
                   capsuleClass(cap),
                 ]"
               >
-                {{ cap.text }}
+                <template v-if="cap.handle && cap.text.startsWith('@')">
+                  <span class="opacity-65 mr-[1px]">@</span>
+                  <span>{{ cap.text.slice(1) }}</span>
+                </template>
+                <template v-else>{{ cap.text }}</template>
               </span>
 
-              <span class="rounded-full bg-secondary/80 px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground tabular-nums shrink-0">
+              <span class="inline-flex h-[22px] items-center rounded-full bg-secondary/80 px-2 text-[11px] leading-none font-mono text-muted-foreground tabular-nums shrink-0">
                 #{{ job.id }}
               </span>
             </div>
@@ -853,10 +857,11 @@ function downloadExportTxt() {
                 <div class="flex items-center gap-1.5 shrink-0 text-[11px] tabular-nums">
                   <span
                     v-if="showItemUploader && item.uploader"
-                    class="hidden md:inline-flex items-center rounded-full border border-border/80 bg-surface-subtle px-2 py-0.5 text-[10px] text-muted-foreground max-w-28 truncate"
+                    class="hidden md:inline-flex h-[21px] items-center rounded-full border border-border/80 bg-surface-subtle px-2.5 text-[11px] leading-none text-muted-foreground max-w-32"
                     :title="item.uploader"
                   >
-                    @{{ item.uploader }}
+                    <span class="opacity-65 mr-[1px] shrink-0">@</span>
+                    <span class="truncate">{{ item.uploader }}</span>
                   </span>
 
                   <span

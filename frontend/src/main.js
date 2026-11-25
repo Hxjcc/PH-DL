@@ -6,6 +6,8 @@ import { useAppStore } from './stores/app'
 import { setUnauthorizedHandler } from './api/client'
 import { useAuthTransition } from './composables/useAuthTransition'
 import { isNewBrowserEntry, markBrowserEntry } from './utils/browserEntry'
+import '@fontsource-variable/inter'
+import '@fontsource-variable/noto-sans-sc'
 import './style.css'
 
 const app = createApp(App)

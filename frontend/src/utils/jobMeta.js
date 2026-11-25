@@ -205,8 +205,8 @@ export function resolveJobVisual(job, targetsList = []) {
       }
       if (avatars.length === 1) {
         title = avatars[0].name
-        if (avatars[0].username && avatars[0].username.toLowerCase() !== avatars[0].name.toLowerCase()) {
-          capsules.push({ text: `@${avatars[0].username}`, mono: true })
+        if (avatars[0].username && !avatars[0].isLiked) {
+          capsules.push({ text: `@${avatars[0].username}`, handle: true })
         }
         const tType = avatars[0].targetType || (params.target_type !== 'auto' ? params.target_type : '')
         if (tType && tType !== 'auto') {
@@ -247,8 +247,8 @@ export function resolveJobVisual(job, targetsList = []) {
       }
       if (avatars.length === 1) {
         title = avatars[0].name
-        if (avatars[0].username && avatars[0].username.toLowerCase() !== avatars[0].name.toLowerCase()) {
-          capsules.push({ text: `@${avatars[0].username}`, mono: true })
+        if (avatars[0].username && !avatars[0].isLiked) {
+          capsules.push({ text: `@${avatars[0].username}`, handle: true })
         }
         if (avatars[0].targetType) {
           capsules.push({ text: targetTypeMeta(avatars[0].targetType) })
@@ -278,6 +278,9 @@ export function resolveJobVisual(job, targetsList = []) {
       pushUniqueAvatar(makeAvatarEntry(targetObj, rawClean, profileAvatars, profileNames))
     }
     title = avatars[0]?.name || rawClean || '基线初始化'
+    if (avatars[0]?.username && !avatars[0]?.isLiked) {
+      capsules.push({ text: `@${avatars[0].username}`, handle: true })
+    }
     if (avatars[0]?.targetType) {
       capsules.push({ text: targetTypeMeta(avatars[0].targetType) })
     }

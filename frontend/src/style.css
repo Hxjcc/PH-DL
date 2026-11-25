@@ -92,6 +92,11 @@
   --radius-lg: 0.75rem;
   --radius-xl: 1rem;
   --radius-2xl: 1.25rem;
+  --font-sans: 'Inter Variable', 'Noto Sans SC Variable', 'Segoe UI Variable', 'Segoe UI',
+    -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI',
+    'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Mono', 'Cascadia Code', 'SFMono-Regular',
+    'Inter Variable', 'Noto Sans SC Variable', ui-monospace, Menlo, Consolas, monospace;
 }
 
 @layer base {
@@ -115,8 +120,11 @@
     min-height: 100%;
     background-color: var(--background);
     color: var(--foreground);
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
-      'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+    font-family: var(--font-sans);
+    font-optical-sizing: auto;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   }
 
