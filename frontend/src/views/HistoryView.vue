@@ -494,11 +494,23 @@ function changePageSize(value) {
   loadVideos({ includeMeta: false, useCache: true })
 }
 
+let sortBeforeTimeRange = null
+
+function changeSortBy() {
+  sortBeforeTimeRange = null
+  changeFilter()
+}
+
 function changeTimeRange() {
   if (filters.time_range === 'published_7d' || filters.time_range === 'published_30d') {
+    if (sortBeforeTimeRange === null) sortBeforeTimeRange = filters.sort_by
     filters.sort_by = 'published'
   } else if (filters.time_range === 'activity_7d') {
+    if (sortBeforeTimeRange === null) sortBeforeTimeRange = filters.sort_by
     filters.sort_by = 'activity'
+  } else if (sortBeforeTimeRange !== null) {
+    filters.sort_by = sortBeforeTimeRange
+    sortBeforeTimeRange = null
   }
   changeFilter()
 }
@@ -507,11 +519,18 @@ function selectStatCard(card) {
   if (card.kind === 'all') {
     if (filters.status === '' && filters.time_range === '') return
     filters.status = ''
-    filters.time_range = ''
+    if (filters.time_range !== '') {
+      filters.time_range = ''
+      filters.sort_by = sortBeforeTimeRange ?? 'activity'
+      sortBeforeTimeRange = null
+    }
   } else if (card.kind === 'time_range') {
     if (filters.time_range === card.key) {
       filters.time_range = ''
+      filters.sort_by = sortBeforeTimeRange ?? 'activity'
+      sortBeforeTimeRange = null
     } else {
+      if (sortBeforeTimeRange === null) sortBeforeTimeRange = filters.sort_by
       filters.time_range = card.key
       filters.sort_by = 'published'
     }
@@ -650,6 +669,7 @@ function applyRouteUploaderQuery() {
   filters.time_range = ''
   filters.search = ''
   filters.page = 1
+  sortBeforeTimeRange = null
   router.replace({ name: 'history', query: {} }).catch(() => {})
   return true
 }
@@ -807,7 +827,7 @@ onDeactivated(() => {
             v-model="filters.sort_by"
             :options="sortOptions"
             class="w-full sm:w-32"
-            @change="changeFilter"
+            @change="changeSortBy"
           />
         </div>
 

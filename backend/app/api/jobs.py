@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,6 +13,7 @@ from ..parsers.video import collect_video_urls
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+_INVALID_USERNAME_RE = re.compile(r"[/\\:?#\s]")
 
 
 class CreateManualDownloadRequest(BaseModel):
@@ -96,8 +98,15 @@ async def create_download_job(
         if payload.pages.strip() and payload.videos.strip():
             raise HTTPException(status_code=400, detail="页码范围和指定视频不能同时使用")
         clean_users = [u.strip() for u in payload.usernames if u and u.strip()]
+        if utype != "liked":
+            for u in clean_users:
+                if _INVALID_USERNAME_RE.search(u):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"用户名格式无效 '{u}'：请输入博主用户名，不要粘贴视频或频道链接",
+                    )
         if utype != "liked" and not clean_users:
-            if utype in {"favorites", "model", "pornstar"} and settings.ph_logged_in_username:
+            if utype == "favorites" and settings.ph_logged_in_username:
                 clean_users = [settings.ph_logged_in_username]
             else:
                 raise HTTPException(status_code=400, detail="请至少输入一个用户名")
@@ -333,7 +342,7 @@ async def retry_failed_items(job_id: int, container: AppContainer = Depends(requ
             "origin_job_id": origin_job_id,
             "origin_label": origin_label,
             "auto_upload": src_params.get("auto_upload"),
-            "quality": src_params.get("quality", ""),
+            "quality": src_params.get("quality"),
             "redownload": bool(src_params.get("redownload", False)),
             "keywords": src_params.get("keywords", ""),
             "exclude_keywords": src_params.get("exclude_keywords", ""),

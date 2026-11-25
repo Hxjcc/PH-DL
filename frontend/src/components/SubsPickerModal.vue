@@ -181,8 +181,9 @@ watch(() => props.open, (isOpen) => {
     query.value = ''
     typeFilter.value = 'all'
     trackFilter.value = 'all'
-    addToAutoTrack.value = false
+    initBaseline.value = true
     baselinePages.value = 'all'
+    baselinePagesValid.value = true
     editingSource.value = false
     if (!manualSource.value) sourceUser.value = defaultSource.value
     if (store.targetsCache === null) store.ensureTargets()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import List, Optional
 
@@ -16,6 +17,15 @@ from .deps import AppContainer, require_auth
 router = APIRouter(prefix="/api/targets", tags=["targets"])
 
 VALID_TYPES = {"auto", "model", "pornstar", "favorites", "liked"}
+_INVALID_USERNAME_RE = re.compile(r"[/\\:?#\s]")
+
+
+def _validate_target_username(uname: str) -> None:
+    if uname and _INVALID_USERNAME_RE.search(uname):
+        raise HTTPException(
+            status_code=400,
+            detail=f"用户名格式无效 '{uname}'：请输入博主用户名，不要粘贴视频或频道链接",
+        )
 
 
 def _validate_baseline_pages(pages: str) -> None:
@@ -79,26 +89,26 @@ async def create_target(
         raise HTTPException(status_code=400, detail=f"不支持的目标类型: {raw_type}")
 
     uname = payload.username.strip()
-    if raw_type != "liked" and not uname:
-        raise HTTPException(status_code=400, detail="请输入用户名")
+    if raw_type != "liked":
+        if not uname:
+            raise HTTPException(status_code=400, detail="请输入用户名")
+        _validate_target_username(uname)
 
     resolved_type = raw_type
     if raw_type == "auto":
         settings = await container.repo.get_settings()
-        if settings.ph_cookie.strip():
-            async with TaskHttpContext(
-                cookie_str=settings.ph_cookie,
-                proxy_url=settings.normalized_proxy,
-                concurrency=2,
-                timeout=settings.request_timeout,
-                max_retries=1,
-            ) as ctx:
-                detected = await resolve_target_type(ctx, uname, timeout=settings.request_timeout)
-                if detected == "channel":
-                    raise HTTPException(status_code=400, detail=f"目标 '{uname}' 是 Channel，暂不支持")
-                resolved_type = detected or "model"
-        else:
-            resolved_type = "model"
+        probe_timeout = min(float(settings.request_timeout), 10.0)
+        async with TaskHttpContext(
+            cookie_str=settings.ph_cookie,
+            proxy_url=settings.normalized_proxy,
+            concurrency=2,
+            timeout=probe_timeout,
+            max_retries=1,
+        ) as ctx:
+            detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
+            if detected == "channel":
+                raise HTTPException(status_code=400, detail=f"目标 '{uname}' 是 Channel，暂不支持")
+            resolved_type = detected or "model"
 
     target = await container.repo.upsert_target(
         username=uname,
@@ -132,6 +142,12 @@ async def batch_create_targets(
     jobs = []
     skipped_channels = []
 
+    for item in payload.items:
+        raw_t = (item.target_type or "model").strip().lower()
+        u_clean = item.username.strip()
+        if raw_t != "liked":
+            _validate_target_username(u_clean)
+
     needs_auto_resolve = any(
         (item.target_type or "").strip().lower() == "auto" and item.username.strip()
         for item in payload.items
@@ -139,25 +155,25 @@ async def batch_create_targets(
     resolved_types: dict[str, str] = {}
     if needs_auto_resolve:
         settings = await container.repo.get_settings()
-        if settings.ph_cookie.strip():
-            async with TaskHttpContext(
-                cookie_str=settings.ph_cookie,
-                proxy_url=settings.normalized_proxy,
-                concurrency=3,
-                timeout=settings.request_timeout,
-                max_retries=1,
-            ) as ctx:
-                seen_auto: set[str] = set()
-                for item in payload.items:
-                    if (item.target_type or "").strip().lower() != "auto":
-                        continue
-                    uname = item.username.strip()
-                    key = uname.lower()
-                    if not uname or key in seen_auto:
-                        continue
-                    seen_auto.add(key)
-                    detected = await resolve_target_type(ctx, uname, timeout=settings.request_timeout)
-                    resolved_types[key] = detected or "model"
+        probe_timeout = min(float(settings.request_timeout), 10.0)
+        async with TaskHttpContext(
+            cookie_str=settings.ph_cookie,
+            proxy_url=settings.normalized_proxy,
+            concurrency=3,
+            timeout=probe_timeout,
+            max_retries=1,
+        ) as ctx:
+            seen_auto: set[str] = set()
+            for item in payload.items:
+                if (item.target_type or "").strip().lower() != "auto":
+                    continue
+                uname = item.username.strip()
+                key = uname.lower()
+                if not uname or key in seen_auto:
+                    continue
+                seen_auto.add(key)
+                detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
+                resolved_types[key] = detected or "model"
 
     for item in payload.items:
         raw_type = (item.target_type or "model").strip().lower()

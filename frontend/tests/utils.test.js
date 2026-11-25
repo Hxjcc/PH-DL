@@ -319,8 +319,15 @@ test('computeJobLiveMetrics renders determinate scan bar for target updates and 
   assert.match(pageScan.phaseText, /42/)
 })
 
-test('parseTargetUsernames splits commas/newlines, strips profile URLs, and deduplicates', () => {
-  const input = 'alice, bob，ALICE\nhttps://www.pornhub.com/model/candy-love/videos @charlie; https://www.pornhub.com/pornstar/dana'
+test('parseTargetUsernames splits commas/newlines, strips profile URLs, ignores non-profile URLs, and deduplicates', () => {
+  const input = [
+    'alice, bob，ALICE',
+    'https://www.pornhub.com/model/candy-love/videos @charlie; https://www.pornhub.com/pornstar/dana',
+    'https://www.pornhub.com/channels/unsupported-chan',
+    'https://www.pornhub.com/view_video.php?viewkey=ph12345',
+    'bad/path',
+    'has?query',
+  ].join('\n')
   assert.deepEqual(parseTargetUsernames(input), ['alice', 'bob', 'candy-love', 'charlie', 'dana'])
 })
 

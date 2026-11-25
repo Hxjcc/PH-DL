@@ -1633,7 +1633,7 @@ class TaskManager:
         if raw_type == "liked":
             targets.append(("_currentUser_", "liked"))
         else:
-            if not usernames and raw_type in {"favorites", "model", "pornstar"} and settings.ph_logged_in_username:
+            if not usernames and raw_type == "favorites" and settings.ph_logged_in_username:
                 usernames = [settings.ph_logged_in_username]
             seen_users: Set[str] = set()
             for uname in usernames:
@@ -2462,7 +2462,7 @@ class TaskManager:
                 {
                     "viewkey": lv.viewkey,
                     "title": lv.title,
-                    "uploader": "" if uname == "_currentUser_" else uname,
+                    "uploader": "My_Liked" if (utype == "liked" or uname == "_currentUser_") else uname,
                     "target_type": utype,
                     "video_page_url": lv.url,
                     "status": "baseline",
@@ -2536,6 +2536,15 @@ class TaskManager:
         detail_failures = 0
         for candidate in candidates:
             detail = detail_by_viewkey.get(candidate["viewkey"])
+            if ctx.cancel_event.is_set() or (detail is not None and detail.error == "操作已取消"):
+                item = await self.repo.update_job_item(
+                    item_ids[candidate["viewkey"]],
+                    status="cancelled",
+                    error_message="已取消",
+                )
+                if item:
+                    self.events.broadcast("item_updated", item)
+                continue
             if detail is None or not detail.download_url:
                 detail_failures += 1
                 error = detail.error if detail else "详情页未返回结果"
@@ -2548,6 +2557,10 @@ class TaskManager:
                     self.events.broadcast("item_updated", item)
                 continue
             ready.append((candidate, detail))
+
+        if ctx.cancel_event.is_set():
+            self.events.emit_log("WARNING", "元数据补全任务已取消。", job_id=job_id)
+            return
 
         self.events.emit_log(
             "INFO",
@@ -2568,14 +2581,20 @@ class TaskManager:
             async with size_sem:
                 if ctx.cancel_event.is_set():
                     return candidate, detail, None, True
-                size = await probe_download_size(
-                    size_session,
-                    detail.download_url or "",
-                    referer_url=detail.referer_url or detail.page_url,
-                    cookie_str=cookie_str,
-                    proxy_url=settings.normalized_proxy,
-                    timeout=settings.request_timeout,
-                )
+                try:
+                    size = await until_stopped(
+                        probe_download_size(
+                            size_session,
+                            detail.download_url or "",
+                            referer_url=detail.referer_url or detail.page_url,
+                            cookie_str=cookie_str,
+                            proxy_url=settings.normalized_proxy,
+                            timeout=settings.request_timeout,
+                        ),
+                        ctx.cancel_event,
+                    )
+                except StopRequested:
+                    return candidate, detail, None, True
                 return candidate, detail, size, False
 
         size_failures = 0
@@ -2594,7 +2613,14 @@ class TaskManager:
 
             for candidate, detail, file_size, cancelled in probe_results:
                 if cancelled or ctx.cancel_event.is_set():
-                    break
+                    item = await self.repo.update_job_item(
+                        item_ids[candidate["viewkey"]],
+                        status="cancelled",
+                        error_message="已取消",
+                    )
+                    if item:
+                        self.events.broadcast("item_updated", item)
+                    continue
                 if file_size:
                     completed_with_size += 1
                 else:
@@ -2674,20 +2700,61 @@ class TaskManager:
         auto_upload = original_opt_in is True or (original_opt_in is None and settings.uploader_enabled)
         quality_option = params.get("quality")
         qualities = _quality_set(settings.preferred_quality if quality_option is None else quality_option)
+        target_qual_by_pair: Dict[Tuple[str, str], Optional[Set[str]]] = {}
+        target_qual_by_user: Dict[str, Optional[Set[str]]] = {}
+        if quality_option is None:
+            for t in await self.repo.list_targets():
+                q_set = _quality_set(t.get("preferred_quality"))
+                if not q_set:
+                    continue
+                u_low = str(t.get("username") or "").strip().lower()
+                t_low = str(t.get("target_type") or "model").strip().lower()
+                if t_low == "liked":
+                    target_qual_by_pair[("my_liked", "liked")] = q_set
+                    target_qual_by_pair[("_currentuser_", "liked")] = q_set
+                else:
+                    target_qual_by_pair[(u_low, t_low)] = q_set
+                    if t_low not in {"favorites", "liked"} and u_low not in target_qual_by_user:
+                        target_qual_by_user[u_low] = q_set
+
+        def _item_default_qualities(old_item: Dict[str, Any]) -> Optional[Set[str]]:
+            if quality_option is not None:
+                return qualities
+            u_low = str(old_item.get("uploader") or "").strip().lower()
+            t_low = str(old_item.get("target_type") or "model").strip().lower()
+            if (u_low, t_low) in target_qual_by_pair:
+                return target_qual_by_pair[(u_low, t_low)]
+            if t_low not in {"favorites", "liked"} and u_low in target_qual_by_user:
+                return target_qual_by_user[u_low]
+            return qualities
+
         include_kw = _split_csv_set(params.get("keywords"), lower=True)
         exclude_kw = _split_csv_set(params.get("exclude_keywords"), lower=True)
-        lookup_urls = list(dict.fromkeys(
-            old["page_url"] for _, _, old, _ in annotated
-            if not old.get("download_url") and not old.get("local_path") and old.get("page_url")
-        ))
+        lookup_groups: Dict[Optional[Tuple[str, ...]], List[str]] = defaultdict(list)
+        lookup_urls_set: Set[str] = set()
+        for _, _, old, _ in annotated:
+            if not old.get("download_url") and not old.get("local_path") and old.get("page_url"):
+                purl = old["page_url"]
+                if purl in lookup_urls_set:
+                    continue
+                lookup_urls_set.add(purl)
+                q_set = _item_default_qualities(old)
+                q_key = tuple(sorted(q_set)) if q_set else None
+                lookup_groups[q_key].append(purl)
         resolved: Dict[str, VideoDetail] = {}
-        if lookup_urls:
+        for q_key, urls_in_group in lookup_groups.items():
             details = await fetch_video_details_batch(
-                ctx, [(url, 0, idx + 1) for idx, url in enumerate(lookup_urls)], settings.selectors,
-                concurrency=settings.max_concurrent_video_details, preferred_qualities=qualities,
-                include_keywords=include_kw, exclude_keywords=exclude_kw, timeout=settings.request_timeout,
+                ctx,
+                [(url, 0, idx + 1) for idx, url in enumerate(urls_in_group)],
+                settings.selectors,
+                concurrency=settings.max_concurrent_video_details,
+                preferred_qualities=set(q_key) if q_key else None,
+                include_keywords=include_kw,
+                exclude_keywords=exclude_kw,
+                timeout=settings.request_timeout,
             )
-            resolved = {detail.page_url: detail for detail in details}
+            for detail in details:
+                resolved[detail.page_url] = detail
         retry_qualities: Dict[int, Optional[Set[str]]] = {}
         seen: Set[str] = set()
         new_item_ids: List[int] = []
@@ -2717,7 +2784,7 @@ class TaskManager:
                     "published_at": detail.published_at or old.get("published_at") or "",
                     "duration_seconds": detail.duration_seconds or int(old.get("duration_seconds") or 0),
                 }
-            elif old["page_url"] in lookup_urls:
+            elif old["page_url"] in lookup_urls_set:
                 status, error = "failed", "重新解析视频没有返回结果"
             row = await self.repo.add_job_item(
                 job_id,
@@ -2741,7 +2808,8 @@ class TaskManager:
             if status == "pending":
                 new_item_ids.append(int(row["id"]))
             previous_quality = normalized_quality(old["quality"])
-            retry_qualities[int(row["id"])] = qualities or ({previous_quality} if previous_quality else None)
+            item_q = _item_default_qualities(old)
+            retry_qualities[int(row["id"])] = item_q or ({previous_quality} if previous_quality else None)
             self.events.broadcast("item_updated", row)
 
         updated_job = await self.repo.recalculate_job_counts(job_id)

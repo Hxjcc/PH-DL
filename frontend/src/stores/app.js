@@ -10,6 +10,7 @@ export const DEFAULT_HISTORY_FILTERS = Object.freeze({
   uploader: '',
   status: '',
   quality: '',
+  time_range: '',
   sort_by: 'activity',
   page: 1,
   page_size: 30,
@@ -710,7 +711,7 @@ export const useAppStore = defineStore('app', {
         items: data.items || [],
         total: Number(data.total || 0),
         facets: data.facets || { uploaders: [], qualities: [] },
-        stats: data.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0 },
+        stats: data.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0 },
         page_size: pageSize,
       }
       this.historyLoadedAt = Date.now()
@@ -972,6 +973,10 @@ export const useAppStore = defineStore('app', {
               delete this.schedulerStatus[msg.data.id]
               delete this.scanStatus[msg.data.id]
               this.refreshTempFiles()
+              this.targetsLoadedAt = 0
+              if (this.targetsCache !== null) {
+                this.refreshTargets().catch(() => {})
+              }
               this.historyLoadedAt = 0
               if (this.historyCache !== null) {
                 this.refreshHistory().catch(() => {})

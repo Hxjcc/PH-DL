@@ -23,6 +23,13 @@ _TRUSTED_PROXY_NETWORKS = (
 )
 
 
+def _normalize_ip(raw: str) -> str:
+    try:
+        return str(ipaddress.ip_address((raw or "").strip()))
+    except ValueError:
+        return ""
+
+
 def _is_trusted_proxy_ip(host: str) -> bool:
     try:
         addr = ipaddress.ip_address(host)
@@ -32,20 +39,21 @@ def _is_trusted_proxy_ip(host: str) -> bool:
 
 
 def _extract_client_ip(request: Request) -> str:
-    direct = request.client.host if request.client else ""
+    raw_direct = (request.client.host or "").strip() if request.client else ""
+    direct = _normalize_ip(raw_direct) or raw_direct
     if direct and _is_trusted_proxy_ip(direct):
-        real_ip = (request.headers.get("X-Real-IP") or "").strip()
-        if real_ip:
-            return real_ip
         xff = (request.headers.get("X-Forwarded-For") or "").strip()
         if xff:
-            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            parts = [ip for p in xff.split(",") if (ip := _normalize_ip(p))]
             # Pick the rightmost non-private hop, or first hop if all private
             for hop in reversed(parts):
                 if not _is_trusted_proxy_ip(hop):
                     return hop
             if parts:
                 return parts[0]
+        real_ip = _normalize_ip(request.headers.get("X-Real-IP") or "")
+        if real_ip:
+            return real_ip
     return direct or "unknown"
 
 

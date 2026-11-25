@@ -565,6 +565,13 @@ async function submitDownload() {
     if (!submitting.value) store.notify('请粘贴或导入至少一条有效视频链接', 'warning')
     return
   }
+  if (sourceTab.value === 'target' && form.target_type !== 'liked') {
+    const parsed = parseTargetUsernames(form.usernames)
+    if (form.usernames.trim() && parsed.length === 0) {
+      store.notify('未识别到有效的博主用户名（视频链接请切换到「视频链接 / TXT」标签）', 'warning')
+      return
+    }
+  }
   if (sourceTab.value === 'target' && videoMode.value === 'specific' && !form.videos) {
     store.notify('请填写要下载的页码和页内视频序号', 'warning')
     return

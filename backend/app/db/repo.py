@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -392,6 +393,8 @@ class Repository:
         allowed = {"enabled", "target_type", "preferred_quality", "username", "display_name"}
         sets = []
         params: List[Any] = []
+        next_username = str(existing.get("username") or "").strip()
+        next_type = str(existing.get("target_type") or "model").strip().lower()
         for k, v in patch.items():
             if k not in allowed:
                 continue
@@ -399,8 +402,23 @@ class Repository:
                 sets.append("enabled = ?")
                 params.append(1 if v else 0)
             else:
+                val = str(v).strip()
+                if k == "target_type":
+                    val = val.lower()
+                    next_type = val
+                elif k == "username":
+                    next_username = val
                 sets.append(f"{k} = ?")
-                params.append(str(v).strip())
+                params.append(val)
+        if "username" in patch or "target_type" in patch:
+            conflict = await self.db.fetch_one(
+                "SELECT id FROM targets WHERE LOWER(username) = LOWER(?) AND target_type = ? AND id != ?",
+                (next_username, next_type, target_id),
+            )
+            if conflict:
+                raise sqlite3.IntegrityError(
+                    "UNIQUE constraint failed: targets.username, targets.target_type"
+                )
         if sets:
             params.append(target_id)
             await self.db.execute(f"UPDATE targets SET {', '.join(sets)} WHERE id = ?", params)
@@ -449,7 +467,7 @@ class Repository:
         """Downloaded videos whose local file may still need to be uploaded."""
         sql = """
             SELECT viewkey, title, uploader, target_type, quality, local_path,
-                   file_size, video_page_url, downloaded_at
+                   file_size, video_page_url, downloaded_at, published_at, duration_seconds
             FROM videos
             WHERE status = 'downloaded'
               AND upload_requested = 1
@@ -560,8 +578,19 @@ class Repository:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(viewkey) DO UPDATE SET
             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE videos.title END,
-            uploader = CASE WHEN excluded.uploader != '' THEN excluded.uploader ELSE videos.uploader END,
-            target_type = CASE WHEN ? != '' THEN ? ELSE videos.target_type END,
+            uploader = CASE
+                WHEN excluded.uploader = '' THEN videos.uploader
+                WHEN videos.uploader = '' THEN excluded.uploader
+                WHEN ? IN ('favorites', 'liked') AND videos.target_type NOT IN ('favorites', 'liked') THEN videos.uploader
+                WHEN ? = 0 AND excluded.status = 'baseline' AND videos.status IN ('downloaded', 'uploaded') THEN videos.uploader
+                ELSE excluded.uploader
+            END,
+            target_type = CASE
+                WHEN ? = '' THEN videos.target_type
+                WHEN ? IN ('favorites', 'liked') AND videos.target_type NOT IN ('favorites', 'liked') AND videos.uploader != '' THEN videos.target_type
+                WHEN ? = 0 AND excluded.status = 'baseline' AND videos.status IN ('downloaded', 'uploaded') THEN videos.target_type
+                ELSE ?
+            END,
             quality = CASE WHEN excluded.quality != '' THEN excluded.quality ELSE videos.quality END,
             video_page_url = CASE WHEN ? != '' THEN ? ELSE videos.video_page_url END,
             status = CASE
@@ -622,7 +651,7 @@ class Repository:
         now_iso: Optional[str] = None,
     ) -> tuple[Any, ...]:
         now = now_iso or utc_now_iso()
-        explicit_type = (target_type or "").strip()
+        explicit_type = (target_type or "").strip().lower()
         insert_type = explicit_type or "model"
         explicit_url = (video_page_url or "").strip()
         insert_url = explicit_url or f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
@@ -645,6 +674,10 @@ class Repository:
             (published_at or "").strip(),
             max(0, int(duration_seconds or 0)),
             explicit_type,
+            force_flag,
+            explicit_type,
+            explicit_type,
+            force_flag,
             explicit_type,
             explicit_url,
             explicit_url,
@@ -847,8 +880,12 @@ class Repository:
                 clauses.append("(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ?)")
                 params.extend([like, like, like])
         if uploader.strip():
-            clauses.append("LOWER(v.uploader) = LOWER(?)")
-            params.append(uploader.strip())
+            u_clean = uploader.strip()
+            if u_clean.lower() == "my_liked":
+                clauses.append("(LOWER(v.uploader) = 'my_liked' OR LOWER(v.target_type) = 'liked')")
+            else:
+                clauses.append("LOWER(v.uploader) = LOWER(?)")
+                params.append(u_clean)
         if status.strip():
             clauses.append("v.status = ?")
             params.append(status.strip())
@@ -903,7 +940,11 @@ class Repository:
         display_map = await self._get_target_display_map() if rows else {}
         for row in rows:
             uname = str(row.get("uploader") or "").strip().lower()
-            row["uploader_display_name"] = display_map.get(uname, "")
+            t_low = str(row.get("target_type") or "").strip().lower()
+            if uname == "my_liked" or (not uname and t_low == "liked"):
+                row["uploader_display_name"] = "Liked Videos"
+            else:
+                row["uploader_display_name"] = display_map.get(uname, "")
         return rows, total
 
     async def get_video_filter_facets(self) -> Dict[str, Any]:
@@ -915,6 +956,9 @@ class Repository:
             ORDER BY LOWER(uploader) ASC
             """
         )
+        has_liked_row = await self.db.fetch_one(
+            "SELECT 1 AS hit FROM videos WHERE LOWER(target_type) = 'liked' LIMIT 1"
+        )
         display_map = await self._get_target_display_map()
         qualities = await self.db.fetch_all(
             """
@@ -925,11 +969,19 @@ class Repository:
             """
         )
         uploaders = [r["uploader"] for r in uploader_rows]
+        if has_liked_row and not any(u.strip().lower() == "my_liked" for u in uploaders):
+            uploaders.append("My_Liked")
+            uploaders.sort(key=lambda u: u.lower())
+        uploader_labels: Dict[str, str] = {}
+        for u in uploaders:
+            low = u.strip().lower()
+            if low == "my_liked":
+                uploader_labels[u] = "Liked Videos"
+            else:
+                uploader_labels[u] = display_map.get(low) or u
         return {
             "uploaders": uploaders,
-            "uploader_labels": {
-                u: (display_map.get(u.strip().lower()) or u) for u in uploaders
-            },
+            "uploader_labels": uploader_labels,
             "qualities": [r["quality"] for r in qualities],
         }
 

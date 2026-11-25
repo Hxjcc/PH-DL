@@ -410,7 +410,12 @@ const parsedNewUsernames = computed(() => parseTargetUsernames(newTarget.usernam
 async function handleAddTarget() {
   if (newTarget.init_baseline && !newBaselineValid.value) return
   if (newTarget.target_type !== 'liked' && parsedNewUsernames.value.length === 0) {
-    store.notify('请输入至少一个用户名', 'warning')
+    store.notify(
+      newTarget.username.trim()
+        ? '未识别到有效的博主用户名（请勿粘贴视频或频道链接）'
+        : '请输入至少一个用户名',
+      'warning'
+    )
     return
   }
   adding.value = true

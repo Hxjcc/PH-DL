@@ -611,8 +611,14 @@ def test_list_targets_tracks_today_new_count_across_downloads_and_rechecks(tmp_p
         assert by_user[("_currentUser_", "liked")]["today_new_count"] == 1
 
 
-def test_account_avatar_upload_serve_delete_and_batch_targets_with_quality(tmp_path: Path):
+def test_account_avatar_upload_serve_delete_and_batch_targets_with_quality(tmp_path: Path, monkeypatch):
     import base64
+    from app.api import targets as targets_api
+
+    async def fake_resolve(_ctx, username: str, **_kwargs):
+        return "model"
+
+    monkeypatch.setattr(targets_api, "resolve_target_type", fake_resolve)
 
     # Valid 1x1 transparent PNG
     tiny_png = base64.b64decode(

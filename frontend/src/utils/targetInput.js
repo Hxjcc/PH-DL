@@ -1,19 +1,20 @@
 const PROFILE_PATH_RE = /\/(?:model|pornstar|users|user)\/([^/?#]+)/i
+const INVALID_USERNAME_RE = /[/\\:?#\s]/
 
 export function normalizeTargetUsername(token) {
   const raw = String(token || '').trim()
   if (!raw) return ''
-  if (/^https?:\/\//i.test(raw) || raw.includes('pornhub.')) {
+  if (/^https?:\/\//i.test(raw) || raw.includes('pornhub.') || raw.includes('/') || raw.includes('?')) {
     const match = raw.match(PROFILE_PATH_RE)
-    if (match?.[1]) {
-      try {
-        return decodeURIComponent(match[1]).trim()
-      } catch {
-        return match[1].trim()
-      }
-    }
+    if (!match?.[1]) return ''
+    let slug = match[1].trim()
+    try {
+      slug = decodeURIComponent(slug).trim()
+    } catch {}
+    return slug && !INVALID_USERNAME_RE.test(slug) ? slug : ''
   }
-  return raw.replace(/^@+/, '').trim()
+  const cleaned = raw.replace(/^@+/, '').trim()
+  return cleaned && !INVALID_USERNAME_RE.test(cleaned) ? cleaned : ''
 }
 
 export function parseTargetUsernames(raw) {
