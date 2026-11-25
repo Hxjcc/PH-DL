@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Download,
@@ -16,6 +16,7 @@ import {
   ChevronRight,
   Sun,
   Moon,
+  UserRound,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { useTheme } from '../composables/useTheme'
@@ -34,6 +35,14 @@ const { authTransition, runAuthTransition } = useAuthTransition()
 
 const collapsed = ref(false)
 const mobileOpen = ref(false)
+const headerAvatarBroken = ref(false)
+
+watch(
+  () => store.accountAvatarUrl,
+  () => {
+    headerAvatarBroken.value = false
+  }
+)
 
 const navGroups = [
   {
@@ -304,6 +313,28 @@ onMounted(() => {
             <Sun v-if="isDark" class="w-3.5 h-3.5 text-amber-400" />
             <Moon v-else class="w-3.5 h-3.5" />
           </Button>
+
+          <RouterLink
+            v-if="store.overviewLoaded && (store.accountAvatarUrl || store.accountUsername)"
+            to="/settings"
+            class="inline-flex h-7 items-center gap-1.5 rounded-full border border-border/80 bg-card pl-0.5 pr-2 text-xs text-foreground/90 no-underline transition-colors hover:bg-accent"
+            :title="`${store.accountUsername || '本地账号'} · 点击进入系统设置更换头像`"
+          >
+            <span class="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-full bg-secondary text-muted-foreground">
+              <img
+                v-if="store.accountAvatarUrl && !headerAvatarBroken"
+                :key="store.accountAvatarUrl"
+                :src="store.accountAvatarUrl"
+                alt=""
+                class="h-full w-full object-cover"
+                @error="headerAvatarBroken = true"
+              />
+              <UserRound v-else class="w-3.5 h-3.5" />
+            </span>
+            <span v-if="store.accountUsername" class="hidden sm:inline max-w-24 truncate font-medium">
+              {{ store.accountUsername }}
+            </span>
+          </RouterLink>
         </div>
       </header>
 

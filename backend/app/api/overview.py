@@ -40,6 +40,14 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
         "running": container.tasks.current_job_id is not None,
         "current_job": current_job,
         "queued_count": container.tasks.queued_count,
+        "account": {
+            "username": (settings.ph_logged_in_username or settings.ph_username or "").strip(),
+            "avatar_url": (
+                f"/api/settings/avatar?v={settings.account_avatar_version}"
+                if settings.account_avatar_version
+                else ""
+            ),
+        },
         "cookie": {
             "configured": bool(settings.ph_cookie.strip()),
             **container.tasks.cookie_status,

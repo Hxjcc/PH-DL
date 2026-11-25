@@ -176,6 +176,25 @@ export const useAppStore = defineStore('app', {
     }
   },
 
+  getters: {
+    accountUsername(state) {
+      return String(
+        state.settingsCache?.ph_logged_in_username ||
+        state.overview?.account?.username ||
+        state.settingsCache?.ph_username ||
+        ''
+      ).trim()
+    },
+    accountAvatarUrl(state) {
+      if (state.settingsCache && typeof state.settingsCache.account_avatar_version === 'string') {
+        return state.settingsCache.account_avatar_version
+          ? `/api/settings/avatar?v=${state.settingsCache.account_avatar_version}`
+          : ''
+      }
+      return String(state.overview?.account?.avatar_url || '')
+    },
+  },
+
   actions: {
     hasRouteCache(routeName) {
       if (!this.overviewLoaded) return false
@@ -559,7 +578,52 @@ export const useAppStore = defineStore('app', {
       if (this.settingsCache && settings.ph_logged_in_username !== this.settingsCache.ph_logged_in_username) this.clearSubscriptionsCache()
       this.settingsCache = { ...settings }
       this.settingsLoadedAt = Date.now()
+      if (this.overview) {
+        this.overview = {
+          ...this.overview,
+          account: {
+            username: (settings.ph_logged_in_username || settings.ph_username || this.overview.account?.username || '').trim(),
+            avatar_url: settings.account_avatar_version
+              ? `/api/settings/avatar?v=${settings.account_avatar_version}`
+              : '',
+          },
+        }
+      }
       this.persistCache()
+    },
+
+    async uploadAccountAvatar(dataUrl) {
+      const res = await api.uploadAccountAvatar(dataUrl)
+      if (res?.settings) {
+        this.setSettingsCache(res.settings)
+      } else if (this.overview) {
+        this.overview = {
+          ...this.overview,
+          account: {
+            ...(this.overview.account || {}),
+            avatar_url: res?.avatar_url || '',
+          },
+        }
+        this.persistCache()
+      }
+      return res
+    },
+
+    async removeAccountAvatar() {
+      const res = await api.deleteAccountAvatar()
+      if (res?.settings) {
+        this.setSettingsCache(res.settings)
+      } else if (this.overview) {
+        this.overview = {
+          ...this.overview,
+          account: {
+            ...(this.overview.account || {}),
+            avatar_url: '',
+          },
+        }
+        this.persistCache()
+      }
+      return res
     },
 
     async refreshSettings() {

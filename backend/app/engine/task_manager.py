@@ -1465,16 +1465,14 @@ class TaskManager:
         if raw_type == "liked":
             targets.append(("_currentUser_", "liked"))
         else:
-            if raw_type == "user":
-                raw_type = "users"
-            if not usernames and raw_type in {"favorites", "model", "pornstar", "users"} and settings.ph_logged_in_username:
+            if not usernames and raw_type in {"favorites", "model", "pornstar"} and settings.ph_logged_in_username:
                 usernames = [settings.ph_logged_in_username]
             seen_users: Set[str] = set()
             for uname in usernames:
                 if uname.casefold() in seen_users:
                     continue
                 seen_users.add(uname.casefold())
-                if raw_type in {"model", "pornstar", "users", "favorites"}:
+                if raw_type in {"model", "pornstar", "favorites"}:
                     resolved = raw_type
                 else:
                     detected = await resolve_target_type(ctx, uname, timeout=settings.request_timeout)
@@ -1860,146 +1858,175 @@ class TaskManager:
         check_notes: List[str] = []
         target_error_count = 0
 
+        target_concurrency = max(1, min(6, int(getattr(settings, "update_target_concurrency", 2) or 1)))
         if targets:
-            self.events.emit_log("INFO", f"开始检查 {len(targets)} 个追更目标的更新...", job_id=job_id)
+            self.events.emit_log(
+                "INFO",
+                f"开始检查 {len(targets)} 个追更目标的更新（目标并发 {target_concurrency}）...",
+                job_id=job_id,
+            )
 
-        for target_idx, target in enumerate(targets):
-            if ctx.cancel_event.is_set():
-                break
-            if target_idx > 0 and settings.page_delay_max > 0:
-                delay_lo = max(0.0, float(settings.page_delay_min))
-                delay_hi = max(delay_lo, float(settings.page_delay_max))
-                try:
-                    await until_stopped(
-                        asyncio.sleep(random.uniform(delay_lo, delay_hi)),
-                        ctx.cancel_event,
+        completed_targets = 0
+        target_sem = asyncio.Semaphore(target_concurrency)
+        # Preserve original target ordering when emitting check notes / creating job items.
+        ordered_outcomes: List[Optional[Dict[str, Any]]] = [None] * len(targets)
+
+        async def _scan_one_target(target_idx: int, target: Dict[str, Any]) -> None:
+            nonlocal completed_targets, target_error_count
+            async with target_sem:
+                if ctx.cancel_event.is_set():
+                    return
+                if target_idx > 0 and settings.page_delay_max > 0:
+                    delay_lo = max(0.0, float(settings.page_delay_min))
+                    delay_hi = max(delay_lo, float(settings.page_delay_max))
+                    try:
+                        await until_stopped(
+                            asyncio.sleep(random.uniform(delay_lo, delay_hi)),
+                            ctx.cancel_event,
+                        )
+                    except StopRequested:
+                        return
+                tid = int(target["id"])
+                uname = target["username"]
+                utype = target["target_type"]
+                display = "Liked Videos" if utype == "liked" else uname
+                display_label = "Liked Videos" if utype == "liked" else ((target.get("display_name") or "").strip() or uname)
+                qual_set = _quality_set(target.get("preferred_quality") or settings.preferred_quality)
+
+                self.events.emit_scan_status(
+                    job_id,
+                    {
+                        "mode": "targets",
+                        "scanned": completed_targets,
+                        "total": len(targets),
+                        "current_target": display_label,
+                        "found_new": sum(new_by_target.values()),
+                    },
+                )
+
+                async def _save_profile(
+                    url: str,
+                    display_name: str,
+                    target_id: int = tid,
+                ) -> None:
+                    await self.repo.update_target_profile(
+                        target_id,
+                        avatar_url=url,
+                        display_name=display_name,
                     )
-                except StopRequested:
-                    break
-            tid = int(target["id"])
-            uname = target["username"]
-            utype = target["target_type"]
-            display = "Liked Videos" if utype == "liked" else uname
-            display_label = "Liked Videos" if utype == "liked" else ((target.get("display_name") or "").strip() or uname)
-            qual_set = _quality_set(target.get("preferred_quality") or settings.preferred_quality)
 
-            self.events.emit_scan_status(
-                job_id,
-                {
-                    "mode": "targets",
-                    "scanned": target_idx,
-                    "total": len(targets),
-                    "current_target": display_label,
-                    "found_new": sum(new_by_target.values()),
-                },
-            )
-
-            async def _save_profile(
-                url: str,
-                display_name: str,
-                target_id: int = tid,
-            ) -> None:
-                await self.repo.update_target_profile(
-                    target_id,
-                    avatar_url=url,
-                    display_name=display_name,
+                list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
+                page_errors: List[str] = []
+                previous_error = str(target.get("last_error") or "")
+                # A prior pass may have saved videos before and after a failed page.
+                # That new overlap must not cause us to stop before the gap next time.
+                # However, if page 1 itself failed with 0 new videos saved (e.g. a transient
+                # 403), there is no gap behind a saved head — keep catch_up enabled so we
+                # don't trigger a full historical rescan across every affected target.
+                only_page1_failed = (
+                    previous_error.startswith("列表第 1 页:")
+                    and "；" not in previous_error
+                    and int(target.get("last_new_count") or 0) == 0
                 )
-
-            list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
-            page_errors: List[str] = []
-            previous_error = str(target.get("last_error") or "")
-            # A prior pass may have saved videos before and after a failed page.
-            # That new overlap must not cause us to stop before the gap next time.
-            # However, if page 1 itself failed with 0 new videos saved (e.g. a transient
-            # 403), there is no gap behind a saved head — keep catch_up enabled so we
-            # don't trigger a full historical rescan across every affected target.
-            only_page1_failed = (
-                previous_error.startswith("列表第 1 页:")
-                and "；" not in previous_error
-                and int(target.get("last_new_count") or 0) == 0
-            )
-            needs_rescan = (
-                bool(previous_error)
-                and "基线" not in previous_error
-                and not only_page1_failed
-            )
-            try:
-                listed, details = await self._scan_target_with_details(
-                    job_id,
-                    ctx=ctx,
-                    list_url=list_url,
-                    target_type=utype,
-                    settings=settings,
-                    catch_up=not needs_rescan,
-                    skip_vkeys=known_vkeys,
-                    preferred_qualities=qual_set,
-                    uploader_hint=(uname if uname != "_currentUser_" else "My_Liked", utype),
-                    on_profile=_save_profile,
-                    on_scan_error=page_errors.append,
+                needs_rescan = (
+                    bool(previous_error)
+                    and "基线" not in previous_error
+                    and not only_page1_failed
                 )
-            except Exception as err:
-                target_error_count += 1
-                await self.repo.mark_target_checked(tid, 0, error=str(err))
-                self.events.emit_log("WARNING", f"检查 '{display}' 失败: {err}", job_id=job_id)
+                try:
+                    listed, details = await self._scan_target_with_details(
+                        job_id,
+                        ctx=ctx,
+                        list_url=list_url,
+                        target_type=utype,
+                        settings=settings,
+                        catch_up=not needs_rescan,
+                        skip_vkeys=known_vkeys,
+                        preferred_qualities=qual_set,
+                        uploader_hint=(uname if uname != "_currentUser_" else "My_Liked", utype),
+                        on_profile=_save_profile,
+                        on_scan_error=page_errors.append,
+                    )
+                except Exception as err:
+                    target_error_count += 1
+                    await self.repo.mark_target_checked(tid, 0, error=str(err))
+                    self.events.emit_log("WARNING", f"检查 '{display}' 失败: {err}", job_id=job_id)
+                    completed_targets += 1
+                    self.events.emit_scan_status(
+                        job_id,
+                        {
+                            "mode": "targets",
+                            "scanned": completed_targets,
+                            "total": len(targets),
+                            "current_target": display_label,
+                            "found_new": sum(new_by_target.values()),
+                        },
+                    )
+                    return
+
+                if ctx.cancel_event.is_set():
+                    return
+                if listed:
+                    self.events.emit_log(
+                        "INFO", f"目标 '{display}' 列表发现 {len(listed)} 个候选，详情解析结束。", job_id=job_id,
+                    )
+                candidates = [d for d in details if not d.viewkey or d.viewkey not in known_vkeys]
+                valid_new = [d for d in candidates if d.download_url and d.viewkey and not d.error]
+                valid_new.sort(key=lambda d: (d.page_num, d.item_num))
+                detail_failures = self._detail_failures(candidates)
+                errors = list(page_errors)
+                if detail_failures:
+                    errors.append(f"{len(detail_failures)} 个视频解析失败")
+                if errors:
+                    target_error_count += 1
+                await self.repo.mark_target_checked(tid, len(valid_new), error="；".join(errors[:3]))
+
+                folder = _target_folder_name(uname, utype)
+                if valid_new:
+                    new_by_target[folder] = new_by_target.get(folder, 0) + len(valid_new)
+                    for d in valid_new:
+                        known_vkeys.add(d.viewkey)
+
+                completed_targets += 1
                 self.events.emit_scan_status(
                     job_id,
                     {
                         "mode": "targets",
-                        "scanned": target_idx + 1,
+                        "scanned": completed_targets,
                         "total": len(targets),
                         "current_target": display_label,
                         "found_new": sum(new_by_target.values()),
                     },
                 )
+
+                if valid_new or detail_failures:
+                    ordered_outcomes[target_idx] = {
+                        "uname": uname,
+                        "utype": utype,
+                        "display": display,
+                        "qual_set": qual_set,
+                        "candidates": candidates,
+                        "valid_new": valid_new,
+                    }
+
+        if targets:
+            if target_concurrency == 1:
+                for target_idx, target in enumerate(targets):
+                    if ctx.cancel_event.is_set():
+                        break
+                    await _scan_one_target(target_idx, target)
+            else:
+                await asyncio.gather(*(_scan_one_target(idx, t) for idx, t in enumerate(targets)))
+
+        for outcome in ordered_outcomes:
+            if outcome is None or ctx.cancel_event.is_set():
                 continue
-
-            if ctx.cancel_event.is_set():
-                break
-            if listed:
-                self.events.emit_log(
-                    "INFO", f"目标 '{display}' 列表发现 {len(listed)} 个候选，详情解析结束。", job_id=job_id,
-                )
-            candidates = [d for d in details if not d.viewkey or d.viewkey not in known_vkeys]
-            valid_new = [d for d in candidates if d.download_url and d.viewkey and not d.error]
-            valid_new.sort(key=lambda d: (d.page_num, d.item_num))
-            detail_failures = self._detail_failures(candidates)
-            errors = list(page_errors)
-            if detail_failures:
-                errors.append(f"{len(detail_failures)} 个视频解析失败")
-            if errors:
-                target_error_count += 1
-            await self.repo.mark_target_checked(tid, len(valid_new), error="；".join(errors[:3]))
-
-            if not valid_new and not detail_failures:
-                self.events.emit_scan_status(
-                    job_id,
-                    {
-                        "mode": "targets",
-                        "scanned": target_idx + 1,
-                        "total": len(targets),
-                        "current_target": display_label,
-                        "found_new": sum(new_by_target.values()),
-                    },
-                )
-                continue
-
-            folder = _target_folder_name(uname, utype)
-            if valid_new:
-                new_by_target[folder] = new_by_target.get(folder, 0) + len(valid_new)
-            for d in valid_new:
-                known_vkeys.add(d.viewkey)
-
-            self.events.emit_scan_status(
-                job_id,
-                {
-                    "mode": "targets",
-                    "scanned": target_idx + 1,
-                    "total": len(targets),
-                    "current_target": display_label,
-                    "found_new": sum(new_by_target.values()),
-                },
-            )
-
+            uname = outcome["uname"]
+            utype = outcome["utype"]
+            display = outcome["display"]
+            qual_set = outcome["qual_set"]
+            candidates = outcome["candidates"]
+            valid_new = outcome["valid_new"]
             if auto_download:
                 created = await self._create_items_from_details(
                     job_id,

@@ -107,6 +107,9 @@ export const api = {
   // Settings & Tools
   getSettings: () => request('/api/settings'),
   saveSettings: (patch) => request('/api/settings', { method: 'PUT', body: patch }),
+  uploadAccountAvatar: (dataUrl) =>
+    request('/api/settings/avatar', { method: 'POST', body: { data_url: dataUrl } }),
+  deleteAccountAvatar: () => request('/api/settings/avatar', { method: 'DELETE' }),
   testCookie: () => request('/api/settings/cookie/test', { method: 'POST' }),
   importCookie: (cookie) => request('/api/settings/cookie/import', { method: 'POST', body: { cookie } }),
   refreshCookie: () => request('/api/settings/cookie/refresh', { method: 'POST' }),

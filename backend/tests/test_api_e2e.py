@@ -609,3 +609,62 @@ def test_list_targets_tracks_today_new_count_across_downloads_and_rechecks(tmp_p
 
         assert by_user[("_currentUser_", "liked")]["today_downloaded_count"] == 1
         assert by_user[("_currentUser_", "liked")]["today_new_count"] == 1
+
+
+def test_account_avatar_upload_serve_delete_and_batch_targets_with_quality(tmp_path: Path):
+    import base64
+
+    # Valid 1x1 transparent PNG
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    png_data_url = "data:image/png;base64," + base64.b64encode(tiny_png).decode("ascii")
+
+    with _make_client(tmp_path) as client:
+        assert client.post("/api/auth/login", json={"password": "super-secret-password"}).status_code == 200
+
+        # Initially no custom avatar
+        assert client.get("/api/settings/avatar").status_code == 404
+        assert client.get("/api/overview").json()["account"]["avatar_url"] == ""
+
+        # Reject invalid non-image payload
+        bad_payload = "data:text/plain;base64," + base64.b64encode(b"not an image").decode("ascii")
+        assert client.post("/api/settings/avatar", json={"data_url": bad_payload}).status_code == 400
+
+        # Upload valid PNG avatar
+        up = client.post("/api/settings/avatar", json={"data_url": png_data_url})
+        assert up.status_code == 200
+        avatar_url = up.json()["avatar_url"]
+        assert avatar_url.startswith("/api/settings/avatar?v=")
+        assert client.get("/api/overview").json()["account"]["avatar_url"] == avatar_url
+
+        # Serve uploaded avatar bytes
+        fetched = client.get("/api/settings/avatar")
+        assert fetched.status_code == 200
+        assert fetched.headers["content-type"].startswith("image/png")
+        assert fetched.content == tiny_png
+
+        # Delete custom avatar restores default
+        deleted = client.delete("/api/settings/avatar")
+        assert deleted.status_code == 200
+        assert deleted.json()["avatar_url"] == ""
+        assert client.get("/api/settings/avatar").status_code == 404
+        assert client.get("/api/overview").json()["account"]["avatar_url"] == ""
+
+        # Batch create targets supports multiple items with auto type + preferred_quality
+        batch = client.post(
+            "/api/targets/batch",
+            json={
+                "items": [
+                    {"username": "multi-a", "target_type": "auto", "preferred_quality": "2160,1080"},
+                    {"username": "multi-b", "target_type": "pornstar", "preferred_quality": "1080"},
+                ],
+                "init_baseline": False,
+            },
+        )
+        assert batch.status_code == 200
+        assert batch.json()["created_count"] == 2
+        by_name = {t["username"]: t for t in client.get("/api/targets").json()["items"]}
+        assert by_name["multi-a"]["preferred_quality"] == "2160,1080"
+        assert by_name["multi-b"]["target_type"] == "pornstar"
+        assert by_name["multi-b"]["preferred_quality"] == "1080"

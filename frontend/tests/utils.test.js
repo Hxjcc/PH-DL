@@ -12,6 +12,7 @@ import {
   resolveJobVisual,
 } from '../src/utils/jobMeta.js'
 import { appendLiveLog, mergeLogsSnapshot } from '../src/utils/logBuffer.js'
+import { buildTargetProfileVideosUrl, parseTargetUsernames } from '../src/utils/targetInput.js'
 
 test('parseVideoLinks deduplicates by viewkey and counts invalid rows', () => {
   const input = [
@@ -284,4 +285,32 @@ test('computeJobLiveMetrics renders determinate scan bar for target updates and 
   assert.match(pageScan.phaseText, /alice/)
   assert.match(pageScan.phaseText, /第 3 页/)
   assert.match(pageScan.phaseText, /42/)
+})
+
+test('parseTargetUsernames splits commas/newlines, strips profile URLs, and deduplicates', () => {
+  const input = 'alice, bob，ALICE\nhttps://www.pornhub.com/model/candy-love/videos @charlie; https://www.pornhub.com/pornstar/dana'
+  assert.deepEqual(parseTargetUsernames(input), ['alice', 'bob', 'candy-love', 'charlie', 'dana'])
+})
+
+test('buildTargetProfileVideosUrl builds /videos profile links for all target types', () => {
+  assert.equal(
+    buildTargetProfileVideosUrl({ username: 'amatemure', target_type: 'model' }),
+    'https://www.pornhub.com/model/amatemure/videos'
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ username: 'aria', target_type: 'pornstar' }),
+    'https://www.pornhub.com/pornstar/aria/videos'
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ username: 'bob', target_type: 'users' }),
+    ''
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ username: 'Hxiay', target_type: 'favorites' }),
+    'https://www.pornhub.com/users/hxiay/videos/favorites'
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ username: '_currentUser_', target_type: 'liked' }),
+    'https://www.pornhub.com/likedvideos'
+  )
 })

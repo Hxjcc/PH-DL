@@ -1616,6 +1616,7 @@ async def test_check_updates_emits_target_scan_progress_and_clears_on_finish(tmp
             {
                 "ph_cookie": "sess=valid",
                 "uploader_enabled": False,
+                "update_target_concurrency": 1,
                 "page_delay_min": 0.0,
                 "page_delay_max": 0.0,
             }
@@ -1650,6 +1651,66 @@ async def test_check_updates_emits_target_scan_progress_and_clears_on_finish(tmp
         assert all(e["mode"] == "targets" and e["total"] == 2 for e in scan_events)
         assert scan_events[0]["current_target"] == "Alice Star"
         assert scan_events[2]["current_target"] == "Bob Pro"
+        assert events.scan_status_snapshot() == {}
+    finally:
+        await tm.stop()
+        await db.close()
+
+
+async def test_check_updates_scans_targets_concurrently_up_to_limit(tmp_path: Path, monkeypatch):
+    """update_target_concurrency runs multiple target scans concurrently bounded by semaphore."""
+    from app.engine import task_manager as tm_mod
+
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": False,
+                "update_target_concurrency": 2,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        for name in ("t1", "t2", "t3", "t4"):
+            await repo.upsert_target(name, "model")
+
+        in_flight = 0
+        max_in_flight = 0
+        two_active = asyncio.Event()
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_scan_list(ctx, initial_url, selectors, **kwargs):
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            if in_flight >= 2:
+                two_active.set()
+            try:
+                await asyncio.sleep(0.05)
+                return []
+            finally:
+                in_flight -= 1
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "scan_list_pages", fake_scan_list)
+
+        tm.start()
+        job = await tm.enqueue_job("check_updates", "全量检查更新", {"target_ids": None})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+        assert done is not None
+        assert done["status"] == "completed"
+        assert two_active.is_set()
+        assert max_in_flight == 2
         assert events.scan_status_snapshot() == {}
     finally:
         await tm.stop()

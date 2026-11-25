@@ -16,9 +16,13 @@ import {
   RotateCcw,
   ShieldCheck,
   ChevronDown,
+  Camera,
+  UserRound,
+  Trash2,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
+import { prepareAvatarDataUrl } from '../utils/avatarImage'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
@@ -96,8 +100,17 @@ const saving = ref(false)
 const busyTool = ref('')
 const form = ref(cloneSettings(store.settingsCache))
 const pasteCookie = ref('')
+const avatarInputRef = ref(null)
+const avatarLoadError = ref(false)
 const rcloneRemotes = ref([])
 const loadingRemotes = ref(false)
+
+watch(
+  () => store.accountAvatarUrl,
+  () => {
+    avatarLoadError.value = false
+  }
+)
 const remotesLoadedOnce = ref(false)
 const providerTab = ref('pikpak')
 const showRcloneAdvanced = ref(false)
@@ -238,6 +251,43 @@ async function saveAll() {
     store.notify(err.message, 'error')
   } finally {
     saving.value = false
+  }
+}
+
+async function handleAvatarChange(event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file || busyTool.value !== '') return
+  busyTool.value = 'avatar_upload'
+  try {
+    const dataUrl = await prepareAvatarDataUrl(file)
+    const res = await store.uploadAccountAvatar(dataUrl)
+    if (res?.settings && form.value) {
+      form.value.account_avatar_version = res.settings.account_avatar_version || ''
+    }
+    avatarLoadError.value = false
+    store.notify('本地账号头像已更新', 'success')
+  } catch (err) {
+    store.notify(err.message || '头像上传失败', 'error')
+  } finally {
+    busyTool.value = ''
+  }
+}
+
+async function handleRemoveAvatar() {
+  if (busyTool.value !== '') return
+  busyTool.value = 'avatar_remove'
+  try {
+    const res = await store.removeAccountAvatar()
+    if (res?.settings && form.value) {
+      form.value.account_avatar_version = ''
+    }
+    avatarLoadError.value = false
+    store.notify('已恢复默认头像', 'info')
+  } catch (err) {
+    store.notify(err.message || '移除头像失败', 'error')
+  } finally {
+    busyTool.value = ''
   }
 }
 
@@ -427,11 +477,64 @@ async function handleTestNotify() {
         </div>
 
         <div class="p-6 space-y-4">
-          <div>
-            <h3 class="text-sm font-semibold text-foreground">账号凭据（可选）</h3>
-            <p class="text-xs text-muted-foreground mt-0.5">
-              仅用于拉取订阅/收藏或尝试自动刷新 Cookie，敏感字段已脱敏保护
-            </p>
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 class="text-sm font-semibold text-foreground">账号凭据与本地头像（可选）</h3>
+              <p class="text-xs text-muted-foreground mt-0.5">
+                凭据仅用于拉取订阅或自动刷新 Cookie；头像仅保存在本地面板，不会修改 PornHub 账号
+              </p>
+            </div>
+            <div class="flex items-center gap-2.5">
+              <button
+                type="button"
+                class="group relative flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-surface-subtle text-muted-foreground cursor-pointer transition-colors hover:border-brand/50"
+                :disabled="busyTool !== ''"
+                title="点击更换本地账号头像"
+                @click="avatarInputRef?.click()"
+              >
+                <img
+                  v-if="store.accountAvatarUrl && !avatarLoadError"
+                  :key="store.accountAvatarUrl"
+                  :src="store.accountAvatarUrl"
+                  alt=""
+                  class="h-full w-full object-cover"
+                  @error="avatarLoadError = true"
+                />
+                <UserRound v-else class="w-4 h-4" />
+                <span class="absolute inset-0 flex items-center justify-center bg-black/45 text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  <Loader2 v-if="busyTool === 'avatar_upload'" class="w-3.5 h-3.5 animate-spin" />
+                  <Camera v-else class="w-3.5 h-3.5" />
+                </span>
+              </button>
+              <input
+                ref="avatarInputRef"
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                class="hidden"
+                @change="handleAvatarChange"
+              />
+              <Button
+                variant="outline"
+                size="xs"
+                :disabled="busyTool !== ''"
+                @click="avatarInputRef?.click()"
+              >
+                <Loader2 v-if="busyTool === 'avatar_upload'" class="w-3.5 h-3.5 animate-spin" />
+                <Camera v-else class="w-3.5 h-3.5" />
+                更换头像
+              </Button>
+              <Button
+                v-if="store.accountAvatarUrl"
+                variant="ghost"
+                size="xs"
+                class="text-muted-foreground hover:text-foreground"
+                :disabled="busyTool !== ''"
+                @click="handleRemoveAvatar"
+              >
+                <Trash2 class="w-3.5 h-3.5" />
+                恢复默认
+              </Button>
+            </div>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div class="space-y-1.5">
@@ -838,10 +941,19 @@ async function handleTestNotify() {
             </p>
           </div>
 
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div class="space-y-1.5">
               <label class="text-xs font-medium text-foreground">每日定时追更时间</label>
               <Input v-model="form.schedule_time" type="time" />
+            </div>
+            <div class="space-y-1.5">
+              <label
+                class="text-xs font-medium text-foreground"
+                title="全量追更与仅检查更新时同时扫描的博主数，建议 1~3，过大易触发 403 限流"
+              >
+                追更扫描目标并发（建议 1~3）
+              </label>
+              <Input v-model="form.update_target_concurrency" type="number" :min="1" :max="6" />
             </div>
             <div class="space-y-1.5">
               <label class="text-xs font-medium text-foreground">网络代理 URL（可选）</label>

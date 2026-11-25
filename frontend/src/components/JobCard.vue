@@ -140,12 +140,15 @@ const canRetry = computed(
 )
 const isMetadataJob = computed(() => props.job.kind === 'enrich_metadata')
 const isExportJob = computed(() => Boolean(props.job.params?.export_only || props.job.export_text))
+const hasNoJobItems = computed(
+  () => isExportJob.value || props.job.kind === 'check_updates' || props.job.kind === 'baseline_sync'
+)
 const detailsOpen = computed(() => expanded.value)
 const detailsContentKey = computed(() => {
   if (loadingItems.value && items.value.length === 0) return 'loading'
   if (itemsLoadError.value && items.value.length === 0) return 'error'
   if (items.value.length === 0) return 'empty'
-  return 'ready'
+  return `ready:${itemStatusFilter.value}:${visibleItems.value.length}:${filteredItems.value.length}`
 })
 
 function statusPillClass(variant) {
@@ -292,23 +295,34 @@ function itemStatusLabel(item) {
   return itemStatusMeta(item.status).label
 }
 
-async function ensureItemsLoaded(force = false) {
-  if (loadingItems.value || isExportJob.value) return
+async function ensureItemsLoaded(force = false, { silent = false } = {}) {
+  if (loadingItems.value || hasNoJobItems.value) return
   const expectedTotal = Number(props.job.total_items || 0)
   const cached = store.jobItems[props.job.id]
   if (!force && cached && (expectedTotal <= 0 || cached.length >= expectedTotal || (!isActive.value && itemsLoaded.value))) {
     return
   }
-  loadingItems.value = true
-  itemsLoadError.value = ''
+  if (!silent) {
+    loadingItems.value = true
+    itemsLoadError.value = ''
+  }
   try {
     const detail = await store.loadJobDetail(props.job.id)
     itemsLoaded.value = !['queued', 'scanning', 'running'].includes(detail?.job?.status || props.job.status)
   } catch (err) {
-    itemsLoadError.value = err.message || '读取视频明细失败，请重试。'
+    if (!silent) {
+      itemsLoadError.value = err.message || '读取视频明细失败，请重试。'
+    }
   } finally {
-    loadingItems.value = false
+    if (!silent) {
+      loadingItems.value = false
+    }
   }
+}
+
+function prefetchItemsOnHover() {
+  if (expanded.value || hasNoJobItems.value) return
+  ensureItemsLoaded(false, { silent: true })
 }
 
 async function toggleExpand() {
@@ -408,7 +422,6 @@ function downloadExportTxt() {
   <Card
     :class="[
       'job-card overflow-hidden transition-[border-color,background-color,box-shadow] duration-200',
-      !expanded && !detailsMounted && !focused ? 'job-card-collapsed' : '',
       selected
         ? 'border-brand/45 bg-brand/[0.03] dark:bg-brand/[0.06]'
         : focused
@@ -417,6 +430,7 @@ function downloadExportTxt() {
             ? 'border-brand/35 shadow-xs'
             : 'hover:border-foreground/20',
     ]"
+    @pointerenter="prefetchItemsOnHover"
   >
     <!-- Job Header -->
     <div class="px-4 sm:px-5 py-4 cursor-pointer select-none" @click="toggleExpand">
@@ -770,6 +784,15 @@ function downloadExportTxt() {
                   : '仅检查更新模式：本次未发现新视频'
             }}
           </template>
+          <template v-else-if="job.kind === 'baseline_sync'">
+            {{
+              isActive
+                ? '正在扫描并登记基线视频（仅去重，不下载）...'
+                : Number(job.done_items || job.total_items || 0) > 0
+                  ? `基线初始化完成：已登记 ${job.done_items || job.total_items} 个已有视频用于去重（不下载文件，可在「历史记录」筛选查看）`
+                  : '基线初始化完成：未发现可登记的视频'
+            }}
+          </template>
           <template v-else>
             暂无视频条目（可能仍在扫描列表或无新视频）
           </template>
@@ -959,16 +982,5 @@ function downloadExportTxt() {
 <style scoped>
 .job-card {
   overflow-anchor: none;
-  contain: layout style;
-}
-
-.job-card-collapsed {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 84px;
-}
-
-.job-item-row {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 46px;
 }
 </style>

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import base64
+import binascii
+import secrets
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from ..engine.scheduler import parse_hhmm
@@ -19,6 +23,52 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 class CookieImportRequest(BaseModel):
     cookie: str
+
+
+class AvatarUploadRequest(BaseModel):
+    data_url: str
+
+
+MAX_AVATAR_BYTES = 2 * 1024 * 1024
+_AVATAR_EXT_TO_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _detect_avatar_image(raw: bytes) -> Optional[Tuple[str, str]]:
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png", "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return ".jpg", "image/jpeg"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return ".webp", "image/webp"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif", "image/gif"
+    return None
+
+
+def _find_avatar_file(data_dir: Path) -> Optional[Tuple[Path, str]]:
+    for ext, mime in _AVATAR_EXT_TO_MIME.items():
+        candidate = data_dir / f"account_avatar{ext}"
+        if candidate.is_file():
+            return candidate, mime
+    return None
+
+
+def _remove_avatar_files(data_dir: Path) -> None:
+    for ext in _AVATAR_EXT_TO_MIME:
+        candidate = data_dir / f"account_avatar{ext}"
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _avatar_url_for(version: str) -> str:
+    return f"/api/settings/avatar?v={version}" if version else ""
 
 
 @router.get("")
@@ -159,6 +209,73 @@ async def test_notify(container: AppContainer = Depends(require_auth)):
         force=True,
     )
     return {"ok": ok, "message": msg}
+
+
+@router.get("/avatar")
+async def get_account_avatar(container: AppContainer = Depends(require_auth)):
+    found = _find_avatar_file(container.env.resolved_data_dir)
+    if not found:
+        raise HTTPException(status_code=404, detail="未设置自定义头像")
+    path, mime = found
+    try:
+        content = path.read_bytes()
+    except OSError as err:
+        raise HTTPException(status_code=404, detail="头像文件读取失败") from err
+    return Response(
+        content=content,
+        media_type=mime,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@router.post("/avatar")
+async def upload_account_avatar(
+    payload: AvatarUploadRequest,
+    container: AppContainer = Depends(require_auth),
+):
+    raw_str = (payload.data_url or "").strip()
+    if not raw_str:
+        raise HTTPException(status_code=400, detail="请选择要上传的图片")
+    b64_part = raw_str.split(",", 1)[1] if raw_str.startswith("data:") and "," in raw_str else raw_str
+    try:
+        decoded = base64.b64decode(b64_part, validate=True)
+    except (binascii.Error, ValueError) as err:
+        raise HTTPException(status_code=400, detail="图片编码无效，请重新选择图片") from err
+
+    if not decoded or len(decoded) > MAX_AVATAR_BYTES:
+        raise HTTPException(status_code=400, detail="头像图片过大（请控制在 2 MB 以内）")
+
+    detected = _detect_avatar_image(decoded)
+    if not detected:
+        raise HTTPException(status_code=400, detail="仅支持 PNG、JPG、WebP 或 GIF 图片格式")
+
+    ext, _ = detected
+    data_dir = container.env.resolved_data_dir
+    container.env.ensure_dirs()
+    _remove_avatar_files(data_dir)
+    target_path = data_dir / f"account_avatar{ext}"
+    target_path.write_bytes(decoded)
+
+    version = secrets.token_hex(6)
+    updated = await container.repo.update_settings_patch({"account_avatar_version": version})
+    container.events.broadcast("overview_changed", {})
+    return {
+        "avatar_url": _avatar_url_for(updated.account_avatar_version),
+        "account_avatar_version": updated.account_avatar_version,
+        "settings": updated.to_redacted_dict(),
+    }
+
+
+@router.delete("/avatar")
+async def delete_account_avatar(container: AppContainer = Depends(require_auth)):
+    _remove_avatar_files(container.env.resolved_data_dir)
+    updated = await container.repo.update_settings_patch({"account_avatar_version": ""})
+    container.events.broadcast("overview_changed", {})
+    return {
+        "avatar_url": "",
+        "account_avatar_version": "",
+        "settings": updated.to_redacted_dict(),
+    }
 
 
 @router.get("/logs")

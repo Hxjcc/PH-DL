@@ -84,9 +84,7 @@ async def create_download_job(
 
     if payload.source_mode == "target":
         utype = (payload.target_type or "auto").strip().lower()
-        if utype == "user":
-            utype = "users"
-        if utype not in {"auto", "model", "pornstar", "users", "favorites", "liked"}:
+        if utype not in {"auto", "model", "pornstar", "favorites", "liked"}:
             raise HTTPException(status_code=400, detail="不支持的目标类型")
         try:
             parse_page_specs(payload.pages)
@@ -97,7 +95,7 @@ async def create_download_job(
             raise HTTPException(status_code=400, detail="页码范围和指定视频不能同时使用")
         clean_users = [u.strip() for u in payload.usernames if u and u.strip()]
         if utype != "liked" and not clean_users:
-            if utype in {"favorites", "model", "pornstar", "users"} and settings.ph_logged_in_username:
+            if utype in {"favorites", "model", "pornstar"} and settings.ph_logged_in_username:
                 clean_users = [settings.ph_logged_in_username]
             else:
                 raise HTTPException(status_code=400, detail="请至少输入一个用户名")

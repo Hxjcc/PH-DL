@@ -32,7 +32,13 @@ function applySettledState(isOpen) {
   el.style.transition = 'none'
   el.style.height = isOpen ? 'auto' : '0px'
   el.style.opacity = isOpen ? '1' : '0'
-  el.style.willChange = ''
+}
+
+function measureContentHeight() {
+  const inner = content.value
+  if (!inner) return 0
+  const rectH = inner.getBoundingClientRect().height
+  return Math.ceil(Math.max(rectH, inner.scrollHeight || 0))
 }
 
 function finishTransition(token, phase) {
@@ -68,7 +74,6 @@ function animateHeight(fromPx, toPx, phase, fromOpacity, toOpacity) {
   el.style.transition = 'none'
   el.style.height = `${fromPx}px`
   el.style.opacity = String(fromOpacity)
-  el.style.willChange = 'height, opacity'
 
   // Force style/layout commit so the browser transitions cleanly from `fromPx` to `toPx`.
   void el.offsetHeight
@@ -77,7 +82,7 @@ function animateHeight(fromPx, toPx, phase, fromOpacity, toOpacity) {
   el.style.height = `${toPx}px`
   el.style.opacity = String(toOpacity)
 
-  fallbackTimer = setTimeout(() => finishTransition(token, phase), 340)
+  fallbackTimer = setTimeout(() => finishTransition(token, phase), 320)
 }
 
 function onTransitionEnd(e) {
@@ -97,10 +102,14 @@ watch(
     if (isOpen !== wasOpen) {
       if (isOpen) {
         const startHeight = Math.ceil(el.getBoundingClientRect().height)
+        const startOpacity = startHeight > 0 ? Number(getComputedStyle(el).opacity || 1) : 0
+        // Lock current height before Vue mounts/patches slot content so the frame never jumps to auto.
+        el.style.transition = 'none'
+        el.style.height = `${startHeight}px`
+        el.style.opacity = String(startOpacity)
         await nextTick()
         if (!props.open) return
-        const targetHeight = Math.ceil(content.value?.scrollHeight || 0)
-        const startOpacity = startHeight > 0 ? Number(getComputedStyle(el).opacity || 1) : 0
+        const targetHeight = measureContentHeight()
         animateHeight(startHeight, targetHeight, 'enter', startOpacity, 1)
       } else {
         const startHeight = Math.ceil(el.getBoundingClientRect().height)
@@ -111,11 +120,18 @@ watch(
     }
     if (!isOpen) return
     const startHeight = Math.ceil(el.getBoundingClientRect().height)
+    const currentOpacity = Number(getComputedStyle(el).opacity || 1)
+    // Freeze height before slot content swaps so height:auto never flashes the new size for 1 frame.
+    el.style.transition = 'none'
+    el.style.height = `${startHeight}px`
+    el.style.opacity = String(currentOpacity)
     await nextTick()
     if (!props.open) return
-    const targetHeight = Math.ceil(content.value?.scrollHeight || 0)
-    if (Math.abs(targetHeight - startHeight) >= 4) {
-      animateHeight(startHeight, targetHeight, 'resize', 1, 1)
+    const targetHeight = measureContentHeight()
+    if (Math.abs(targetHeight - startHeight) >= 1) {
+      animateHeight(startHeight, targetHeight, activePhase === 'enter' ? 'enter' : 'resize', currentOpacity, 1)
+    } else if (!activePhase) {
+      applySettledState(true)
     }
   }
 )

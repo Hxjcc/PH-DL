@@ -76,14 +76,14 @@ def parse_page_video_specs(spec_str: Optional[str]) -> Optional[Dict[int, Set[in
 def build_target_list_url(username: Optional[str], target_type: str) -> str:
     t = (target_type or "model").strip().lower()
     if t == "liked":
-        return f"{PH_BASE_URL}/liked/videos"
-    quoted = urllib.parse.quote((username or "").strip(), safe="")
+        return f"{PH_BASE_URL}/likedvideos"
+    raw_name = (username or "").strip()
     if t == "favorites":
-        return f"{PH_BASE_URL}/users/{quoted}/videos/favorites"
+        quoted_lower = urllib.parse.quote(raw_name.lower(), safe="")
+        return f"{PH_BASE_URL}/users/{quoted_lower}/videos/favorites"
+    quoted = urllib.parse.quote(raw_name, safe="")
     if t == "pornstar":
         return f"{PH_BASE_URL}/pornstar/{quoted}/videos/upload"
-    if t in {"user", "users"}:
-        return f"{PH_BASE_URL}/users/{quoted}/videos"
     return f"{PH_BASE_URL}/{t}/{quoted}/videos"
 
 

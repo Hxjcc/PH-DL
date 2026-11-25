@@ -69,11 +69,9 @@ async def resolve_target_type(
     quoted = urllib.parse.quote(norm_user, safe="")
     ordered: List[str] = []
     hint = (hinted_type or "").strip().lower()
-    if hint == "user":
-        hint = "users"
-    if hint in {"model", "pornstar", "users"}:
+    if hint in {"model", "pornstar"}:
         ordered.append(hint)
-    for cand in ("model", "pornstar", "users"):
+    for cand in ("model", "pornstar"):
         if cand not in ordered:
             ordered.append(cand)
 
@@ -90,7 +88,7 @@ async def resolve_target_type(
         if res is None or res.status_code >= 400:
             continue
         detected = parse_target_type_from_url(res.final_url)
-        if detected:
+        if detected in {"model", "pornstar", "channel"}:
             return detected
     return None
 
@@ -102,7 +100,7 @@ async def fetch_subscriptions(
     timeout: float = 20.0,
 ) -> List[Tuple[str, str, str, str]]:
     """Fetch subscriptions as (target_type, username, display_name, avatar_url)."""
-    subs_url = f"https://www.pornhub.com/users/{urllib.parse.quote(username.strip(), safe='')}/subscriptions"
+    subs_url = f"https://www.pornhub.com/users/{urllib.parse.quote(username.strip().lower(), safe='')}/subscriptions"
     page_num = 1
     results: List[Tuple[str, str, str, str]] = []
     seen_profiles: Set[Tuple[str, str]] = set()
@@ -137,9 +135,7 @@ async def fetch_subscriptions(
                 utype, uname = parts[0].lower(), parts[1]
                 if utype == "channels":
                     utype = "channel"
-                elif utype == "user":
-                    utype = "users"
-                if utype in {"model", "pornstar", "users", "channel"}:
+                if utype in {"model", "pornstar", "channel"}:
                     profile_key = (utype, uname.lower())
                     if profile_key in seen_profiles:
                         continue

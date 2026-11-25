@@ -1,8 +1,9 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { Search, Check, RefreshCw, UserRound } from 'lucide-vue-next'
+import { Search, Check, RefreshCw, UserRound, Camera } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { targetTypeMeta } from '../utils/format'
+import { prepareAvatarDataUrl } from '../utils/avatarImage'
 import Dialog from './ui/Dialog.vue'
 import Input from './ui/Input.vue'
 import Select from './ui/Select.vue'
@@ -16,6 +17,7 @@ const props = defineProps({
   open: { type: Boolean, default: false },
   confirmLabel: { type: String, default: '确认选择' },
   showBaselineOption: { type: Boolean, default: false },
+  showAutoTrackOption: { type: Boolean, default: false },
 })
 const emit = defineEmits(['close', 'confirm'])
 const store = useAppStore()
@@ -27,11 +29,14 @@ const manualSource = ref(false)
 const editingSource = ref(false)
 const sourceInput = ref(null)
 const searchInput = ref(null)
+const avatarInput = ref(null)
+const uploadingAvatar = ref(false)
 const items = ref([])
 const query = ref('')
 const typeFilter = ref('all')
 const selected = ref(new Set())
 const initBaseline = ref(true)
+const addToAutoTrack = ref(false)
 const baselinePages = ref('1')
 const baselinePagesValid = ref(true)
 const fetchedAt = ref(0)
@@ -39,21 +44,32 @@ const fromCache = ref(false)
 const failedAvatarUrls = ref(new Set())
 let requestVersion = 0
 
-const defaultSource = computed(() => store.settingsCache?.ph_logged_in_username || store.subscriptionsLastSource || '')
-const sourceAvatar = computed(() => store.targetsCache?.find(
-  (target) => target.username.toLowerCase() === sourceUser.value.toLowerCase() && canShowAvatar(target.avatar_url)
-)?.avatar_url || '')
+const defaultSource = computed(() => store.accountUsername || store.subscriptionsLastSource || '')
+const isOwnAccount = computed(() => {
+  const cur = sourceUser.value.trim().toLowerCase()
+  const own = defaultSource.value.trim().toLowerCase()
+  return !cur || (own && cur === own) || !manualSource.value
+})
+const sourceAvatar = computed(() => {
+  if (isOwnAccount.value && canShowAvatar(store.accountAvatarUrl)) {
+    return store.accountAvatarUrl
+  }
+  return store.targetsCache?.find(
+    (target) => target.username.toLowerCase() === sourceUser.value.toLowerCase() && canShowAvatar(target.avatar_url)
+  )?.avatar_url || ''
+})
 const trackedAvatars = computed(() => new Map(
   (store.targetsCache || [])
     .filter((target) => target.avatar_url)
     .map((target) => [avatarKey(target.target_type, target.username), target.avatar_url])
 ))
-const availableItems = computed(() => items.value.filter((sub) => sub.type !== 'channel'))
+const availableItems = computed(() =>
+  items.value.filter((sub) => sub.type !== 'channel' && sub.type !== 'users' && sub.type !== 'user')
+)
 const typeOptions = [
   { label: '全部类型', value: 'all' },
   { label: 'Model', value: 'model' },
   { label: 'Pornstar', value: 'pornstar' },
-  { label: 'User', value: 'users' },
 ]
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase()
@@ -135,6 +151,7 @@ watch(() => props.open, (isOpen) => {
     selected.value = new Set()
     query.value = ''
     typeFilter.value = 'all'
+    addToAutoTrack.value = false
     editingSource.value = false
     if (!manualSource.value) sourceUser.value = defaultSource.value
     loadSubs()
@@ -143,6 +160,23 @@ watch(() => props.open, (isOpen) => {
     loading.value = false
   }
 })
+
+async function handleAvatarPicked(event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file || uploadingAvatar.value) return
+  uploadingAvatar.value = true
+  try {
+    const dataUrl = await prepareAvatarDataUrl(file)
+    await store.uploadAccountAvatar(dataUrl)
+    failedAvatarUrls.value.clear()
+    store.notify('本地账号头像已更新', 'success')
+  } catch (err) {
+    store.notify(err.message || '头像更新失败', 'error')
+  } finally {
+    uploadingAvatar.value = false
+  }
+}
 
 function subKey(sub) { return sub.type + ':' + sub.username }
 function avatarKey(type, username) { return `${type}:${username.toLowerCase()}` }
@@ -172,7 +206,11 @@ function confirm() {
   const picked = availableItems.value
     .filter((sub) => selected.value.has(subKey(sub)))
     .map((sub) => ({ ...sub, avatar_url: avatarFor(sub) }))
-  emit('confirm', picked, { initBaseline: initBaseline.value, baselinePages: baselinePages.value })
+  emit('confirm', picked, {
+    initBaseline: initBaseline.value,
+    baselinePages: baselinePages.value,
+    addToAutoTrack: props.showAutoTrackOption && addToAutoTrack.value,
+  })
   emit('close')
 }
 </script>
@@ -195,10 +233,36 @@ function confirm() {
         </div>
         <template v-else>
           <div class="flex min-w-0 items-center gap-2.5">
-            <span class="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-muted-foreground">
+            <button
+              v-if="isOwnAccount"
+              type="button"
+              class="group relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-muted-foreground cursor-pointer transition-colors hover:border-brand/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30"
+              :disabled="uploadingAvatar"
+              title="点击更换本地账号头像（仅本地显示，不修改 PornHub 账号）"
+              aria-label="更换本地账号头像"
+              @click="avatarInput?.click()"
+            >
+              <img v-if="sourceAvatar" :key="sourceAvatar" :src="sourceAvatar" alt="" class="h-full w-full object-cover" referrerpolicy="no-referrer" @error="markAvatarFailed" />
+              <UserRound v-else class="w-4 h-4" />
+              <span class="absolute inset-0 flex items-center justify-center bg-black/45 text-white opacity-0 transition-opacity group-hover:opacity-100">
+                <Spinner v-if="uploadingAvatar" class="w-3.5 h-3.5" />
+                <Camera v-else class="w-3.5 h-3.5" />
+              </span>
+            </button>
+            <span
+              v-else
+              class="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-muted-foreground"
+            >
               <img v-if="sourceAvatar" :key="sourceAvatar" :src="sourceAvatar" alt="" class="h-full w-full object-cover" referrerpolicy="no-referrer" @error="markAvatarFailed" />
               <UserRound v-else class="w-4 h-4" />
             </span>
+            <input
+              ref="avatarInput"
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              class="hidden"
+              @change="handleAvatarPicked"
+            />
             <div class="min-w-0">
               <div class="text-[10px] text-muted-foreground">订阅账号</div>
               <div class="max-w-44 truncate text-sm font-medium" :title="sourceUser">{{ sourceUser || '当前登录账号' }}</div>
@@ -281,9 +345,13 @@ function confirm() {
       <div class="flex w-full flex-wrap items-center justify-between gap-3">
         <div class="flex flex-wrap items-center gap-3">
           <span class="text-xs text-muted-foreground">已选择 <strong class="font-semibold text-foreground tabular-nums">{{ selected.size }}</strong> 项</span>
-          <label v-if="showBaselineOption" class="inline-flex items-center gap-1.5 text-xs text-foreground/85 cursor-pointer">
+          <label v-if="showBaselineOption" class="inline-flex items-center gap-1.5 text-xs text-foreground/85 cursor-pointer select-none">
             <Switch v-model="initBaseline" />
             <span>同时初始化基线</span>
+          </label>
+          <label v-if="showAutoTrackOption" class="inline-flex items-center gap-1.5 text-xs text-foreground/85 cursor-pointer select-none">
+            <Switch v-model="addToAutoTrack" />
+            <span>同时加入自动追更</span>
           </label>
         </div>
         <div class="flex items-center gap-2">

@@ -30,6 +30,7 @@ import { api } from '../api/client'
 import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta } from '../utils/format'
 import { computeJobLiveMetrics, resolveJobVisual } from '../utils/jobMeta'
 import { parseVideoLinks } from '../utils/videoLinks'
+import { parseTargetUsernames } from '../utils/targetInput'
 import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../utils/specificVideos'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
@@ -63,7 +64,6 @@ const targetTypeOptions = [
   { label: '自动识别', value: 'auto' },
   { label: 'Model / 个人', value: 'model' },
   { label: 'Pornstar / 明星', value: 'pornstar' },
-  { label: 'User / 普通用户', value: 'users' },
   { label: '收藏夹 (Favorites)', value: 'favorites' },
   { label: '我的点赞 (Liked)', value: 'liked' },
 ]
@@ -223,7 +223,7 @@ function markRecentAvatarBroken(url) {
 const recentJobCards = computed(() =>
   recentJobs.value.map((job) => {
     const visual = resolveJobVisual(job, store.targetsCache || [])
-    const metrics = computeJobLiveMetrics(job, store.liveProgress, store.jobItems[job.id])
+    const metrics = computeJobLiveMetrics(job, store.liveProgress, store.jobItems[job.id], store.scanStatus)
     const isActive = ['queued', 'scanning', 'running'].includes(job.status)
     return {
       job,
@@ -235,8 +235,19 @@ const recentJobCards = computed(() =>
   })
 )
 const quickTargets = computed(() =>
-  (store.targetsCache || []).filter((target) => target.enabled).slice(0, 5)
+  (store.targetsCache || []).filter((target) => target.enabled)
 )
+const quickTargetsByName = computed(() => {
+  const map = new Map()
+  for (const t of quickTargets.value) {
+    if (t.target_type !== 'liked' && t.username) {
+      map.set(t.username.toLowerCase(), t)
+    }
+  }
+  return map
+})
+const selectedUsernameList = computed(() => parseTargetUsernames(form.usernames))
+const selectedUsernameSet = computed(() => new Set(selectedUsernameList.value.map((u) => u.toLowerCase())))
 
 function targetName(target) {
   if (target.target_type === 'liked') return 'Liked Videos'
@@ -244,15 +255,63 @@ function targetName(target) {
 }
 
 function isQuickTargetSelected(target) {
-  return target.target_type === 'liked'
-    ? form.target_type === 'liked'
-    : form.target_type === target.target_type && form.usernames === target.username
+  if (target.target_type === 'liked') return form.target_type === 'liked'
+  return form.target_type !== 'liked' && selectedUsernameSet.value.has(target.username.toLowerCase())
+}
+
+function syncTargetTypeForNames(names) {
+  if (names.length === 0) {
+    form.target_type = 'auto'
+    return
+  }
+  const types = new Set()
+  for (const name of names) {
+    const matched = quickTargetsByName.value.get(name.toLowerCase())
+    if (!matched) {
+      form.target_type = 'auto'
+      return
+    }
+    types.add(matched.target_type)
+  }
+  form.target_type = types.size === 1 ? Array.from(types)[0] : 'auto'
 }
 
 function fillQuickTarget(target) {
   sourceTab.value = 'target'
-  form.target_type = target.target_type === 'liked' ? 'liked' : target.target_type
-  form.usernames = target.target_type === 'liked' ? '' : target.username
+  if (target.target_type === 'liked') {
+    if (form.target_type === 'liked') {
+      form.target_type = 'auto'
+    } else {
+      form.target_type = 'liked'
+      form.usernames = ''
+    }
+    return
+  }
+
+  if (form.target_type === 'liked') {
+    form.target_type = 'auto'
+  }
+  const key = target.username.toLowerCase()
+  const current = selectedUsernameList.value
+  const next = selectedUsernameSet.value.has(key)
+    ? current.filter((u) => u.toLowerCase() !== key)
+    : [...current, target.username]
+  form.usernames = next.join(', ')
+  syncTargetTypeForNames(next)
+}
+
+function clearTargetUsernames() {
+  form.usernames = ''
+  if (form.target_type !== 'liked') form.target_type = 'auto'
+}
+
+function handleQuickTargetsWheel(event) {
+  const el = event.currentTarget
+  if (!el || el.scrollWidth <= el.clientWidth) return
+  if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+    event.preventDefault()
+    el.scrollLeft += event.deltaY
+  }
 }
 
 let activatedOnce = false
@@ -324,16 +383,31 @@ function clearUrls() {
   form.urlsText = ''
 }
 
-function handleSubsPicked(picked) {
+async function handleSubsPicked(picked, opts = {}) {
   const names = picked.map((p) => p.username)
-  const existing = form.usernames
-    .split(/[\s,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-  const merged = Array.from(new Set([...existing, ...names]))
+  const existing = parseTargetUsernames(form.usernames)
+  const merged = parseTargetUsernames([...existing, ...names].join(','))
   form.usernames = merged.join(', ')
   form.target_type = 'auto'
   sourceTab.value = 'target'
+
+  if (opts?.addToAutoTrack && picked.length > 0) {
+    try {
+      const res = await api.batchCreateTargets({
+        items: picked.map((p) => ({
+          username: p.username,
+          target_type: p.type,
+          display_name: p.display_name || p.username,
+          avatar_url: p.avatar_url || '',
+        })),
+        init_baseline: false,
+      })
+      await store.refreshTargets()
+      store.notify(`已填入 ${picked.length} 个用户名，并同步加入 ${res.created_count} 个自动追更目标`, 'success')
+    } catch (err) {
+      store.notify(`用户名已填入，但加入自动追更失败: ${err.message}`, 'warning')
+    }
+  }
 }
 
 async function submitDownload() {
@@ -359,10 +433,7 @@ async function submitDownload() {
     if (sourceTab.value === 'target') {
       payload.pages = form.pages.trim()
       payload.videos = form.videos.trim()
-      payload.usernames = form.usernames
-        .split(/[\s,，]+/)
-        .map((s) => s.trim())
-        .filter(Boolean)
+      payload.usernames = parseTargetUsernames(form.usernames)
       payload.target_type = form.target_type
     } else {
       payload.urls = parsedUrls.value
@@ -584,6 +655,14 @@ async function handleClearTemp() {
                     <div class="field-heading">
                       <label for="download-usernames">用户名</label>
                       <span>多个以逗号或空格分隔</span>
+                      <button
+                        v-if="form.target_type !== 'liked' && selectedUsernameList.length > 0"
+                        type="button"
+                        class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+                        @click="clearTargetUsernames"
+                      >
+                        清空 ({{ selectedUsernameList.length }})
+                      </button>
                     </div>
                     <Input
                       id="download-usernames"
@@ -609,34 +688,37 @@ async function handleClearTemp() {
 
                 <div v-if="quickTargets.length > 0" class="quick-targets">
                   <span class="text-[11px] text-muted-foreground shrink-0">快速填入</span>
-                  <Button
-                    v-for="target in quickTargets"
-                    :key="target.id"
-                    variant="outline"
-                    size="xs"
-                    :aria-pressed="isQuickTargetSelected(target)"
-                    :class="[
-                      'h-[26px] min-w-0 gap-1.5 rounded-full px-2 text-[11px] shadow-none hover:shadow-none',
-                      isQuickTargetSelected(target)
-                        ? 'border-brand/40 bg-brand/10 text-brand hover:border-brand/40 hover:bg-brand/10'
-                        : 'border-border text-muted-foreground hover:text-foreground',
-                    ]"
-                    @click="fillQuickTarget(target)"
-                  >
-                    <img
-                      v-if="target.avatar_url"
-                      :src="target.avatar_url"
-                      alt=""
-                      aria-hidden="true"
-                      class="w-4 h-4 rounded-full object-cover bg-secondary"
-                      loading="lazy"
-                      referrerpolicy="no-referrer"
-                    />
-                    <span v-else class="w-4 h-4 rounded-full bg-secondary flex items-center justify-center text-[9px]">
-                      {{ targetName(target).slice(0, 1).toUpperCase() }}
-                    </span>
-                    <span class="max-w-24 truncate" :title="targetName(target)">{{ targetName(target) }}</span>
-                  </Button>
+                  <div class="quick-targets-rail" @wheel="handleQuickTargetsWheel">
+                    <Button
+                      v-for="target in quickTargets"
+                      :key="target.id"
+                      variant="outline"
+                      size="xs"
+                      :aria-pressed="isQuickTargetSelected(target)"
+                      :title="isQuickTargetSelected(target) ? `点击取消选择 ${targetName(target)}` : `点击加入 ${targetName(target)}（可多选）`"
+                      :class="[
+                        'h-[26px] shrink-0 gap-1.5 rounded-full px-2 text-[11px] shadow-none hover:shadow-none',
+                        isQuickTargetSelected(target)
+                          ? 'border-brand/40 bg-brand/10 text-brand hover:border-brand/40 hover:bg-brand/10'
+                          : 'border-border text-muted-foreground hover:text-foreground',
+                      ]"
+                      @click="fillQuickTarget(target)"
+                    >
+                      <img
+                        v-if="target.avatar_url"
+                        :src="target.avatar_url"
+                        alt=""
+                        aria-hidden="true"
+                        class="w-4 h-4 rounded-full object-cover bg-secondary shrink-0"
+                        loading="lazy"
+                        referrerpolicy="no-referrer"
+                      />
+                      <span v-else class="w-4 h-4 rounded-full bg-secondary flex items-center justify-center text-[9px] shrink-0">
+                        {{ targetName(target).slice(0, 1).toUpperCase() }}
+                      </span>
+                      <span class="max-w-24 truncate">{{ targetName(target) }}</span>
+                    </Button>
+                  </div>
                 </div>
               </div>
 
@@ -951,6 +1033,7 @@ async function handleClearTemp() {
     <SubsPickerModal
       :open="subsModalOpen"
       confirm-label="填入用户名"
+      show-auto-track-option
       @close="subsModalOpen = false"
       @confirm="handleSubsPicked"
     />
@@ -1095,10 +1178,27 @@ async function handleClearTemp() {
 
 .quick-targets {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 12px;
+}
+
+.quick-targets-rail {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
-  margin-top: 12px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.quick-targets-rail::-webkit-scrollbar {
+  display: none;
 }
 
 .url-source {

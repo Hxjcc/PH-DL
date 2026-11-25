@@ -20,14 +20,17 @@ import {
   PauseCircle,
   Sparkles,
   Pencil,
+  ExternalLink,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
 import { avatarGradient, formatDateTime, targetTypeMeta } from '../utils/format'
+import { buildTargetProfileVideosUrl, parseTargetUsernames } from '../utils/targetInput'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
 import Input from '../components/ui/Input.vue'
+import Textarea from '../components/ui/Textarea.vue'
 import Select from '../components/ui/Select.vue'
 import Switch from '../components/ui/Switch.vue'
 import Dialog from '../components/ui/Dialog.vue'
@@ -74,7 +77,6 @@ const editForm = reactive({
 const editTargetTypeOptions = [
   { label: 'Model', value: 'model' },
   { label: 'Pornstar', value: 'pornstar' },
-  { label: 'User (普通用户)', value: 'users' },
   { label: 'Favorites (收藏夹)', value: 'favorites' },
 ]
 const qualityPresetChoices = ['2160', '1440', '1080', '720', '480']
@@ -102,7 +104,6 @@ const targetTypeOptions = [
   { label: '自动识别', value: 'auto' },
   { label: 'Model', value: 'model' },
   { label: 'Pornstar', value: 'pornstar' },
-  { label: 'User (普通用户)', value: 'users' },
   { label: 'Favorites (收藏夹)', value: 'favorites' },
   { label: 'Liked (我的点赞)', value: 'liked' },
 ]
@@ -282,18 +283,47 @@ async function saveSchedule() {
   }
 }
 
+const parsedNewUsernames = computed(() => parseTargetUsernames(newTarget.username))
+
 async function handleAddTarget() {
   if (newTarget.init_baseline && !newBaselineValid.value) return
+  if (newTarget.target_type !== 'liked' && parsedNewUsernames.value.length === 0) {
+    store.notify('请输入至少一个用户名', 'warning')
+    return
+  }
   adding.value = true
   try {
-    const res = await api.createTarget({ ...newTarget })
-    const addedName = res.target.display_name || res.target.username
-    store.notify(
-      res.baseline_job
-        ? `已添加 '${addedName}' 并启动基线任务 #${res.baseline_job.id}`
-        : `已添加追更目标 '${addedName}'`,
-      'success'
-    )
+    if (newTarget.target_type === 'liked' || parsedNewUsernames.value.length === 1) {
+      const singleUsername = newTarget.target_type === 'liked' ? '' : parsedNewUsernames.value[0]
+      const res = await api.createTarget({ ...newTarget, username: singleUsername })
+      const addedName = res.target.display_name || res.target.username
+      store.notify(
+        res.baseline_job
+          ? `已添加 '${addedName}' 并启动基线任务 #${res.baseline_job.id}`
+          : `已添加追更目标 '${addedName}'`,
+        'success'
+      )
+    } else {
+      const res = await api.batchCreateTargets({
+        items: parsedNewUsernames.value.map((username) => ({
+          username,
+          target_type: newTarget.target_type,
+          preferred_quality: newTarget.preferred_quality.trim(),
+        })),
+        init_baseline: newTarget.init_baseline,
+        baseline_pages: newTarget.baseline_pages,
+      })
+      const baselineCount = (res.baseline_jobs || []).length
+      const skipped = (res.skipped_channels || []).length
+      const skipNote = skipped > 0 ? `（已跳过 ${skipped} 个不支持的 Channel）` : ''
+      store.notify(
+        baselineCount > 0
+          ? `已批量添加 ${res.created_count} 个追更目标，并创建 ${baselineCount} 个基线任务${skipNote}`
+          : `已批量添加 ${res.created_count} 个追更目标${skipNote}`,
+        'success'
+      )
+      await store.refreshJobs()
+    }
     addModalOpen.value = false
     newTarget.username = ''
     newTarget.preferred_quality = ''
@@ -765,6 +795,16 @@ async function handleDelete(t) {
               >
                 <BookmarkCheck class="w-3.5 h-3.5" />
               </Button>
+              <a
+                v-if="buildTargetProfileVideosUrl(t)"
+                :href="buildTargetProfileVideosUrl(t)"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                :title="`打开 ${targetDisplayName(t)} 视频主页`"
+              >
+                <ExternalLink class="w-3.5 h-3.5" />
+              </a>
               <ConfirmPopover
                 :title="`移除追更目标 '${targetDisplayName(t)}'？`"
                 description="不会删除已有视频的去重历史记录。"
@@ -891,6 +931,16 @@ async function handleDelete(t) {
                     >
                       <BookmarkCheck class="w-3.5 h-3.5" />
                     </Button>
+                    <a
+                      v-if="buildTargetProfileVideosUrl(t)"
+                      :href="buildTargetProfileVideosUrl(t)"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                      :title="`打开 ${targetDisplayName(t)} 视频主页`"
+                    >
+                      <ExternalLink class="w-3.5 h-3.5" />
+                    </a>
                     <ConfirmPopover
                       :title="`移除追更目标 '${targetDisplayName(t)}'？`"
                       description="不会删除已有视频的去重历史记录。"
@@ -925,11 +975,18 @@ async function handleDelete(t) {
     >
       <form id="add-target-form" class="space-y-4" @submit.prevent="handleAddTarget">
         <div class="space-y-1.5">
-          <label class="text-xs font-medium text-foreground">用户名</label>
-          <Input
+          <div class="flex items-center justify-between gap-2">
+            <label class="text-xs font-medium text-foreground">用户名</label>
+            <span v-if="newTarget.target_type !== 'liked' && parsedNewUsernames.length > 1" class="text-[11px] font-medium text-brand tabular-nums">
+              将添加 {{ parsedNewUsernames.length }} 个目标
+            </span>
+            <span v-else class="text-[11px] text-muted-foreground">支持多个（逗号、空格或换行分隔）</span>
+          </div>
+          <Textarea
             v-model="newTarget.username"
+            :rows="2"
             :disabled="newTarget.target_type === 'liked'"
-            placeholder="例如: candy-love"
+            :placeholder="newTarget.target_type === 'liked' ? 'Liked 模式无需输入用户名' : '例如: candy-love, alice（也可换行或粘贴主页链接批量添加）'"
           />
         </div>
 
@@ -963,9 +1020,14 @@ async function handleDelete(t) {
 
       <template #footer>
         <Button variant="outline" size="sm" @click="addModalOpen = false">取消</Button>
-        <Button type="submit" form="add-target-form" size="sm" :disabled="adding || (newTarget.init_baseline && !newBaselineValid)">
+        <Button
+          type="submit"
+          form="add-target-form"
+          size="sm"
+          :disabled="adding || (newTarget.target_type !== 'liked' && parsedNewUsernames.length === 0) || (newTarget.init_baseline && !newBaselineValid)"
+        >
           <Loader2 v-if="adding" class="w-3.5 h-3.5 animate-spin" />
-          {{ adding ? '保存中...' : '确认添加' }}
+          {{ adding ? '保存中...' : parsedNewUsernames.length > 1 && newTarget.target_type !== 'liked' ? `确认添加 (${parsedNewUsernames.length})` : '确认添加' }}
         </Button>
       </template>
     </Dialog>

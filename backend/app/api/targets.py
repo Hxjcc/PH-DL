@@ -15,7 +15,7 @@ from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api/targets", tags=["targets"])
 
-VALID_TYPES = {"auto", "model", "pornstar", "users", "favorites", "liked"}
+VALID_TYPES = {"auto", "model", "pornstar", "favorites", "liked"}
 
 
 def _validate_baseline_pages(pages: str) -> None:
@@ -40,6 +40,7 @@ class TargetBatchItem(BaseModel):
     target_type: str = "model"
     display_name: str = ""
     avatar_url: str = ""
+    preferred_quality: str = ""
 
 
 class TargetBatchCreateRequest(BaseModel):
@@ -129,20 +130,57 @@ async def batch_create_targets(
         _validate_baseline_pages(payload.baseline_pages)
     created = []
     jobs = []
+    skipped_channels = []
+
+    needs_auto_resolve = any(
+        (item.target_type or "").strip().lower() == "auto" and item.username.strip()
+        for item in payload.items
+    )
+    resolved_types: dict[str, str] = {}
+    if needs_auto_resolve:
+        settings = await container.repo.get_settings()
+        if settings.ph_cookie.strip():
+            async with TaskHttpContext(
+                cookie_str=settings.ph_cookie,
+                proxy_url=settings.normalized_proxy,
+                concurrency=3,
+                timeout=settings.request_timeout,
+                max_retries=1,
+            ) as ctx:
+                seen_auto: set[str] = set()
+                for item in payload.items:
+                    if (item.target_type or "").strip().lower() != "auto":
+                        continue
+                    uname = item.username.strip()
+                    key = uname.lower()
+                    if not uname or key in seen_auto:
+                        continue
+                    seen_auto.add(key)
+                    detected = await resolve_target_type(ctx, uname, timeout=settings.request_timeout)
+                    resolved_types[key] = detected or "model"
+
     for item in payload.items:
-        utype = (item.target_type or "model").strip().lower()
+        raw_type = (item.target_type or "model").strip().lower()
+        uname = item.username.strip()
+        if raw_type == "auto":
+            utype = resolved_types.get(uname.lower(), "model")
+        else:
+            utype = raw_type
         if utype == "channel":
+            if uname:
+                skipped_channels.append(uname)
             continue
-        if utype == "user":
-            utype = "users"
-        if utype not in {"model", "pornstar", "users", "favorites", "liked"}:
+        if utype in {"user", "users"}:
+            continue
+        if utype not in {"model", "pornstar", "favorites", "liked"}:
             utype = "model"
-        if utype != "liked" and not item.username.strip():
+        if utype != "liked" and not uname:
             continue
         t = await container.repo.upsert_target(
-            item.username.strip(),
+            uname,
             utype,
             enabled=True,
+            preferred_quality=item.preferred_quality,
             display_name=item.display_name,
             avatar_url=item.avatar_url,
         )
@@ -157,7 +195,12 @@ async def batch_create_targets(
             jobs.append(j)
 
     container.events.broadcast("overview_changed", {})
-    return {"created_count": len(created), "targets": created, "baseline_jobs": jobs}
+    return {
+        "created_count": len(created),
+        "targets": created,
+        "baseline_jobs": jobs,
+        "skipped_channels": skipped_channels,
+    }
 
 
 @router.patch("/{target_id}")
@@ -169,9 +212,7 @@ async def update_target(
     patch = payload.model_dump(exclude_none=True)
     if "target_type" in patch:
         t = patch["target_type"].strip().lower()
-        if t == "user":
-            t = "users"
-        if t not in {"model", "pornstar", "users", "favorites", "liked"}:
+        if t not in {"model", "pornstar", "favorites", "liked"}:
             raise HTTPException(status_code=400, detail=f"不支持的目标类型: {t}")
         patch["target_type"] = t
 

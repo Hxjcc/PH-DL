@@ -165,6 +165,7 @@ class RuntimeSettings(BaseModel):
     ph_password: str = ""
     ph_logged_in_username: str = ""
     ph_cookie: str = ""
+    account_avatar_version: str = ""
 
     # YesCaptcha (reCAPTCHA solver used by auto-login)
     yescaptcha_enabled: bool = False
@@ -217,6 +218,7 @@ class RuntimeSettings(BaseModel):
     # Auto-Update Scheduler
     schedule_enabled: bool = True
     schedule_time: str = "04:00"  # HH:MM local time
+    update_target_concurrency: int = Field(default=2, ge=1, le=6)
     notify_if_no_updates: bool = False
 
     # ServerChan Notification

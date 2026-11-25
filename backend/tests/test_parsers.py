@@ -558,16 +558,20 @@ def test_page_and_video_spec_parsers():
     assert parse_page_video_specs("1-1,3-4;2-2") == {1: {0, 2, 3}, 2: {1}}
 
 
-async def test_subscriptions_include_users_type_and_title_fallback(monkeypatch):
+async def test_subscriptions_filter_users_and_build_target_urls(monkeypatch):
     from app.parsers.list_scanner import build_target_list_url
     from app.parsers.target import fetch_subscriptions, parse_target_type_from_url
 
     assert parse_target_type_from_url("https://www.pornhub.com/users/slutyou9") == "users"
-    assert build_target_list_url("slutyou9", "users") == "https://www.pornhub.com/users/slutyou9/videos"
+    assert build_target_list_url(None, "liked") == "https://www.pornhub.com/likedvideos"
+    assert build_target_list_url("Hxiay", "favorites") == "https://www.pornhub.com/users/hxiay/videos/favorites"
+    assert build_target_list_url("amatemure", "model") == "https://www.pornhub.com/model/amatemure/videos"
 
     ctx = TaskHttpContext()
+    requested_urls: list[str] = []
 
     async def fake_fetch(url, **kwargs):
+        requested_urls.append(url)
         if "page=1" in url:
             html = """
             <ul id="moreData" class="userWidgetWrapperGrid">
@@ -581,10 +585,10 @@ async def test_subscriptions_include_users_type_and_title_fallback(monkeypatch):
         return PowFetchResult(text='<ul id="moreData"></ul>', final_url=url, status_code=200, challenge_solves=0, retried=False), None
 
     monkeypatch.setattr(ctx, "fetch_with_pow", fake_fetch)
-    subs = await fetch_subscriptions(ctx, "hxiay", SelectorSettings())
+    subs = await fetch_subscriptions(ctx, "Hxiay", SelectorSettings())
+    assert requested_urls[0] == "https://www.pornhub.com/users/hxiay/subscriptions?page=1"
     assert subs == [
         ("model", "aquari", "AquaRi", "https://cdn.example/aquari.jpg"),
-        ("users", "slutyou9", "slutyou9", "https://www.pornhub.com/avatars/user.jpg"),
         ("pornstar", "eva-elfie", "Eva", ""),
     ]
 
