@@ -458,14 +458,6 @@ async function handleTestNotify() {
             <Input v-model="form.preferred_quality" placeholder="如 2160,1440,1080" />
           </div>
           <div class="space-y-1.5">
-            <label class="text-xs font-medium text-foreground">单批触发上传文件数（1 = 下完即传）</label>
-            <Input v-model="form.upload_batch_size" type="number" :min="1" :max="100" />
-          </div>
-          <div class="space-y-1.5">
-            <label class="text-xs font-medium text-foreground">并行上传 Worker 数（建议 3，配合分块并发 4）</label>
-            <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
-          </div>
-          <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">待上传最大本地堆积数</label>
             <Input v-model="form.max_pending_upload_files" type="number" :min="1" :max="200" />
           </div>
@@ -540,7 +532,15 @@ async function handleTestNotify() {
               <Input v-model="form.rclone_bin" />
             </div>
             <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">上传并发 (transfers)</label>
+              <label class="text-xs font-medium text-foreground">并行上传 Worker 数（独立并发文件数）</label>
+              <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-xs font-medium text-foreground">单批触发上传文件数（1 = 下完即传）</label>
+              <Input v-model="form.upload_batch_size" type="number" :min="1" :max="100" />
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-xs font-medium text-foreground">单 Worker 内并发 (transfers，多 Worker 建议 1)</label>
               <Input v-model="form.rclone_transfers" type="number" :min="1" :max="16" />
             </div>
             <div class="space-y-1.5">
@@ -552,8 +552,8 @@ async function handleTestNotify() {
               <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
             </div>
             <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">PikPak 分块大小（4G 内存建议 32Mi）</label>
-              <Input v-model="form.rclone_pikpak_chunk_size" placeholder="32Mi" />
+              <label class="text-xs font-medium text-foreground">PikPak 分块大小（如 16Mi / 32Mi）</label>
+              <Input v-model="form.rclone_pikpak_chunk_size" placeholder="16Mi" />
             </div>
             <div class="space-y-1.5">
               <label class="text-xs font-medium text-foreground">rclone 单次执行超时（秒）</label>

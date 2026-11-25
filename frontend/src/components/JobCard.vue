@@ -37,7 +37,6 @@ import {
 import { buildExportFilename } from '../utils/exportFilename'
 import Card from './ui/Card.vue'
 import Button from './ui/Button.vue'
-import Badge from './ui/Badge.vue'
 import Progress from './ui/Progress.vue'
 import Checkbox from './ui/Checkbox.vue'
 import ConfirmPopover from './ui/ConfirmPopover.vue'
@@ -70,12 +69,12 @@ const expanded = ref(props.defaultExpanded)
 const loadingItems = ref(false)
 const busyAction = ref(false)
 const detailsMounted = ref(props.defaultExpanded)
-const detailsRevealed = ref(false)
 const itemsLoaded = ref(false)
 const itemsLoadError = ref('')
-const showLoadingIndicator = ref(false)
+const deletePopoverMounted = ref(false)
+const deletePopoverDefaultOpen = ref(false)
 const itemStatusFilter = ref('all')
-const ITEM_PAGE_STEP = 40
+const ITEM_PAGE_STEP = 30
 const itemRenderLimit = ref(ITEM_PAGE_STEP)
 const brokenAvatars = ref(new Set())
 
@@ -140,7 +139,30 @@ const canRetry = computed(
 )
 const isMetadataJob = computed(() => props.job.kind === 'enrich_metadata')
 const isExportJob = computed(() => Boolean(props.job.params?.export_only || props.job.export_text))
-const detailsOpen = computed(() => expanded.value && (detailsRevealed.value || !loadingItems.value))
+const detailsOpen = computed(() => expanded.value)
+const detailsContentKey = computed(() => {
+  if (loadingItems.value && items.value.length === 0) return 'loading'
+  if (itemsLoadError.value && items.value.length === 0) return 'error'
+  if (items.value.length === 0) return 'empty'
+  return 'ready'
+})
+
+function statusPillClass(variant) {
+  if (variant === 'destructive') return 'border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400'
+  if (variant === 'secondary') return 'border-transparent bg-secondary text-secondary-foreground'
+  return 'border-border bg-card/90 text-foreground'
+}
+
+function warmDeletePopover() {
+  if (!deletePopoverMounted.value) {
+    deletePopoverMounted.value = true
+  }
+}
+
+function openDeletePopoverNow() {
+  deletePopoverDefaultOpen.value = true
+  deletePopoverMounted.value = true
+}
 
 const retryButtonText = computed(() => {
   if (isExportJob.value) return '重试导出'
@@ -289,23 +311,17 @@ async function ensureItemsLoaded(force = false) {
 }
 
 async function toggleExpand() {
-  const wasOpen = detailsOpen.value
   expanded.value = !expanded.value
   emit('activate', props.job.id, expanded.value)
   if (expanded.value) {
     detailsMounted.value = true
     await ensureItemsLoaded()
-  } else if (!wasOpen) {
-    detailsMounted.value = false
-    detailsRevealed.value = false
-    itemRenderLimit.value = ITEM_PAGE_STEP
   }
 }
 
 function handleDetailsAfterLeave() {
   if (!expanded.value) {
     detailsMounted.value = false
-    detailsRevealed.value = false
     itemRenderLimit.value = ITEM_PAGE_STEP
   }
 }
@@ -325,17 +341,6 @@ watch(
   },
   { immediate: true }
 )
-
-watch(detailsOpen, (open) => {
-  if (open) detailsRevealed.value = true
-}, { immediate: true })
-
-watch(loadingItems, (loading, _, onCleanup) => {
-  showLoadingIndicator.value = false
-  if (!loading) return
-  const timer = setTimeout(() => { showLoadingIndicator.value = true }, 140)
-  onCleanup(() => clearTimeout(timer))
-}, { flush: 'sync', immediate: true })
 
 watch(
   [() => props.job.total_items, () => props.job.status],
@@ -583,9 +588,15 @@ function downloadExportTxt() {
 
         <!-- Right: Status Pill + Action Buttons -->
         <div class="flex items-center gap-1.5 shrink-0 ml-auto" @click.stop>
-          <Badge :variant="statusMeta.variant" :dot="statusMeta.dot" class="h-6 px-2.5 text-[11px]">
+          <span
+            :class="[
+              'inline-flex items-center gap-1.5 rounded-full border font-medium whitespace-nowrap h-6 px-2.5 text-[11px]',
+              statusPillClass(statusMeta.variant),
+            ]"
+          >
+            <span v-if="statusMeta.dot" :class="['w-1.5 h-1.5 rounded-full shrink-0', statusMeta.dot]" />
             {{ statusMeta.label }}
-          </Badge>
+          </span>
 
           <Button
             v-if="job.export_text"
@@ -622,37 +633,50 @@ function downloadExportTxt() {
             {{ retryButtonText }}
           </Button>
 
-          <ConfirmPopover
-            v-if="!isActive"
-            :title="`删除任务记录 #${job.id}？`"
-            description="仅删除队列记录，不会删除已下载的视频与历史去重记录。"
-            confirm-text="删除"
-            @confirm="handleDelete"
-          >
-            <Button
-              variant="ghost"
-              size="icon"
-              class="h-7 w-7 text-muted-foreground hover:text-red-600"
+          <template v-if="!isActive">
+            <ConfirmPopover
+              v-if="deletePopoverMounted"
+              :title="`删除任务记录 #${job.id}？`"
+              description="仅删除队列记录，不会删除已下载的视频与历史去重记录。"
+              confirm-text="删除"
+              :default-open="deletePopoverDefaultOpen"
+              @confirm="handleDelete"
+              @open-change="(v) => { if (!v) deletePopoverDefaultOpen = false }"
+            >
+              <button
+                type="button"
+                class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-red-600 transition-colors cursor-pointer disabled:pointer-events-none disabled:opacity-50"
+                title="删除任务记录"
+                :disabled="busyAction"
+              >
+                <Trash2 class="w-3.5 h-3.5" />
+              </button>
+            </ConfirmPopover>
+            <button
+              v-else
+              type="button"
+              class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-red-600 transition-colors cursor-pointer disabled:pointer-events-none disabled:opacity-50"
               title="删除任务记录"
               :disabled="busyAction"
+              @pointerenter="warmDeletePopover"
+              @focus="warmDeletePopover"
+              @click="openDeletePopoverNow"
             >
               <Trash2 class="w-3.5 h-3.5" />
-            </Button>
-          </ConfirmPopover>
+            </button>
+          </template>
 
-          <Button
-            variant="ghost"
-            size="icon"
-            class="h-7 w-7 text-muted-foreground"
+          <button
+            type="button"
+            class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors cursor-pointer"
             :aria-label="expanded ? '收起任务明细' : '展开任务明细'"
             :aria-expanded="expanded"
             :aria-controls="`job-details-${job.id}`"
             :aria-busy="loadingItems"
             @click="toggleExpand"
           >
-            <Loader2 v-if="expanded && showLoadingIndicator" class="w-4 h-4 animate-spin" />
-            <ChevronDown v-else :class="['w-4 h-4 transition-transform duration-300', expanded ? 'rotate-180' : '']" />
-          </Button>
+            <ChevronDown :class="['w-4 h-4 transition-transform duration-[260ms] ease-[cubic-bezier(0.22,1,0.36,1)]', expanded ? 'rotate-180' : '']" />
+          </button>
         </div>
       </div>
 
@@ -708,7 +732,12 @@ function downloadExportTxt() {
     </div>
 
     <!-- Expanded Per-Video Rows -->
-    <AnimatedCollapse :id="`job-details-${job.id}`" :open="detailsOpen" @after-leave="handleDetailsAfterLeave">
+    <AnimatedCollapse
+      :id="`job-details-${job.id}`"
+      :open="detailsOpen"
+      :content-key="detailsContentKey"
+      @after-leave="handleDetailsAfterLeave"
+    >
       <div
         v-if="detailsMounted"
         class="job-details border-t border-border bg-surface-subtle/50 dark:bg-surface-subtle/25 px-4 sm:px-5 py-3.5"
@@ -917,7 +946,7 @@ function downloadExportTxt() {
 
 .job-card-collapsed {
   content-visibility: auto;
-  contain-intrinsic-size: auto 92px;
+  contain-intrinsic-size: auto 84px;
 }
 
 .job-item-row {

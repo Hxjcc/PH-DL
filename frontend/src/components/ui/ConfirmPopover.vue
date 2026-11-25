@@ -8,10 +8,11 @@ const props = defineProps({
   description: { type: String, default: '' },
   confirmText: { type: String, default: '确认' },
   destructive: { type: Boolean, default: true },
+  defaultOpen: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['confirm', 'open-change'])
-const open = ref(false)
+const open = ref(props.defaultOpen)
 
 watch(open, (val) => {
   emit('open-change', val)

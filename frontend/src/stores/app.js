@@ -781,7 +781,21 @@ export const useAppStore = defineStore('app', {
     _upsertJob(job) {
       const idx = this.jobs.findIndex((j) => j.id === job.id)
       if (idx >= 0) {
-        this.jobs[idx] = { ...this.jobs[idx], ...job }
+        const cur = this.jobs[idx]
+        const unchanged =
+          cur.status === job.status &&
+          cur.total_items === job.total_items &&
+          cur.done_items === job.done_items &&
+          cur.uploaded_items === job.uploaded_items &&
+          cur.failed_items === job.failed_items &&
+          cur.skipped_items === job.skipped_items &&
+          cur.error_message === job.error_message &&
+          cur.finished_at === job.finished_at &&
+          cur.label === job.label &&
+          cur.export_text === job.export_text &&
+          cur.params_json === job.params_json
+        if (unchanged) return
+        this.jobs[idx] = { ...cur, ...job }
       } else {
         this.jobs.unshift(job)
       }

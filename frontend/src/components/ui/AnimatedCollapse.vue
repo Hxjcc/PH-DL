@@ -1,143 +1,135 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
+  contentKey: { type: [String, Number, Boolean], default: '' },
 })
 
 const emit = defineEmits(['after-enter', 'after-leave'])
 
 const wrapper = ref(null)
 const content = ref(null)
-const heightValue = ref(props.open ? 'auto' : '0px')
-const transitionEnabled = ref(false)
 
-let rafId = 0
 let fallbackTimer = null
 let animToken = 0
-let activePhase = null
+let activePhase = null // 'enter' | 'leave' | 'resize' | null
 
 function prefersReducedMotion() {
   return typeof window !== 'undefined' && Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches)
 }
 
-function clearPending() {
-  if (rafId) {
-    cancelAnimationFrame(rafId)
-    rafId = 0
-  }
+function clearFallback() {
   if (fallbackTimer) {
     clearTimeout(fallbackTimer)
     fallbackTimer = null
   }
 }
 
-function finishTransition(token, opening) {
+function applySettledState(isOpen) {
+  const el = wrapper.value
+  if (!el) return
+  el.style.transition = 'none'
+  el.style.height = isOpen ? 'auto' : '0px'
+  el.style.opacity = isOpen ? '1' : '0'
+  el.style.willChange = ''
+}
+
+function finishTransition(token, phase) {
   if (token !== animToken) return
-  clearPending()
+  clearFallback()
   activePhase = null
-  transitionEnabled.value = false
-  if (opening && props.open) {
-    heightValue.value = 'auto'
-    emit('after-enter')
-  } else if (!opening && !props.open) {
-    heightValue.value = '0px'
-    emit('after-leave')
+  if (phase === 'leave') {
+    if (!props.open) {
+      applySettledState(false)
+      emit('after-leave')
+    }
+  } else if (props.open) {
+    applySettledState(true)
+    if (phase === 'enter') emit('after-enter')
   }
+}
+
+function animateHeight(fromPx, toPx, phase, fromOpacity, toOpacity) {
+  const el = wrapper.value
+  if (!el) return
+  clearFallback()
+  const token = ++animToken
+
+  if (prefersReducedMotion() || Math.abs(toPx - fromPx) < 1) {
+    activePhase = null
+    applySettledState(phase !== 'leave')
+    if (phase === 'enter') emit('after-enter')
+    else if (phase === 'leave') emit('after-leave')
+    return
+  }
+
+  activePhase = phase
+  el.style.transition = 'none'
+  el.style.height = `${fromPx}px`
+  el.style.opacity = String(fromOpacity)
+  el.style.willChange = 'height, opacity'
+
+  // Force style/layout commit so the browser transitions cleanly from `fromPx` to `toPx`.
+  void el.offsetHeight
+
+  el.style.transition = ''
+  el.style.height = `${toPx}px`
+  el.style.opacity = String(toOpacity)
+
+  fallbackTimer = setTimeout(() => finishTransition(token, phase), 340)
 }
 
 function onTransitionEnd(e) {
   if (e.target !== wrapper.value || e.propertyName !== 'height' || !activePhase) return
-  finishTransition(animToken, activePhase === 'enter')
+  finishTransition(animToken, activePhase)
 }
 
+onMounted(() => {
+  applySettledState(props.open)
+})
+
 watch(
-  () => props.open,
-  async (isOpen) => {
-    clearPending()
-    const token = ++animToken
-
-    if (isOpen) {
-      await nextTick()
-      if (token !== animToken) return
-      const targetHeight = Math.ceil(content.value?.scrollHeight || 0)
-      if (prefersReducedMotion() || targetHeight <= 0) {
-        activePhase = null
-        transitionEnabled.value = false
-        heightValue.value = 'auto'
-        emit('after-enter')
-        return
+  [() => props.open, () => props.contentKey],
+  async ([isOpen], [wasOpen]) => {
+    const el = wrapper.value
+    if (!el) return
+    if (isOpen !== wasOpen) {
+      if (isOpen) {
+        const startHeight = Math.ceil(el.getBoundingClientRect().height)
+        await nextTick()
+        if (!props.open) return
+        const targetHeight = Math.ceil(content.value?.scrollHeight || 0)
+        const startOpacity = startHeight > 0 ? Number(getComputedStyle(el).opacity || 1) : 0
+        animateHeight(startHeight, targetHeight, 'enter', startOpacity, 1)
+      } else {
+        const startHeight = Math.ceil(el.getBoundingClientRect().height)
+        const startOpacity = Number(getComputedStyle(el).opacity || 1)
+        animateHeight(startHeight, 0, 'leave', startOpacity, 0)
       }
-
-      const startHeight = Math.ceil(wrapper.value?.getBoundingClientRect().height || 0)
-      if (startHeight >= targetHeight) {
-        activePhase = null
-        transitionEnabled.value = false
-        heightValue.value = 'auto'
-        emit('after-enter')
-        return
-      }
-
-      activePhase = 'enter'
-      transitionEnabled.value = false
-      heightValue.value = `${startHeight}px`
-      await nextTick()
-      if (token !== animToken) return
-
-      rafId = requestAnimationFrame(() => {
-        rafId = 0
-        if (token !== animToken || !props.open) return
-        const measured = Math.ceil(content.value?.scrollHeight || 0)
-        if (measured <= startHeight) {
-          finishTransition(token, true)
-          return
-        }
-        transitionEnabled.value = true
-        heightValue.value = `${measured}px`
-        fallbackTimer = setTimeout(() => finishTransition(token, true), 240)
-      })
-    } else {
-      const startHeight = Math.ceil(wrapper.value?.getBoundingClientRect().height || 0)
-      if (prefersReducedMotion() || startHeight <= 0) {
-        activePhase = null
-        transitionEnabled.value = false
-        heightValue.value = '0px'
-        emit('after-leave')
-        return
-      }
-
-      activePhase = 'leave'
-      transitionEnabled.value = false
-      heightValue.value = `${startHeight}px`
-      await nextTick()
-      if (token !== animToken) return
-
-      rafId = requestAnimationFrame(() => {
-        rafId = 0
-        if (token !== animToken || props.open) return
-        transitionEnabled.value = true
-        heightValue.value = '0px'
-        fallbackTimer = setTimeout(() => finishTransition(token, false), 240)
-      })
+      return
+    }
+    if (!isOpen) return
+    const startHeight = Math.ceil(el.getBoundingClientRect().height)
+    await nextTick()
+    if (!props.open) return
+    const targetHeight = Math.ceil(content.value?.scrollHeight || 0)
+    if (Math.abs(targetHeight - startHeight) >= 4) {
+      animateHeight(startHeight, targetHeight, 'resize', 1, 1)
     }
   }
 )
 
 onBeforeUnmount(() => {
   animToken += 1
-  clearPending()
+  clearFallback()
 })
-
-const wrapperStyle = computed(() => ({
-  height: heightValue.value,
-}))
 </script>
 
 <template>
   <div
     ref="wrapper"
-    :class="['animated-collapse', transitionEnabled ? 'animated-collapse-transition' : '']"
-    :style="wrapperStyle"
+    class="animated-collapse"
     :inert="!open"
     :aria-hidden="!open"
     @transitionend="onTransitionEnd"
@@ -150,12 +142,12 @@ const wrapperStyle = computed(() => ({
 
 <style scoped>
 .animated-collapse {
+  height: 0;
+  opacity: 0;
   overflow: hidden;
-}
-
-.animated-collapse-transition {
-  transition: height 180ms cubic-bezier(0.22, 1, 0.36, 1);
-  will-change: height;
+  transition:
+    height 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 200ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .collapse-content {
@@ -163,9 +155,8 @@ const wrapperStyle = computed(() => ({
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .animated-collapse-transition {
+  .animated-collapse {
     transition: none;
-    will-change: auto;
   }
 }
 </style>
