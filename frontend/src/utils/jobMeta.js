@@ -94,10 +94,19 @@ function stripKnownPrefix(rawLabel = '') {
   return text.trim()
 }
 
+const targetLookupCache = new WeakMap()
+const EMPTY_TARGET_LOOKUP = Object.freeze({ byId: new Map(), byName: new Map() })
+
 function buildTargetLookup(targetsList = []) {
+  if (!Array.isArray(targetsList) || targetsList.length === 0) {
+    return EMPTY_TARGET_LOOKUP
+  }
+  const cached = targetLookupCache.get(targetsList)
+  if (cached) return cached
+
   const byId = new Map()
   const byName = new Map()
-  for (const t of targetsList || []) {
+  for (const t of targetsList) {
     if (!t) continue
     if (t.id != null) byId.set(Number(t.id), t)
     const uname = String(t.username || '').trim().toLowerCase()
@@ -105,7 +114,9 @@ function buildTargetLookup(targetsList = []) {
     if (uname && !byName.has(uname)) byName.set(uname, t)
     if (dname && !byName.has(dname)) byName.set(dname, t)
   }
-  return { byId, byName }
+  const lookup = { byId, byName }
+  targetLookupCache.set(targetsList, lookup)
+  return lookup
 }
 
 function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames = {}) {
@@ -367,16 +378,27 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
     failed = Math.max(failed, iFailed)
   }
 
-  let speedBps = 0
+  let downloadSpeedBps = 0
+  let uploadSpeedBps = 0
   let fractional = 0
   let liveDlCount = 0
+  let liveUpCount = 0
   const jobIdNum = Number(job?.id)
   if (liveProgressMap && jobIdNum > 0) {
     for (const prog of Object.values(liveProgressMap)) {
       if (!prog || Number(prog.job_id) !== jobIdNum) continue
+      const phase = String(prog.phase || 'downloading').toLowerCase()
+      const spd = Number(prog.speed_bps || 0)
+      if (phase === 'uploading' || phase === 'verifying') {
+        liveUpCount += 1
+        if (spd > 0) {
+          uploadSpeedBps += spd
+        }
+        continue
+      }
       liveDlCount += 1
-      if (Number(prog.speed_bps) > 0) {
-        speedBps += Number(prog.speed_bps)
+      if (spd > 0) {
+        downloadSpeedBps += spd
       }
       const bDone = Number(prog.bytes_downloaded || 0)
       const bTotal = Number(prog.bytes_total || 0)
@@ -386,6 +408,8 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
     }
   }
   downloadingCount = Math.max(downloadingCount, liveDlCount)
+  uploadingCount = Math.max(uploadingCount, liveUpCount)
+  const speedBps = downloadSpeedBps
 
   const finishedCount = done + skipped + failed
   const isActive = ['queued', 'scanning', 'running'].includes(job?.status)
@@ -430,10 +454,95 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
     finishedCount,
     percent,
     speedBps,
+    downloadSpeedBps,
+    uploadSpeedBps,
     downloadingCount,
     uploadingCount,
     indeterminate,
     phaseText,
     durationText: formatDurationCompact(job?.started_at, job?.finished_at),
   }
+}
+
+const ITEM_STATUS_ORDER = [
+  'downloading',
+  'uploading',
+  'downloaded',
+  'pending',
+  'done',
+  'skipped',
+  'failed',
+  'cancelled',
+]
+
+const ITEM_STATUS_PILL_META = {
+  downloading: { label: '下载中', dot: 'bg-brand' },
+  uploading: { label: '上传中', dot: 'bg-amber-500' },
+  downloaded: { label: '已落盘', dot: 'bg-sky-500' },
+  pending: { label: '等待中', dot: 'bg-zinc-400' },
+  done: { label: '已上传', dot: 'bg-emerald-500' },
+  skipped: { label: '已跳过', dot: 'bg-zinc-400' },
+  failed: { label: '失败', dot: 'bg-red-500' },
+  cancelled: { label: '已取消', dot: 'bg-zinc-400' },
+}
+
+const METADATA_ITEM_STATUS_LABELS = {
+  pending: '等待补全',
+  done: '已补全',
+  failed: '失败',
+  cancelled: '已取消',
+}
+
+function getItemStatusPillMeta(status, isMetadataJob = false) {
+  const base = ITEM_STATUS_PILL_META[status] || { label: status || '未知', dot: 'bg-zinc-400' }
+  if (isMetadataJob && METADATA_ITEM_STATUS_LABELS[status]) {
+    return { label: METADATA_ITEM_STATUS_LABELS[status], dot: base.dot }
+  }
+  return base
+}
+
+export function buildItemStatusPills(items = [], { isMetadataJob = false, activeFilter = 'all' } = {}) {
+  const list = Array.isArray(items) ? items : []
+  const counts = Object.create(null)
+  const extraStatuses = []
+
+  for (const it of list) {
+    const status = String(it?.status || '').trim()
+    if (!status) continue
+    if (counts[status] == null) {
+      counts[status] = 0
+      if (!ITEM_STATUS_ORDER.includes(status)) {
+        extraStatuses.push(status)
+      }
+    }
+    counts[status] += 1
+  }
+
+  const pills = [{ value: 'all', label: '全部', count: list.length, dot: '' }]
+  const orderedStatuses = [...ITEM_STATUS_ORDER, ...extraStatuses]
+
+  if (activeFilter && activeFilter !== 'all' && !orderedStatuses.includes(activeFilter)) {
+    orderedStatuses.push(activeFilter)
+  }
+
+  for (const status of orderedStatuses) {
+    const count = counts[status] || 0
+    if (count > 0 || activeFilter === status) {
+      const meta = getItemStatusPillMeta(status, isMetadataJob)
+      pills.push({
+        value: status,
+        label: meta.label,
+        count,
+        dot: meta.dot,
+      })
+    }
+  }
+
+  return pills
+}
+
+export function filterJobItemsByStatus(items = [], filter = 'all') {
+  const list = Array.isArray(items) ? items : []
+  if (!filter || filter === 'all') return list
+  return list.filter((it) => it?.status === filter)
 }

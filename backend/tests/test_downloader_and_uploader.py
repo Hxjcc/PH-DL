@@ -437,3 +437,104 @@ async def test_probe_download_size_reads_range_total_without_body(tmp_path: Path
     assert kwargs["headers"]["Range"] == "bytes=0-0"
     assert kwargs["headers"]["Cookie"] == "sess=abc"
     assert kwargs["headers"]["Referer"].endswith("viewkey=vk_size")
+
+
+async def test_uploader_streams_json_progress_and_caches_remote_session(tmp_path: Path, monkeypatch):
+    dl_dir = tmp_path / "alice"
+    dl_dir.mkdir()
+    f1 = dl_dir / "Clip One [vk1].mp4"
+    f2 = dl_dir / "Clip Two [vk2].mp4"
+    f1.write_bytes(VALID_MP4)
+    f2.write_bytes(VALID_MP4)
+
+    # First exercise real streaming _run_cmd(on_stderr_line=...) on a subprocess
+    streamed_lines: List[str] = []
+    rc, _, _ = await uploader._run_cmd(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; "
+                "sys.stderr.write(json.dumps({'level':'notice','stats':{'bytes':50,'speed':100}}) + '\\n'); "
+                "sys.stderr.flush()"
+            ),
+        ],
+        timeout=5.0,
+        on_stderr_line=streamed_lines.append,
+    )
+    assert rc == 0 and len(streamed_lines) == 1
+    assert uploader.parse_rclone_json_line(streamed_lines[0])["stats"]["bytes"] == 50
+
+    # Now verify upload_file_batch emits uploading/verifying progress and reuses UploadSessionCache
+    cmd_actions: List[str] = []
+    progress_events: List[tuple[str, int, int, float, str]] = []
+
+    async def fake_run_cmd(cmd: List[str], **kwargs):
+        action = cmd[1]
+        cmd_actions.append(action)
+        if action == "listremotes":
+            return 0, "pikpak: pikpak\n", ""
+        if action == "mkdir":
+            return 0, "", ""
+        if action == "copy":
+            assert "--use-json-log" in cmd
+            assert "--stats=500ms" in cmd
+            cb = kwargs.get("on_stderr_line")
+            assert cb is not None
+            list_file = Path(cmd[cmd.index("--files-from-raw") + 1])
+            rel_name = list_file.read_text(encoding="utf-8").strip().splitlines()[0]
+            cb(
+                json.dumps(
+                    {
+                        "level": "notice",
+                        "stats": {
+                            "speed": 125_000_000,
+                            "transferring": [
+                                {
+                                    "name": rel_name,
+                                    "bytes": len(VALID_MP4) // 2,
+                                    "size": len(VALID_MP4),
+                                    "speed": 125_000_000,
+                                }
+                            ],
+                        },
+                    }
+                )
+            )
+            return 0, "", ""
+        if action == "lsjson":
+            return 0, json.dumps({"Size": len(VALID_MP4), "IsDir": False}), ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(uploader, "_run_cmd", fake_run_cmd)
+    settings = RuntimeSettings(rclone_remote="pikpak", rclone_remote_base_dir="Pornhub", min_file_size_bytes=64)
+    cache = uploader.UploadSessionCache()
+
+    def on_progress(vk: str, sent: int, total: int, speed: float, phase: str) -> None:
+        progress_events.append((vk, sent, total, speed, phase))
+
+    res1 = await uploader.upload_file_batch(
+        download_dir=dl_dir,
+        uploader_folder="alice",
+        files_by_viewkey={"vk1": f1},
+        settings=settings,
+        session_cache=cache,
+        on_progress=on_progress,
+    )
+    res2 = await uploader.upload_file_batch(
+        download_dir=dl_dir,
+        uploader_folder="alice",
+        files_by_viewkey={"vk2": f2},
+        settings=settings,
+        session_cache=cache,
+        on_progress=on_progress,
+    )
+    assert res1.uploaded_viewkeys == ["vk1"]
+    assert res2.uploaded_viewkeys == ["vk2"]
+    # Session cache prevents repeating listremotes and mkdir on the second upload to the same remote dir!
+    assert cmd_actions.count("listremotes") == 1
+    assert cmd_actions.count("mkdir") == 1
+    assert cmd_actions.count("copy") == 2
+    assert any(vk == "vk1" and phase == "uploading" and speed == 125_000_000 for vk, _, _, speed, phase in progress_events)
+    assert any(vk == "vk1" and phase == "verifying" and sent == len(VALID_MP4) for vk, sent, _, _, phase in progress_events)
+    assert any(vk == "vk2" and phase == "uploading" for vk, _, _, _, phase in progress_events)

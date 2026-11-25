@@ -17,6 +17,7 @@ class EventBus:
         self._logs: Deque[Dict[str, Any]] = deque(maxlen=max_logs)
         self._log_seq: int = 0
         self._live_progress: Dict[int, Dict[str, Any]] = {}
+        self._scheduler_status: Dict[int, Dict[str, Any]] = {}
 
     def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
         q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=500)
@@ -67,6 +68,7 @@ class EventBus:
         bytes_downloaded: int,
         bytes_total: int,
         speed_bps: float,
+        phase: str = "downloading",
     ) -> None:
         payload = {
             "job_id": job_id,
@@ -74,6 +76,7 @@ class EventBus:
             "bytes_downloaded": int(bytes_downloaded),
             "bytes_total": int(bytes_total),
             "speed_bps": round(float(speed_bps), 1),
+            "phase": (phase or "downloading").strip().lower(),
         }
         self._live_progress[item_id] = payload
         self.broadcast("item_progress", payload)
@@ -81,9 +84,19 @@ class EventBus:
     def clear_item_progress(self, item_id: int) -> None:
         self._live_progress.pop(item_id, None)
 
+    def emit_scheduler_status(self, job_id: int, status: Dict[str, Any]) -> None:
+        payload = {"job_id": int(job_id), **status}
+        self._scheduler_status[int(job_id)] = payload
+        self.broadcast("job_scheduler", payload)
+
+    def clear_scheduler_status(self, job_id: int) -> None:
+        if self._scheduler_status.pop(int(job_id), None) is not None:
+            self.broadcast("job_scheduler", {"job_id": int(job_id), "cleared": True})
+
     def clear_job_progress(self, job_id: int) -> None:
         for k in [k for k, v in self._live_progress.items() if v.get("job_id") == job_id]:
             self._live_progress.pop(k, None)
+        self.clear_scheduler_status(job_id)
 
     def recent_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
         if limit <= 0:
@@ -95,3 +108,6 @@ class EventBus:
 
     def live_progress_snapshot(self) -> Dict[int, Dict[str, Any]]:
         return dict(self._live_progress)
+
+    def scheduler_status_snapshot(self) -> Dict[int, Dict[str, Any]]:
+        return dict(self._scheduler_status)

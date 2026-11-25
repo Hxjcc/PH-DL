@@ -46,6 +46,7 @@ class DownloadOutcome:
     quality: str = ""
     download_url: str = ""
     error: str = ""
+    disk_wait_bytes: int = 0
 
 
 class _RangeMismatch(Exception):
@@ -53,16 +54,29 @@ class _RangeMismatch(Exception):
 
 
 class _DiskSpaceError(Exception):
-    pass
+    def __init__(self, message: str, *, required_bytes: int = 0, during_write: bool = False) -> None:
+        super().__init__(message)
+        self.required_bytes = max(0, int(required_bytes))
+        self.during_write = during_write
 
 
 class DownloadDiskBudget:
     """Reserve known response sizes across downloads and enforce the floor on writes."""
 
+    _CHECK_INTERVAL_BYTES = 4 * 1024 * 1024
+    _STRICT_NEAR_FLOOR_BYTES = 64 * 1024 * 1024
+
     def __init__(self, path: Path, keep_free_bytes: int):
         self.path = path
         self.keep_free_bytes = max(0, int(keep_free_bytes))
         self._reserved = 0
+
+    @property
+    def reserved_bytes(self) -> int:
+        return self._reserved
+
+    def free_bytes(self) -> int:
+        return int(shutil.disk_usage(self.path).free)
 
     @contextlib.contextmanager
     def reserve(self, expected_bytes: int) -> Iterator[Callable[[int], None]]:
@@ -71,14 +85,31 @@ class DownloadDiskBudget:
             return
 
         remaining = max(0, expected_bytes)
-        if shutil.disk_usage(self.path).free < self.keep_free_bytes + self._reserved + remaining:
-            raise _DiskSpaceError("磁盘余量不足，无法为此下载预留空间")
+        initial_free = shutil.disk_usage(self.path).free
+        if initial_free < self.keep_free_bytes + self._reserved + remaining:
+            raise _DiskSpaceError("磁盘余量不足，无法为此下载预留空间", required_bytes=remaining)
         self._reserved += remaining
+        last_free = initial_free
+        written_since_check = 0
         try:
             def before_write(size: int) -> None:
+                nonlocal last_free, written_since_check
                 others = self._reserved - remaining
-                if shutil.disk_usage(self.path).free < self.keep_free_bytes + others + size:
-                    raise _DiskSpaceError("写入会低于磁盘保留空间，已保留下载断点")
+                projected_free = last_free - written_since_check - size
+                need_check = (
+                    written_since_check + size >= self._CHECK_INTERVAL_BYTES
+                    or projected_free < self.keep_free_bytes + others + self._STRICT_NEAR_FLOOR_BYTES
+                )
+                if need_check:
+                    last_free = shutil.disk_usage(self.path).free
+                    written_since_check = 0
+                    if last_free < self.keep_free_bytes + others + size:
+                        raise _DiskSpaceError(
+                            "写入会低于磁盘保留空间，已保留下载断点",
+                            required_bytes=max(size, remaining),
+                            during_write=True,
+                        )
+                written_since_check += size
 
             def consume(size: int) -> None:
                 nonlocal remaining
@@ -250,7 +281,7 @@ async def download_mp4_with_resume(
         if on_log:
             on_log(level, message)
 
-    def incomplete(error: str, *, cancelled: bool = False) -> DownloadOutcome:
+    def incomplete(error: str, *, cancelled: bool = False, disk_wait_bytes: int = 0) -> DownloadOutcome:
         try:
             size = _size(part)
         except OSError:
@@ -263,6 +294,7 @@ async def download_mp4_with_resume(
             quality=current_quality,
             download_url=url,
             error=error,
+            disk_wait_bytes=max(0, int(disk_wait_bytes)),
         )
 
     def new_part() -> Path:
@@ -364,15 +396,26 @@ async def download_mp4_with_resume(
                 last_tick = time.monotonic()
                 if on_progress:
                     on_progress(downloaded, total, 0.0)
-                # Unbuffered writes make the free-space check cover bytes already written.
+                # Unbuffered writes keep the disk free-space check aligned with written bytes;
+                # offload large chunks to a worker thread so 1000 Mbps disk I/O never stalls the loop.
                 with open(part, mode, buffering=0) as fp:
-                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                    async for chunk in response.content.iter_chunked(2 * 1024 * 1024):
                         if stop.is_set():
                             raise StopRequested
                         if expected and downloaded - start + len(chunk) > expected:
                             raise _RangeMismatch("下载响应超过声明的字节范围")
                         prepare_write(len(chunk))
-                        if fp.write(chunk) != len(chunk):
+                        if len(chunk) >= 512 * 1024:
+                            write_task = asyncio.create_task(asyncio.to_thread(fp.write, chunk))
+                            try:
+                                written = await write_task
+                            except BaseException:
+                                with contextlib.suppress(Exception):
+                                    await write_task
+                                raise
+                        else:
+                            written = fp.write(chunk)
+                        if written != len(chunk):
                             raise OSError("未能写入全部下载数据")
                         downloaded += len(chunk)
                         bytes_since_tick += len(chunk)
@@ -435,7 +478,7 @@ async def download_mp4_with_resume(
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 last_error = f"下载连接中断: {type(err).__name__}"
             except _DiskSpaceError as err:
-                return incomplete(str(err))
+                return incomplete(str(err), disk_wait_bytes=err.required_bytes)
 
             if attempt < attempts - 1:
                 emit("WARNING", f"{title}: {last_error}，准备重试")

@@ -187,9 +187,16 @@ async def get_job_detail(job_id: int, container: AppContainer = Depends(require_
     for it in items:
         prog = live.get(int(it["id"]))
         if prog:
-            it["bytes_downloaded"] = prog["bytes_downloaded"]
-            it["bytes_total"] = prog["bytes_total"]
+            phase = prog.get("phase", "downloading")
+            it["progress_phase"] = phase
             it["speed_bps"] = prog["speed_bps"]
+            if phase in {"uploading", "verifying"}:
+                it["upload_bytes"] = prog["bytes_downloaded"]
+                if prog["bytes_total"] > 0:
+                    it["bytes_total"] = prog["bytes_total"]
+            else:
+                it["bytes_downloaded"] = prog["bytes_downloaded"]
+                it["bytes_total"] = prog["bytes_total"]
         else:
             it["speed_bps"] = 0.0
     return {"job": job, "items": items}

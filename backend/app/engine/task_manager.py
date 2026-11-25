@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import random
 import shutil
@@ -37,8 +38,14 @@ from ..services.downloader import (
 )
 from ..services.filename import is_valid_video_file, normalized_quality, sanitize_filename, video_filename_base
 from ..services.notifier import build_auto_update_report, send_serverchan
-from ..services.uploader import delete_verified_source, file_snapshot, upload_file_batch
+from ..services.uploader import (
+    UploadSessionCache,
+    delete_verified_source,
+    file_snapshot,
+    upload_file_batch,
+)
 from .events import EventBus
+from .disk_scheduler import AdaptiveDiskScheduler, SmartUploadPool, UploadQueuedItem
 
 
 def _split_csv_set(raw: Optional[str], lower: bool = False) -> Optional[Set[str]]:
@@ -64,17 +71,43 @@ def _target_folder_name(username: Optional[str], target_type: str) -> str:
     return clean
 
 
-_FLUSH_SENTINEL = object()
-
-
 @dataclass
-class _UploadQueuedItem:
+class _PendingParseSpec:
     item_id: int
-    viewkey: str
-    uploader_folder: str
-    download_dir: Path
-    local_path: Path
-    page_url: str = ""
+    page_url: str
+    page_num: int
+    item_num: int
+    default_uploader: str
+    default_type: str
+    group_by_uploader: bool = False
+    uploader_hint: Optional[Tuple[str, str]] = None
+
+
+async def _invoke_upload_file_batch(
+    *,
+    download_dir: Path,
+    uploader_folder: str,
+    files_by_viewkey: Dict[str, Path],
+    settings: RuntimeSettings,
+    cancel_event: Optional[asyncio.Event],
+    session_cache: UploadSessionCache,
+    on_progress: Optional[Callable[[str, int, int, float, str], None]],
+):
+    """Invoke `upload_file_batch`, staying compatible with legacy 5-arg test mocks."""
+    params = inspect.signature(upload_file_batch).parameters
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kwargs: Dict[str, Any] = {
+        "download_dir": download_dir,
+        "uploader_folder": uploader_folder,
+        "files_by_viewkey": files_by_viewkey,
+        "settings": settings,
+        "cancel_event": cancel_event,
+    }
+    if has_var_kw or "session_cache" in params:
+        kwargs["session_cache"] = session_cache
+    if has_var_kw or "on_progress" in params:
+        kwargs["on_progress"] = on_progress
+    return await upload_file_batch(**kwargs)
 
 
 class TaskManager:
@@ -369,7 +402,7 @@ class TaskManager:
             )
 
     # ------------------------------------------------------------------
-    # Pipeline: Concurrent Download -> Streaming rclone Upload + Backpressure
+    # Pipeline: Streaming Pre-Parse -> Adaptive Download -> Multi-Worker Upload
     # ------------------------------------------------------------------
     async def _run_download_upload_pipeline(
         self,
@@ -383,8 +416,11 @@ class TaskManager:
         preferred_qualities: Optional[Set[str]] = None,
         item_preferred_qualities: Optional[Dict[int, Optional[Set[str]]]] = None,
         allow_reparse_retry: bool = True,
+        parse_specs: Optional[Dict[int, _PendingParseSpec]] = None,
+        include_keywords: Optional[Set[str]] = None,
+        exclude_keywords: Optional[Set[str]] = None,
     ) -> Tuple[Dict[str, int], Dict[str, List[str]]]:
-        """Download items concurrently and stream completed files into rclone upload batches."""
+        """Stream pre-parse, byte-adaptive downloads, and multi-worker zero-wait uploads."""
         uploaded_by_uploader: Dict[str, int] = defaultdict(int)
         failed_urls_by_uploader: Dict[str, List[str]] = defaultdict(list)
 
@@ -404,19 +440,32 @@ class TaskManager:
         if running_job:
             self.events.broadcast("job_updated", running_job)
 
-        upload_queue: asyncio.Queue[Any] = asyncio.Queue()
         disk_budget = DownloadDiskBudget(self.env.temp_dir, int(settings.min_free_disk_gb * 1024 ** 3))
-        pending_local_count = 0
-        flush_pending = False
-        pending_lock = asyncio.Lock()
-        space_freed_event = asyncio.Event()
-        space_freed_event.set()
+        upload_worker_count = max(1, int(getattr(settings, "upload_workers", 2))) if auto_upload else 0
+        scheduler = AdaptiveDiskScheduler(
+            self.env.resolved_data_dir,
+            disk_budget,
+            max_downloads=max(1, settings.max_concurrent_downloads),
+            max_uploads=max(1, upload_worker_count),
+            min_free_disk_gb=settings.min_free_disk_gb,
+            max_pending_upload_files=settings.max_pending_upload_files,
+            disk_usage_fn=lambda p: shutil.disk_usage(p),
+            on_status=lambda snap: self.events.emit_scheduler_status(job_id, snap),
+        )
+        upload_pool = SmartUploadPool(
+            scheduler,
+            batch_trigger_size=max(1, int(settings.upload_batch_size)),
+            chunk_size=max(1, int(settings.rclone_transfers)),
+            allow_small_micro_batch=True,
+        )
+        upload_session_cache = UploadSessionCache()
+        scheduler.emit_status(force=True)
 
-        async def _mark_entries_cancelled(entries: List[_UploadQueuedItem]) -> None:
-            nonlocal pending_local_count
+        async def _mark_entries_cancelled(entries: List[UploadQueuedItem]) -> None:
             if not entries:
                 return
             for entry in entries:
+                self.events.clear_item_progress(entry.item_id)
                 it = await self.repo.update_job_item(
                     entry.item_id,
                     status="cancelled",
@@ -429,79 +478,86 @@ class TaskManager:
                     f"[上传失败] {entry.local_path.name}: 上传已取消，保留本地文件",
                     job_id=job_id,
                 )
-            async with pending_lock:
-                pending_local_count = max(0, pending_local_count - len(entries))
-                space_freed_event.set()
+            await scheduler.on_upload_discarded(len(entries), sum(e.file_size for e in entries))
             refreshed = await self.repo.recalculate_job_counts(job_id)
             if refreshed:
                 self.events.broadcast("job_updated", refreshed)
 
-        async def _flush_uploader_group(
-            uploader_folder: str,
-            download_dir: Path,
-            batch_entries: List[_UploadQueuedItem],
-        ) -> None:
-            nonlocal pending_local_count
-            if not batch_entries:
+        async def _upload_chunk(chunk: List[UploadQueuedItem]) -> None:
+            if not chunk:
                 return
             if ctx.cancel_event.is_set():
-                await _mark_entries_cancelled(batch_entries)
+                await _mark_entries_cancelled(chunk)
                 return
 
-            chunk_size = max(1, int(settings.rclone_transfers))
-            batch_total = len(batch_entries)
-            batch_verified = 0
-            batch_deleted = 0
+            uploader_folder = chunk[0].uploader_folder
+            download_dir = chunk[0].download_dir
             remote_target = (
                 f"{settings.rclone_remote}:{settings.rclone_remote_base_dir}/{uploader_folder}"
                 if settings.rclone_remote_base_dir
                 else f"{settings.rclone_remote}:{uploader_folder}"
             )
+            vk_to_entry = {e.viewkey: e for e in chunk}
+            chunk_bytes = sum(e.file_size for e in chunk)
 
-            for offset in range(0, batch_total, chunk_size):
-                if ctx.cancel_event.is_set():
-                    await _mark_entries_cancelled(batch_entries[offset:])
-                    break
+            for entry in chunk:
+                it = await self.repo.update_job_item(entry.item_id, status="uploading")
+                if it:
+                    self.events.broadcast("item_updated", it)
+                self.events.emit_item_progress(
+                    job_id,
+                    entry.item_id,
+                    0,
+                    entry.file_size,
+                    0.0,
+                    phase="uploading",
+                )
 
-                chunk = batch_entries[offset : offset + chunk_size]
-                for entry in chunk:
-                    it = await self.repo.update_job_item(entry.item_id, status="uploading")
-                    if it:
-                        self.events.broadcast("item_updated", it)
+            files_map = {e.viewkey: e.local_path for e in chunk}
+            if len(chunk) == 1:
+                size_mb = chunk[0].file_size / (1024 * 1024)
+                size_tag = f" ({size_mb:.1f} MB)" if chunk[0].file_size > 0 else ""
+                self.events.emit_log(
+                    "INFO",
+                    f"[上传] 开始上传至 {remote_target}: {chunk[0].local_path.name}{size_tag}",
+                    job_id=job_id,
+                )
+            else:
+                self.events.emit_log(
+                    "INFO",
+                    f"[上传] 开始向 {remote_target} 并行上传 {len(chunk)} 个视频...",
+                    job_id=job_id,
+                )
 
-                files_map = {e.viewkey: e.local_path for e in chunk}
-                if len(chunk) == 1:
-                    try:
-                        size_mb = chunk[0].local_path.stat().st_size / (1024 * 1024)
-                        size_tag = f" ({size_mb:.1f} MB)"
-                    except OSError:
-                        size_tag = ""
-                    self.events.emit_log(
-                        "INFO",
-                        f"[上传] ({offset + 1}/{batch_total}) 开始上传至 {remote_target}: "
-                        f"{chunk[0].local_path.name}{size_tag}",
-                        job_id=job_id,
+            def _on_upload_progress(vk: str, sent: int, total: int, speed: float, phase: str) -> None:
+                entry = vk_to_entry.get(vk)
+                if entry is not None:
+                    self.events.emit_item_progress(
+                        job_id,
+                        entry.item_id,
+                        sent,
+                        total if total > 0 else entry.file_size,
+                        speed,
+                        phase=phase,
                     )
-                else:
-                    self.events.emit_log(
-                        "INFO",
-                        f"[上传] ({offset + 1}-{offset + len(chunk)}/{batch_total}) "
-                        f"开始向 {remote_target} 上传 {len(chunk)} 个视频...",
-                        job_id=job_id,
-                    )
 
-                upload_started = time.monotonic()
-                up_res = await upload_file_batch(
+            await scheduler.on_upload_started()
+            upload_started = time.monotonic()
+            try:
+                up_res = await _invoke_upload_file_batch(
                     download_dir=download_dir,
                     uploader_folder=uploader_folder,
                     files_by_viewkey=files_map,
                     settings=settings,
                     cancel_event=ctx.cancel_event,
+                    session_cache=upload_session_cache,
+                    on_progress=_on_upload_progress,
                 )
                 elapsed = max(0.0, time.monotonic() - upload_started)
                 uploaded_set = set(up_res.uploaded_viewkeys)
 
                 for entry in chunk:
+                    self.events.clear_item_progress(entry.item_id)
                     snapshot = up_res.verified_sources.get(entry.viewkey)
                     if (
                         entry.viewkey in uploaded_set and snapshot is not None
@@ -518,7 +574,6 @@ class TaskManager:
                             await self.repo.clear_uploaded_local_path(entry.viewkey, local_path)
                             local_path = ""
                             removed_local = True
-                            batch_deleted += 1
                         elif not ctx.cancel_event.is_set():
                             self.events.emit_log(
                                 "WARNING",
@@ -535,12 +590,15 @@ class TaskManager:
                         if it:
                             self.events.broadcast("item_updated", it)
                         uploaded_by_uploader[uploader_folder] += 1
-                        batch_verified += 1
                         cleanup_note = "，已删除本地文件" if removed_local else "，保留本地副本"
+                        speed_note = ""
+                        if elapsed > 0.1 and entry.file_size > 0 and len(chunk) == 1:
+                            speed_mb_s = (entry.file_size / (1024 * 1024)) / elapsed
+                            speed_note = f", {speed_mb_s:.1f} MB/s"
                         self.events.emit_log(
                             "INFO",
                             f"[上传成功] {entry.local_path.name} -> {up_res.remote_dir} "
-                            f"(耗时 {elapsed:.1f}s{cleanup_note})",
+                            f"(耗时 {elapsed:.1f}s{speed_note}{cleanup_note})",
                             job_id=job_id,
                         )
                     else:
@@ -556,167 +614,67 @@ class TaskManager:
                         if not cancelled:
                             _record_failed_url(uploader_folder, entry.page_url)
                         self.events.emit_log("WARNING", f"[上传失败] {entry.local_path.name}: {err_txt}", job_id=job_id)
+            finally:
+                for entry in chunk:
+                    self.events.clear_item_progress(entry.item_id)
+                # Release disk backpressure immediately once local files are deleted.
+                await scheduler.on_upload_finished(len(chunk), chunk_bytes)
 
-                async with pending_lock:
-                    # Release backpressure immediately after each uploaded file/chunk.
-                    pending_local_count = max(0, pending_local_count - len(chunk))
-                    space_freed_event.set()
-
-                refreshed = await self.repo.recalculate_job_counts(job_id)
-                if refreshed:
-                    self.events.broadcast("job_updated", refreshed)
-
-            self.events.emit_log(
-                "INFO",
-                f"[上传完成] {uploader_folder}: 成功 {batch_verified}，删除本地 {batch_deleted}，"
-                f"未完成 {batch_total - batch_verified}",
-                job_id=job_id,
-            )
+            refreshed = await self.repo.recalculate_job_counts(job_id)
+            if refreshed:
+                self.events.broadcast("job_updated", refreshed)
 
         async def _upload_worker() -> None:
-            nonlocal flush_pending, pending_local_count
-            buffers: Dict[Tuple[str, Path], List[_UploadQueuedItem]] = defaultdict(list)
+            while True:
+                chunk = await upload_pool.take_next_chunk(ctx.cancel_event)
+                if chunk is None:
+                    return
+                await _upload_chunk(chunk)
+                if ctx.cancel_event.is_set():
+                    return
 
-            async def _cancel_all_buffered() -> None:
-                leftovers: List[_UploadQueuedItem] = []
-                for key in list(buffers.keys()):
-                    entries = buffers.pop(key, [])
-                    if entries:
-                        leftovers.extend(entries)
-                if leftovers:
-                    await _mark_entries_cancelled(leftovers)
+        async def _enqueue_for_upload(
+            *,
+            item_id: int,
+            viewkey: str,
+            uploader_folder: str,
+            download_dir: Path,
+            local_path: Path,
+            page_url: str,
+            file_size: int,
+        ) -> None:
+            size = int(file_size or 0)
+            if size <= 0:
+                with contextlib.suppress(OSError):
+                    size = local_path.stat().st_size
+            await scheduler.on_upload_queued(size)
+            await upload_pool.put(
+                UploadQueuedItem(
+                    item_id=item_id,
+                    viewkey=viewkey,
+                    uploader_folder=uploader_folder,
+                    download_dir=download_dir,
+                    local_path=local_path,
+                    page_url=page_url,
+                    file_size=size,
+                )
+            )
 
-            async def _flush_all() -> None:
-                for (folder, dl_dir) in list(buffers.keys()):
-                    entries = buffers.pop((folder, dl_dir), [])
-                    if not entries:
-                        continue
-                    if ctx.cancel_event.is_set():
-                        await _mark_entries_cancelled(entries)
-                    else:
-                        await _flush_uploader_group(folder, dl_dir, entries)
-
-            try:
-                while True:
-                    item = await upload_queue.get()
-                    try:
-                        if item is None:
-                            if ctx.cancel_event.is_set():
-                                await _cancel_all_buffered()
-                            else:
-                                await _flush_all()
-                            return
-                        if item is _FLUSH_SENTINEL:
-                            async with pending_lock:
-                                flush_pending = False
-                            if ctx.cancel_event.is_set():
-                                await _cancel_all_buffered()
-                            else:
-                                await _flush_all()
-                            async with pending_lock:
-                                space_freed_event.set()
-                            continue
-                        if ctx.cancel_event.is_set():
-                            await _cancel_all_buffered()
-                            await _mark_entries_cancelled([item])
-                            continue
-                        key = (item.uploader_folder, item.download_dir)
-                        buffers[key].append(item)
-                        if len(buffers[key]) >= settings.upload_batch_size:
-                            batch = buffers.pop(key)
-                            await _flush_uploader_group(item.uploader_folder, item.download_dir, batch)
-                            if ctx.cancel_event.is_set():
-                                await _cancel_all_buffered()
-                    finally:
-                        upload_queue.task_done()
-            finally:
-                if buffers and ctx.cancel_event.is_set():
-                    with contextlib.suppress(Exception):
-                        await _cancel_all_buffered()
-                async with pending_lock:
-                    flush_pending = False
-                    pending_local_count = 0
-                    space_freed_event.set()
-
-        async def _wait_for_disk_and_queue_headroom(will_upload: bool) -> bool:
-            """Apply VPS disk & pending-upload backpressure before starting a download."""
-            nonlocal flush_pending
-            if not will_upload:
-                # Even when uploads are disabled, never let manual downloads
-                # consume the last reserved bytes of the VPS disk.
-                if settings.min_free_disk_gb <= 0:
-                    return True
-                try:
-                    free_gb = shutil.disk_usage(self.env.resolved_data_dir).free / (1024 ** 3)
-                except OSError:
-                    return True
-                if free_gb < settings.min_free_disk_gb:
-                    self.events.emit_log(
-                        "ERROR",
-                        f"VPS 磁盘可用空间不足（{free_gb:.2f} GB < {settings.min_free_disk_gb:.2f} GB），"
-                        "已停止继续下载。",
-                        job_id=job_id,
-                    )
-                    return False
-                return True
-            logged_wait = False
-            while not ctx.cancel_event.is_set():
-                low_disk = False
-                if settings.min_free_disk_gb > 0:
-                    try:
-                        free_gb = shutil.disk_usage(self.env.resolved_data_dir).free / (1024 ** 3)
-                        low_disk = free_gb < settings.min_free_disk_gb
-                    except OSError:
-                        low_disk = False
-
-                async with pending_lock:
-                    cur_pending = pending_local_count
-                    too_many_pending = cur_pending >= settings.max_pending_upload_files
-                    if not too_many_pending and not low_disk:
-                        return True
-                    if cur_pending == 0 and low_disk:
-                        self.events.emit_log("ERROR", "VPS 磁盘可用空间不足，无法继续下载。", job_id=job_id)
-                        return False
-                    space_freed_event.clear()
-                    if not flush_pending:
-                        flush_pending = True
-                        await upload_queue.put(_FLUSH_SENTINEL)
-
-                if not logged_wait:
-                    logged_wait = True
-                    self.events.emit_log(
-                        "INFO",
-                        "VPS 磁盘或待上传文件达到背压阈值，正在触发上传释放空间...",
-                        job_id=job_id,
-                    )
-
-                wait_space = asyncio.create_task(space_freed_event.wait())
-                wait_cancel = asyncio.create_task(ctx.cancel_event.wait())
-                try:
-                    done, pending = await asyncio.wait(
-                        {wait_space, wait_cancel},
-                        timeout=2.0,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for t in pending:
-                        t.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                except asyncio.CancelledError:
-                    wait_space.cancel()
-                    wait_cancel.cancel()
-                    raise
-            return False
-
-        upload_task: Optional[asyncio.Task] = None
+        upload_tasks: List[asyncio.Task] = []
         if auto_upload:
-            upload_task = asyncio.create_task(_upload_worker(), name=f"phdl-upload-{job_id}")
+            upload_tasks = [
+                asyncio.create_task(_upload_worker(), name=f"phdl-upload-{job_id}-{idx + 1}")
+                for idx in range(upload_worker_count)
+            ]
 
         failed_item_ids_pass1: List[int] = []
 
-        async def _download_items_pass(target_item_ids: List[int], pass_num: int) -> List[int]:
-            nonlocal pending_local_count
+        async def _download_items_pass(
+            target_item_ids: List[int],
+            pass_num: int,
+            pass_parse_specs: Optional[Dict[int, _PendingParseSpec]] = None,
+        ) -> List[int]:
             pass_failed: List[int] = []
-            sem = asyncio.Semaphore(max(1, settings.max_concurrent_downloads))
             refresh_lock = asyncio.Lock()
             last_refresh_at = 0.0
 
@@ -741,257 +699,474 @@ class TaskManager:
                 trust_env=True,
             ) as dl_session:
                 async def _dl_one(item_id: int) -> None:
-                    nonlocal pending_local_count
-                    async with sem:
-                        if ctx.cancel_event.is_set():
-                            it = await self.repo.update_job_item(item_id, status="cancelled", error_message="已取消")
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            return
+                    if ctx.cancel_event.is_set():
+                        it = await self.repo.update_job_item(item_id, status="cancelled", error_message="已取消")
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        return
 
-                        item = await self.repo.get_job_item(item_id)
-                        if not item:
-                            return
+                    item = await self.repo.get_job_item(item_id)
+                    if not item:
+                        return
 
-                        vkey = item["viewkey"]
-                        uploader_folder = _target_folder_name(item["uploader"], item["target_type"])
-                        dl_dir = self.env.downloads_dir / uploader_folder
-                        tmp_dir = self.env.temp_dir / uploader_folder
-                        partial_path = Path(item["temp_path"]) if item.get("temp_path") else None
-                        if partial_path is not None and partial_path.resolve().is_relative_to(self.env.temp_dir.resolve()):
-                            tmp_dir = partial_path.parent
-                        else:
-                            partial_path = None
-                        will_upload = auto_upload and item.get("upload_requested") != 0
-                        requested = _resolve_item_qualities(item_id)
-                        ledger = await self.repo.get_video(vkey) if vkey and not redownload else None
-                        quality = normalized_quality(item["quality"])
-                        saved_quality = normalized_quality(ledger["quality"]) if ledger else ""
-                        quality_matches = (
-                            saved_quality == quality if quality else not requested or saved_quality in requested
-                        )
+                    vkey = item["viewkey"]
+                    uploader_folder = _target_folder_name(item["uploader"], item["target_type"])
+                    dl_dir = self.env.downloads_dir / uploader_folder
+                    tmp_dir = self.env.temp_dir / uploader_folder
+                    partial_path = Path(item["temp_path"]) if item.get("temp_path") else None
+                    if partial_path is not None and partial_path.resolve().is_relative_to(self.env.temp_dir.resolve()):
+                        tmp_dir = partial_path.parent
+                    else:
+                        partial_path = None
+                    will_upload = auto_upload and item.get("upload_requested") != 0
+                    requested = _resolve_item_qualities(item_id)
+                    ledger = await self.repo.get_video(vkey) if vkey and not redownload else None
+                    quality = normalized_quality(item["quality"])
+                    saved_quality = normalized_quality(ledger["quality"]) if ledger else ""
+                    quality_matches = (
+                        saved_quality == quality if quality else not requested or saved_quality in requested
+                    )
 
-                        if ledger and ledger["status"] == "uploaded" and (not requested or quality_matches):
-                            it = await self.repo.update_job_item(
-                                item_id,
-                                status="skipped",
-                                error_message="已在云端上传记录中，跳过",
-                            )
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            await _refresh_job_progress()
-                            return
-
-                        if ledger and ledger["status"] == "downloaded" and ledger["local_path"] and quality_matches:
-                            existing_local = Path(ledger["local_path"])
-                            if existing_local.resolve().is_relative_to(self.env.downloads_dir.resolve()) and await asyncio.to_thread(
-                                is_valid_video_file, existing_local, settings.min_file_size_bytes, ledger["file_size"] or None,
-                            ):
-                                existing_size = existing_local.stat().st_size
-                                await self.repo.upsert_video(
-                                    vkey,
-                                    status="downloaded",
-                                    local_path=str(existing_local),
-                                    file_size=existing_size,
-                                    upload_requested=will_upload,
-                                )
-                                it = await self.repo.update_job_item(
-                                    item_id,
-                                    status="downloaded" if will_upload else "skipped",
-                                    local_path=str(existing_local),
-                                    quality=ledger["quality"],
-                                    bytes_downloaded=existing_size,
-                                    bytes_total=existing_size,
-                                    upload_requested=int(will_upload),
-                                    error_message="" if will_upload else "本地已有符合画质的完整文件，跳过",
-                                )
-                                if it:
-                                    self.events.broadcast("item_updated", it)
-                                if will_upload:
-                                    async with pending_lock:
-                                        pending_local_count += 1
-                                    await upload_queue.put(
-                                        _UploadQueuedItem(
-                                            item_id=item_id,
-                                            viewkey=vkey,
-                                            uploader_folder=uploader_folder,
-                                            download_dir=existing_local.parent,
-                                            local_path=existing_local,
-                                            page_url=item["page_url"],
-                                        )
-                                    )
-                                await _refresh_job_progress()
-                                return
-
-                        if not await _wait_for_disk_and_queue_headroom(will_upload):
-                            cancelled = ctx.cancel_event.is_set()
-                            it = await self.repo.update_job_item(
-                                item_id, status="cancelled" if cancelled else "failed",
-                                error_message="已取消" if cancelled else "磁盘空间不足",
-                            )
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            return
-
+                    if ledger and ledger["status"] == "uploaded" and (not requested or quality_matches):
                         it = await self.repo.update_job_item(
                             item_id,
-                            status="downloading",
-                            retry_count=pass_num - 1,
-                            upload_requested=int(will_upload),
-                            error_message="",
+                            status="skipped",
+                            error_message="已在云端上传记录中，跳过",
                         )
                         if it:
                             self.events.broadcast("item_updated", it)
+                        await _refresh_job_progress()
+                        return
 
-                        def _on_progress(dl_bytes: int, tot_bytes: int, speed_bps: float) -> None:
-                            self.events.emit_item_progress(job_id, item_id, dl_bytes, tot_bytes, speed_bps)
-
-                        outcome = await download_mp4_with_resume(
-                            session=dl_session,
-                            parse_ctx=ctx,
-                            selectors=settings.selectors,
-                            viewkey=vkey,
-                            title=item["title"],
-                            download_url=item["download_url"],
-                            page_url=item["page_url"],
-                            referer_url=item["referer_url"],
-                            quality=item["quality"],
-                            download_dir=dl_dir,
-                            temp_dir=tmp_dir,
-                            partial_path=partial_path,
-                            replace_existing=redownload,
-                            disk_budget=disk_budget,
-                            cookie_str=settings.ph_cookie,
-                            proxy_url=settings.normalized_proxy,
-                            preferred_qualities=requested,
-                            max_attempts=settings.download_attempts,
-                            retry_delay_base=settings.retry_delay_base,
-                            retry_delay_max=settings.retry_delay_max,
-                            request_timeout=settings.request_timeout,
-                            min_file_size_bytes=settings.min_file_size_bytes,
-                            cancel_event=ctx.cancel_event,
-                            on_progress=_on_progress,
-                            on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
-                        )
-                        self.events.clear_item_progress(item_id)
-
-                        if outcome.cancelled:
+                    if ledger and ledger["status"] == "downloaded" and ledger["local_path"] and quality_matches:
+                        existing_local = Path(ledger["local_path"])
+                        if existing_local.resolve().is_relative_to(self.env.downloads_dir.resolve()) and await asyncio.to_thread(
+                            is_valid_video_file, existing_local, settings.min_file_size_bytes, ledger["file_size"] or None,
+                        ):
+                            existing_size = existing_local.stat().st_size
+                            await self.repo.upsert_video(
+                                vkey,
+                                status="downloaded",
+                                local_path=str(existing_local),
+                                file_size=existing_size,
+                                upload_requested=will_upload,
+                            )
                             it = await self.repo.update_job_item(
                                 item_id,
-                                status="cancelled",
-                                temp_path=str(outcome.temp_path or ""),
-                                bytes_downloaded=outcome.file_size,
-                                quality=outcome.quality or item["quality"],
-                                download_url=outcome.download_url or item["download_url"],
-                                error_message="已取消（断点已保留）" if outcome.temp_path else "已取消",
+                                status="downloaded" if will_upload else "skipped",
+                                local_path=str(existing_local),
+                                quality=ledger["quality"],
+                                bytes_downloaded=existing_size,
+                                bytes_total=existing_size,
+                                upload_requested=int(will_upload),
+                                error_message="" if will_upload else "本地已有符合画质的完整文件，跳过",
                             )
                             if it:
                                 self.events.broadcast("item_updated", it)
-                            return
-
-                        if not outcome.success or outcome.local_path is None:
-                            it = await self.repo.update_job_item(
-                                item_id,
-                                status="failed",
-                                temp_path=str(outcome.temp_path or ""),
-                                bytes_downloaded=outcome.file_size,
-                                quality=outcome.quality or item["quality"],
-                                download_url=outcome.download_url or item["download_url"],
-                                error_message=outcome.error or "下载失败",
-                            )
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            if not (outcome.error or "").startswith(("磁盘", "写入")):
-                                pass_failed.append(item_id)
-                            else:
-                                _record_failed_url(uploader_folder, item["page_url"])
-                            self.events.emit_log("WARNING", f"下载失败: {item['title']} ({outcome.error})", job_id=job_id)
-                            await _refresh_job_progress()
-                            return
-
-                        await self.repo.upsert_video(
-                            vkey,
-                            title=item["title"],
-                            uploader=item["uploader"],
-                            target_type=item["target_type"],
-                            quality=outcome.quality or item["quality"],
-                            video_page_url=item["page_url"],
-                            status="downloaded",
-                            local_path=str(outcome.local_path),
-                            file_size=outcome.file_size,
-                            downloaded_at=utc_now_iso(),
-                            force_status=True,
-                            upload_requested=will_upload,
-                        )
-                        it = await self.repo.update_job_item(
-                            item_id,
-                            status="downloaded",
-                            quality=outcome.quality or item["quality"],
-                            download_url=outcome.download_url or item["download_url"],
-                            local_path=str(outcome.local_path),
-                            temp_path="",
-                            bytes_downloaded=outcome.file_size,
-                            bytes_total=outcome.file_size,
-                            error_message="",
-                        )
-                        if it:
-                            self.events.broadcast("item_updated", it)
-
-                        self.events.emit_log(
-                            "INFO",
-                            f"下载成功: {item['title']} ({outcome.quality or item['quality']}, "
-                            f"{outcome.file_size / (1024 * 1024):.1f} MB)",
-                            job_id=job_id,
-                        )
-
-                        if will_upload:
-                            async with pending_lock:
-                                pending_local_count += 1
-                            await upload_queue.put(
-                                _UploadQueuedItem(
+                            if will_upload:
+                                await _enqueue_for_upload(
                                     item_id=item_id,
                                     viewkey=vkey,
                                     uploader_folder=uploader_folder,
-                                    download_dir=dl_dir,
-                                    local_path=outcome.local_path,
+                                    download_dir=existing_local.parent,
+                                    local_path=existing_local,
                                     page_url=item["page_url"],
+                                    file_size=existing_size,
                                 )
-                            )
+                            await _refresh_job_progress()
+                            return
 
+                    required_bytes = 0
+                    disk_wait_rounds = 0
+                    max_disk_wait_rounds = 60
+                    outcome = None
+
+                    while True:
+                        ok_slot, slot_err = await scheduler.acquire_download_slot(
+                            will_upload=will_upload,
+                            required_bytes=required_bytes,
+                            cancel_event=ctx.cancel_event,
+                            on_wait=lambda msg: self.events.emit_log("INFO", msg, job_id=job_id),
+                            on_request_flush=upload_pool.request_flush_nowait if auto_upload else None,
+                        )
+                        if not ok_slot:
+                            cancelled = ctx.cancel_event.is_set()
+                            it = await self.repo.update_job_item(
+                                item_id,
+                                status="cancelled" if cancelled else "failed",
+                                error_message="已取消" if cancelled else (slot_err or "磁盘空间不足"),
+                            )
+                            if it:
+                                self.events.broadcast("item_updated", it)
+                            if not cancelled:
+                                if slot_err:
+                                    self.events.emit_log("ERROR", slot_err, job_id=job_id)
+                                _record_failed_url(uploader_folder, item["page_url"])
+                            await _refresh_job_progress()
+                            return
+
+                        try:
+                            it = await self.repo.update_job_item(
+                                item_id,
+                                status="downloading",
+                                retry_count=pass_num - 1,
+                                upload_requested=int(will_upload),
+                                error_message="",
+                            )
+                            if it:
+                                self.events.broadcast("item_updated", it)
+
+                            def _on_progress(dl_bytes: int, tot_bytes: int, speed_bps: float) -> None:
+                                self.events.emit_item_progress(
+                                    job_id, item_id, dl_bytes, tot_bytes, speed_bps, phase="downloading",
+                                )
+
+                            outcome = await download_mp4_with_resume(
+                                session=dl_session,
+                                parse_ctx=ctx,
+                                selectors=settings.selectors,
+                                viewkey=vkey,
+                                title=item["title"],
+                                download_url=item["download_url"],
+                                page_url=item["page_url"],
+                                referer_url=item["referer_url"],
+                                quality=item["quality"],
+                                download_dir=dl_dir,
+                                temp_dir=tmp_dir,
+                                partial_path=partial_path,
+                                replace_existing=redownload,
+                                disk_budget=disk_budget,
+                                cookie_str=settings.ph_cookie,
+                                proxy_url=settings.normalized_proxy,
+                                preferred_qualities=requested,
+                                max_attempts=settings.download_attempts,
+                                retry_delay_base=settings.retry_delay_base,
+                                retry_delay_max=settings.retry_delay_max,
+                                request_timeout=settings.request_timeout,
+                                min_file_size_bytes=settings.min_file_size_bytes,
+                                cancel_event=ctx.cancel_event,
+                                on_progress=_on_progress,
+                                on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
+                            )
+                        finally:
+                            self.events.clear_item_progress(item_id)
+                            await scheduler.release_download_slot()
+
+                        if (
+                            outcome is not None
+                            and not outcome.success
+                            and not outcome.cancelled
+                            and getattr(outcome, "disk_wait_bytes", 0) > 0
+                            and will_upload
+                            and not ctx.cancel_event.is_set()
+                            and disk_wait_rounds < max_disk_wait_rounds
+                        ):
+                            disk_wait_rounds += 1
+                            required_bytes = int(outcome.disk_wait_bytes)
+                            scheduler.record_video_size(required_bytes)
+                            it = await self.repo.update_job_item(
+                                item_id,
+                                status="pending",
+                                temp_path=str(outcome.temp_path or ""),
+                                bytes_downloaded=outcome.file_size,
+                                quality=outcome.quality or item["quality"],
+                                download_url=outcome.download_url or item["download_url"],
+                                error_message="",
+                            )
+                            if it:
+                                self.events.broadcast("item_updated", it)
+                            if auto_upload:
+                                await upload_pool.request_flush()
+                            refreshed_item = await self.repo.get_job_item(item_id)
+                            if refreshed_item:
+                                item = refreshed_item
+                                if item.get("temp_path"):
+                                    partial_path = Path(item["temp_path"])
+                            continue
+                        break
+
+                    if outcome is None:
+                        return
+
+                    if outcome.cancelled:
+                        it = await self.repo.update_job_item(
+                            item_id,
+                            status="cancelled",
+                            temp_path=str(outcome.temp_path or ""),
+                            bytes_downloaded=outcome.file_size,
+                            quality=outcome.quality or item["quality"],
+                            download_url=outcome.download_url or item["download_url"],
+                            error_message="已取消（断点已保留）" if outcome.temp_path else "已取消",
+                        )
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        return
+
+                    if not outcome.success or outcome.local_path is None:
+                        it = await self.repo.update_job_item(
+                            item_id,
+                            status="failed",
+                            temp_path=str(outcome.temp_path or ""),
+                            bytes_downloaded=outcome.file_size,
+                            quality=outcome.quality or item["quality"],
+                            download_url=outcome.download_url or item["download_url"],
+                            error_message=outcome.error or "下载失败",
+                        )
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        if not (outcome.error or "").startswith(("磁盘", "写入", "单文件")):
+                            pass_failed.append(item_id)
+                        else:
+                            _record_failed_url(uploader_folder, item["page_url"])
+                        self.events.emit_log("WARNING", f"下载失败: {item['title']} ({outcome.error})", job_id=job_id)
                         await _refresh_job_progress()
+                        return
+
+                    scheduler.record_video_size(outcome.file_size)
+                    await self.repo.upsert_video(
+                        vkey,
+                        title=item["title"],
+                        uploader=item["uploader"],
+                        target_type=item["target_type"],
+                        quality=outcome.quality or item["quality"],
+                        video_page_url=item["page_url"],
+                        status="downloaded",
+                        local_path=str(outcome.local_path),
+                        file_size=outcome.file_size,
+                        downloaded_at=utc_now_iso(),
+                        force_status=True,
+                        upload_requested=will_upload,
+                    )
+                    it = await self.repo.update_job_item(
+                        item_id,
+                        status="downloaded",
+                        quality=outcome.quality or item["quality"],
+                        download_url=outcome.download_url or item["download_url"],
+                        local_path=str(outcome.local_path),
+                        temp_path="",
+                        bytes_downloaded=outcome.file_size,
+                        bytes_total=outcome.file_size,
+                        error_message="",
+                    )
+                    if it:
+                        self.events.broadcast("item_updated", it)
+
+                    self.events.emit_log(
+                        "INFO",
+                        f"下载成功: {item['title']} ({outcome.quality or item['quality']}, "
+                        f"{outcome.file_size / (1024 * 1024):.1f} MB)",
+                        job_id=job_id,
+                    )
+
+                    if will_upload:
+                        await _enqueue_for_upload(
+                            item_id=item_id,
+                            viewkey=vkey,
+                            uploader_folder=uploader_folder,
+                            download_dir=dl_dir,
+                            local_path=outcome.local_path,
+                            page_url=item["page_url"],
+                            file_size=outcome.file_size,
+                        )
+
+                    await _refresh_job_progress()
 
                 worker_count = min(len(target_item_ids), max(1, settings.max_concurrent_downloads))
                 if worker_count > 0:
-                    item_queue: asyncio.Queue[Optional[int]] = asyncio.Queue()
-                    for iid in target_item_ids:
-                        item_queue.put_nowait(iid)
-                    for _ in range(worker_count):
-                        item_queue.put_nowait(None)
+                    ready_queue: asyncio.Queue[Optional[int]] = asyncio.Queue()
+                    in_window_ids: Set[int] = set()
+                    window_sem: Optional[asyncio.Semaphore] = None
+                    producer_task: Optional[asyncio.Task] = None
+
+                    if pass_parse_specs:
+                        prefetch_window = max(8, max(1, settings.max_concurrent_downloads) * 3)
+                        parse_concurrency = max(1, min(settings.max_concurrent_video_details, 6))
+                        window_sem = asyncio.Semaphore(prefetch_window)
+
+                        async def _preparse_producer() -> None:
+                            parse_input: asyncio.Queue[Optional[int]] = asyncio.Queue()
+                            for iid in target_item_ids:
+                                parse_input.put_nowait(iid)
+                            for _ in range(parse_concurrency):
+                                parse_input.put_nowait(None)
+
+                            async def _parse_worker() -> None:
+                                assert window_sem is not None
+                                while True:
+                                    iid = await parse_input.get()
+                                    try:
+                                        if iid is None:
+                                            return
+                                        spec = pass_parse_specs.get(iid)
+                                        if spec is None:
+                                            await ready_queue.put(iid)
+                                            continue
+
+                                        if ctx.cancel_event.is_set():
+                                            it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                                            if it:
+                                                self.events.broadcast("item_updated", it)
+                                            continue
+
+                                        try:
+                                            await until_stopped(window_sem.acquire(), ctx.cancel_event)
+                                        except StopRequested:
+                                            it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                                            if it:
+                                                self.events.broadcast("item_updated", it)
+                                            continue
+
+                                        handed_off = False
+                                        try:
+                                            if ctx.cancel_event.is_set():
+                                                it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                                                if it:
+                                                    self.events.broadcast("item_updated", it)
+                                                continue
+
+                                            details = await fetch_video_details_batch(
+                                                ctx,
+                                                [(spec.page_url, spec.page_num, spec.item_num)],
+                                                settings.selectors,
+                                                concurrency=1,
+                                                preferred_qualities=_resolve_item_qualities(iid),
+                                                include_keywords=include_keywords,
+                                                exclude_keywords=exclude_keywords,
+                                                uploader_hint=spec.uploader_hint,
+                                                timeout=settings.request_timeout,
+                                            )
+                                            detail = details[0] if details else VideoDetail(
+                                                viewkey=extract_viewkey_from_url(spec.page_url) or "",
+                                                title="",
+                                                page_url=spec.page_url,
+                                                referer_url=spec.page_url,
+                                                error="未解析到视频详情",
+                                            )
+
+                                            if ctx.cancel_event.is_set() or detail.error == "操作已取消":
+                                                it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
+                                                if it:
+                                                    self.events.broadcast("item_updated", it)
+                                                continue
+
+                                            if detail.filtered_out:
+                                                it = await self.repo.update_job_item(
+                                                    iid,
+                                                    status="skipped",
+                                                    error_message="不符合画质或关键词筛选，跳过",
+                                                )
+                                                if it:
+                                                    self.events.broadcast("item_updated", it)
+                                                await _refresh_job_progress()
+                                                continue
+
+                                            err_msg = detail.error or (
+                                                "未解析到视频标识或 MP4 直链"
+                                                if not detail.download_url or not detail.viewkey
+                                                else ""
+                                            )
+                                            if err_msg:
+                                                it = await self.repo.update_job_item(
+                                                    iid,
+                                                    status="failed",
+                                                    error_message=err_msg,
+                                                )
+                                                if it:
+                                                    self.events.broadcast("item_updated", it)
+                                                self.events.emit_log(
+                                                    "WARNING",
+                                                    f"视频解析失败 [{detail.viewkey or spec.page_url}]: {err_msg}",
+                                                    job_id=job_id,
+                                                )
+                                                folder = _target_folder_name(spec.default_uploader, spec.default_type)
+                                                _record_failed_url(folder, spec.page_url)
+                                                await _refresh_job_progress()
+                                                continue
+
+                                            resolved_uploader = (
+                                                (detail.uploader_username or spec.default_uploader)
+                                                if spec.group_by_uploader
+                                                else spec.default_uploader
+                                            )
+                                            resolved_type = (
+                                                (detail.uploader_type or spec.default_type)
+                                                if spec.group_by_uploader
+                                                else spec.default_type
+                                            )
+                                            patch: Dict[str, Any] = {
+                                                "viewkey": detail.viewkey,
+                                                "uploader": resolved_uploader,
+                                                "target_type": resolved_type,
+                                                "download_url": detail.download_url,
+                                                "referer_url": detail.referer_url,
+                                                "quality": detail.quality,
+                                            }
+                                            if detail.title:
+                                                patch["title"] = detail.title
+                                            it = await self.repo.update_job_item(iid, **patch)
+                                            if it:
+                                                self.events.broadcast("item_updated", it)
+
+                                            in_window_ids.add(iid)
+                                            await ready_queue.put(iid)
+                                            handed_off = True
+                                        finally:
+                                            if not handed_off:
+                                                window_sem.release()
+                                    finally:
+                                        parse_input.task_done()
+
+                            pworkers = [asyncio.create_task(_parse_worker()) for _ in range(parse_concurrency)]
+                            try:
+                                await asyncio.gather(*pworkers)
+                            finally:
+                                for pw in pworkers:
+                                    if not pw.done():
+                                        pw.cancel()
+                                await asyncio.gather(*pworkers, return_exceptions=True)
+                                for _ in range(worker_count):
+                                    await ready_queue.put(None)
+
+                        producer_task = asyncio.create_task(_preparse_producer(), name=f"phdl-preparse-{job_id}")
+                    else:
+                        for iid in target_item_ids:
+                            ready_queue.put_nowait(iid)
+                        for _ in range(worker_count):
+                            ready_queue.put_nowait(None)
 
                     async def _worker() -> None:
                         while True:
-                            iid = await item_queue.get()
+                            iid = await ready_queue.get()
                             try:
                                 if iid is None:
                                     return
+                                if window_sem is not None and iid in in_window_ids:
+                                    in_window_ids.discard(iid)
+                                    window_sem.release()
                                 await _dl_one(iid)
                             finally:
-                                item_queue.task_done()
+                                ready_queue.task_done()
 
                     workers = [asyncio.create_task(_worker()) for _ in range(worker_count)]
                     try:
-                        await asyncio.gather(*workers)
+                        if producer_task is not None:
+                            await asyncio.gather(producer_task, *workers)
+                        else:
+                            await asyncio.gather(*workers)
                     except BaseException:
+                        if producer_task is not None and not producer_task.done():
+                            producer_task.cancel()
                         for worker in workers:
                             worker.cancel()
-                        await asyncio.gather(*workers, return_exceptions=True)
+                        tasks_to_wait = [*workers, *([producer_task] if producer_task is not None else [])]
+                        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
                         raise
                 await _refresh_job_progress(force=True)
 
             return pass_failed
 
         try:
-            failed_item_ids_pass1 = await _download_items_pass(item_ids, pass_num=1)
+            failed_item_ids_pass1 = await _download_items_pass(item_ids, pass_num=1, pass_parse_specs=parse_specs)
 
             # One automatic re-parse & retry pass for failed downloads
             final_failed_ids = list(failed_item_ids_pass1)
@@ -1051,9 +1226,15 @@ class TaskManager:
                     folder = _target_folder_name(row.get("uploader"), row.get("target_type") or "model")
                     _record_failed_url(folder, row["page_url"])
         finally:
-            if upload_task is not None:
-                await upload_queue.put(None)
-                await upload_task
+            if upload_tasks:
+                await upload_pool.mark_downloads_done()
+                if ctx.cancel_event.is_set():
+                    await upload_pool.notify_cancel()
+                await asyncio.gather(*upload_tasks, return_exceptions=True)
+                leftovers = await upload_pool.drain_all()
+                if leftovers:
+                    await _mark_entries_cancelled(leftovers)
+            self.events.clear_scheduler_status(job_id)
 
         return dict(uploaded_by_uploader), dict(failed_urls_by_uploader)
 
@@ -1305,7 +1486,7 @@ class TaskManager:
         known_vkeys = set() if (redownload or export_only or qualities) else await self.repo.get_uploaded_viewkeys()
         known_vkeys.update(params.get("skip_completed_viewkeys") or ())
         all_details: List[VideoDetail] = []
-        scoped: Dict[str, Tuple[VideoDetail, str, str]] = {}
+        scoped_listed: Dict[str, Tuple[ListedVideo, str, str]] = {}
         scan_errors: List[str] = []
         profile_avatars: Dict[str, str] = dict(params.get("profile_avatars") or {})
         profile_names: Dict[str, str] = dict(params.get("profile_names") or {})
@@ -1345,38 +1526,57 @@ class TaskManager:
                         self.events.broadcast("job_updated", updated_job)
 
             page_errors: List[str] = []
-            listed, details = await self._scan_target_with_details(
-                job_id,
-                ctx=ctx,
-                list_url=list_url,
-                target_type=utype,
-                settings=settings,
-                pages_spec=pages_spec,
-                videos_spec=videos_spec,
-                skip_vkeys=known_vkeys,
-                preferred_qualities=qualities,
-                include_keywords=include_kw,
-                exclude_keywords=exclude_kw,
-                uploader_hint=(uname if uname != "_currentUser_" else "My_Liked", utype),
-                on_profile=_save_target_profile,
-                on_scan_error=page_errors.append,
-            )
-            scan_errors.extend(f"{uname}: {error}" for error in page_errors)
-            if not listed:
-                if not page_errors and not ctx.cancel_event.is_set():
-                    self.events.emit_log("INFO", f"目标 '{uname}' ({utype}) 未发现待处理的视频。", job_id=job_id)
-                continue
-
+            resolved_user = uname if uname != "_currentUser_" else "My_Liked"
             if export_only:
+                listed, details = await self._scan_target_with_details(
+                    job_id,
+                    ctx=ctx,
+                    list_url=list_url,
+                    target_type=utype,
+                    settings=settings,
+                    pages_spec=pages_spec,
+                    videos_spec=videos_spec,
+                    skip_vkeys=known_vkeys,
+                    preferred_qualities=qualities,
+                    include_keywords=include_kw,
+                    exclude_keywords=exclude_kw,
+                    uploader_hint=(resolved_user, utype),
+                    on_profile=_save_target_profile,
+                    on_scan_error=page_errors.append,
+                )
+                scan_errors.extend(f"{uname}: {error}" for error in page_errors)
+                if not listed:
+                    if not page_errors and not ctx.cancel_event.is_set():
+                        self.events.emit_log("INFO", f"目标 '{uname}' ({utype}) 未发现待处理的视频。", job_id=job_id)
+                    continue
                 all_details.extend(details)
             else:
-                for detail in details:
-                    if detail.filtered_out or detail.error == "操作已取消":
-                        continue
-                    key = detail.viewkey or detail.page_url
-                    old = scoped.get(key)
-                    if old is None or ((old[0].error or not old[0].download_url) and detail.download_url and not detail.error):
-                        scoped[key] = (detail, uname if uname != "_currentUser_" else "My_Liked", utype)
+                listed = await scan_list_pages(
+                    ctx,
+                    list_url,
+                    settings.selectors,
+                    target_type=utype,
+                    pages_spec=pages_spec,
+                    videos_spec=videos_spec,
+                    catch_up=False,
+                    skip_vkeys=known_vkeys,
+                    delay_min=settings.page_delay_min,
+                    delay_max=settings.page_delay_max,
+                    page_concurrency=settings.max_concurrent_list_pages,
+                    timeout=settings.request_timeout,
+                    profile_username=resolved_user,
+                    on_profile=_save_target_profile,
+                    on_error=page_errors.append,
+                )
+                scan_errors.extend(f"{uname}: {error}" for error in page_errors)
+                if not listed:
+                    if not page_errors and not ctx.cancel_event.is_set():
+                        self.events.emit_log("INFO", f"目标 '{uname}' ({utype}) 未发现待处理的视频。", job_id=job_id)
+                    continue
+                for lv in listed:
+                    key = lv.viewkey or lv.url
+                    if key not in scoped_listed:
+                        scoped_listed[key] = (lv, resolved_user, utype)
 
         if scan_errors:
             await self.repo.update_job(job_id, error_message=f"{len(scan_errors)} 页扫描未完成：{scan_errors[0]}")
@@ -1384,15 +1584,51 @@ class TaskManager:
             await self._record_export_result(job_id, all_details)
             return
 
-        groups: Dict[Tuple[str, str], List[VideoDetail]] = defaultdict(list)
-        for detail, uname, utype in scoped.values():
-            groups[(uname, utype)].append(detail)
+        if not scoped_listed or ctx.cancel_event.is_set():
+            return
+
+        listed_entries = list(scoped_listed.values())
+        item_specs = [
+            {
+                "viewkey": lv.viewkey,
+                "title": lv.title or lv.viewkey or lv.url,
+                "uploader": uname,
+                "target_type": utype,
+                "page_url": lv.url,
+                "download_url": "",
+                "referer_url": lv.url,
+                "quality": "",
+                "status": "pending",
+                "error_message": "",
+                "upload_requested": auto_upload,
+            }
+            for lv, uname, utype in listed_entries
+        ]
+        rows = await self.repo.add_job_items_batch(job_id, item_specs)
         all_item_ids: List[int] = []
-        for (uname, utype), details in groups.items():
-            all_item_ids.extend(await self._create_items_from_details(
-                job_id, details, default_uploader=uname, default_type=utype,
-                group_by_uploader=False, upload_requested=auto_upload,
-            ))
+        parse_specs: Dict[int, _PendingParseSpec] = {}
+        for row, (lv, uname, utype) in zip(rows, listed_entries):
+            iid = int(row["id"])
+            all_item_ids.append(iid)
+            parse_specs[iid] = _PendingParseSpec(
+                item_id=iid,
+                page_url=lv.url,
+                page_num=lv.page_num,
+                item_num=lv.item_num,
+                default_uploader=uname,
+                default_type=utype,
+                group_by_uploader=False,
+                uploader_hint=(uname, utype),
+            )
+            self.events.broadcast("item_updated", row)
+        updated_job = await self.repo.recalculate_job_counts(job_id)
+        if updated_job:
+            self.events.broadcast("job_updated", updated_job)
+        self.events.emit_log(
+            "INFO",
+            f"列表扫描完成：共 {len(all_item_ids)} 个视频，启动流式按需解析、动态下载与实时上传...",
+            job_id=job_id,
+        )
         if all_item_ids and not ctx.cancel_event.is_set():
             await self._run_download_upload_pipeline(
                 job_id,
@@ -1402,6 +1638,9 @@ class TaskManager:
                 auto_upload=auto_upload,
                 redownload=redownload,
                 preferred_qualities=qualities,
+                parse_specs=parse_specs,
+                include_keywords=include_kw,
+                exclude_keywords=exclude_kw,
             )
 
     async def _exec_manual_urls(
@@ -1431,29 +1670,60 @@ class TaskManager:
         auto_upload = bool(params.get("auto_upload", settings.uploader_enabled))
         batch_folder = sanitize_filename(params.get("batch_name") or "url_batch")
 
-        self.events.emit_log("INFO", f"正在并发解析 {len(video_urls)} 条视频链接...", job_id=job_id)
-        details = await fetch_video_details_batch(
-            ctx,
-            [(u, 1, idx + 1) for idx, u in enumerate(video_urls)],
-            settings.selectors,
-            concurrency=settings.max_concurrent_video_details,
-            preferred_qualities=qualities,
-            include_keywords=include_kw,
-            exclude_keywords=exclude_kw,
-            timeout=settings.request_timeout,
-        )
-
         if export_only:
+            self.events.emit_log("INFO", f"正在并发解析 {len(video_urls)} 条视频链接...", job_id=job_id)
+            details = await fetch_video_details_batch(
+                ctx,
+                [(u, 1, idx + 1) for idx, u in enumerate(video_urls)],
+                settings.selectors,
+                concurrency=settings.max_concurrent_video_details,
+                preferred_qualities=qualities,
+                include_keywords=include_kw,
+                exclude_keywords=exclude_kw,
+                timeout=settings.request_timeout,
+            )
             await self._record_export_result(job_id, details)
             return
 
-        item_ids = await self._create_items_from_details(
-            job_id,
-            details,
-            default_uploader=batch_folder,
-            default_type="model",
-            group_by_uploader=group_by_uploader,
-            upload_requested=auto_upload,
+        item_specs = [
+            {
+                "viewkey": extract_viewkey_from_url(u) or "",
+                "title": extract_viewkey_from_url(u) or u,
+                "uploader": batch_folder,
+                "target_type": "model",
+                "page_url": u,
+                "download_url": "",
+                "referer_url": u,
+                "quality": "",
+                "status": "pending",
+                "error_message": "",
+                "upload_requested": auto_upload,
+            }
+            for u in video_urls
+        ]
+        rows = await self.repo.add_job_items_batch(job_id, item_specs)
+        item_ids: List[int] = []
+        parse_specs: Dict[int, _PendingParseSpec] = {}
+        for idx, (row, u) in enumerate(zip(rows, video_urls), start=1):
+            iid = int(row["id"])
+            item_ids.append(iid)
+            parse_specs[iid] = _PendingParseSpec(
+                item_id=iid,
+                page_url=u,
+                page_num=1,
+                item_num=idx,
+                default_uploader=batch_folder,
+                default_type="model",
+                group_by_uploader=group_by_uploader,
+            )
+            self.events.broadcast("item_updated", row)
+        updated_job = await self.repo.recalculate_job_counts(job_id)
+        if updated_job:
+            self.events.broadcast("job_updated", updated_job)
+        self.events.emit_log(
+            "INFO",
+            f"已入队 {len(item_ids)} 条链接，启动流式按需解析、动态下载与实时上传...",
+            job_id=job_id,
         )
         if item_ids and not ctx.cancel_event.is_set():
             await self._run_download_upload_pipeline(
@@ -1464,6 +1734,9 @@ class TaskManager:
                 auto_upload=auto_upload,
                 redownload=redownload,
                 preferred_qualities=qualities,
+                parse_specs=parse_specs,
+                include_keywords=include_kw,
+                exclude_keywords=exclude_kw,
             )
 
     async def _exec_update_check(

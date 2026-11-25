@@ -458,8 +458,12 @@ async function handleTestNotify() {
             <Input v-model="form.preferred_quality" placeholder="如 2160,1440,1080" />
           </div>
           <div class="space-y-1.5">
-            <label class="text-xs font-medium text-foreground">单批触发上传文件数</label>
+            <label class="text-xs font-medium text-foreground">单批触发上传文件数（1 = 下完即传）</label>
             <Input v-model="form.upload_batch_size" type="number" :min="1" :max="100" />
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-xs font-medium text-foreground">并行上传 Worker 数（建议 3，配合分块并发 4）</label>
+            <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
           </div>
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">待上传最大本地堆积数</label>
@@ -548,7 +552,7 @@ async function handleTestNotify() {
               <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
             </div>
             <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">PikPak 分块大小（仅 PikPak 生效）</label>
+              <label class="text-xs font-medium text-foreground">PikPak 分块大小（4G 内存建议 32Mi）</label>
               <Input v-model="form.rclone_pikpak_chunk_size" placeholder="32Mi" />
             </div>
             <div class="space-y-1.5">

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onActivated, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ListChecks,
@@ -61,28 +61,46 @@ const visibleJobs = computed(() => {
 })
 
 let suppressQueryScroll = false
+let syncQueryTimer = null
+
+function clearPendingQuerySync() {
+  if (syncQueryTimer) {
+    clearTimeout(syncQueryTimer)
+    syncQueryTimer = null
+  }
+}
 
 function readFocusedJob() {
   const raw = Number(route.query.job)
   focusedJobId.value = Number.isInteger(raw) && raw > 0 ? raw : null
 }
 
-function syncJobQuery(nextId) {
-  if (route.name !== 'jobs') return
-  const currentRaw = route.query.job ? String(route.query.job) : ''
-  const nextRaw = nextId ? String(nextId) : ''
-  if (currentRaw === nextRaw) return
-  suppressQueryScroll = true
-  const nextQuery = { ...route.query }
-  if (nextRaw) nextQuery.job = nextRaw
-  else delete nextQuery.job
-  router.replace({ query: nextQuery }).finally(() => {
-    suppressQueryScroll = false
-  })
+function syncJobQuery(nextId, { immediate = false } = {}) {
+  clearPendingQuerySync()
+  const apply = () => {
+    syncQueryTimer = null
+    if (route.name !== 'jobs') return
+    const currentRaw = route.query.job ? String(route.query.job) : ''
+    const nextRaw = nextId ? String(nextId) : ''
+    if (currentRaw === nextRaw) return
+    suppressQueryScroll = true
+    const nextQuery = { ...route.query }
+    if (nextRaw) nextQuery.job = nextRaw
+    else delete nextQuery.job
+    router.replace({ query: nextQuery }).finally(() => {
+      suppressQueryScroll = false
+    })
+  }
+  if (immediate) {
+    apply()
+  } else {
+    syncQueryTimer = setTimeout(apply, 220)
+  }
 }
 
 function handleJobActivate(jobId, isExpanded) {
   if (isExpanded) {
+    if (focusedJobId.value === jobId) return
     focusedJobId.value = jobId
     syncJobQuery(jobId)
   } else if (focusedJobId.value === jobId) {
@@ -166,7 +184,7 @@ async function changeJobsLimit(value) {
 function handleJobDeleted(jobId) {
   if (focusedJobId.value === jobId) {
     focusedJobId.value = null
-    syncJobQuery(null)
+    syncJobQuery(null, { immediate: true })
   }
   if (!selectedJobIds.value.has(jobId)) return
   const next = new Set(selectedJobIds.value)
@@ -200,7 +218,7 @@ async function handleBatchDeleteJobs() {
       store.removeJobs(deletedIds)
       if (focusedJobId.value && deletedIds.includes(focusedJobId.value)) {
         focusedJobId.value = null
-        syncJobQuery(null)
+        syncJobQuery(null, { immediate: true })
       }
     }
     selectedJobIds.value = new Set()
@@ -234,6 +252,14 @@ onActivated(async () => {
   }
   if (tasks.length > 0) await Promise.all(tasks)
   await scrollToFocusedJob()
+})
+
+onDeactivated(() => {
+  clearPendingQuerySync()
+})
+
+onBeforeUnmount(() => {
+  clearPendingQuerySync()
 })
 </script>
 
@@ -359,6 +385,7 @@ onActivated(async () => {
           v-for="job in visibleJobs"
           :id="`job-${job.id}`"
           :key="job.id"
+          v-memo="[job, job.id === runningJobId, job.id === focusedJobId, selectedJobIds.has(job.id)]"
           :job="job"
           :default-expanded="job.id === runningJobId || job.id === focusedJobId"
           :focused="job.id === focusedJobId"

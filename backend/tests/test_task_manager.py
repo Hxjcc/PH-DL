@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Dict
 
@@ -1113,6 +1114,7 @@ async def test_upload_streams_per_file_and_cancel_marks_remaining_without_spurio
                 "ph_cookie": "sess=valid",
                 "uploader_enabled": True,
                 "rclone_transfers": 1,
+                "upload_workers": 1,
                 "upload_batch_size": 3,
                 "max_pending_upload_files": 20,
                 "min_free_disk_gb": 0.0,
@@ -1238,6 +1240,326 @@ async def test_page1_only_error_keeps_catch_up_enabled_on_next_update(tmp_path: 
         done = await _wait_job_done(repo, job["id"], timeout=5.0)
         assert done is not None and done["status"] == "completed"
         assert seen_catch_up == [True]
+    finally:
+        await tm.stop()
+        await db.close()
+
+
+async def test_adaptive_disk_scheduler_waterlines_priority_and_large_file_fairness(tmp_path: Path):
+    from types import SimpleNamespace
+    from app.engine.disk_scheduler import AdaptiveDiskScheduler, GIB, MIB, SmartUploadPool, UploadQueuedItem
+    from app.services.downloader import DownloadDiskBudget
+
+    simulated_free = {"bytes": 20 * GIB}
+    budget = DownloadDiskBudget(tmp_path, keep_free_bytes=2 * GIB)
+    sched = AdaptiveDiskScheduler(
+        tmp_path,
+        budget,
+        max_downloads=5,
+        max_uploads=2,
+        min_free_disk_gb=2.0,
+        disk_usage_fn=lambda _p: SimpleNamespace(free=simulated_free["bytes"]),
+    )
+
+    # Green zone: >= 8 GB headroom -> full 5 downloads, FIFO upload
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert lvl == "green" and allowed == 5 and sched.prefer_largest_upload is False
+
+    # Yellow zone: 2 GB floor + 5 GB headroom = 7 GB free -> throttled to 2 downloads, Largest-First upload
+    simulated_free["bytes"] = 7 * GIB
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert lvl == "yellow" and allowed == 2 and sched.prefer_largest_upload is True
+
+    # Orange zone: 2 GB floor + 1 GB headroom = 3 GB free -> 1 download
+    simulated_free["bytes"] = 3 * GIB
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert lvl == "orange" and allowed == 1 and sched.prefer_largest_upload is True
+
+    # Red zone: <= 2 GB floor -> 0 downloads
+    simulated_free["bytes"] = 2 * GIB
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert lvl == "red" and allowed == 0
+
+    # SmartUploadPool switches between FIFO (green) and Largest-First (tight)
+    pool = SmartUploadPool(sched, batch_trigger_size=1, chunk_size=1, allow_small_micro_batch=False)
+    small = UploadQueuedItem(1, "vk_s", "alice", tmp_path, tmp_path / "s.mp4", file_size=200 * MIB)
+    big = UploadQueuedItem(2, "vk_b", "alice", tmp_path, tmp_path / "b.mp4", file_size=1500 * MIB)
+    mid = UploadQueuedItem(3, "vk_m", "alice", tmp_path, tmp_path / "m.mp4", file_size=600 * MIB)
+    for item in (small, big, mid):
+        await pool.put(item)
+
+    cancel = asyncio.Event()
+    # Tight (red) -> largest first (big: 1500 MiB)
+    first_chunk = await pool.take_next_chunk(cancel)
+    assert first_chunk is not None and [x.viewkey for x in first_chunk] == ["vk_b"]
+
+    # Back to green -> FIFO (small before mid)
+    simulated_free["bytes"] = 20 * GIB
+    second_chunk = await pool.take_next_chunk(cancel)
+    assert second_chunk is not None and [x.viewkey for x in second_chunk] == ["vk_s"]
+
+    # True physical oversize fails fast when no upload/download can free space
+    simulated_free["bytes"] = 3 * GIB  # only 1 GiB above 2 GiB floor
+    ok, err = await sched.acquire_download_slot(will_upload=True, required_bytes=2 * GIB, cancel_event=cancel)
+    assert ok is False and "超过 VPS 可用空间" in err
+
+
+async def test_tight_disk_suspends_download_until_upload_frees_space(tmp_path: Path, monkeypatch):
+    """When disk_wait_bytes triggers while uploads are pending, download suspends and resumes instead of failing."""
+    from types import SimpleNamespace
+    from app.engine import task_manager as tm_mod
+    from app.engine.disk_scheduler import GIB
+
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": True,
+                "max_concurrent_downloads": 2,
+                "upload_workers": 1,
+                "upload_batch_size": 1,
+                "min_free_disk_gb": 2.0,
+                "min_file_size_bytes": 1,
+            }
+        )
+
+        # Start with 3.5 GiB free (1.5 GiB headroom above 2 GiB floor).
+        disk_free = {"bytes": int(3.5 * GIB)}
+        monkeypatch.setattr(tm_mod.shutil, "disk_usage", lambda _p: SimpleNamespace(free=disk_free["bytes"]))
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_fetch_batch(ctx, items, selectors, **kwargs):
+            res = []
+            for url, pn, itn in items:
+                vk = url.split("viewkey=")[1]
+                res.append(
+                    VideoDetail(
+                        viewkey=vk,
+                        title=f"Video {vk}",
+                        page_url=url,
+                        referer_url=url,
+                        download_url=f"https://cdn.example/{vk}.mp4",
+                        quality="2160p",
+                        uploader_username="alice",
+                        uploader_type="model",
+                        page_num=pn,
+                        item_num=itn,
+                    )
+                )
+            return res
+
+        dl_attempts = {"vk1": 0, "vk2": 0}
+        vk1_uploaded = asyncio.Event()
+
+        async def fake_download(*, download_dir: Path, viewkey: str, title: str, **kwargs):
+            dl_attempts[viewkey] += 1
+            download_dir.mkdir(parents=True, exist_ok=True)
+            # First attempt of vk2 needs 2 GiB (> 1.5 GiB headroom) -> triggers suspend/wait!
+            if viewkey == "vk2" and dl_attempts["vk2"] == 1:
+                return DownloadOutcome(
+                    success=False,
+                    error="磁盘余量不足，无法为此下载预留空间",
+                    disk_wait_bytes=2 * GIB,
+                )
+            out = download_dir / f"{title} [{viewkey}].mp4"
+            out.write_bytes(mp4_payload())
+            return DownloadOutcome(
+                success=True,
+                local_path=out,
+                file_size=out.stat().st_size,
+                quality="2160p",
+                download_url=f"https://cdn.example/{viewkey}.mp4",
+            )
+
+        async def fake_upload(download_dir, uploader_folder, files_by_viewkey, settings, cancel_event=None, **kwargs):
+            await asyncio.sleep(0.05)
+            # Uploading vk1 frees 2 GiB of disk space, raising headroom to 3.5 GiB >= 2 GiB!
+            if "vk1" in files_by_viewkey:
+                disk_free["bytes"] = int(5.5 * GIB)
+                vk1_uploaded.set()
+            return UploadBatchResult(
+                uploaded_viewkeys=list(files_by_viewkey.keys()),
+                failed_viewkeys=[],
+                verified_sources={vk: file_snapshot(p) for vk, p in files_by_viewkey.items()},
+                remote_dir=f"pikpak:Pornhub/{uploader_folder}",
+            )
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "fetch_video_details_batch", fake_fetch_batch)
+        monkeypatch.setattr(tm_mod, "download_mp4_with_resume", fake_download)
+        monkeypatch.setattr(tm_mod, "upload_file_batch", fake_upload)
+
+        tm.start()
+        job = await tm.enqueue_job(
+            "manual_urls",
+            "动态磁盘挂起恢复测试",
+            {
+                "urls": [
+                    "https://www.pornhub.com/view_video.php?viewkey=vk1",
+                    "https://www.pornhub.com/view_video.php?viewkey=vk2",
+                ],
+                "auto_upload": True,
+            },
+        )
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+        assert done is not None
+        assert done["status"] == "completed"
+        assert done["uploaded_items"] == 2
+        assert done["failed_items"] == 0
+        assert dl_attempts["vk2"] == 2
+        assert vk1_uploaded.is_set()
+    finally:
+        await tm.stop()
+        await db.close()
+
+
+async def test_streaming_preparse_overlaps_download_and_runs_multi_worker_uploads(tmp_path: Path, monkeypatch):
+    """manual_target starts downloading before later items finish parsing and runs 2 upload workers concurrently."""
+    from app.engine import task_manager as tm_mod
+
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": True,
+                "max_concurrent_downloads": 3,
+                "max_concurrent_video_details": 2,
+                "upload_workers": 2,
+                "upload_batch_size": 1,
+                "min_free_disk_gb": 0.0,
+                "min_file_size_bytes": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_scan_list(ctx, initial_url, selectors, **kwargs):
+            return [
+                ListedVideo(f"vk{i}", f"https://www.pornhub.com/view_video.php?viewkey=vk{i}", f"Clip {i}", 1, i, 4)
+                for i in range(1, 5)
+            ]
+
+        first_download_started = asyncio.Event()
+        parse_overlapped_download = False
+
+        async def fake_fetch_batch(ctx, items, selectors, **kwargs):
+            nonlocal parse_overlapped_download
+            url, pn, itn = items[0]
+            vk = url.split("viewkey=")[1]
+            if vk == "vk4":
+                # Wait briefly to prove earlier items already entered download while vk4 is still parsing
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(first_download_started.wait(), timeout=0.5)
+                if first_download_started.is_set():
+                    parse_overlapped_download = True
+            return [
+                VideoDetail(
+                    viewkey=vk,
+                    title=f"Clip {vk}",
+                    page_url=url,
+                    referer_url=url,
+                    download_url=f"https://cdn.example/{vk}.mp4",
+                    quality="1080p",
+                    uploader_username="alice",
+                    uploader_type="model",
+                    page_num=pn,
+                    item_num=itn,
+                )
+            ]
+
+        async def fake_download(*, download_dir: Path, viewkey: str, title: str, **kwargs):
+            first_download_started.set()
+            download_dir.mkdir(parents=True, exist_ok=True)
+            out = download_dir / f"{title} [{viewkey}].mp4"
+            out.write_bytes(mp4_payload())
+            return DownloadOutcome(
+                success=True,
+                local_path=out,
+                file_size=out.stat().st_size,
+                quality="1080p",
+                download_url=f"https://cdn.example/{viewkey}.mp4",
+            )
+
+        active_uploads = 0
+        max_concurrent_uploads = 0
+        seen_upload_phases: list[str] = []
+
+        async def fake_upload(
+            download_dir,
+            uploader_folder,
+            files_by_viewkey,
+            settings,
+            cancel_event=None,
+            *,
+            session_cache=None,
+            on_progress=None,
+        ):
+            nonlocal active_uploads, max_concurrent_uploads
+            assert session_cache is not None
+            active_uploads += 1
+            max_concurrent_uploads = max(max_concurrent_uploads, active_uploads)
+            try:
+                for vk, p in files_by_viewkey.items():
+                    if on_progress is not None:
+                        sz = p.stat().st_size
+                        on_progress(vk, sz // 2, sz, 120_000_000.0, "uploading")
+                        seen_upload_phases.append("uploading")
+                await asyncio.sleep(0.08)
+                for vk, p in files_by_viewkey.items():
+                    if on_progress is not None:
+                        sz = p.stat().st_size
+                        on_progress(vk, sz, sz, 0.0, "verifying")
+                        seen_upload_phases.append("verifying")
+                return UploadBatchResult(
+                    uploaded_viewkeys=list(files_by_viewkey.keys()),
+                    failed_viewkeys=[],
+                    verified_sources={vk: file_snapshot(p) for vk, p in files_by_viewkey.items()},
+                    remote_dir=f"pikpak:Pornhub/{uploader_folder}",
+                )
+            finally:
+                active_uploads -= 1
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "scan_list_pages", fake_scan_list)
+        monkeypatch.setattr(tm_mod, "fetch_video_details_batch", fake_fetch_batch)
+        monkeypatch.setattr(tm_mod, "download_mp4_with_resume", fake_download)
+        monkeypatch.setattr(tm_mod, "upload_file_batch", fake_upload)
+
+        tm.start()
+        job = await tm.enqueue_job(
+            "manual_target",
+            "下载目标: alice",
+            {"usernames": ["alice"], "target_type": "model", "pages": "1", "auto_upload": True},
+        )
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+        assert done is not None
+        assert done["status"] == "completed"
+        assert done["uploaded_items"] == 4
+        assert parse_overlapped_download is True
+        assert max_concurrent_uploads == 2
+        assert "uploading" in seen_upload_phases and "verifying" in seen_upload_phases
+        assert events.scheduler_status_snapshot() == {}
     finally:
         await tm.stop()
         await db.close()

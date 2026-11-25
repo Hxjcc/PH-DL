@@ -183,13 +183,14 @@ class RuntimeSettings(BaseModel):
     page_delay_max: float = Field(default=1.5, ge=0.0, le=20.0)
 
     # Download & Backpressure
-    max_concurrent_downloads: int = Field(default=3, ge=1, le=16)
+    max_concurrent_downloads: int = Field(default=4, ge=1, le=16)
     max_concurrent_video_details: int = Field(default=6, ge=1, le=40)
     max_concurrent_list_pages: int = Field(default=2, ge=1, le=10)
     download_attempts: int = Field(default=3, ge=1, le=10)
     min_file_size_bytes: int = Field(default=10240, ge=1)
     preferred_quality: str = ""  # e.g. "2160,1440,1080" or empty for best
-    upload_batch_size: int = Field(default=10, ge=1, le=100)
+    upload_batch_size: int = Field(default=1, ge=1, le=100)
+    upload_workers: int = Field(default=3, ge=1, le=8)
     max_pending_upload_files: int = Field(default=20, ge=1, le=200)
     min_free_disk_gb: float = Field(default=2.0, ge=0.0, le=500.0)
 

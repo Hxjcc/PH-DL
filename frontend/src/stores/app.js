@@ -20,8 +20,20 @@ const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
 const inflight = new Map()
 const latestSeq = new Map()
 let sessionEpoch = 0
-let persistScheduled = false
+let persistTimer = null
+let persistIdleId = null
 let persistGen = 0
+
+function cancelScheduledPersist() {
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer)
+    persistTimer = null
+  }
+  if (persistIdleId !== null && typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
+    window.cancelIdleCallback(persistIdleId)
+    persistIdleId = null
+  }
+}
 
 function readSessionCache() {
   try {
@@ -41,7 +53,7 @@ function readSessionCache() {
 
 function clearSessionCache() {
   persistGen += 1
-  persistScheduled = false
+  cancelScheduledPersist()
   try {
     window.sessionStorage.removeItem(SESSION_CACHE_KEY)
   } catch {}
@@ -49,11 +61,11 @@ function clearSessionCache() {
 
 function schedulePersistSessionCache(store) {
   if (!store.authenticated) return
-  if (persistScheduled) return
-  persistScheduled = true
+  if (persistTimer !== null || persistIdleId !== null) return
   const gen = persistGen
   const flush = () => {
-    persistScheduled = false
+    persistTimer = null
+    persistIdleId = null
     if (gen !== persistGen || !store.authenticated) return
     try {
       const runningJobId = store.overview?.current_job?.id
@@ -81,11 +93,15 @@ function schedulePersistSessionCache(store) {
       window.sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify(payload))
     } catch {}
   }
-  if (typeof queueMicrotask === 'function') {
-    queueMicrotask(flush)
-  } else {
-    Promise.resolve().then(flush)
-  }
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    if (gen !== persistGen || !store.authenticated) return
+    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+      persistIdleId = window.requestIdleCallback(flush, { timeout: 800 })
+    } else {
+      flush()
+    }
+  }, 450)
 }
 
 function resetInflight() {
@@ -148,6 +164,7 @@ export const useAppStore = defineStore('app', {
       historyPageSize: readListPreference('history', HISTORY_PAGE_SIZES),
       jobItems: hasCache && cached.jobItems && typeof cached.jobItems === 'object' ? cached.jobItems : {},
       liveProgress: {},
+      schedulerStatus: {},
       logs: hasCache && Array.isArray(cached.logs) ? cached.logs : [],
       logsLoaded: Boolean(hasCache && Array.isArray(cached.logs)),
       _wsClient: null,
@@ -716,6 +733,7 @@ export const useAppStore = defineStore('app', {
       this.jobs = this.jobs.filter((j) => !idSet.has(Number(j.id)))
       for (const jid of idSet) {
         delete this.jobItems[jid]
+        delete this.schedulerStatus[jid]
       }
       this.persistCache()
     },
@@ -728,17 +746,21 @@ export const useAppStore = defineStore('app', {
       if (Array.isArray(res?.items)) {
         this.jobItems[jobId] = res.items
         for (const it of res.items) {
-          if (it.speed_bps > 0 || it.status === 'downloading') {
+          if (it.speed_bps > 0 || it.status === 'downloading' || it.status === 'uploading') {
+            const isUploading = it.status === 'uploading' || ['uploading', 'verifying'].includes(it.progress_phase)
             this.liveProgress[it.id] = {
               job_id: Number(jobId),
               item_id: it.id,
-              bytes_downloaded: it.bytes_downloaded,
-              bytes_total: it.bytes_total,
-              speed_bps: it.speed_bps || 0,
+              bytes_downloaded: isUploading ? Number(it.upload_bytes || 0) : Number(it.bytes_downloaded || 0),
+              bytes_total: Number(it.bytes_total || 0),
+              speed_bps: Number(it.speed_bps || 0),
+              phase: it.progress_phase || (isUploading ? 'uploading' : 'downloading'),
             }
           }
         }
-        this.persistCache()
+        if (Number(jobId) === Number(this.overview?.current_job?.id)) {
+          this.persistCache()
+        }
       }
       return res
     },
@@ -771,7 +793,7 @@ export const useAppStore = defineStore('app', {
     },
 
     _upsertItem(item) {
-      if (item.status !== 'downloading') {
+      if (item.status !== 'downloading' && item.status !== 'uploading') {
         delete this.liveProgress[item.id]
       }
       const list = this.jobItems[item.job_id]
@@ -821,6 +843,7 @@ export const useAppStore = defineStore('app', {
           if (msg.type === 'snapshot') {
             this._applyLogsSnapshot(msg.data?.logs || [])
             this.liveProgress = msg.data?.live_progress || {}
+            this.schedulerStatus = msg.data?.scheduler_status || {}
           } else if (msg.type === 'log') {
             const entry = msg.data
             if (entry && (entry.id == null || !this.logs.some((x) => x.id === entry.id))) {
@@ -832,6 +855,7 @@ export const useAppStore = defineStore('app', {
             this._upsertJob(msg.data)
             this._scheduleOverviewRefresh()
             if (['completed', 'cancelled', 'failed', 'partial_failed'].includes(msg.data?.status)) {
+              delete this.schedulerStatus[msg.data.id]
               this.refreshTempFiles()
               this.historyLoadedAt = 0
               if (this.historyCache !== null) {
@@ -842,6 +866,15 @@ export const useAppStore = defineStore('app', {
             this._upsertItem(msg.data)
           } else if (msg.type === 'item_progress') {
             this.liveProgress[msg.data.item_id] = msg.data
+          } else if (msg.type === 'job_scheduler') {
+            const jid = Number(msg.data?.job_id)
+            if (jid > 0) {
+              if (msg.data?.cleared) {
+                delete this.schedulerStatus[jid]
+              } else {
+                this.schedulerStatus[jid] = msg.data
+              }
+            }
           } else if (msg.type === 'overview_changed') {
             this._scheduleOverviewRefresh()
           }

@@ -5,7 +5,6 @@ import {
   Square,
   RotateCcw,
   Download as DownloadIcon,
-  ExternalLink,
   Loader2,
   Trash2,
   RefreshCw,
@@ -29,7 +28,12 @@ import {
   itemStatusMeta,
   jobStatusMeta,
 } from '../utils/format'
-import { computeJobLiveMetrics, resolveJobVisual } from '../utils/jobMeta'
+import {
+  buildItemStatusPills,
+  computeJobLiveMetrics,
+  filterJobItemsByStatus,
+  resolveJobVisual,
+} from '../utils/jobMeta'
 import { buildExportFilename } from '../utils/exportFilename'
 import Card from './ui/Card.vue'
 import Button from './ui/Button.vue'
@@ -71,18 +75,23 @@ const itemsLoaded = ref(false)
 const itemsLoadError = ref('')
 const showLoadingIndicator = ref(false)
 const itemStatusFilter = ref('all')
-const ITEM_PAGE_STEP = 80
+const ITEM_PAGE_STEP = 40
 const itemRenderLimit = ref(ITEM_PAGE_STEP)
 const brokenAvatars = ref(new Set())
 
 const isActive = computed(() => ['queued', 'scanning', 'running'].includes(props.job.status))
+const tracksLiveProgress = computed(() => ['scanning', 'running'].includes(props.job.status))
 const items = computed(() => store.jobItems[props.job.id] || [])
 const statusMeta = computed(() => jobStatusMeta(props.job.status))
 
 const visual = computed(() => resolveJobVisual(props.job, store.targetsCache || []))
 const categoryIcon = computed(() => CATEGORY_ICONS[visual.value.category.icon] || DownloadIcon)
 const liveMetrics = computed(() =>
-  computeJobLiveMetrics(props.job, store.liveProgress, store.jobItems[props.job.id])
+  computeJobLiveMetrics(
+    props.job,
+    tracksLiveProgress.value ? store.liveProgress : null,
+    store.jobItems[props.job.id]
+  )
 )
 
 const showItemUploader = computed(() => {
@@ -159,40 +168,89 @@ const retryButtonTitle = computed(() => {
   return '继续下载该任务中全部失败与中断条目（已下部分自动断点续传，已完成项自动跳过）'
 })
 
-const itemFilterCounts = computed(() => {
-  let active = 0
-  let done = 0
-  let failed = 0
-  for (const it of items.value) {
-    if (['pending', 'downloading', 'uploading'].includes(it.status)) active += 1
-    else if (['done', 'downloaded', 'skipped'].includes(it.status)) done += 1
-    else if (['failed', 'cancelled'].includes(it.status)) failed += 1
-  }
-  return { all: items.value.length, active, done, failed }
-})
+const itemFilterPills = computed(() =>
+  buildItemStatusPills(items.value, {
+    isMetadataJob: isMetadataJob.value,
+    activeFilter: itemStatusFilter.value,
+  })
+)
 
-const itemFilterPills = computed(() => {
-  const c = itemFilterCounts.value
-  const pills = [{ value: 'all', label: '全部', count: c.all }]
-  if (c.active > 0) pills.push({ value: 'active', label: '进行中', count: c.active })
-  if (c.done > 0) pills.push({ value: 'done', label: '已处理', count: c.done })
-  if (c.failed > 0) pills.push({ value: 'failed', label: '失败/取消', count: c.failed })
-  return pills
-})
-
-const filteredItems = computed(() => {
-  const f = itemStatusFilter.value
-  if (f === 'all') return items.value
-  if (f === 'active') return items.value.filter((it) => ['pending', 'downloading', 'uploading'].includes(it.status))
-  if (f === 'done') return items.value.filter((it) => ['done', 'downloaded', 'skipped'].includes(it.status))
-  if (f === 'failed') return items.value.filter((it) => ['failed', 'cancelled'].includes(it.status))
-  return items.value
-})
+const filteredItems = computed(() => filterJobItemsByStatus(items.value, itemStatusFilter.value))
 
 const visibleItems = computed(() => filteredItems.value.slice(0, itemRenderLimit.value))
 const remainingItemsCount = computed(() => Math.max(0, filteredItems.value.length - visibleItems.value.length))
 
+const transferProgressMap = computed(() => {
+  if (!detailsMounted.value || !tracksLiveProgress.value) return {}
+  const map = Object.create(null)
+  for (const item of visibleItems.value) {
+    if (item.status !== 'downloading' && item.status !== 'uploading') continue
+    const live = store.liveProgress[item.id]
+    const isUploading = item.status === 'uploading'
+    const phase = String(live?.phase || (isUploading ? 'uploading' : 'downloading')).toLowerCase()
+    const done = live
+      ? Number(live.bytes_downloaded || 0)
+      : (isUploading ? 0 : Number(item.bytes_downloaded || 0))
+    const total = live && Number(live.bytes_total || 0) > 0
+      ? Number(live.bytes_total)
+      : Number(item.bytes_total || 0)
+    const speed = live ? Number(live.speed_bps || 0) : 0
+    const pct = phase === 'verifying'
+      ? 100
+      : total > 0
+        ? Math.min(100, Math.round((done / total) * 1000) / 10)
+        : 0
+    const hasProgress = phase === 'verifying' || done > 0 || speed > 0
+    map[item.id] = {
+      phase,
+      doneText: formatBytes(done),
+      totalText: total > 0 ? formatBytes(total) : '',
+      speedText: speed > 0 ? formatSpeed(speed) : '',
+      pct,
+      hasProgress,
+    }
+  }
+  return map
+})
+
+const schedulerChip = computed(() => {
+  if (!tracksLiveProgress.value) return null
+  const st = store.schedulerStatus[props.job.id]
+  if (!st || typeof st !== 'object') return null
+  const level = String(st.level || 'green')
+  const freeText = st.free_bytes > 0 ? formatBytes(st.free_bytes) : '0 B'
+  const waiting = Number(st.waiting_for_space || 0)
+  const dlInfo = `下载 ${st.active_downloads ?? 0}/${st.allowed_downloads ?? st.max_downloads ?? 0}`
+  if (waiting > 0 || level === 'red') {
+    return {
+      text: `等待上传释放空间 · 余量 ${freeText}`,
+      toneClass: 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300',
+      dotClass: 'bg-red-500',
+    }
+  }
+  if (level === 'orange') {
+    return {
+      text: `磁盘紧张 ${freeText} · ${dlInfo}`,
+      toneClass: 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-300',
+      dotClass: 'bg-orange-500',
+    }
+  }
+  if (level === 'yellow') {
+    return {
+      text: `磁盘收紧 ${freeText} · ${dlInfo}`,
+      toneClass: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+      dotClass: 'bg-amber-500',
+    }
+  }
+  return {
+    text: `余量 ${freeText} · ${dlInfo}`,
+    toneClass: 'border-border/80 bg-card/80 text-muted-foreground',
+    dotClass: 'bg-emerald-500',
+  }
+})
+
 function selectItemFilter(val) {
+  if (itemStatusFilter.value === val) return
   itemStatusFilter.value = val
   itemRenderLimit.value = ITEM_PAGE_STEP
 }
@@ -231,22 +289,37 @@ async function ensureItemsLoaded(force = false) {
 }
 
 async function toggleExpand() {
+  const wasOpen = detailsOpen.value
   expanded.value = !expanded.value
   emit('activate', props.job.id, expanded.value)
   if (expanded.value) {
     detailsMounted.value = true
     await ensureItemsLoaded()
+  } else if (!wasOpen) {
+    detailsMounted.value = false
+    detailsRevealed.value = false
+    itemRenderLimit.value = ITEM_PAGE_STEP
+  }
+}
+
+function handleDetailsAfterLeave() {
+  if (!expanded.value) {
+    detailsMounted.value = false
+    detailsRevealed.value = false
+    itemRenderLimit.value = ITEM_PAGE_STEP
   }
 }
 
 watch(
   () => props.defaultExpanded,
   async (val) => {
-    if (val && !expanded.value) {
+    if (!val) return
+    const alreadyExpanded = expanded.value && detailsMounted.value
+    if (!expanded.value) {
       expanded.value = true
     }
-    if (val) {
-      detailsMounted.value = true
+    detailsMounted.value = true
+    if (!alreadyExpanded) {
       await ensureItemsLoaded()
     }
   },
@@ -272,15 +345,6 @@ watch(
     }
   }
 )
-
-function itemProgress(item) {
-  const live = store.liveProgress[item.id]
-  const done = live ? live.bytes_downloaded : item.bytes_downloaded || 0
-  const total = live ? live.bytes_total : item.bytes_total || 0
-  const speed = live ? live.speed_bps : 0
-  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 1000) / 10) : 0
-  return { done, total, speed, pct }
-}
 
 async function handleCancel() {
   busyAction.value = true
@@ -338,6 +402,7 @@ function downloadExportTxt() {
   <Card
     :class="[
       'job-card overflow-hidden transition-[border-color,background-color,box-shadow] duration-200',
+      !expanded && !detailsMounted && !focused ? 'job-card-collapsed' : '',
       selected
         ? 'border-brand/45 bg-brand/[0.03] dark:bg-brand/[0.06]'
         : focused
@@ -601,12 +666,30 @@ function downloadExportTxt() {
             <Loader2 class="w-3 h-3 animate-spin text-brand shrink-0" />
             <span>{{ liveMetrics.phaseText }}</span>
           </span>
-          <div class="flex items-center gap-2 ml-auto">
+          <div class="flex flex-wrap items-center gap-1.5 ml-auto">
             <span
-              v-if="liveMetrics.speedBps > 0"
-              class="inline-flex items-center rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-700 dark:text-emerald-300"
+              v-if="schedulerChip"
+              :class="[
+                'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium',
+                schedulerChip.toneClass,
+              ]"
             >
-              {{ formatSpeed(liveMetrics.speedBps) }}
+              <span :class="['w-1.5 h-1.5 rounded-full shrink-0', schedulerChip.dotClass]" />
+              {{ schedulerChip.text }}
+            </span>
+            <span
+              v-if="liveMetrics.downloadSpeedBps > 0"
+              class="inline-flex items-center rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-700 dark:text-emerald-300"
+              title="实时总下载速率"
+            >
+              ↓ {{ formatSpeed(liveMetrics.downloadSpeedBps) }}
+            </span>
+            <span
+              v-if="liveMetrics.uploadSpeedBps > 0"
+              class="inline-flex items-center rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-amber-700 dark:text-amber-300"
+              title="实时总上传速率"
+            >
+              ↑ {{ formatSpeed(liveMetrics.uploadSpeedBps) }}
             </span>
             <span v-if="!liveMetrics.indeterminate && liveMetrics.total > 0" class="font-mono font-semibold text-foreground">
               {{ liveMetrics.percent }}%
@@ -625,11 +708,11 @@ function downloadExportTxt() {
     </div>
 
     <!-- Expanded Per-Video Rows -->
-    <AnimatedCollapse :id="`job-details-${job.id}`" :open="detailsOpen">
+    <AnimatedCollapse :id="`job-details-${job.id}`" :open="detailsOpen" @after-leave="handleDetailsAfterLeave">
       <div
         v-if="detailsMounted"
         class="job-details border-t border-border bg-surface-subtle/50 dark:bg-surface-subtle/25 px-4 sm:px-5 py-3.5"
-        @click="emit('activate', job.id, true)"
+        @click="!focused && emit('activate', job.id, true)"
       >
         <div v-if="loadingItems && items.length === 0" class="py-5 flex items-center justify-center gap-2 text-xs text-muted-foreground">
           <Loader2 class="w-3.5 h-3.5 animate-spin text-brand" />
@@ -648,22 +731,23 @@ function downloadExportTxt() {
         <div v-else class="space-y-2.5">
           <div v-if="itemFilterPills.length > 1" class="flex flex-wrap items-center justify-between gap-2">
             <div class="flex flex-wrap items-center gap-1.5">
-              <Button
+              <button
                 v-for="pill in itemFilterPills"
                 :key="pill.value"
-                variant="outline"
-                size="xs"
+                type="button"
                 :aria-pressed="itemStatusFilter === pill.value"
                 :class="[
-                  'h-6 px-2.5 rounded-full text-[11px] shadow-none hover:shadow-none tabular-nums',
+                  'inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full border text-[11px] font-medium transition-colors cursor-pointer select-none tabular-nums',
                   itemStatusFilter === pill.value
-                    ? 'border-brand/35 bg-brand/10 dark:bg-brand/15 text-brand hover:bg-brand/10 hover:border-brand/35 dark:hover:bg-brand/15'
-                    : 'border-border bg-card text-muted-foreground hover:text-foreground',
+                    ? 'border-brand/35 bg-brand/10 dark:bg-brand/15 text-brand'
+                    : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-foreground/20',
                 ]"
                 @click="selectItemFilter(pill.value)"
               >
-                {{ pill.label }} {{ pill.count }}
-              </Button>
+                <span v-if="pill.dot" :class="['w-1.5 h-1.5 rounded-full shrink-0', pill.dot]" />
+                <span>{{ pill.label }}</span>
+                <span class="font-mono text-[10px] opacity-80">{{ pill.count }}</span>
+              </button>
             </div>
             <span v-if="filteredItems.length > ITEM_PAGE_STEP" class="text-[11px] text-muted-foreground tabular-nums">
               显示 {{ visibleItems.length }} / {{ filteredItems.length }} 项
@@ -678,7 +762,7 @@ function downloadExportTxt() {
             <div
               v-for="(item, idx) in visibleItems"
               :key="item.id"
-              class="rounded-lg border border-border/80 bg-card px-3.5 py-2.5 space-y-2 transition-colors hover:border-foreground/20"
+              class="job-item-row rounded-lg border border-border/80 bg-card px-3.5 py-2.5 space-y-2 transition-colors hover:border-foreground/20"
             >
               <div class="flex items-center justify-between gap-2.5">
                 <!-- Left: Index + Status Badge + Title -->
@@ -686,9 +770,10 @@ function downloadExportTxt() {
                   <span class="w-5 shrink-0 text-[11px] font-mono text-muted-foreground/65 tabular-nums">
                     {{ String(idx + 1).padStart(2, '0') }}
                   </span>
-                  <Badge variant="outline" :dot="itemStatusMeta(item.status).dot" class="shrink-0 h-5 px-2 text-[10px]">
+                  <span class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card/90 text-foreground font-medium whitespace-nowrap shrink-0 h-5 px-2 text-[10px]">
+                    <span :class="['w-1.5 h-1.5 rounded-full shrink-0', itemStatusMeta(item.status).dot]" />
                     {{ itemStatusLabel(item) }}
-                  </Badge>
+                  </span>
                   <span class="text-xs sm:text-[13px] font-medium text-foreground truncate" :title="item.title || item.viewkey">
                     {{ item.title || item.viewkey }}
                   </span>
@@ -716,17 +801,46 @@ function downloadExportTxt() {
 
                   <template v-if="item.status === 'downloading'">
                     <span class="hidden sm:inline text-muted-foreground font-mono text-[11px]">
-                      {{ formatBytes(itemProgress(item).done) }}
-                      <template v-if="itemProgress(item).total > 0"> / {{ formatBytes(itemProgress(item).total) }}</template>
+                      {{ transferProgressMap[item.id]?.doneText || '0 B' }}
+                      <template v-if="transferProgressMap[item.id]?.totalText"> / {{ transferProgressMap[item.id].totalText }}</template>
                     </span>
                     <span
-                      v-if="itemProgress(item).speed"
+                      v-if="transferProgressMap[item.id]?.speedText"
                       class="rounded-full bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400"
                     >
-                      {{ formatSpeed(itemProgress(item).speed) }}
+                      ↓ {{ transferProgressMap[item.id].speedText }}
                     </span>
                     <span class="font-mono font-semibold text-foreground w-11 text-right">
-                      {{ itemProgress(item).pct }}%
+                      {{ transferProgressMap[item.id]?.pct || 0 }}%
+                    </span>
+                  </template>
+                  <template v-else-if="item.status === 'uploading'">
+                    <span
+                      v-if="transferProgressMap[item.id]?.hasProgress && transferProgressMap[item.id]?.totalText"
+                      class="hidden sm:inline text-muted-foreground font-mono text-[11px]"
+                    >
+                      {{ transferProgressMap[item.id].doneText }} / {{ transferProgressMap[item.id].totalText }}
+                    </span>
+                    <span v-else-if="item.bytes_total > 0" class="hidden sm:inline text-muted-foreground font-mono text-[11px]">
+                      {{ formatBytes(item.bytes_total) }}
+                    </span>
+                    <span
+                      v-if="transferProgressMap[item.id]?.phase === 'verifying'"
+                      class="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400"
+                    >
+                      校验中
+                    </span>
+                    <span
+                      v-else-if="transferProgressMap[item.id]?.speedText"
+                      class="rounded-full bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-amber-700 dark:text-amber-300"
+                    >
+                      ↑ {{ transferProgressMap[item.id].speedText }}
+                    </span>
+                    <span
+                      v-if="transferProgressMap[item.id]?.hasProgress"
+                      class="font-mono font-semibold text-foreground w-11 text-right"
+                    >
+                      {{ transferProgressMap[item.id].pct }}%
                     </span>
                   </template>
                   <span v-else-if="item.bytes_total > 0" class="text-muted-foreground font-mono text-[11px] min-w-[54px] text-right">
@@ -749,13 +863,31 @@ function downloadExportTxt() {
                     :title="`打开原视频页 (${item.viewkey || 'PornHub'})`"
                     @click.stop
                   >
-                    <ExternalLink class="w-3.5 h-3.5" />
+                    <svg
+                      class="w-3.5 h-3.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M15 3h6v6" />
+                      <path d="M10 14 21 3" />
+                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                    </svg>
                   </a>
                 </div>
               </div>
 
-              <Progress v-if="item.status === 'downloading'" :model-value="itemProgress(item).pct" class="h-1" />
-              <Progress v-else-if="item.status === 'uploading'" indeterminate class="h-1" />
+              <Progress v-if="item.status === 'downloading'" :model-value="transferProgressMap[item.id]?.pct || 0" class="h-1" />
+              <Progress
+                v-else-if="item.status === 'uploading'"
+                :model-value="transferProgressMap[item.id]?.pct || 0"
+                :indeterminate="!transferProgressMap[item.id]?.hasProgress"
+                class="h-1"
+              />
 
               <div v-if="item.error_message" class="text-[11px] text-red-600 dark:text-red-400 pl-7">
                 {{ item.error_message }}
@@ -780,5 +912,16 @@ function downloadExportTxt() {
 <style scoped>
 .job-card {
   overflow-anchor: none;
+  contain: layout style;
+}
+
+.job-card-collapsed {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 92px;
+}
+
+.job-item-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 46px;
 }
 </style>

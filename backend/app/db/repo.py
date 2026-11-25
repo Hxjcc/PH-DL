@@ -1000,6 +1000,7 @@ class Repository:
 
     async def update_job_item(self, item_id: int, **fields: Any) -> Optional[Dict[str, Any]]:
         allowed = {
+            "viewkey",
             "title",
             "uploader",
             "target_type",

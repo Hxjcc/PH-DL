@@ -9,12 +9,34 @@ import json
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..config import RuntimeSettings
 from .filename import is_valid_video_file
 
 FileSnapshot = Tuple[int, int, int, int, int]
+UploadProgressCallback = Callable[[str, int, int, float, str], None]  # (viewkey, bytes_sent, total, speed_bps, phase)
+
+
+@dataclass
+class UploadSessionCache:
+    """Per-job cache avoiding repeated `rclone listremotes` and `rclone mkdir` calls."""
+
+    remote_type: Optional[str] = None
+    remote_type_checked: bool = False
+    created_remote_dirs: Set[str] = field(default_factory=set)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+
+def parse_rclone_json_line(line: str) -> Optional[Dict[str, Any]]:
+    text = (line or "").strip()
+    if not text or not text.startswith("{"):
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 @dataclass
@@ -67,6 +89,7 @@ async def _run_cmd(
     *,
     timeout: Optional[float] = None,
     cancel_event: Optional[asyncio.Event] = None,
+    on_stderr_line: Optional[Callable[[str], None]] = None,
 ) -> Tuple[int, str, str]:
     if cancel_event is not None and cancel_event.is_set():
         return 130, "", "rclone 执行已取消"
@@ -82,9 +105,51 @@ async def _run_cmd(
     except Exception as err:
         return 1, "", f"{type(err).__name__}: {err}"
 
+    if on_stderr_line is not None:
+        stderr_lines: List[str] = []
+
+        async def _stream_communicate() -> Tuple[bytes, bytes]:
+            async def _read_stdout() -> bytes:
+                if proc.stdout is None:
+                    return b""
+                return await proc.stdout.read()
+
+            async def _read_stderr() -> None:
+                if proc.stderr is None:
+                    return
+                while True:
+                    raw = await proc.stderr.readline()
+                    if not raw:
+                        break
+                    text = raw.decode(errors="replace").rstrip("\r\n")
+                    if text:
+                        parsed = parse_rclone_json_line(text)
+                        if parsed is not None:
+                            if not isinstance(parsed.get("stats"), dict):
+                                msg = str(parsed.get("msg") or "").strip()
+                                lvl = str(parsed.get("level") or "").lower()
+                                if msg and lvl in {"error", "critical", "fatal", "warning"}:
+                                    stderr_lines.append(msg)
+                                    if len(stderr_lines) > 50:
+                                        stderr_lines.pop(0)
+                        else:
+                            stderr_lines.append(text)
+                            if len(stderr_lines) > 50:
+                                stderr_lines.pop(0)
+                        with contextlib.suppress(Exception):
+                            on_stderr_line(text)
+
+            out_b, _ = await asyncio.gather(_read_stdout(), _read_stderr())
+            await proc.wait()
+            return out_b, ("\n".join(stderr_lines)).encode("utf-8", errors="replace")
+
+        comm_coro = _stream_communicate()
+    else:
+        comm_coro = proc.communicate()
+
     if timeout is None and cancel_event is None:
         try:
-            stdout_b, stderr_b = await proc.communicate()
+            stdout_b, stderr_b = await comm_coro
         except asyncio.CancelledError:
             await _terminate_process(proc)
             raise
@@ -94,7 +159,7 @@ async def _run_cmd(
             (stderr_b or b"").decode(errors="replace"),
         )
 
-    communicate_task = asyncio.create_task(proc.communicate())
+    communicate_task = asyncio.create_task(comm_coro)
     cancel_task = asyncio.create_task(cancel_event.wait()) if cancel_event is not None else None
     wait_tasks = {communicate_task}
     if cancel_task is not None:
@@ -188,14 +253,18 @@ def build_rclone_copy_opts(
     settings: RuntimeSettings,
     *,
     remote_type: Optional[str] = None,
+    stream_stats: bool = False,
 ) -> List[str]:
     opts = [
         "--no-traverse",
         f"--transfers={settings.rclone_transfers}",
         f"--checkers={settings.rclone_checkers}",
         f"--log-level={settings.rclone_log_level}",
-        "--stats=0",
     ]
+    if stream_stats:
+        opts.extend(["--use-json-log", "--stats=500ms", "--stats-log-level=NOTICE"])
+    else:
+        opts.append("--stats=0")
     if settings.rclone_ignore_size:
         opts.append("--ignore-size")
     else:
@@ -400,6 +469,9 @@ async def upload_file_batch(
     files_by_viewkey: Dict[str, Path],
     settings: RuntimeSettings,
     cancel_event: Optional[asyncio.Event] = None,
+    *,
+    session_cache: Optional[UploadSessionCache] = None,
+    on_progress: Optional[UploadProgressCallback] = None,
 ) -> UploadBatchResult:
     """Copy and verify the batch. The caller records success before deleting any source."""
     remote_dir = build_remote_dir(settings, uploader_folder)
@@ -428,17 +500,99 @@ async def upload_file_batch(
         return result
 
     rclone = (settings.rclone_bin or "rclone").strip()
-    remote_type = await detect_remote_type(settings, cancel_event=cancel_event)
+    if session_cache is not None:
+        async with session_cache._lock:
+            if not session_cache.remote_type_checked:
+                session_cache.remote_type = await detect_remote_type(settings, cancel_event=cancel_event)
+                if cancel_event is None or not cancel_event.is_set():
+                    session_cache.remote_type_checked = True
+            remote_type = session_cache.remote_type
+    else:
+        remote_type = await detect_remote_type(settings, cancel_event=cancel_event)
 
-    rc_mk, _, err_mk = await _run_cmd(
-        [rclone, "mkdir", remote_dir, f"--log-level={settings.rclone_log_level}"],
-        timeout=min(settings.rclone_timeout_seconds, 60),
-        cancel_event=cancel_event,
+    need_mkdir = True
+    if session_cache is not None:
+        async with session_cache._lock:
+            if remote_dir in session_cache.created_remote_dirs:
+                need_mkdir = False
+            else:
+                rc_mk, _, err_mk = await _run_cmd(
+                    [rclone, "mkdir", remote_dir, f"--log-level={settings.rclone_log_level}"],
+                    timeout=min(settings.rclone_timeout_seconds, 60),
+                    cancel_event=cancel_event,
+                )
+                if rc_mk != 0:
+                    result.failed_viewkeys.extend(entries)
+                    result.error = err_mk.strip() or f"rclone mkdir 失败 (code={rc_mk})"
+                    return result
+                session_cache.created_remote_dirs.add(remote_dir)
+                need_mkdir = False
+
+    if need_mkdir:
+        rc_mk, _, err_mk = await _run_cmd(
+            [rclone, "mkdir", remote_dir, f"--log-level={settings.rclone_log_level}"],
+            timeout=min(settings.rclone_timeout_seconds, 60),
+            cancel_event=cancel_event,
+        )
+        if rc_mk != 0:
+            result.failed_viewkeys.extend(entries)
+            result.error = err_mk.strip() or f"rclone mkdir 失败 (code={rc_mk})"
+            return result
+
+    by_relative: Dict[str, Tuple[str, int]] = {
+        relative: (vk, snapshot[2]) for vk, (_, relative, snapshot) in entries.items()
+    }
+    by_name: Dict[str, Tuple[str, int]] = {
+        Path(relative).name: (vk, snapshot[2]) for vk, (_, relative, snapshot) in entries.items()
+    }
+    sole_entry: Optional[Tuple[str, int]] = (
+        next(((vk, snapshot[2]) for vk, (_, _, snapshot) in entries.items()), None)
+        if len(entries) == 1
+        else None
     )
-    if rc_mk != 0:
-        result.failed_viewkeys.extend(entries)
-        result.error = err_mk.strip() or f"rclone mkdir 失败 (code={rc_mk})"
-        return result
+    reported_error_lines: List[str] = []
+
+    def _on_stderr_line(line: str) -> None:
+        parsed = parse_rclone_json_line(line)
+        if parsed is None:
+            return
+        lvl = str(parsed.get("level") or "").lower()
+        if lvl in {"error", "critical", "fatal"}:
+            msg = str(parsed.get("msg") or "").strip()
+            if msg:
+                reported_error_lines.append(msg)
+        if on_progress is None:
+            return
+        stats = parsed.get("stats")
+        if not isinstance(stats, dict):
+            return
+        transferring = stats.get("transferring")
+        if isinstance(transferring, list) and transferring:
+            fallback_speed = float(stats.get("speed") or 0.0)
+            for item in transferring:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                matched = by_relative.get(name) or by_name.get(Path(name).name) or sole_entry
+                if matched is None:
+                    continue
+                vk, local_total = matched
+                raw_total = item.get("size")
+                total = int(raw_total) if isinstance(raw_total, (int, float)) and raw_total > 0 else local_total
+                raw_bytes = item.get("bytes")
+                sent = int(raw_bytes) if isinstance(raw_bytes, (int, float)) and raw_bytes >= 0 else 0
+                if total > 0:
+                    sent = min(sent, total)
+                raw_speed = item.get("speed")
+                speed = float(raw_speed) if isinstance(raw_speed, (int, float)) and raw_speed >= 0 else fallback_speed
+                on_progress(vk, sent, total, speed, "uploading")
+        elif sole_entry is not None:
+            vk, local_total = sole_entry
+            raw_bytes = stats.get("bytes")
+            if isinstance(raw_bytes, (int, float)) and raw_bytes > 0:
+                sent = min(int(raw_bytes), local_total) if local_total > 0 else int(raw_bytes)
+                speed = float(stats.get("speed") or 0.0)
+                on_progress(vk, sent, local_total, max(0.0, speed), "uploading")
 
     with _upload_file_list([entry[1] for entry in entries.values()]) as list_file:
         cmd = [
@@ -446,18 +600,23 @@ async def upload_file_batch(
             "copy",
             str(root),
             remote_dir,
-            *build_rclone_copy_opts(settings, remote_type=remote_type),
+            *build_rclone_copy_opts(settings, remote_type=remote_type, stream_stats=on_progress is not None),
             "--files-from-raw",
             str(list_file),
         ]
-        rc, _, stderr = await _run_cmd(
-            cmd,
-            timeout=settings.rclone_timeout_seconds,
-            cancel_event=cancel_event,
-        )
+        run_kwargs: Dict[str, Any] = {
+            "timeout": settings.rclone_timeout_seconds,
+            "cancel_event": cancel_event,
+        }
+        if on_progress is not None:
+            run_kwargs["on_stderr_line"] = _on_stderr_line
+        rc, _, stderr = await _run_cmd(cmd, **run_kwargs)
     if rc != 0:
-        lines = [line for line in stderr.strip().splitlines() if line.strip()]
-        result.error = lines[-1] if lines else f"rclone copy 返回 {rc}"
+        if reported_error_lines:
+            result.error = reported_error_lines[-1]
+        else:
+            lines = [line for line in stderr.strip().splitlines() if line.strip()]
+            result.error = lines[-1] if lines else f"rclone copy 返回 {rc}"
         result.failed_viewkeys.extend(entries)
         return result
 
@@ -466,6 +625,9 @@ async def upload_file_batch(
         if cancel_event and cancel_event.is_set():
             result.failed_viewkeys.append(vk)
             continue
+        if on_progress is not None:
+            with contextlib.suppress(Exception):
+                on_progress(vk, snapshot[2], snapshot[2], 0.0, "verifying")
         if file_snapshot(path) != snapshot:
             result.failed_viewkeys.append(vk)
             verify_error = verify_error or "本地文件在上传期间发生变化，已保留本地文件"
