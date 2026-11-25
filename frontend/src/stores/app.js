@@ -1001,6 +1001,12 @@ export const useAppStore = defineStore('app', {
             }
           } else if (msg.type === 'overview_changed') {
             this._scheduleOverviewRefresh()
+          } else if (msg.type === 'targets_changed') {
+            this.targetsLoadedAt = 0
+            this.refreshTargets().catch(() => {})
+            this._scheduleOverviewRefresh()
+          } else if (msg.type === 'subscriptions_changed') {
+            this.clearSubscriptionsCache()
           }
         },
       })

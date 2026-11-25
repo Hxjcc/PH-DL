@@ -9,6 +9,7 @@ import json
 import random
 import shutil
 import time
+import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,14 @@ from ..config import EnvSettings, RuntimeSettings
 from ..db.repo import Repository, utc_now_iso
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.list_scanner import ListedVideo, build_target_list_url, scan_list_pages
-from ..parsers.target import resolve_target_type
+from ..parsers.target import (
+    PH_ORIGIN,
+    SubscribeAction,
+    SubscribeResult,
+    extract_subscribe_action,
+    resolve_target_type,
+    subscribe_from_action,
+)
 from ..parsers.video import (
     VideoDetail,
     collect_video_urls,
@@ -428,6 +436,7 @@ class TaskManager:
         parse_specs: Optional[Dict[int, _PendingParseSpec]] = None,
         include_keywords: Optional[Set[str]] = None,
         exclude_keywords: Optional[Set[str]] = None,
+        on_detail_parsed: Optional[Callable[[VideoDetail], Awaitable[None]]] = None,
     ) -> Tuple[Dict[str, int], Dict[str, List[str]]]:
         """Stream pre-parse, byte-adaptive downloads, and multi-worker zero-wait uploads."""
         uploaded_by_uploader: Dict[str, int] = defaultdict(int)
@@ -1111,6 +1120,16 @@ class TaskManager:
                                                     self.events.broadcast("item_updated", it)
                                                 continue
 
+                                            if on_detail_parsed is not None and (not detail.error or detail.filtered_out):
+                                                try:
+                                                    await on_detail_parsed(detail)
+                                                except Exception as link_err:
+                                                    self.events.emit_log(
+                                                        "WARNING",
+                                                        f"博主联动处理失败: {link_err}",
+                                                        job_id=job_id,
+                                                    )
+
                                             if detail.filtered_out:
                                                 it = await self.repo.update_job_item(
                                                     iid,
@@ -1429,6 +1448,7 @@ class TaskManager:
         exclude_keywords: Optional[Set[str]] = None,
         uploader_hint: Optional[Tuple[str, str]] = None,
         on_profile: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_subscribe_action: Optional[Callable[[SubscribeAction, str], Awaitable[None]]] = None,
         on_page_progress: Optional[Callable[[int, int, int], None]] = None,
         on_scan_error: Optional[Callable[[str], None]] = None,
     ) -> Tuple[List[ListedVideo], List[VideoDetail]]:
@@ -1475,6 +1495,8 @@ class TaskManager:
                 "on_page": _on_page,
                 "on_error": on_scan_error,
             }
+            if on_subscribe_action is not None:
+                scan_kwargs["on_subscribe_action"] = on_subscribe_action
             if on_page_progress is not None:
                 scan_kwargs["on_page_progress"] = on_page_progress
             listed = await scan_list_pages(
@@ -1513,6 +1535,79 @@ class TaskManager:
         details.sort(key=lambda d: (d.page_num, d.item_num))
         return listed, details
 
+    async def _maybe_track_creator(
+        self,
+        job_id: int,
+        username: str,
+        target_type: str,
+        *,
+        display_name: str = "",
+        avatar_url: str = "",
+        tracked_keys: Set[Tuple[str, str]],
+    ) -> None:
+        uname = (username or "").strip()
+        utype = (target_type or "model").strip().lower()
+        if not uname or uname == "_currentUser_":
+            return
+        if utype not in {"model", "pornstar"}:
+            dedup = (utype, uname.lower())
+            if dedup not in tracked_keys and utype == "channel":
+                tracked_keys.add(dedup)
+                self.events.emit_log("INFO", f"跳过加入自动追更 '{uname}'：暂不支持 Channel 类型追更。", job_id=job_id)
+            return
+        dedup = (utype, uname.lower())
+        if dedup in tracked_keys:
+            return
+        tracked_keys.add(dedup)
+        target, created = await self.repo.ensure_target(
+            uname,
+            utype,
+            avatar_url=avatar_url,
+            display_name=display_name,
+        )
+        shown = (target or {}).get("display_name") or display_name or uname
+        if created:
+            self.events.emit_log("INFO", f"已自动加入追更目标: {shown} ({utype})", job_id=job_id)
+            self.events.broadcast("targets_changed", {})
+            self.events.broadcast("overview_changed", {})
+        else:
+            self.events.emit_log("INFO", f"已在自动追更列表中: {shown} ({utype})", job_id=job_id)
+
+    async def _maybe_subscribe_creator(
+        self,
+        job_id: int,
+        ctx: TaskHttpContext,
+        action: Optional[SubscribeAction],
+        *,
+        referer_url: str,
+        creator_label: str,
+        dedup_key: str,
+        subscribed_keys: Set[str],
+        timeout: float,
+    ) -> Optional[SubscribeResult]:
+        if ctx.cancel_event.is_set():
+            return None
+        key = (action.creator_id if action and action.creator_id else dedup_key).strip().lower()
+        if not key or key in subscribed_keys:
+            return None
+        subscribed_keys.add(key)
+
+        res = await subscribe_from_action(
+            ctx,
+            action,
+            referer_url=referer_url,
+            label=creator_label,
+            timeout=timeout,
+        )
+        if res.status == "already_subscribed":
+            self.events.emit_log("INFO", f"已订阅博主 '{creator_label}'，跳过重复订阅。", job_id=job_id)
+        elif res.ok:
+            self.events.emit_log("INFO", f"已自动订阅博主: {creator_label}", job_id=job_id)
+            self.events.broadcast("subscriptions_changed", {})
+        else:
+            self.events.emit_log("WARNING", f"自动订阅博主 '{creator_label}' 失败: {res.message}", job_id=job_id)
+        return res
+
     async def _exec_manual_target(
         self,
         job_id: int,
@@ -1531,6 +1626,8 @@ class TaskManager:
         redownload = bool(params.get("redownload", False))
         export_only = bool(params.get("export_only", False))
         auto_upload = bool(params.get("auto_upload", settings.uploader_enabled))
+        add_to_auto_track = bool(params.get("add_to_auto_track", False))
+        subscribe_creator = bool(params.get("subscribe_creator", False))
 
         targets: List[Tuple[str, str]] = []
         if raw_type == "liked":
@@ -1566,6 +1663,8 @@ class TaskManager:
         scan_errors: List[str] = []
         profile_avatars: Dict[str, str] = dict(params.get("profile_avatars") or {})
         profile_names: Dict[str, str] = dict(params.get("profile_names") or {})
+        tracked_keys: Set[Tuple[str, str]] = set()
+        subscribed_keys: Set[str] = set()
 
         for target_idx, (uname, utype) in enumerate(targets):
             if ctx.cancel_event.is_set():
@@ -1623,6 +1722,32 @@ class TaskManager:
                     if updated_job:
                         self.events.broadcast("job_updated", updated_job)
 
+            can_link_creator = utype in {"model", "pornstar"} and uname != "_currentUser_"
+            subscribe_attempted = False
+
+            async def _handle_list_subscribe(
+                action: SubscribeAction,
+                referer_url: str,
+                target_user: str = uname,
+                target_type: str = utype,
+            ) -> None:
+                nonlocal subscribe_attempted
+                subscribe_attempted = True
+                label = profile_names.get(target_user) or target_user
+                sub_res = await self._maybe_subscribe_creator(
+                    job_id,
+                    ctx,
+                    action,
+                    referer_url=referer_url,
+                    creator_label=label,
+                    dedup_key=f"{target_type}:{target_user.lower()}",
+                    subscribed_keys=subscribed_keys,
+                    timeout=settings.request_timeout,
+                )
+                if sub_res and sub_res.avatar_url and not profile_avatars.get(target_user):
+                    await _save_target_profile(sub_res.avatar_url, profile_names.get(target_user) or "")
+
+            on_sub_cb = _handle_list_subscribe if (subscribe_creator and can_link_creator) else None
             page_errors: List[str] = []
             resolved_user = uname if uname != "_currentUser_" else "My_Liked"
             if export_only:
@@ -1640,39 +1765,75 @@ class TaskManager:
                     exclude_keywords=exclude_kw,
                     uploader_hint=(resolved_user, utype),
                     on_profile=_save_target_profile,
+                    on_subscribe_action=on_sub_cb,
                     on_page_progress=_emit_manual_page_progress,
                     on_scan_error=page_errors.append,
                 )
                 scan_errors.extend(f"{uname}: {error}" for error in page_errors)
-                if not listed:
-                    if not page_errors and not ctx.cancel_event.is_set():
-                        self.events.emit_log("INFO", f"目标 '{uname}' ({utype}) 未发现待处理的视频。", job_id=job_id)
-                    continue
-                all_details.extend(details)
             else:
+                scan_kwargs: Dict[str, Any] = {
+                    "target_type": utype,
+                    "pages_spec": pages_spec,
+                    "videos_spec": videos_spec,
+                    "catch_up": False,
+                    "skip_vkeys": known_vkeys,
+                    "delay_min": settings.page_delay_min,
+                    "delay_max": settings.page_delay_max,
+                    "page_concurrency": settings.max_concurrent_list_pages,
+                    "timeout": settings.request_timeout,
+                    "profile_username": resolved_user,
+                    "on_profile": _save_target_profile,
+                    "on_page_progress": _emit_manual_page_progress,
+                    "on_error": page_errors.append,
+                }
+                if on_sub_cb is not None:
+                    scan_kwargs["on_subscribe_action"] = on_sub_cb
                 listed = await scan_list_pages(
                     ctx,
                     list_url,
                     settings.selectors,
-                    target_type=utype,
-                    pages_spec=pages_spec,
-                    videos_spec=videos_spec,
-                    catch_up=False,
-                    skip_vkeys=known_vkeys,
-                    delay_min=settings.page_delay_min,
-                    delay_max=settings.page_delay_max,
-                    page_concurrency=settings.max_concurrent_list_pages,
-                    timeout=settings.request_timeout,
-                    profile_username=resolved_user,
-                    on_profile=_save_target_profile,
-                    on_page_progress=_emit_manual_page_progress,
-                    on_error=page_errors.append,
+                    **scan_kwargs,
                 )
+                details = []
                 scan_errors.extend(f"{uname}: {error}" for error in page_errors)
-                if not listed:
-                    if not page_errors and not ctx.cancel_event.is_set():
-                        self.events.emit_log("INFO", f"目标 '{uname}' ({utype}) 未发现待处理的视频。", job_id=job_id)
-                    continue
+
+            if subscribe_creator and can_link_creator and not subscribe_attempted and not ctx.cancel_event.is_set():
+                # Fallback to profile homepage only if list pages yielded no subscribe button.
+                profile_url = f"{PH_ORIGIN}/{utype}/{urllib.parse.quote(uname, safe='')}"
+                prof_res, _ = await ctx.fetch_with_pow(
+                    profile_url,
+                    timeout=max(5.0, float(settings.request_timeout)),
+                    max_retries=1,
+                    log_label=f"获取博主主页 {uname}",
+                )
+                fallback_action = (
+                    extract_subscribe_action(prof_res.text)
+                    if prof_res is not None and prof_res.status_code < 400
+                    else None
+                )
+                await _handle_list_subscribe(
+                    fallback_action or SubscribeAction(),
+                    (prof_res.final_url if prof_res is not None else profile_url),
+                )
+
+            if add_to_auto_track and can_link_creator and not ctx.cancel_event.is_set():
+                await self._maybe_track_creator(
+                    job_id,
+                    uname,
+                    utype,
+                    display_name=profile_names.get(uname) or "",
+                    avatar_url=profile_avatars.get(uname) or "",
+                    tracked_keys=tracked_keys,
+                )
+
+            if not listed:
+                if not page_errors and not ctx.cancel_event.is_set():
+                    self.events.emit_log("INFO", f"目标 '{uname}' ({utype}) 未发现待处理的视频。", job_id=job_id)
+                continue
+
+            if export_only:
+                all_details.extend(details)
+            else:
                 for lv in listed:
                     key = lv.viewkey or lv.url
                     if key not in scoped_listed:
@@ -1771,7 +1932,42 @@ class TaskManager:
         redownload = bool(params.get("redownload", False))
         export_only = bool(params.get("export_only", False))
         auto_upload = bool(params.get("auto_upload", settings.uploader_enabled))
+        add_to_auto_track = bool(params.get("add_to_auto_track", False))
+        subscribe_creator = bool(params.get("subscribe_creator", False))
         batch_folder = sanitize_filename(params.get("batch_name") or "url_batch")
+
+        creator_link_lock = asyncio.Lock()
+        tracked_keys: Set[Tuple[str, str]] = set()
+        subscribed_keys: Set[str] = set()
+
+        async def _handle_url_creator_linkage(detail: VideoDetail) -> None:
+            if not (add_to_auto_track or subscribe_creator) or ctx.cancel_event.is_set():
+                return
+            async with creator_link_lock:
+                sub_res: Optional[SubscribeResult] = None
+                uploader_name = (detail.uploader_username or "").strip()
+                uploader_type = (detail.uploader_type or "model").strip().lower()
+                creator_label = uploader_name or (detail.subscribe_action.creator_id if detail.subscribe_action else "") or detail.viewkey
+                if subscribe_creator:
+                    dedup_key = f"{uploader_type}:{uploader_name.lower()}" if uploader_name else (detail.viewkey or detail.page_url)
+                    sub_res = await self._maybe_subscribe_creator(
+                        job_id,
+                        ctx,
+                        detail.subscribe_action,
+                        referer_url=detail.referer_url or detail.page_url,
+                        creator_label=creator_label,
+                        dedup_key=dedup_key,
+                        subscribed_keys=subscribed_keys,
+                        timeout=settings.request_timeout,
+                    )
+                if add_to_auto_track and uploader_name:
+                    await self._maybe_track_creator(
+                        job_id,
+                        uploader_name,
+                        uploader_type,
+                        avatar_url=sub_res.avatar_url if sub_res else "",
+                        tracked_keys=tracked_keys,
+                    )
 
         if export_only:
             self.events.emit_log("INFO", f"正在并发解析 {len(video_urls)} 条视频链接...", job_id=job_id)
@@ -1785,6 +1981,10 @@ class TaskManager:
                 exclude_keywords=exclude_kw,
                 timeout=settings.request_timeout,
             )
+            if add_to_auto_track or subscribe_creator:
+                for d in details:
+                    if not d.error or d.filtered_out:
+                        await _handle_url_creator_linkage(d)
             await self._record_export_result(job_id, details)
             return
 
@@ -1840,6 +2040,7 @@ class TaskManager:
                 parse_specs=parse_specs,
                 include_keywords=include_kw,
                 exclude_keywords=exclude_kw,
+                on_detail_parsed=_handle_url_creator_linkage if (add_to_auto_track or subscribe_creator) else None,
             )
 
     async def _exec_update_check(

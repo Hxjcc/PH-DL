@@ -15,7 +15,7 @@ from ..cancel import StopRequested, until_stopped
 from ..config import SelectorSettings
 from ..services.filename import extract_date_from_cdn_url
 from .http_session import TaskHttpContext
-from .target import select_many, select_one
+from .target import SubscribeAction, extract_subscribe_action, select_many, select_one
 from .video import parse_duration_seconds
 
 PH_BASE_URL = "https://www.pornhub.com"
@@ -328,6 +328,7 @@ async def scan_list_pages(
     timeout: float = 20.0,
     profile_username: Optional[str] = None,
     on_profile: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    on_subscribe_action: Optional[Callable[[SubscribeAction, str], Awaitable[None]]] = None,
     on_page: Optional[Callable[[List[ListedVideo]], Awaitable[None]]] = None,
     on_page_progress: Optional[Callable[[int, int, int], None]] = None,
     on_error: Optional[Callable[[str], None]] = None,
@@ -352,6 +353,7 @@ async def scan_list_pages(
     pages_scanned = 0
     end_reached = False
     profile_found = False
+    subscribe_notified = False
 
     def report_error(page: int, reason: str) -> None:
         message = f"列表第 {page} 页: {reason}"
@@ -433,25 +435,33 @@ async def scan_list_pages(
                 continue
 
             want_profile = bool(on_profile and not profile_found)
+            want_subscribe = bool(on_subscribe_action and not subscribe_notified)
             if len(res.text) >= _OFFLOAD_HTML_THRESHOLD:
                 def _parse_page_sync(
                     html_body: str = res.text,
                     fetch_profile: bool = want_profile,
-                ) -> Tuple[List[Tuple[str, str, str, str, int]], str, str]:
+                    fetch_subscribe: bool = want_subscribe,
+                ) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[SubscribeAction]]:
                     av = extract_target_avatar(html_body, profile_username) if fetch_profile else ""
                     dn = extract_target_display_name(html_body, profile_username) if fetch_profile else ""
+                    sub = extract_subscribe_action(html_body) if fetch_subscribe else None
                     items = extract_video_cards_from_list_page(html_body, selectors, target_type=target_type)
-                    return items, av, dn
+                    return items, av, dn, sub
 
-                raw_items, avatar_url, display_name = await asyncio.to_thread(_parse_page_sync)
+                raw_items, avatar_url, display_name, subscribe_action = await asyncio.to_thread(_parse_page_sync)
             else:
                 avatar_url = extract_target_avatar(res.text, profile_username) if want_profile else ""
                 display_name = extract_target_display_name(res.text, profile_username) if want_profile else ""
+                subscribe_action = extract_subscribe_action(res.text) if want_subscribe else None
                 raw_items = extract_video_cards_from_list_page(res.text, selectors, target_type=target_type)
 
             if want_profile and (avatar_url or display_name):
                 profile_found = True
                 await on_profile(avatar_url, display_name)
+
+            if want_subscribe and subscribe_action is not None:
+                subscribe_notified = True
+                await on_subscribe_action(subscribe_action, res.final_url or page_url)
 
             if not raw_items:
                 if is_natural and current_page == 1:

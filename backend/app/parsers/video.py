@@ -16,7 +16,7 @@ from selectolax.lexbor import LexborHTMLParser as HTMLParser
 from ..config import SelectorSettings
 from ..services.filename import extract_date_from_cdn_url, normalize_published_date
 from .http_session import TaskHttpContext
-from .target import select_one
+from .target import SubscribeAction, extract_subscribe_action, select_one
 
 _FLASHVARS_START_RE = re.compile(r"var\s+flashvars_\d+\s*=\s*\{")
 _JSONLD_SCRIPT_RE = re.compile(
@@ -133,6 +133,7 @@ class VideoDetail:
     mp4_sources: Tuple[MediaSource, ...] = ()
     published_at: str = ""
     duration_seconds: int = 0
+    subscribe_action: Optional[SubscribeAction] = None
 
 
 def extract_viewkey_from_url(url: Optional[str]) -> Optional[str]:
@@ -415,9 +416,10 @@ def _parse_video_html_fields(
     selectors: SelectorSettings,
     uploader_hint: Optional[Tuple[str, str]],
     skip_dom: bool,
-) -> Tuple[Optional[Dict[str, Any]], str, str, str, str, int]:
+) -> Tuple[Optional[Dict[str, Any]], str, str, str, str, int, Optional[SubscribeAction]]:
     vdata = extract_flashvars(html, final_url, vkey)
     published_at, duration_seconds = extract_detail_published_and_duration(html, vdata)
+    subscribe_action = extract_subscribe_action(html)
     js_title = (vdata or {}).get("video_title")
     title = html_lib.unescape(str(js_title).strip()) if js_title else ""
     if uploader_hint and uploader_hint[0]:
@@ -433,7 +435,7 @@ def _parse_video_html_fields(
             uploader_name, uploader_type = _extract_uploader(tree, vdata, selectors)
     if not title:
         title = f"未知标题_{vkey or os.path.basename(final_url)}"
-    return vdata, title, uploader_name, uploader_type, published_at, duration_seconds
+    return vdata, title, uploader_name, uploader_type, published_at, duration_seconds, subscribe_action
 
 
 async def fetch_single_video_detail(
@@ -485,7 +487,7 @@ async def fetch_single_video_detail(
             return VideoDetail(viewkey=vkey, title="", page_url=page_url, referer_url=final_url, error="操作已取消")
 
         if len(html) >= _OFFLOAD_HTML_THRESHOLD:
-            vdata, title, uploader_name, uploader_type, published_at, duration_seconds = await asyncio.to_thread(
+            vdata, title, uploader_name, uploader_type, published_at, duration_seconds, subscribe_action = await asyncio.to_thread(
                 _parse_video_html_fields,
                 html,
                 final_url,
@@ -495,7 +497,7 @@ async def fetch_single_video_detail(
                 skip_dom,
             )
         else:
-            vdata, title, uploader_name, uploader_type, published_at, duration_seconds = _parse_video_html_fields(
+            vdata, title, uploader_name, uploader_type, published_at, duration_seconds, subscribe_action = _parse_video_html_fields(
                 html,
                 final_url,
                 vkey,
@@ -519,6 +521,7 @@ async def fetch_single_video_detail(
                 filtered_out=True,
                 published_at=published_at,
                 duration_seconds=duration_seconds,
+                subscribe_action=subscribe_action,
             )
 
         media_defs = (vdata or {}).get("mediaDefinitions")
@@ -595,6 +598,7 @@ async def fetch_single_video_detail(
                 error="媒体接口获取失败" if media_lookup_failed else "无可用 MP4 媒体源",
                 published_at=published_at,
                 duration_seconds=duration_seconds,
+                subscribe_action=subscribe_action,
             )
 
         dl_url, quality, sel_err = select_best_mp4_option(mp4_options, preferred_qualities)
@@ -612,6 +616,7 @@ async def fetch_single_video_detail(
                 filtered_out=bool(preferred_qualities and not media_lookup_failed),
                 published_at=published_at,
                 duration_seconds=duration_seconds,
+                subscribe_action=subscribe_action,
             )
 
         return VideoDetail(
@@ -629,6 +634,7 @@ async def fetch_single_video_detail(
             mp4_sources=_describe_media_sources(mp4_options) if include_mp4_sources else (),
             published_at=published_at,
             duration_seconds=duration_seconds,
+            subscribe_action=subscribe_action,
         )
 
 

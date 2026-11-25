@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..config import RuntimeSettings
@@ -21,6 +21,11 @@ def local_day_start_utc(now: Optional[datetime] = None) -> datetime:
     local_now = (now or datetime.now().astimezone()).astimezone()
     local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     return local_midnight.astimezone(timezone.utc)
+
+
+def local_date_days_ago(days: int, now: Optional[datetime] = None) -> str:
+    local_now = (now or datetime.now().astimezone()).astimezone()
+    return (local_now.date() - timedelta(days=days)).isoformat()
 
 
 def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
@@ -123,30 +128,54 @@ class Repository:
 
         today_start_dt = local_day_start_utc()
         today_start_iso = today_start_dt.isoformat(timespec="seconds")
-        today_rows = await self.db.fetch_all(
+        recent_publish_cutoff = local_date_days_ago(30)
+        video_rows = await self.db.fetch_all(
             """
             SELECT LOWER(uploader) AS uploader_lower,
                    LOWER(target_type) AS target_type_lower,
-                   COUNT(*) AS cnt
+                   COUNT(*) AS total_cnt,
+                   SUM(CASE WHEN status IN ('downloaded', 'uploaded') THEN 1 ELSE 0 END) AS saved_cnt,
+                   SUM(CASE WHEN status = 'baseline' THEN 1 ELSE 0 END) AS baseline_cnt,
+                   SUM(
+                       CASE
+                           WHEN status IN ('downloaded', 'uploaded')
+                            AND COALESCE(downloaded_at, uploaded_at, created_at) >= ?
+                            AND (published_at = '' OR published_at >= ?)
+                           THEN 1 ELSE 0
+                       END
+                   ) AS today_cnt
             FROM videos
-            WHERE status IN ('downloaded', 'uploaded')
-              AND COALESCE(downloaded_at, uploaded_at, created_at) >= ?
             GROUP BY LOWER(uploader), LOWER(target_type)
             """,
-            (today_start_iso,),
+            (today_start_iso, recent_publish_cutoff),
         )
-        counts_by_pair: Dict[Tuple[str, str], int] = {}
-        non_special_counts_by_uploader: Dict[str, int] = {}
-        liked_today_count = 0
-        for item in today_rows:
+
+        def _empty_counts() -> Dict[str, int]:
+            return {"total": 0, "saved": 0, "baseline": 0, "today": 0}
+
+        def _add_counts(bucket: Dict[str, int], total_c: int, saved_c: int, base_c: int, today_c: int) -> None:
+            bucket["total"] += total_c
+            bucket["saved"] += saved_c
+            bucket["baseline"] += base_c
+            bucket["today"] += today_c
+
+        counts_by_pair: Dict[Tuple[str, str], Dict[str, int]] = {}
+        non_special_counts_by_uploader: Dict[str, Dict[str, int]] = {}
+        liked_counts = _empty_counts()
+        for item in video_rows:
             u_low = str(item.get("uploader_lower") or "").strip()
             t_low = str(item.get("target_type_lower") or "").strip()
-            cnt = int(item.get("cnt") or 0)
-            counts_by_pair[(u_low, t_low)] = cnt
+            total_c = int(item.get("total_cnt") or 0)
+            saved_c = int(item.get("saved_cnt") or 0)
+            base_c = int(item.get("baseline_cnt") or 0)
+            today_c = int(item.get("today_cnt") or 0)
+            pair_bucket = counts_by_pair.setdefault((u_low, t_low), _empty_counts())
+            _add_counts(pair_bucket, total_c, saved_c, base_c, today_c)
             if t_low == "liked" or u_low == "my_liked":
-                liked_today_count += cnt
+                _add_counts(liked_counts, total_c, saved_c, base_c, today_c)
             elif t_low != "favorites" and u_low:
-                non_special_counts_by_uploader[u_low] = non_special_counts_by_uploader.get(u_low, 0) + cnt
+                user_bucket = non_special_counts_by_uploader.setdefault(u_low, _empty_counts())
+                _add_counts(user_bucket, total_c, saved_c, base_c, today_c)
 
         non_special_targets_per_user: Dict[str, int] = {}
         for r in rows:
@@ -160,19 +189,23 @@ class Repository:
             u_low = str(r.get("username") or "").strip().lower()
             t_low = str(r.get("target_type") or "model").strip().lower()
             if t_low == "liked":
-                downloaded_today = liked_today_count
+                matched = liked_counts
             elif t_low == "favorites":
-                downloaded_today = counts_by_pair.get((u_low, "favorites"), 0)
+                matched = counts_by_pair.get((u_low, "favorites")) or _empty_counts()
             elif non_special_targets_per_user.get(u_low, 0) == 1:
-                downloaded_today = non_special_counts_by_uploader.get(u_low, 0)
+                matched = non_special_counts_by_uploader.get(u_low) or _empty_counts()
             else:
-                downloaded_today = counts_by_pair.get((u_low, t_low), 0)
+                matched = counts_by_pair.get((u_low, t_low)) or _empty_counts()
 
+            downloaded_today = matched["today"]
             checked_dt = _parse_iso_utc(r.get("last_checked_at"))
             checked_today = bool(checked_dt and checked_dt >= today_start_dt)
             last_new_today = int(r.get("last_new_count") or 0) if checked_today else 0
             r["today_downloaded_count"] = downloaded_today
             r["today_new_count"] = max(downloaded_today, last_new_today)
+            r["video_total_count"] = matched["total"]
+            r["video_saved_count"] = matched["saved"]
+            r["video_baseline_count"] = matched["baseline"]
         return rows
 
     async def get_target(self, target_id: int) -> Optional[Dict[str, Any]]:
@@ -236,6 +269,59 @@ class Repository:
             ),
         )
         return (await self.get_target(new_id)) or {}
+
+    async def ensure_target(
+        self,
+        username: str,
+        target_type: str = "model",
+        *,
+        avatar_url: str = "",
+        display_name: str = "",
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Insert an enabled tracking target if absent; never overwrite existing enabled/quality settings."""
+        norm_type = (target_type or "model").strip().lower()
+        norm_user = "_currentUser_" if norm_type == "liked" else username.strip()
+        if norm_type in ("model", "pornstar"):
+            existing = await self.db.fetch_one(
+                """
+                SELECT * FROM targets
+                WHERE LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar')
+                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (norm_user, norm_type),
+            )
+        else:
+            existing = await self.db.fetch_one(
+                "SELECT * FROM targets WHERE LOWER(username) = LOWER(?) AND target_type = ?",
+                (norm_user, norm_type),
+            )
+        if existing:
+            clean_avatar = avatar_url.strip()
+            clean_name = display_name.strip()
+            need_avatar = bool(clean_avatar and not str(existing.get("avatar_url") or "").strip())
+            need_name = bool(clean_name and not str(existing.get("display_name") or "").strip())
+            if need_avatar or need_name:
+                await self.db.execute(
+                    """
+                    UPDATE targets
+                    SET avatar_url = CASE WHEN COALESCE(avatar_url, '') = '' AND ? != '' THEN ? ELSE avatar_url END,
+                        display_name = CASE WHEN COALESCE(display_name, '') = '' AND ? != '' THEN ? ELSE display_name END
+                    WHERE id = ?
+                    """,
+                    (clean_avatar, clean_avatar, clean_name, clean_name, existing["id"]),
+                )
+            return ((await self.get_target(existing["id"])) or existing), False
+
+        created = await self.upsert_target(
+            norm_user,
+            norm_type,
+            enabled=True,
+            preferred_quality="",
+            avatar_url=avatar_url,
+            display_name=display_name,
+        )
+        return created, True
 
     async def update_target_profile(
         self,
@@ -736,6 +822,7 @@ class Repository:
         uploader: str = "",
         status: str = "",
         quality: str = "",
+        time_range: str = "",
         sort_by: str = "activity",
         page: int = 1,
         page_size: int = 30,
@@ -768,6 +855,19 @@ class Repository:
         if quality.strip():
             clauses.append("v.quality = ?")
             params.append(quality.strip())
+        norm_time_range = (time_range or "").strip().lower()
+        if norm_time_range == "published_7d":
+            clauses.append("v.published_at != '' AND v.published_at >= ?")
+            params.append(local_date_days_ago(7))
+        elif norm_time_range == "published_30d":
+            clauses.append("v.published_at != '' AND v.published_at >= ?")
+            params.append(local_date_days_ago(30))
+        elif norm_time_range == "activity_7d":
+            activity_cutoff = (local_day_start_utc() - timedelta(days=7)).isoformat(timespec="seconds")
+            clauses.append(
+                "v.status IN ('uploaded', 'downloaded') AND COALESCE(v.downloaded_at, v.uploaded_at, v.created_at) >= ?"
+            )
+            params.append(activity_cutoff)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         total_row = await self.db.fetch_one(
@@ -841,6 +941,11 @@ class Repository:
             counts["total"] += c
             if r["status"] in counts:
                 counts[r["status"]] = c
+        recent_row = await self.db.fetch_one(
+            "SELECT COUNT(*) AS cnt FROM videos WHERE published_at != '' AND published_at >= ?",
+            (local_date_days_ago(7),),
+        )
+        counts["published_7d"] = int(recent_row["cnt"]) if recent_row else 0
         counts["baseline_missing_metadata"] = await self.count_baseline_metadata_candidates()
         return counts
 

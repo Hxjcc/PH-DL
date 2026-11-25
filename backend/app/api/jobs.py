@@ -29,6 +29,8 @@ class CreateManualDownloadRequest(BaseModel):
     redownload: bool = False
     auto_upload: Optional[bool] = None
     export_only: bool = False
+    add_to_auto_track: bool = False
+    subscribe_creator: bool = False
 
 
 @router.get("")
@@ -119,6 +121,8 @@ async def create_download_job(
                 "redownload": payload.redownload,
                 "auto_upload": auto_upload,
                 "export_only": payload.export_only,
+                "add_to_auto_track": utype not in {"liked", "favorites"} and bool(payload.add_to_auto_track),
+                "subscribe_creator": utype not in {"liked", "favorites"} and bool(payload.subscribe_creator),
             },
         )
         return {"job": job}
@@ -144,6 +148,8 @@ async def create_download_job(
             "redownload": payload.redownload,
             "auto_upload": auto_upload,
             "export_only": payload.export_only,
+            "add_to_auto_track": bool(payload.add_to_auto_track),
+            "subscribe_creator": bool(payload.subscribe_creator),
         },
     )
     return {"job": job}

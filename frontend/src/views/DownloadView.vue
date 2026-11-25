@@ -25,6 +25,7 @@ import {
   Link2,
   FileText,
   Heart,
+  Info,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
@@ -181,7 +182,26 @@ const form = reactive({
       ? store.overview.uploader_enabled
       : true,
   export_only: false,
+  add_to_auto_track: false,
+  subscribe_creator: false,
 })
+
+const creatorActionsDisabled = computed(
+  () => sourceTab.value === 'target' && (form.target_type === 'liked' || form.target_type === 'favorites')
+)
+
+const isPartialDownloadScope = computed(() => {
+  if (sourceTab.value === 'urls') return true
+  return (
+    downloadScope.value !== 'all' ||
+    form.keywords.length > 0 ||
+    form.exclude_keywords.length > 0
+  )
+})
+
+const showPartialTrackHint = computed(
+  () => !creatorActionsDisabled.value && form.add_to_auto_track && isPartialDownloadScope.value
+)
 
 const activeFilterCount = computed(() => {
   const base = [form.quality, form.keywords.length, form.exclude_keywords.length]
@@ -531,31 +551,13 @@ function clearUrls() {
   form.urlsText = ''
 }
 
-async function handleSubsPicked(picked, opts = {}) {
+function handleSubsPicked(picked) {
   const names = picked.map((p) => p.username)
   const existing = parseTargetUsernames(form.usernames)
   const merged = parseTargetUsernames([...existing, ...names].join(','))
   form.usernames = merged.join(', ')
   form.target_type = 'auto'
   sourceTab.value = 'target'
-
-  if (opts?.addToAutoTrack && picked.length > 0) {
-    try {
-      const res = await api.batchCreateTargets({
-        items: picked.map((p) => ({
-          username: p.username,
-          target_type: p.type,
-          display_name: p.display_name || p.username,
-          avatar_url: p.avatar_url || '',
-        })),
-        init_baseline: false,
-      })
-      await store.refreshTargets()
-      store.notify(`已填入 ${picked.length} 个用户名，并同步加入 ${res.created_count} 个自动追更目标`, 'success')
-    } catch (err) {
-      store.notify(`用户名已填入，但加入自动追更失败: ${err.message}`, 'warning')
-    }
-  }
 }
 
 async function submitDownload() {
@@ -577,6 +579,8 @@ async function submitDownload() {
       redownload: !form.export_only && form.redownload,
       auto_upload: !form.export_only && form.auto_upload,
       export_only: form.export_only,
+      add_to_auto_track: !creatorActionsDisabled.value && form.add_to_auto_track,
+      subscribe_creator: !creatorActionsDisabled.value && form.subscribe_creator,
     }
     if (sourceTab.value === 'target') {
       payload.pages = form.pages.trim()
@@ -985,6 +989,27 @@ async function handleClearTemp() {
                 <Switch v-model="form.export_only" />
                 <span>仅导出视频页链接 TXT</span>
               </label>
+              <label
+                :class="{ 'download-option-disabled': creatorActionsDisabled }"
+                :title="creatorActionsDisabled ? '仅对博主目标或视频链接生效' : '任务解析到博主后自动加入“自动追更”列表（已存在时不覆盖原有设置）'"
+              >
+                <Switch v-model="form.add_to_auto_track" :disabled="creatorActionsDisabled" />
+                <span>同时加入自动追更</span>
+              </label>
+              <label
+                :class="{ 'download-option-disabled': creatorActionsDisabled }"
+                :title="creatorActionsDisabled ? '仅对博主目标或视频链接生效' : '使用当前登录 Cookie 自动在 PornHub 订阅该博主（已订阅自动跳过）'"
+              >
+                <Switch v-model="form.subscribe_creator" :disabled="creatorActionsDisabled" />
+                <span>同时订阅博主</span>
+              </label>
+            </div>
+
+            <div v-if="showPartialTrackHint" class="track-scope-hint" role="note">
+              <Info class="w-3.5 h-3.5 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+              <span>
+                当前为局部范围或单视频下载，未下载的历史视频下次追更可能会被补扫；若只想追更之后的新片，建议先在「自动追更」页建立基线。
+              </span>
             </div>
 
             <div
@@ -1229,7 +1254,6 @@ async function handleClearTemp() {
     <SubsPickerModal
       :open="subsModalOpen"
       confirm-label="填入用户名"
-      show-auto-track-option
       @close="subsModalOpen = false"
       @confirm="handleSubsPicked"
     />
@@ -1588,6 +1612,19 @@ async function handleClearTemp() {
 
 .download-option-disabled > span {
   opacity: 0.65;
+}
+
+.track-scope-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, #f59e0b 28%, var(--border));
+  background: color-mix(in srgb, #f59e0b 8%, var(--surface-subtle));
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--muted-foreground);
 }
 
 .advanced-filters {

@@ -21,11 +21,19 @@ import {
   Sparkles,
   Pencil,
   ExternalLink,
+  ChevronLeft,
+  ChevronRight,
+  Film,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
 import { avatarGradient, formatDateTime, targetTypeMeta } from '../utils/format'
 import { buildTargetProfileVideosUrl, parseTargetUsernames } from '../utils/targetInput'
+import {
+  TARGETS_PAGE_SIZES,
+  readListPreference,
+  saveListPreference,
+} from '../utils/listPreferences'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
@@ -42,6 +50,18 @@ const store = useAppStore()
 const router = useRouter()
 
 const VIEW_MODE_KEY = 'phdl-targets-view'
+const SORT_BY_KEY = 'phdl-targets-sort'
+const TARGET_SORT_OPTIONS = [
+  { label: '按名称 A-Z', value: 'name_asc' },
+  { label: '最新加入', value: 'created_desc' },
+  { label: '最早加入', value: 'created_asc' },
+  { label: '视频最多', value: 'videos_desc' },
+]
+const targetPageSizeOptions = TARGETS_PAGE_SIZES.map((value) => ({
+  label: value === 0 ? '全部显示' : `每页 ${value} 个`,
+  value,
+}))
+
 function loadInitialViewMode() {
   try {
     const saved = localStorage.getItem(VIEW_MODE_KEY)
@@ -50,10 +70,21 @@ function loadInitialViewMode() {
   return 'grid'
 }
 
+function loadInitialSortBy() {
+  try {
+    const saved = localStorage.getItem(SORT_BY_KEY)
+    if (TARGET_SORT_OPTIONS.some((opt) => opt.value === saved)) return saved
+  } catch {}
+  return 'name_asc'
+}
+
 const targets = ref(store.targetsCache ? [...store.targetsCache] : [])
 const loading = ref(false)
 const search = ref('')
 const statusFilter = ref('all')
+const sortBy = ref(loadInitialSortBy())
+const pageSize = ref(readListPreference('targets', TARGETS_PAGE_SIZES, 24))
+const currentPage = ref(1)
 const viewMode = ref(loadInitialViewMode())
 const subsModalOpen = ref(false)
 const addModalOpen = ref(false)
@@ -158,6 +189,30 @@ const statusPills = computed(() => [
     : []),
 ])
 
+function targetVideoCount(t) {
+  return Math.max(0, Number(t?.video_total_count || 0))
+}
+
+function targetVideoCountTitle(t) {
+  const total = targetVideoCount(t)
+  const saved = Math.max(0, Number(t?.video_saved_count || 0))
+  const baseline = Math.max(0, Number(t?.video_baseline_count || 0))
+  if (total === 0) return '去重索引中暂无该目标的视频记录'
+  return `共索引 ${total} 个视频（已入库 ${saved} · 仅基线 ${baseline}），点击前往历史记录查看`
+}
+
+function openTargetHistory(t) {
+  const uploader = t.target_type === 'liked' ? 'My_Liked' : String(t.username || '').trim()
+  if (!uploader) return
+  router.push({ name: 'history', query: { uploader } })
+}
+
+function parseCreatedTs(iso) {
+  if (!iso) return 0
+  const ts = Date.parse(iso)
+  return Number.isNaN(ts) ? 0 : ts
+}
+
 const filteredTargets = computed(() => {
   const q = search.value.trim().toLowerCase()
   const list = targets.value.filter((t) => {
@@ -173,6 +228,28 @@ const filteredTargets = computed(() => {
     }
     return true
   })
+
+  if (sortBy.value === 'created_desc') {
+    return [...list].sort((a, b) => {
+      const diff = parseCreatedTs(b.created_at) - parseCreatedTs(a.created_at)
+      if (diff !== 0) return diff
+      return Number(b.id || 0) - Number(a.id || 0)
+    })
+  }
+  if (sortBy.value === 'created_asc') {
+    return [...list].sort((a, b) => {
+      const diff = parseCreatedTs(a.created_at) - parseCreatedTs(b.created_at)
+      if (diff !== 0) return diff
+      return Number(a.id || 0) - Number(b.id || 0)
+    })
+  }
+  if (sortBy.value === 'videos_desc') {
+    return [...list].sort((a, b) => {
+      const diff = targetVideoCount(b) - targetVideoCount(a)
+      if (diff !== 0) return diff
+      return targetDisplayName(a).toLowerCase().localeCompare(targetDisplayName(b).toLowerCase())
+    })
+  }
   if (statusFilter.value === 'updated_today') {
     return [...list].sort((a, b) => {
       const diff = targetTodayNewCount(b) - targetTodayNewCount(a)
@@ -180,8 +257,53 @@ const filteredTargets = computed(() => {
       return String(b.last_checked_at || '').localeCompare(String(a.last_checked_at || ''))
     })
   }
-  return list
+  return [...list].sort((a, b) => {
+    const diff = targetDisplayName(a).toLowerCase().localeCompare(targetDisplayName(b).toLowerCase())
+    if (diff !== 0) return diff
+    return Number(a.id || 0) - Number(b.id || 0)
+  })
 })
+
+const totalPages = computed(() => {
+  if (pageSize.value <= 0) return 1
+  return Math.max(1, Math.ceil(filteredTargets.value.length / pageSize.value))
+})
+
+const pagedTargets = computed(() => {
+  if (pageSize.value <= 0) return filteredTargets.value
+  const safePage = Math.min(Math.max(1, currentPage.value), totalPages.value)
+  const start = (safePage - 1) * pageSize.value
+  return filteredTargets.value.slice(start, start + pageSize.value)
+})
+
+watch([search, statusFilter, sortBy, pageSize], () => {
+  currentPage.value = 1
+})
+
+watch(totalPages, (maxPage) => {
+  if (currentPage.value > maxPage) {
+    currentPage.value = maxPage
+  }
+})
+
+function setSortBy(value) {
+  sortBy.value = value
+  try {
+    localStorage.setItem(SORT_BY_KEY, value)
+  } catch {}
+}
+
+function setPageSize(value) {
+  const num = Number(value)
+  pageSize.value = TARGETS_PAGE_SIZES.includes(num) ? num : 24
+  saveListPreference('targets', pageSize.value)
+}
+
+function goTargetPage(nextPage) {
+  const clamped = Math.min(Math.max(1, nextPage), totalPages.value)
+  if (clamped === currentPage.value) return
+  currentPage.value = clamped
+}
 
 function setViewMode(mode) {
   viewMode.value = mode
@@ -582,44 +704,96 @@ async function handleDelete(t) {
           </Button>
         </div>
 
-        <!-- Search + View Mode Switcher -->
-        <div class="flex items-center gap-2 w-full sm:w-auto">
-          <div class="relative flex-1 sm:w-64">
-            <Search class="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2" />
-            <Input v-model="search" placeholder="搜索监控目标..." class="pl-8 rounded-full" />
+        <!-- Search + Sort + Page Size + View Mode Switcher -->
+        <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2 w-full sm:w-auto">
+          <div class="flex items-center gap-2 w-full sm:w-auto">
+            <div class="relative flex-1 sm:w-56">
+              <Search class="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2" />
+              <Input v-model="search" placeholder="搜索监控目标..." class="pl-8 rounded-full" />
+            </div>
+
+            <div class="inline-flex sm:hidden items-center rounded-lg border border-border bg-card p-0.5 shrink-0" role="group" aria-label="目标视图">
+              <Button
+                variant="ghost"
+                size="icon"
+                :aria-pressed="viewMode === 'grid'"
+                :class="[
+                  'h-7 w-7 rounded-md',
+                  viewMode === 'grid'
+                    ? 'bg-brand/12 text-brand hover:bg-brand/12'
+                    : 'text-muted-foreground hover:text-foreground',
+                ]"
+                title="卡片视图"
+                @click="setViewMode('grid')"
+              >
+                <LayoutGrid class="w-3.5 h-3.5" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                :aria-pressed="viewMode === 'table'"
+                :class="[
+                  'h-7 w-7 rounded-md',
+                  viewMode === 'table'
+                    ? 'bg-brand/12 text-brand hover:bg-brand/12'
+                    : 'text-muted-foreground hover:text-foreground',
+                ]"
+                title="列表视图"
+                @click="setViewMode('table')"
+              >
+                <List class="w-3.5 h-3.5" />
+              </Button>
+            </div>
           </div>
 
-          <div class="inline-flex items-center rounded-lg border border-border bg-card p-0.5 shrink-0" role="group" aria-label="目标视图">
-            <Button
-              variant="ghost"
-              size="icon"
-              :aria-pressed="viewMode === 'grid'"
-              :class="[
-                'h-7 w-7 rounded-md',
-                viewMode === 'grid'
-                  ? 'bg-brand/12 text-brand hover:bg-brand/12'
-                  : 'text-muted-foreground hover:text-foreground',
-              ]"
-              title="卡片视图"
-              @click="setViewMode('grid')"
-            >
-              <LayoutGrid class="w-3.5 h-3.5" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              :aria-pressed="viewMode === 'table'"
-              :class="[
-                'h-7 w-7 rounded-md',
-                viewMode === 'table'
-                  ? 'bg-brand/12 text-brand hover:bg-brand/12'
-                  : 'text-muted-foreground hover:text-foreground',
-              ]"
-              title="列表视图"
-              @click="setViewMode('table')"
-            >
-              <List class="w-3.5 h-3.5" />
-            </Button>
+          <div class="grid grid-cols-2 gap-2 sm:flex sm:items-center">
+            <Select
+              :model-value="sortBy"
+              :options="TARGET_SORT_OPTIONS"
+              aria-label="排序方式"
+              class="h-9 w-full sm:w-32 text-xs"
+              @update:model-value="setSortBy"
+            />
+            <Select
+              :model-value="pageSize"
+              :options="targetPageSizeOptions"
+              aria-label="每页显示数量"
+              class="h-9 w-full sm:w-28 text-xs"
+              @update:model-value="setPageSize"
+            />
+
+            <div class="hidden sm:inline-flex items-center rounded-lg border border-border bg-card p-0.5 shrink-0" role="group" aria-label="目标视图">
+              <Button
+                variant="ghost"
+                size="icon"
+                :aria-pressed="viewMode === 'grid'"
+                :class="[
+                  'h-7 w-7 rounded-md',
+                  viewMode === 'grid'
+                    ? 'bg-brand/12 text-brand hover:bg-brand/12'
+                    : 'text-muted-foreground hover:text-foreground',
+                ]"
+                title="卡片视图"
+                @click="setViewMode('grid')"
+              >
+                <LayoutGrid class="w-3.5 h-3.5" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                :aria-pressed="viewMode === 'table'"
+                :class="[
+                  'h-7 w-7 rounded-md',
+                  viewMode === 'table'
+                    ? 'bg-brand/12 text-brand hover:bg-brand/12'
+                    : 'text-muted-foreground hover:text-foreground',
+                ]"
+                title="列表视图"
+                @click="setViewMode('table')"
+              >
+                <List class="w-3.5 h-3.5" />
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -663,7 +837,7 @@ async function handleDelete(t) {
         class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 sm:gap-4"
       >
         <Card
-          v-for="t in filteredTargets"
+          v-for="t in pagedTargets"
           :key="t.id"
           class="group p-4 sm:p-5 flex flex-col justify-between gap-3 sm:gap-4 transition-all duration-200 hover:border-brand/35"
         >
@@ -725,6 +899,15 @@ async function handleDelete(t) {
                   <Badge variant="secondary" class="text-[11px] px-2 py-0">
                     {{ targetTypeMeta(t.target_type) }}
                   </Badge>
+                  <button
+                    type="button"
+                    class="inline-flex items-center gap-1 rounded-full border border-border/80 bg-surface-subtle px-2 py-0 text-[11px] font-medium text-muted-foreground tabular-nums transition-colors hover:border-brand/35 hover:text-foreground cursor-pointer"
+                    :title="targetVideoCountTitle(t)"
+                    @click="openTargetHistory(t)"
+                  >
+                    <Film class="w-3 h-3 opacity-75 shrink-0" />
+                    <span>{{ targetVideoCount(t) }} 视频</span>
+                  </button>
                   <Badge
                     v-if="t.preferred_quality"
                     variant="outline"
@@ -833,15 +1016,16 @@ async function handleDelete(t) {
               <tr class="border-b border-border bg-surface-subtle text-xs font-medium text-muted-foreground whitespace-nowrap">
                 <th class="h-11 px-5 w-20">状态</th>
                 <th class="h-11 px-5">目标用户名</th>
-                <th class="h-11 px-5 w-32">类型</th>
-                <th class="h-11 px-5 w-48">上次检查</th>
+                <th class="h-11 px-5 w-28">类型</th>
+                <th class="h-11 px-5 w-28">视频数</th>
+                <th class="h-11 px-5 w-44">上次检查</th>
                 <th class="h-11 px-5 w-32">今日 / 上次新增</th>
                 <th class="h-11 px-5 w-36 text-right">操作</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-border">
               <tr
-                v-for="t in filteredTargets"
+                v-for="t in pagedTargets"
                 :key="t.id"
                 class="hover:bg-accent/50 transition-colors"
               >
@@ -880,6 +1064,17 @@ async function handleDelete(t) {
                 </td>
                 <td class="px-5 py-3.5 whitespace-nowrap">
                   <Badge variant="secondary">{{ targetTypeMeta(t.target_type) }}</Badge>
+                </td>
+                <td class="px-5 py-3.5 whitespace-nowrap">
+                  <button
+                    type="button"
+                    class="inline-flex items-center gap-1 rounded-full border border-border/80 bg-surface-subtle px-2.5 py-0.5 text-xs font-medium text-muted-foreground tabular-nums transition-colors hover:border-brand/35 hover:text-foreground cursor-pointer"
+                    :title="targetVideoCountTitle(t)"
+                    @click="openTargetHistory(t)"
+                  >
+                    <Film class="w-3 h-3 opacity-75 shrink-0" />
+                    <span>{{ targetVideoCount(t) }}</span>
+                  </button>
                 </td>
                 <td class="px-5 py-3.5 text-xs text-muted-foreground tabular-nums whitespace-nowrap">
                   {{ formatDateTime(t.last_checked_at) }}
@@ -963,6 +1158,34 @@ async function handleDelete(t) {
           </table>
         </div>
       </Card>
+
+      <!-- Pagination Bar -->
+      <div
+        v-if="filteredTargets.length > 0 && pageSize > 0 && totalPages > 1"
+        class="rounded-2xl border border-border bg-card px-3.5 sm:px-5 py-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground shadow-[var(--card-shadow)]"
+      >
+        <span class="tabular-nums">共 {{ filteredTargets.length }} 个目标 · 第 {{ currentPage }} / {{ totalPages }} 页</span>
+        <div class="flex items-center gap-1.5">
+          <Button
+            variant="outline"
+            size="xs"
+            :disabled="currentPage <= 1"
+            @click="goTargetPage(currentPage - 1)"
+          >
+            <ChevronLeft class="w-3.5 h-3.5" />
+            上一页
+          </Button>
+          <Button
+            variant="outline"
+            size="xs"
+            :disabled="currentPage >= totalPages"
+            @click="goTargetPage(currentPage + 1)"
+          >
+            下一页
+            <ChevronRight class="w-3.5 h-3.5" />
+          </Button>
+        </div>
+      </div>
     </div>
 
     <!-- Add Target Dialog -->

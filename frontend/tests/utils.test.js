@@ -13,6 +13,12 @@ import {
 } from '../src/utils/jobMeta.js'
 import { appendLiveLog, mergeLogsSnapshot } from '../src/utils/logBuffer.js'
 import { buildTargetProfileVideosUrl, parseTargetUsernames } from '../src/utils/targetInput.js'
+import {
+  JOB_LIMITS,
+  TARGETS_PAGE_SIZES,
+  readListPreference,
+  saveListPreference,
+} from '../src/utils/listPreferences.js'
 
 test('parseVideoLinks deduplicates by viewkey and counts invalid rows', () => {
   const input = [
@@ -356,4 +362,25 @@ test('formatPublishedDate, formatVideoDuration, and enrich_metadata phase text',
     null
   )
   assert.equal(runningMeta.phaseText, '正在补全基线元数据 (12/100)...')
+})
+
+test('listPreferences supports 10-item job limit and target page sizes including 0 (all)', () => {
+  assert.ok(JOB_LIMITS.includes(10))
+  assert.ok(TARGETS_PAGE_SIZES.includes(0))
+  const backing = new Map()
+  const prevStorage = globalThis.localStorage
+  globalThis.localStorage = {
+    getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+    setItem: (k, v) => backing.set(k, String(v)),
+  }
+  try {
+    // Missing key must return fallback (24), not 0 via Number(null)
+    assert.equal(readListPreference('targets', TARGETS_PAGE_SIZES, 24), 24)
+    saveListPreference('targets', 0)
+    assert.equal(readListPreference('targets', TARGETS_PAGE_SIZES, 24), 0)
+    saveListPreference('jobs', 10)
+    assert.equal(readListPreference('jobs', JOB_LIMITS, 30), 10)
+  } finally {
+    globalThis.localStorage = prevStorage
+  }
 })

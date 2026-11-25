@@ -1,14 +1,146 @@
-"""Target type resolution via redirect and account subscription parser."""
+"""Target type resolution via redirect, creator subscription, and account subscription parser."""
 
 from __future__ import annotations
 
+import html as html_lib
+import json
+import re
 import urllib.parse
+from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from ..config import SelectorSettings
 from .http_session import TaskHttpContext
+
+PH_ORIGIN = "https://www.pornhub.com"
+_SUBSCRIBE_TAG_RE = re.compile(
+    r"<(?:button|a)\b[^>]*\bdata-subscribe-url\s*=\s*([\"'])([^\"']+)\1[^>]*>",
+    re.IGNORECASE,
+)
+_HTML_ATTR_RE = re.compile(
+    r"\b(data-(?:subscribe-url|subscribed|login|id))\s*=\s*([\"'])([^\"']*)\2",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class SubscribeAction:
+    subscribe_url: str = ""
+    already_subscribed: bool = False
+    login_required: bool = False
+    creator_id: str = ""
+
+
+@dataclass(frozen=True)
+class SubscribeResult:
+    ok: bool
+    status: str  # "subscribed" | "already_subscribed" | "login_required" | "not_found" | "failed"
+    message: str = ""
+    avatar_url: str = ""
+    profile_path: str = ""
+
+
+def extract_subscribe_action(html: str) -> Optional[SubscribeAction]:
+    """Extract PornHub subscribe button metadata from profile, list, or video HTML without full DOM parsing."""
+    if not html or "data-subscribe-url" not in html.lower():
+        return None
+    for match in _SUBSCRIBE_TAG_RE.finditer(html):
+        tag_html = match.group(0)
+        attrs = {
+            m.group(1).lower(): html_lib.unescape(m.group(3)).strip()
+            for m in _HTML_ATTR_RE.finditer(tag_html)
+        }
+        sub_url = attrs.get("data-subscribe-url", "")
+        if not sub_url or "subscribe_add_json" not in sub_url:
+            continue
+        return SubscribeAction(
+            subscribe_url=sub_url,
+            already_subscribed=attrs.get("data-subscribed") == "1",
+            login_required=attrs.get("data-login") == "1",
+            creator_id=attrs.get("data-id", ""),
+        )
+    return None
+
+
+def _is_pornhub_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").rstrip(".").lower()
+    return parsed.scheme in {"https", "http"} and (host == "pornhub.com" or host.endswith(".pornhub.com"))
+
+
+async def subscribe_from_action(
+    ctx: TaskHttpContext,
+    action: Optional[SubscribeAction],
+    *,
+    referer_url: str = "",
+    label: str = "",
+    timeout: float = 15.0,
+) -> SubscribeResult:
+    """Invoke PornHub's JSON subscribe endpoint using the task's authenticated HTTP context."""
+    if action is None or not action.subscribe_url:
+        return SubscribeResult(ok=False, status="not_found", message="页面未找到订阅按钮")
+    if action.already_subscribed:
+        return SubscribeResult(ok=True, status="already_subscribed", message="已订阅")
+    if action.login_required:
+        return SubscribeResult(ok=False, status="login_required", message="Cookie 未登录或已失效")
+
+    full_url = urllib.parse.urljoin(PH_ORIGIN, action.subscribe_url)
+    if not _is_pornhub_url(full_url):
+        return SubscribeResult(ok=False, status="failed", message="订阅接口地址不受信任")
+
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": PH_ORIGIN,
+        "Referer": referer_url or f"{PH_ORIGIN}/",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    res, err = await ctx.fetch_with_pow(
+        full_url,
+        method="POST",
+        data=None,
+        headers=headers,
+        timeout=max(5.0, float(timeout)),
+        max_retries=1,
+        log_label=f"订阅 {label or action.creator_id or '博主'}",
+    )
+    if res is None:
+        return SubscribeResult(ok=False, status="failed", message=err or "订阅请求失败")
+    if res.status_code >= 400:
+        return SubscribeResult(ok=False, status="failed", message=f"HTTP {res.status_code}")
+
+    try:
+        payload = json.loads(res.text)
+    except (ValueError, TypeError):
+        return SubscribeResult(ok=False, status="failed", message="订阅响应不是有效 JSON")
+
+    if not isinstance(payload, dict):
+        return SubscribeResult(ok=False, status="failed", message="订阅响应格式异常")
+
+    raw_success = payload.get("success")
+    passed = raw_success is True or str(raw_success or "").strip().upper() in {"PASS", "TRUE", "1", "OK"}
+    message = str(payload.get("message") or "").strip()
+    user_info = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    avatar_url = str(user_info.get("avatar") or "").strip()
+    if avatar_url and not avatar_url.startswith(("http://", "https://")):
+        avatar_url = urllib.parse.urljoin(PH_ORIGIN, avatar_url)
+    if "/pics/users/default/" in avatar_url:
+        avatar_url = ""
+    profile_path = str(user_info.get("profile") or "").strip()
+
+    if passed:
+        return SubscribeResult(
+            ok=True,
+            status="subscribed",
+            message=message or "Subscription added.",
+            avatar_url=avatar_url,
+            profile_path=profile_path,
+        )
+    return SubscribeResult(ok=False, status="failed", message=message or "订阅未成功")
 
 
 def select_one(node, selectors: List[str]):

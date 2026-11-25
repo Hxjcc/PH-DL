@@ -362,7 +362,7 @@ class TaskHttpContext:
         self,
         url: str,
         cookies: Dict[str, str],
-        data: Dict[str, Any],
+        data: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
     ) -> Tuple[str, str, List[str], int]:
@@ -410,7 +410,7 @@ class TaskHttpContext:
                     request = self._raw_post(
                         url,
                         merged_cookies,
-                        data or {},
+                        data,
                         headers=headers,
                         timeout=timeout,
                     )

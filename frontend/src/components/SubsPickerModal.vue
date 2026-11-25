@@ -17,7 +17,6 @@ const props = defineProps({
   open: { type: Boolean, default: false },
   confirmLabel: { type: String, default: '确认选择' },
   showBaselineOption: { type: Boolean, default: false },
-  showAutoTrackOption: { type: Boolean, default: false },
 })
 const emit = defineEmits(['close', 'confirm'])
 const store = useAppStore()
@@ -37,7 +36,6 @@ const typeFilter = ref('all')
 const trackFilter = ref('all')
 const selected = ref(new Set())
 const initBaseline = ref(true)
-const addToAutoTrack = ref(false)
 const baselinePages = ref('all')
 const baselinePagesValid = ref(true)
 const fetchedAt = ref(0)
@@ -243,7 +241,6 @@ function confirm() {
   emit('confirm', picked, {
     initBaseline: initBaseline.value,
     baselinePages: baselinePages.value,
-    addToAutoTrack: props.showAutoTrackOption && addToAutoTrack.value,
   })
   emit('close')
 }
@@ -423,10 +420,6 @@ function confirm() {
           <label v-if="showBaselineOption" class="inline-flex items-center gap-1.5 text-xs text-foreground/85 cursor-pointer select-none">
             <Switch v-model="initBaseline" />
             <span>同时初始化基线</span>
-          </label>
-          <label v-if="showAutoTrackOption" class="inline-flex items-center gap-1.5 text-xs text-foreground/85 cursor-pointer select-none">
-            <Switch v-model="addToAutoTrack" />
-            <span>同时加入自动追更</span>
           </label>
         </div>
         <div class="flex items-center justify-end gap-2 w-full sm:w-auto">

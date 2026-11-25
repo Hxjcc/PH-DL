@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onActivated, onDeactivated, onUnmounted, reactive, ref, shallowRef, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   Search,
   Trash2,
@@ -14,6 +14,7 @@ import {
   Bookmark,
   Layers,
   Sparkles,
+  CalendarDays,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
@@ -29,6 +30,7 @@ import VideoPlaybackDialog from '../components/VideoPlaybackDialog.vue'
 import { HISTORY_PAGE_SIZES } from '../utils/listPreferences'
 
 const store = useAppStore()
+const route = useRoute()
 const router = useRouter()
 
 const cached = store.hasRouteCache('history') ? store.historyCache : null
@@ -57,10 +59,10 @@ const facets = ref(
 )
 const stats = ref(
   cached
-    ? { ...cached.stats }
+    ? { published_7d: 0, ...cached.stats }
     : store.overview?.videos
-      ? { ...store.overview.videos }
-      : { total: 0, uploaded: 0, downloaded: 0, baseline: 0 }
+      ? { published_7d: 0, ...store.overview.videos }
+      : { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0 }
 )
 
 const filters = reactive({
@@ -68,10 +70,18 @@ const filters = reactive({
   uploader: '',
   status: '',
   quality: '',
+  time_range: '',
   sort_by: 'activity',
   page: 1,
   page_size: store.historyPageSize,
 })
+
+const timeRangeOptions = [
+  { label: '全部时间', value: '' },
+  { label: '近 7 天发布', value: 'published_7d' },
+  { label: '近 30 天发布', value: 'published_30d' },
+  { label: '近 7 天入库', value: 'activity_7d' },
+]
 
 const sortOptions = [
   { label: '按记录时间', value: 'activity' },
@@ -117,42 +127,82 @@ function clearSelection() {
 
 const statCards = computed(() => [
   {
+    id: 'all',
+    kind: 'all',
     key: '',
     label: '总记录数',
-    value: stats.value.total,
+    value: stats.value.total ?? 0,
     icon: Layers,
     iconBox: 'bg-brand/10 text-brand',
+    active: filters.status === '' && filters.time_range === '',
+    spanClass: '',
   },
   {
+    id: 'uploaded',
+    kind: 'status',
     key: 'uploaded',
     label: '已上传云端',
-    value: stats.value.uploaded,
+    value: stats.value.uploaded ?? 0,
     icon: CloudUpload,
     iconBox: 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400',
+    active: filters.status === 'uploaded',
+    spanClass: '',
   },
   {
+    id: 'downloaded',
+    kind: 'status',
     key: 'downloaded',
     label: '本地已下载',
-    value: stats.value.downloaded,
+    value: stats.value.downloaded ?? 0,
     icon: HardDriveDownload,
     iconBox: 'bg-secondary text-foreground',
+    active: filters.status === 'downloaded',
+    spanClass: '',
   },
   {
+    id: 'baseline',
+    kind: 'status',
     key: 'baseline',
     label: '仅基线去重',
-    value: stats.value.baseline,
+    value: stats.value.baseline ?? 0,
     icon: Bookmark,
     iconBox: 'bg-zinc-500/12 text-zinc-600 dark:text-zinc-400',
+    active: filters.status === 'baseline',
+    spanClass: '',
+  },
+  {
+    id: 'published_7d',
+    kind: 'time_range',
+    key: 'published_7d',
+    label: '近 7 天发布',
+    value: stats.value.published_7d ?? 0,
+    icon: CalendarDays,
+    iconBox: 'bg-amber-500/12 text-amber-600 dark:text-amber-400',
+    active: filters.time_range === 'published_7d',
+    spanClass: 'col-span-2 sm:col-span-1',
   },
 ])
 
-const uploaderOptions = computed(() => [
-  { label: '全部上传者', value: '' },
-  ...(facets.value.uploaders || []).map((u) => ({
-    label: facets.value.uploader_labels?.[u] || u,
-    value: u,
-  })),
-])
+const uploaderOptions = computed(() => {
+  const list = facets.value.uploaders || []
+  const opts = [
+    { label: '全部上传者', value: '' },
+    ...list.map((u) => ({
+      label: facets.value.uploader_labels?.[u] || u,
+      value: u,
+    })),
+  ]
+  if (filters.uploader && !list.includes(filters.uploader)) {
+    const matched = list.find((u) => u.toLowerCase() === filters.uploader.toLowerCase())
+    if (!matched) {
+      opts.push({
+        label: facets.value.uploader_labels?.[filters.uploader] || filters.uploader,
+        value: filters.uploader,
+      })
+    }
+  }
+  return opts
+})
 
 const statusOptions = [
   { label: '全部状态', value: '' },
@@ -185,6 +235,7 @@ function buildQueryCacheKey(page = filters.page) {
     filters.uploader,
     filters.status,
     filters.quality,
+    filters.time_range,
     filters.sort_by,
     page,
     filters.page_size,
@@ -237,6 +288,7 @@ function prefetchPage(targetPage) {
     uploader: filters.uploader,
     status: filters.status,
     quality: filters.quality,
+    time_range: filters.time_range,
     sort_by: filters.sort_by,
     page: targetPage,
     page_size: filters.page_size,
@@ -296,6 +348,7 @@ function isDefaultFilters() {
     !filters.uploader &&
     !filters.status &&
     !filters.quality &&
+    !filters.time_range &&
     filters.sort_by === 'activity' &&
     filters.page === 1 &&
     filters.page_size === store.historyPageSize
@@ -441,12 +494,29 @@ function changePageSize(value) {
   loadVideos({ includeMeta: false, useCache: true })
 }
 
-function selectStatusCard(statusKey) {
-  if (statusKey === '') {
-    if (filters.status === '') return
+function changeTimeRange() {
+  if (filters.time_range === 'published_7d' || filters.time_range === 'published_30d') {
+    filters.sort_by = 'published'
+  } else if (filters.time_range === 'activity_7d') {
+    filters.sort_by = 'activity'
+  }
+  changeFilter()
+}
+
+function selectStatCard(card) {
+  if (card.kind === 'all') {
+    if (filters.status === '' && filters.time_range === '') return
     filters.status = ''
+    filters.time_range = ''
+  } else if (card.kind === 'time_range') {
+    if (filters.time_range === card.key) {
+      filters.time_range = ''
+    } else {
+      filters.time_range = card.key
+      filters.sort_by = 'published'
+    }
   } else {
-    filters.status = filters.status === statusKey ? '' : statusKey
+    filters.status = filters.status === card.key ? '' : card.key
   }
   changeFilter()
 }
@@ -563,11 +633,35 @@ watch(
       uploader_labels: { ...(val.facets?.uploader_labels || {}) },
       qualities: [...(val.facets?.qualities || [])],
     }
-    stats.value = { ...(val.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0 }) }
+    stats.value = {
+      published_7d: 0,
+      ...(val.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0 }),
+    }
   }
 )
 
+function applyRouteUploaderQuery() {
+  const raw = typeof route.query.uploader === 'string' ? route.query.uploader.trim() : ''
+  if (!raw) return false
+  const exact = (facets.value.uploaders || []).find((u) => u.toLowerCase() === raw.toLowerCase())
+  filters.uploader = exact || raw
+  filters.status = ''
+  filters.quality = ''
+  filters.time_range = ''
+  filters.search = ''
+  filters.page = 1
+  router.replace({ name: 'history', query: {} }).catch(() => {})
+  return true
+}
+
 onActivated(() => {
+  const appliedUploader = applyRouteUploaderQuery()
+  if (appliedUploader) {
+    activatedOnce = true
+    invalidateQueryCache()
+    loadVideos({ silent: false, includeMeta: true })
+    return
+  }
   if (!activatedOnce) {
     activatedOnce = true
     if (store.hydratedFromCache && store.hasRouteCache('history')) {
@@ -615,7 +709,7 @@ onDeactivated(() => {
         <div class="min-w-0">
           <h1 class="text-lg sm:text-xl font-bold tracking-tight text-foreground">历史记录</h1>
           <p class="text-xs sm:text-sm text-muted-foreground mt-0.5">
-            统一 SQLite 视频去重索引库，点击统计卡片可快速筛选对应状态
+            统一 SQLite 视频去重索引库，点击统计卡片可快速筛选对应状态或近 7 天新片
           </p>
         </div>
       </div>
@@ -642,18 +736,19 @@ onDeactivated(() => {
     </div>
 
     <!-- Interactive Semantic KPI Cards (inspired by rust-srec Pipeline Statistics) -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 sm:gap-3.5">
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 sm:gap-3.5">
       <button
         v-for="card in statCards"
-        :key="card.key || 'all'"
+        :key="card.id"
         type="button"
         :class="[
           'text-left rounded-2xl border bg-card p-3.5 sm:p-4 shadow-[var(--card-shadow)] transition-all duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30',
-          filters.status === card.key
+          card.spanClass,
+          card.active
             ? 'border-brand/45 ring-2 ring-brand/12'
             : 'border-border hover:border-foreground/20',
         ]"
-        @click="selectStatusCard(card.key)"
+        @click="selectStatCard(card)"
       >
         <div class="flex items-center justify-between gap-2">
           <span class="text-xs font-medium text-muted-foreground">{{ card.label }}</span>
@@ -687,7 +782,7 @@ onDeactivated(() => {
           <Select
             v-model="filters.uploader"
             :options="uploaderOptions"
-            class="w-full sm:w-40"
+            class="w-full col-span-2 sm:w-40"
             @change="changeFilter"
           />
           <Select
@@ -695,6 +790,12 @@ onDeactivated(() => {
             :options="statusOptions"
             class="w-full sm:w-32"
             @change="changeFilter"
+          />
+          <Select
+            v-model="filters.time_range"
+            :options="timeRangeOptions"
+            class="w-full sm:w-32"
+            @change="changeTimeRange"
           />
           <Select
             v-model="filters.quality"
