@@ -145,8 +145,7 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
         timeout=settings.request_timeout,
         yescaptcha_enabled=settings.yescaptcha_enabled,
         yescaptcha_client_key=settings.yescaptcha_client_key,
-        yescaptcha_api_base=settings.yescaptcha_api_base,
-        yescaptcha_task_type=settings.yescaptcha_task_type,
+        yescaptcha_task_type=settings.yescaptcha_ph_task_type,
         yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
         on_log=lambda level, message: container.events.emit_log(level, message),
     )
@@ -216,7 +215,7 @@ async def refresh_xh_cookie(container: AppContainer = Depends(require_auth)):
         timeout=settings.request_timeout,
         yescaptcha_enabled=settings.yescaptcha_enabled,
         yescaptcha_client_key=settings.yescaptcha_client_key,
-        yescaptcha_api_base=settings.yescaptcha_api_base,
+        yescaptcha_task_type=settings.yescaptcha_xh_task_type,
         yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
         on_log=lambda level, message: container.events.emit_log(level, message),
     )
@@ -243,10 +242,7 @@ async def test_yescaptcha(container: AppContainer = Depends(require_auth)):
     if not (settings.yescaptcha_client_key or "").strip():
         return {"ok": False, "message": "未配置 YesCaptcha ClientKey"}
     try:
-        balance = await get_yescaptcha_balance(
-            settings.yescaptcha_client_key,
-            api_base=settings.yescaptcha_api_base,
-        )
+        balance = await get_yescaptcha_balance(settings.yescaptcha_client_key)
     except CaptchaError as err:
         return {"ok": False, "message": str(err)}
     except Exception as err:  # pragma: no cover - defensive

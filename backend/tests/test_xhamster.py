@@ -889,8 +889,9 @@ def _xh_show_captcha() -> Dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("task_type", ["NoCaptchaTaskProxyless", "RecaptchaV2TaskProxyless"])
 @pytest.mark.asyncio
-async def test_login_xhamster_prefers_v2_captcha(monkeypatch):
+async def test_login_xhamster_uses_selected_v2_route(monkeypatch, task_type):
     from app.services import cookie as cookie_svc
     from app.services.captcha import CaptchaSolution
     from app.parsers import xhamster as xh_parser
@@ -930,6 +931,7 @@ async def test_login_xhamster_prefers_v2_captcha(monkeypatch):
         "good-pass",
         yescaptcha_enabled=True,
         yescaptcha_client_key="client-key",
+        yescaptcha_task_type=task_type,
         yescaptcha_timeout_seconds=60,
     )
 
@@ -944,13 +946,14 @@ async def test_login_xhamster_prefers_v2_captcha(monkeypatch):
     assert all("g-recaptcha-response" not in payload for payload in ctx.post_payloads)
 
     assert len(solver_calls) == 1
-    assert solver_calls[0]["task_type"] == "RecaptchaV2TaskProxyless"
+    assert solver_calls[0]["task_type"] == task_type
     assert solver_calls[0]["website_key"] == "page-v2-key"
+    assert solver_calls[0]["timeout"] == 60
     assert "page_action" not in solver_calls[0]
 
 
 @pytest.mark.asyncio
-async def test_login_xhamster_falls_back_to_v3_when_v2_rejected(monkeypatch):
+async def test_login_xhamster_rejected_v2_token_does_not_fallback_to_v3(monkeypatch):
     from app.services import cookie as cookie_svc
     from app.services.captcha import CaptchaSolution
     from app.parsers import xhamster as xh_parser
@@ -959,33 +962,20 @@ async def test_login_xhamster_falls_back_to_v3_when_v2_rejected(monkeypatch):
     solver_calls: List[Dict[str, Any]] = []
 
     async def fake_solver(client_key, website_url, website_key, **kwargs):
-        solver_calls.append(
-            {
-                "client_key": client_key,
-                "website_url": website_url,
-                "website_key": website_key,
-                **kwargs,
-            }
-        )
-        token = "v2-token" if len(solver_calls) == 1 else "v3-token"
-        return CaptchaSolution(token=token, task_id=f"task-{len(solver_calls)}", task_type="type")
-
-    async def fake_verify(cookie_str: str, **kwargs):
-        assert "_id=fake_after_captcha" in cookie_str
-        return True, "Cookie 有效（当前账号: NativePea222）", "NativePea222"
+        solver_calls.append(kwargs)
+        return CaptchaSolution(token="v2-token", task_id="task-v2", task_type="type")
 
     def make_ctx(*args, **kwargs):
         ctx = FakeLoginCtx(*args, **kwargs)
         ctx.responses = [
             (403, _xh_show_captcha()),
             (400, {"extras": {"result": False, "errorMessage": "Recaptcha failure. Try again"}, "requestData": []}),
-            (200, {"extras": {"result": True, "userId": 1}, "requestData": []}),
         ]
         return ctx
 
     monkeypatch.setattr(cookie_svc, "TaskHttpContext", make_ctx)
     monkeypatch.setattr(cookie_svc, "solve_recaptcha", fake_solver)
-    monkeypatch.setattr(xh_parser, "check_xhamster_cookie_valid", fake_verify)
+    monkeypatch.setattr(xh_parser, "check_xhamster_cookie_valid", lambda *a, **k: None)
 
     result = await cookie_svc.login_xhamster_and_get_cookies(
         "NativePea222",
@@ -995,21 +985,12 @@ async def test_login_xhamster_falls_back_to_v3_when_v2_rejected(monkeypatch):
         yescaptcha_timeout_seconds=60,
     )
 
-    assert result.success is True
+    assert result.success is False
+    assert "切换另一个标准 v2 线路" in result.message
+    assert len(solver_calls) == 1
 
     ctx = FakeLoginCtx.instances[-1]
-    assert len(ctx.post_urls) == 3
-    assert "g-recaptcha-response=v2-token" in ctx.post_urls[1]
-    assert "g-recaptcha-version=v2" in ctx.post_urls[1]
-    assert "g-recaptcha-response=v3-token" in ctx.post_urls[2]
-    assert "g-recaptcha-version" not in ctx.post_urls[2]
-
-    assert len(solver_calls) == 2
-    assert solver_calls[0]["task_type"] == "RecaptchaV2TaskProxyless"
-    assert solver_calls[1]["task_type"] == "RecaptchaV3EnterpriseTask"
-    assert solver_calls[1]["page_action"] == "customLoginAction"
-    assert solver_calls[1]["website_key"] == "page-ent-key"
-    assert solver_calls[1]["timeout"] == 45.0
+    assert len(ctx.post_urls) == 2
 
 
 @pytest.mark.asyncio

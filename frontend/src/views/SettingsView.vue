@@ -77,16 +77,20 @@ const SELECTOR_FIELDS = [
   { key: 'pornstar_page_video_container_check', label: 'Pornstar 上传容器校验' },
 ]
 
-const YESCAPTCHA_ENDPOINTS = [
-  { label: '国际节点 api.yescaptcha.com', value: 'https://api.yescaptcha.com' },
-  { label: '国内节点 cn.yescaptcha.com', value: 'https://cn.yescaptcha.com' },
+const YESCAPTCHA_SITE_OPTIONS = [
+  { label: 'PornHub', value: 'pornhub' },
+  { label: 'xHamster', value: 'xhamster' },
 ]
 
-const YESCAPTCHA_TASK_TYPES = [
-  { label: 'reCAPTCHA v2 企业版（推荐，PornHub 使用 enterprise.js）', value: 'RecaptchaV2EnterpriseTaskProxyless' },
-  { label: 'reCAPTCHA v2 普通版（15 点/次，低价）', value: 'NoCaptchaTaskProxyless' },
-  { label: 'reCAPTCHA v2 备用线路（20 点/次）', value: 'RecaptchaV2TaskProxyless' },
-]
+const YESCAPTCHA_TASK_TYPES = {
+  pornhub: [
+    { label: 'reCAPTCHA v2 企业版（PornHub 使用 enterprise.js）', value: 'RecaptchaV2EnterpriseTaskProxyless' },
+  ],
+  xhamster: [
+    { label: '标准 v2 · 低价线路（15 点/次）', value: 'NoCaptchaTaskProxyless' },
+    { label: '标准 v2 · 标准线路（20 点/次）', value: 'RecaptchaV2TaskProxyless' },
+  ],
+}
 
 const UPDATE_SCAN_MODE_OPTIONS = [
   { label: '智能衔接（快 · 衔接已知视频即止）', value: 'catch_up' },
@@ -102,6 +106,9 @@ function cloneSettings(src) {
   if (!src) return null
   return {
     ...src,
+    yescaptcha_ph_task_type:
+      src.yescaptcha_ph_task_type || 'RecaptchaV2EnterpriseTaskProxyless',
+    yescaptcha_xh_task_type: src.yescaptcha_xh_task_type || 'RecaptchaV2TaskProxyless',
     selectors: { ...DEFAULT_SELECTORS, ...(src.selectors || {}) },
   }
 }
@@ -129,6 +136,23 @@ const xhAuthMode = ref(
     ? 'cookie'
     : 'account'
 )
+const yescaptchaTaskSite = ref('pornhub')
+const yescaptchaTaskTypeOptions = computed(
+  () => YESCAPTCHA_TASK_TYPES[yescaptchaTaskSite.value] || []
+)
+const currentYescaptchaTaskType = computed({
+  get: () => {
+    if (!form.value) return ''
+    return yescaptchaTaskSite.value === 'pornhub'
+      ? form.value.yescaptcha_ph_task_type
+      : form.value.yescaptcha_xh_task_type
+  },
+  set: (value) => {
+    if (!form.value) return
+    if (yescaptchaTaskSite.value === 'pornhub') form.value.yescaptcha_ph_task_type = value
+    else form.value.yescaptcha_xh_task_type = value
+  },
+})
 let authModesSynced = Boolean(store.settingsCache)
 const avatarInputRef = ref(null)
 const avatarLoadError = ref(false)
@@ -816,7 +840,7 @@ async function handleTestNotify() {
             </Button>
           </div>
 
-          <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+          <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             <div class="space-y-1.5">
               <label class="text-xs font-medium text-foreground">ClientKey（已脱敏）</label>
               <Input
@@ -826,22 +850,34 @@ async function handleTestNotify() {
               />
             </div>
             <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">API 节点</label>
-              <Select v-model="form.yescaptcha_api_base" :options="YESCAPTCHA_ENDPOINTS" />
-            </div>
-            <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">识别任务类型</label>
-              <Select v-model="form.yescaptcha_task_type" :options="YESCAPTCHA_TASK_TYPES" />
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <label class="text-xs font-medium text-foreground">识别任务类型</label>
+                <SegmentedControl
+                  v-model="yescaptchaTaskSite"
+                  :options="YESCAPTCHA_SITE_OPTIONS"
+                  aria-label="验证码任务站点"
+                  size="sm"
+                />
+              </div>
+              <Select v-model="currentYescaptchaTaskType" :options="yescaptchaTaskTypeOptions" />
+              <p class="text-[11px] text-muted-foreground">
+                {{
+                  yescaptchaTaskSite === 'pornhub'
+                    ? 'PornHub 使用企业版 v2 线路。'
+                    : '两个标准 v2 线路参数相同，可互相切换。'
+                }}
+              </p>
             </div>
             <div class="space-y-1.5">
               <label class="text-xs font-medium text-foreground">解题超时（秒）</label>
               <Input v-model="form.yescaptcha_timeout_seconds" type="number" :min="30" :max="600" />
+              <p class="text-[11px] text-muted-foreground">两个站点共用此超时。</p>
             </div>
           </div>
 
           <p class="text-xs text-muted-foreground">
-            国内服务器若无法访问国际节点，可切换到 cn.yescaptcha.com。若 token 提交后仍要求验证码，可尝试切换识别任务类型。
-            xHamster 会优先使用 reCAPTCHA v2，失败后再尝试 Enterprise v3，不受上方任务类型影响。
+            默认使用国际节点 api.yescaptcha.com。PornHub 固定企业版 v2；xHamster 可选两个标准 v2 线路。
+            若 token 提交后仍要求验证码，可切换线路或粘贴浏览器 Cookie。
           </p>
         </div>
       </Card>

@@ -98,7 +98,7 @@ async def get_subscriptions(
                 timeout=settings.request_timeout,
                 yescaptcha_enabled=settings.yescaptcha_enabled,
                 yescaptcha_client_key=settings.yescaptcha_client_key,
-                yescaptcha_api_base=settings.yescaptcha_api_base,
+                yescaptcha_task_type=settings.yescaptcha_xh_task_type,
                 yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
                 on_log=lambda level, message: container.events.emit_log(level, message),
             )

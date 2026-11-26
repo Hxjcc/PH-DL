@@ -27,7 +27,7 @@ SUPPORTED_TASK_TYPES = (
     "RecaptchaV2TaskProxyless",
     "NoCaptchaTask",
     "RecaptchaV2EnterpriseTask",
-    # reCAPTCHA v3 / Enterprise v3 (used by xHamster login)
+    # reCAPTCHA v3 / Enterprise v3
     "RecaptchaV3TaskProxyless",
     "RecaptchaV3TaskProxylessM1",
     "RecaptchaV3EnterpriseTask",

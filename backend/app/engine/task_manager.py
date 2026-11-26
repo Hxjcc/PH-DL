@@ -312,8 +312,7 @@ class TaskManager:
                 timeout=settings.request_timeout,
                 yescaptcha_enabled=settings.yescaptcha_enabled,
                 yescaptcha_client_key=settings.yescaptcha_client_key,
-                yescaptcha_api_base=settings.yescaptcha_api_base,
-                yescaptcha_task_type=settings.yescaptcha_task_type,
+                yescaptcha_task_type=settings.yescaptcha_ph_task_type,
                 yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
                 on_log=lambda level, message: self.events.emit_log(level, message, job_id=job_id),
             )
@@ -461,7 +460,7 @@ class TaskManager:
                 timeout=settings.request_timeout,
                 yescaptcha_enabled=settings.yescaptcha_enabled,
                 yescaptcha_client_key=settings.yescaptcha_client_key,
-                yescaptcha_api_base=settings.yescaptcha_api_base,
+                yescaptcha_task_type=settings.yescaptcha_xh_task_type,
                 yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
                 on_log=lambda lvl, message: self.events.emit_log(lvl, message, job_id=job_id),
             )
