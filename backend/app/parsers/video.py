@@ -131,6 +131,8 @@ class VideoDetail:
     video_format: str = "mp4"
     uploader_username: str = ""
     uploader_type: str = "model"
+    uploader_display_name: str = ""
+    uploader_avatar_url: str = ""
     page_num: int = 0
     item_num: int = 0
     error: Optional[str] = None

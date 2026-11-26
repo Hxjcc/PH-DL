@@ -1575,7 +1575,12 @@ async def test_task_manager_xhamster_auto_subscribe_in_target_and_url_modes(tmp_
                     "duration": 120,
                     "created": 1767225600,
                     "author": {"name": "SweetHot69", "pageURL": "https://xhamster.com/users/sweethot69"},
-                    "landing": {"type": "person", "name": "SweetGirl69", "link": "https://xhamster.com/creators/sweetgirl69"},
+                    "landing": {
+                        "type": "person",
+                        "name": "SweetGirl69",
+                        "logo": "https://ic-ut-nss.xhcdn.com/a/sweet/avatar_80.jpg",
+                        "link": "https://xhamster.com/creators/sweetgirl69",
+                    },
                 },
                 "subscriptionComponent": {
                     "subscribeButtonsProps": {
@@ -1656,10 +1661,17 @@ async def test_task_manager_xhamster_auto_subscribe_in_target_and_url_modes(tmp_
         assert subscribe_calls[0]["data"][0]["requestData"]["model"]["entityModel"] == "pornstarModel"
         assert subscribe_calls[0]["data"][0]["requestData"]["model"]["entityID"] == 227768
         targets = await repo.list_targets()
-        assert any(
-            t["site"] == "xhamster" and t["username"] == "sweetgirl69" and t["target_type"] == "creator"
-            for t in targets
+        matched = next(
+            (
+                t
+                for t in targets
+                if t["site"] == "xhamster" and t["username"] == "sweetgirl69" and t["target_type"] == "creator"
+            ),
+            None,
         )
+        assert matched is not None
+        assert matched["display_name"] == "SweetGirl69"
+        assert matched["avatar_url"] == "https://ic-ut-nss.xhcdn.com/a/sweet/avatar_80.jpg"
     finally:
         await db.close()
 
@@ -1830,3 +1842,46 @@ async def test_xhamster_resolve_target_upgrades_bound_user_and_user_scan_unions_
         delay_max=0,
     )
     assert [v.viewkey for v in scoped] == ["xhAAA11"]
+
+
+def test_xhamster_profile_meta_extracts_channel_logo_and_creator_pornstar_top():
+    from app.parsers.xhamster import _extract_profile_meta_from_initials
+
+    av_ch, dn_ch = _extract_profile_meta_from_initials(
+        {
+            "layoutPage": {
+                "channelLandingInfoProps": {
+                    "sponsorChannel": {
+                        "channelName": "VIXEN",
+                        "siteLogoURL": "https://thumb-v-nss.xhcdn.com/site/000/007/179/logo.jpg",
+                    }
+                }
+            }
+        },
+        target_type="channel",
+    )
+    assert dn_ch == "VIXEN"
+    assert av_ch == "https://thumb-v-nss.xhcdn.com/site/000/007/179/logo.jpg"
+
+    av_cr, dn_cr = _extract_profile_meta_from_initials(
+        {
+            "infoComponent": {
+                "pornstarTop": {
+                    "name": "SweetGirl69",
+                    "thumbUrl": "https://ic-tt-nss.xhcdn.com/a/xxx/avatar1.jpg",
+                },
+                "displayUserModel": {
+                    "name": "SweetHot69",
+                    "thumbURL": "https://ic-ut-nss.xhcdn.com/a/yyy/avatar_150.jpg",
+                },
+            }
+        },
+        target_type="creator",
+    )
+    assert dn_cr == "SweetGirl69"
+    assert av_cr == "https://ic-tt-nss.xhcdn.com/a/xxx/avatar1.jpg"
+
+    from app.parsers.xhamster import parse_xhamster_target_from_url
+
+    assert parse_xhamster_target_from_url("https://xhamster.com/users/profiles/nativepea222") == ("users", "nativepea222")
+    assert parse_xhamster_target_from_url("https://xhamster.com/users/profiles") is None

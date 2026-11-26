@@ -1096,6 +1096,84 @@ async def test_retry_items_broadcasts_all_pending_items_and_prioritizes_partial_
         await db.close()
 
 
+async def test_retry_items_enqueues_unparsed_items_before_detail_fetch(tmp_path: Path, monkeypatch):
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch({"ph_cookie": "sess=valid", "uploader_enabled": False, "max_concurrent_downloads": 1})
+        src = await repo.create_job("manual_target", "下载目标: shinaryen", {"usernames": ["shinaryen"], "auto_upload": False})
+        await repo.update_job(src["id"], status="cancelled")
+        for idx in range(1, 4):
+            await repo.add_job_item(
+                src["id"],
+                viewkey=f"vk{idx}",
+                title=f"Clip {idx}",
+                uploader="shinaryen",
+                target_type="model",
+                page_url=f"https://www.pornhub.com/view_video.php?viewkey=vk{idx}",
+                download_url="",
+                status="cancelled",
+            )
+
+        from app.engine import task_manager as tm_mod
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        seen_total_when_parse_started: list[int] = []
+
+        async def fake_details(_ctx, items, _selectors, **kwargs):
+            # When the first detail parse starts, all 3 retry items MUST already exist in the DB!
+            cur_items = await repo.list_job_items(retry_job["id"])
+            seen_total_when_parse_started.append(len(cur_items))
+            out = []
+            for url, pnum, inum in items:
+                vk = url.split("viewkey=")[1]
+                out.append(
+                    VideoDetail(
+                        viewkey=vk,
+                        title=f"Parsed {vk}",
+                        page_url=url,
+                        referer_url=url,
+                        download_url=f"https://cdn.example/{vk}.mp4",
+                        quality="1080p",
+                        page_num=pnum,
+                        item_num=inum,
+                    )
+                )
+            return out
+
+        async def fake_download(**kwargs):
+            out = kwargs["download_dir"] / f"{kwargs['viewkey']}.mp4"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(mp4_payload())
+            return DownloadOutcome(success=True, local_path=out, file_size=out.stat().st_size, quality="1080p")
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "fetch_video_details_batch", fake_details)
+        monkeypatch.setattr(tm_mod, "download_mp4_with_resume", fake_download)
+
+        tm.start()
+        retry_job = await tm.enqueue_job(
+            "retry_items",
+            "重试/续传 · 下载目标: shinaryen (3 项)",
+            {"source_job_id": src["id"], "auto_upload": False},
+        )
+        done = await _wait_job_done(repo, retry_job["id"])
+        assert done is not None and done["status"] == "completed"
+        assert done["total_items"] == 3 and done["done_items"] == 3
+        assert seen_total_when_parse_started and all(cnt == 3 for cnt in seen_total_when_parse_started)
+    finally:
+        await tm.stop()
+        await db.close()
+
+
 async def test_upload_streams_per_file_and_cancel_marks_remaining_without_spurious_batches(
     tmp_path: Path, monkeypatch
 ):

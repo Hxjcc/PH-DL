@@ -269,6 +269,15 @@ async def test_pornhub_login_emits_uniform_site_prefixed_logs(monkeypatch):
 def test_pornhub_cookie_valid_message_extracts_username_and_formats_uniformly():
     html = '<div id="topRightProfileMenu"><a href="/users/hxiay">Hxiay</a></div>'
     assert cookie_mod._extract_pornhub_logged_in_username(html) == "Hxiay"
+
+    # Must ignore random video uploader usernameLink outside the logged-in profile menu!
+    noisy_html = (
+        '<header>'
+        '<a href="/users/breadedtoast1097" class="usernameLink">breadedtoast1097</a>'
+        '<div id="topRightProfileMenu"><a href="/users/hxiay">My Profile</a></div>'
+        '</header>'
+    )
+    assert cookie_mod._extract_pornhub_logged_in_username(noisy_html) == "hxiay"
     assert cookie_mod.prefer_cased_username("hxiay", "Hxiay") == "Hxiay"
     assert cookie_mod.prefer_cased_username("Hxiay", "hxiay") == "Hxiay"
     assert cookie_mod.prefer_cased_username("OtherUser", "Hxiay") == "OtherUser"

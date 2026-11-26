@@ -412,30 +412,64 @@ def _extract_pornhub_logged_in_username(html: str) -> str:
     """Best-effort extraction of the logged-in PornHub username, preserving original capitalization."""
     if not html:
         return ""
-    ignore = {"", "null", "none", "guest", "anonymous", "login", "signup", "settings", "security", "subscriptions"}
+    ignore = {
+        "",
+        "null",
+        "none",
+        "guest",
+        "anonymous",
+        "login",
+        "signup",
+        "settings",
+        "security",
+        "subscriptions",
+        "profile",
+        "my profile",
+    }
 
     def _clean(raw: str) -> str:
         candidate = (raw or "").strip().strip("/")
-        if not candidate or len(candidate) > 64 or "/" in candidate or "?" in candidate:
+        if not candidate or len(candidate) > 64 or "/" in candidate or "?" in candidate or " " in candidate:
             return ""
         if candidate.lower() in ignore:
             return ""
         return candidate
 
-    fallback_slug = ""
+    profile_slug = ""
     try:
         tree = HTMLParser(html)
-        for sel in (
-            "[data-username]",
-            "#topRightProfileMenu a[href*='/users/']",
-            ".profileMenu a[href*='/users/']",
-            "a.usernameLink[href*='/users/']",
-            "a[data-mxptext='Profile'][href*='/users/']",
-        ):
-            for node in tree.css(sel):
+        menu_containers = []
+        for menu_sel in ("#topRightProfileMenu", ".profileMenu", "#headerProfileMenu"):
+            menu_containers.extend(tree.css(menu_sel))
+
+        # 1. Strictly inspect logged-in profile menu containers first (never match random video uploaders!).
+        for container in menu_containers:
+            for node in container.css("[data-username]"):
                 data_user = _clean(node.attributes.get("data-username") or "")
                 if data_user:
                     return data_user
+            for node in container.css("a[href*='/users/']"):
+                href = (node.attributes.get("href") or "").strip()
+                m_href = re.search(r"/users/([^/?#]+)", href, re.I)
+                if not m_href:
+                    continue
+                slug = _clean(m_href.group(1))
+                if not slug:
+                    continue
+                label = _clean(node.text(strip=True) or "")
+                if label and label.lower() == slug.lower():
+                    return label
+                if not profile_slug:
+                    profile_slug = slug
+            if profile_slug:
+                for label_node in container.css("span, a, div, p"):
+                    label = _clean(label_node.text(strip=True) or "")
+                    if label and label.lower() == profile_slug.lower() and label != label.lower():
+                        return label
+
+        # 2. Explicit Profile nav link (still safe because data-mxptext='Profile' is the user's own profile)
+        if not profile_slug:
+            for node in tree.css("a[data-mxptext='Profile'][href*='/users/']"):
                 href = (node.attributes.get("href") or "").strip()
                 m_href = re.search(r"/users/([^/?#]+)", href, re.I)
                 if m_href:
@@ -444,21 +478,35 @@ def _extract_pornhub_logged_in_username(html: str) -> str:
                         label = _clean(node.text(strip=True) or "")
                         if label and label.lower() == slug.lower():
                             return label
-                        if not fallback_slug:
-                            fallback_slug = slug
+                        profile_slug = slug
+                        break
     except Exception:
         pass
 
+    # 3. If profile_slug was found in the account menu, ONLY upgrade its letter casing with a same-user match.
+    # Never replace it with an unrelated user's name from elsewhere on the page.
+    if profile_slug:
+        for pattern in (
+            r'data-username=["\']([^"\']{2,64})["\']',
+            r'(?:"username"|\'username\'|\buser_name\b|\bcurrentUsername\b)\s*[:=]\s*["\']([^"\'\\]{2,64})["\']',
+        ):
+            for m in re.finditer(pattern, html, re.I):
+                cand = _clean(m.group(1))
+                if cand and cand.lower() == profile_slug.lower() and cand != cand.lower():
+                    return cand
+        return profile_slug
+
+    # 4. Fallback for minimal HTML without a profile menu
     for pattern in (
         r'data-username=["\']([^"\']{2,64})["\']',
-        r'(?:"username"|\'username\'|\buser_name\b|\bcurrentUsername\b)\s*[:=]\s*["\']([^"\'\\]{2,64})["\']',
+        r'(?:\bcurrentUsername\b|"username"|\'username\'|\buser_name\b)\s*[:=]\s*["\']([^"\'\\]{2,64})["\']',
     ):
         m = re.search(pattern, html, re.I)
         if m:
             user = _clean(m.group(1))
             if user:
-                return prefer_cased_username(user, fallback_slug)
-    return fallback_slug
+                return user
+    return ""
 
 
 async def _finish_login(

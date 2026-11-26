@@ -501,6 +501,8 @@ def parse_xhamster_target_from_url(url: str) -> Optional[Tuple[str, str]]:
     if head == "pornstars":
         return "pornstar", slug
     if head == "users":
+        if slug.lower() == "profiles":
+            return ("users", parts[2].strip()) if len(parts) >= 3 and parts[2].strip() else None
         return "users", slug
     if head == "channels":
         return "channel", slug
@@ -523,8 +525,10 @@ def _build_xhamster_paged_url(initial_url: str, target_type: Optional[str], page
     return urllib.parse.urlunparse(parsed._replace(path=f"{clean_path}/{p}"))
 
 
-def _extract_linked_creator_from_user_initials(initials: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
-    """Return ``(target_type, creator_slug, list_url)`` if a ``/users/<slug>`` page links to a creator/pornstar."""
+def _extract_linked_creator_from_user_initials(
+    initials: Dict[str, Any],
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Return ``(target_type, creator_slug, list_url, display_name, avatar_url)`` if linked."""
     sec = initials.get("pornstarSectionComponent")
     if not isinstance(sec, dict):
         return None
@@ -534,7 +538,14 @@ def _extract_linked_creator_from_user_initials(initials: Dict[str, Any]) -> Opti
     page_url = str(pornstar.get("pageURL") or pornstar.get("url") or "").strip()
     parsed = parse_xhamster_target_from_url(page_url)
     if parsed and parsed[0] in {"creator", "pornstar"} and parsed[1]:
-        return parsed[0], parsed[1], build_xhamster_list_url(parsed[1], parsed[0], page=1)
+        display_name = html_lib.unescape(str(pornstar.get("name") or "").strip())
+        avatar_url = (
+            _normalize_thumb_url(pornstar.get("imageUserAvatarUrl"))
+            or _normalize_thumb_url(pornstar.get("imageThumbUrl"))
+            or _normalize_thumb_url(pornstar.get("thumbUrl"))
+            or _normalize_thumb_url(pornstar.get("logoThumbUrl"))
+        )
+        return parsed[0], parsed[1], build_xhamster_list_url(parsed[1], parsed[0], page=1), display_name, avatar_url
     return None
 
 
@@ -544,6 +555,18 @@ async def resolve_xhamster_linked_creator(
     timeout: float = 15.0,
 ) -> Optional[Tuple[str, str, str]]:
     """Probe ``/users/<username>`` to discover a linked creator/pornstar page."""
+    detailed = await resolve_xhamster_linked_creator_with_profile(ctx, username, timeout=timeout)
+    if detailed is None:
+        return None
+    return detailed[0], detailed[1], detailed[2]
+
+
+async def resolve_xhamster_linked_creator_with_profile(
+    ctx: TaskHttpContext,
+    username: str,
+    timeout: float = 15.0,
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Probe ``/users/<username>`` to discover a linked creator/pornstar page with profile metadata."""
     norm_user = (username or "").strip()
     if not norm_user or norm_user == "_currentUser_":
         return None
@@ -563,22 +586,22 @@ async def resolve_xhamster_linked_creator(
     return _extract_linked_creator_from_user_initials(initials)
 
 
-async def resolve_xhamster_target(
+async def resolve_xhamster_target_with_profile(
     ctx: TaskHttpContext,
     username: str,
     hinted_type: Optional[str] = None,
     timeout: float = 15.0,
-) -> Optional[Tuple[str, str]]:
-    """Resolve ``(target_type, canonical_username)`` for an xHamster target, upgrading bound users to creators."""
+) -> Optional[Tuple[str, str, str, str]]:
+    """Resolve ``(target_type, canonical_username, display_name, avatar_url)`` for an xHamster target."""
     norm_user = (username or "").strip()
     if not norm_user or norm_user == "_currentUser_":
         return None
 
     ordered: List[str] = []
     hint = (hinted_type or "").strip().lower()
-    if hint in {"creator", "pornstar", "users", "channel"}:
+    if hint in {"creator", "pornstar", "channel", "users"}:
         ordered.append(hint)
-    for cand in ("creator", "pornstar", "users", "channel"):
+    for cand in ("creator", "pornstar", "channel", "users"):
         if cand not in ordered:
             ordered.append(cand)
 
@@ -595,15 +618,31 @@ async def resolve_xhamster_target(
         )
         if res is None or res.status_code >= 400:
             continue
+        final_path = urllib.parse.urlparse(res.final_url or "").path.strip("/").lower()
+        if cand == "users" and (final_path.startswith("users/profiles/") or "/videos" not in f"/{final_path}"):
+            continue
         detected = parse_xhamster_target_from_url(res.final_url)
         if detected and detected[0] in {"creator", "pornstar", "users", "channel"}:
             det_type, det_user = detected[0], detected[1] or norm_user
+            initials = extract_xhamster_initials(res.text) or {}
+            avatar_url, display_name = _extract_profile_meta_from_initials(initials, target_type=det_type)
             if det_type == "users":
-                linked = await resolve_xhamster_linked_creator(ctx, det_user, timeout=timeout)
+                linked = await resolve_xhamster_linked_creator_with_profile(ctx, det_user, timeout=timeout)
                 if linked is not None:
-                    return linked[0], linked[1]
-            return det_type, det_user
+                    return linked[0], linked[1], linked[3] or display_name, linked[4] or avatar_url
+            return det_type, det_user, display_name, avatar_url
     return None
+
+
+async def resolve_xhamster_target(
+    ctx: TaskHttpContext,
+    username: str,
+    hinted_type: Optional[str] = None,
+    timeout: float = 15.0,
+) -> Optional[Tuple[str, str]]:
+    """Resolve ``(target_type, canonical_username)`` for an xHamster target, upgrading bound users to creators."""
+    resolved = await resolve_xhamster_target_with_profile(ctx, username, hinted_type=hinted_type, timeout=timeout)
+    return (resolved[0], resolved[1]) if resolved else None
 
 
 async def resolve_xhamster_target_type(
@@ -673,6 +712,7 @@ def _extract_profile_meta_from_initials(
                 "avatarURL",
                 "avatarUrl",
                 "avatar",
+                "siteLogoURL",
                 "thumbURL",
                 "thumbUrl",
                 "imageThumbUrl",
@@ -690,16 +730,26 @@ def _extract_profile_meta_from_initials(
         _pick_from_dict(initials.get("profile"))
         return avatar_url, display_name or "xHamster Favorites"
 
+    info_comp = initials.get("infoComponent") if isinstance(initials.get("infoComponent"), dict) else {}
+    layout_page = initials.get("layoutPage") if isinstance(initials.get("layoutPage"), dict) else {}
+    channel_landing = (
+        layout_page.get("channelLandingInfoProps")
+        if isinstance(layout_page.get("channelLandingInfoProps"), dict)
+        else {}
+    )
     candidates = [
         initials.get("profile"),
-        initials.get("infoComponent"),
-        (initials.get("infoComponent") or {}).get("displayUserModel") if isinstance(initials.get("infoComponent"), dict) else None,
-        (initials.get("infoComponent") or {}).get("pornstar") if isinstance(initials.get("infoComponent"), dict) else None,
-        (initials.get("infoComponent") or {}).get("channel") if isinstance(initials.get("infoComponent"), dict) else None,
-        (initials.get("infoComponent") or {}).get("entity") if isinstance(initials.get("infoComponent"), dict) else None,
-        (initials.get("layoutPage") or {}).get("channel") if isinstance(initials.get("layoutPage"), dict) else None,
-        (initials.get("layoutPage") or {}).get("pornstar") if isinstance(initials.get("layoutPage"), dict) else None,
-        (initials.get("layoutPage") or {}).get("creator") if isinstance(initials.get("layoutPage"), dict) else None,
+        info_comp.get("pornstarTop"),
+        info_comp,
+        info_comp.get("displayUserModel"),
+        info_comp.get("pornstar"),
+        info_comp.get("channel"),
+        info_comp.get("entity"),
+        channel_landing.get("sponsorChannel"),
+        channel_landing,
+        layout_page.get("channel"),
+        layout_page.get("pornstar"),
+        layout_page.get("creator"),
         initials.get("entity"),
     ]
     for cand in candidates:
@@ -1425,6 +1475,62 @@ def _extract_xhamster_uploader(video_model: Dict[str, Any], uploader_hint: Optio
     return "", "creator"
 
 
+def _extract_xhamster_uploader_profile(video_model: Dict[str, Any]) -> Tuple[str, str]:
+    """Return ``(display_name, avatar_url)`` for a video's primary uploader/creator/channel."""
+    if not isinstance(video_model, dict):
+        return "", ""
+
+    def _pick(node: Any) -> Tuple[str, str]:
+        if not isinstance(node, dict):
+            return "", ""
+        name = ""
+        for k in ("name", "channelName", "displayName", "title"):
+            val = str(node.get(k) or "").strip()
+            if val:
+                name = html_lib.unescape(val)
+                break
+        avatar = ""
+        for k in ("logo", "siteLogoURL", "imageUserAvatarUrl", "avatarURL", "avatarUrl", "thumbURL", "thumbUrl", "logoThumbUrl"):
+            cand = _normalize_thumb_url(node.get(k))
+            if cand:
+                avatar = cand
+                break
+        return name, avatar
+
+    landing = video_model.get("landing")
+    landing_user_meta: Tuple[str, str] = ("", "")
+    if isinstance(landing, dict):
+        parsed_landing = parse_xhamster_target_from_url(
+            str(landing.get("link") or landing.get("pageURL") or landing.get("url") or "")
+        )
+        name, avatar = _pick(landing)
+        if parsed_landing and parsed_landing[0] in {"creator", "pornstar", "channel"}:
+            return name, avatar
+        landing_user_meta = (name, avatar)
+
+    channel_model = video_model.get("channelModel")
+    if isinstance(channel_model, dict):
+        name, avatar = _pick(channel_model)
+        if name or avatar:
+            return name, avatar
+
+    if landing_user_meta[0] or landing_user_meta[1]:
+        return landing_user_meta
+
+    for key in ("creator", "pornstar", "author"):
+        name, avatar = _pick(video_model.get(key))
+        if name or avatar:
+            return name, avatar
+
+    channels = video_model.get("channels")
+    if isinstance(channels, list) and channels:
+        name, avatar = _pick(channels[0])
+        if name or avatar:
+            return name, avatar
+
+    return "", ""
+
+
 async def fetch_xhamster_video_detail(
     ctx: TaskHttpContext,
     page_url: str,
@@ -1511,6 +1617,7 @@ async def fetch_xhamster_video_detail(
     raw_dur = video_model.get("duration")
     duration_seconds = max(0, int(raw_dur)) if isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool) else 0
     uploader_name, uploader_type = _extract_xhamster_uploader(video_model, uploader_hint)
+    uploader_display_name, uploader_avatar_url = _extract_xhamster_uploader_profile(video_model)
     subscribe_action = extract_xhamster_subscribe_action(initials)
 
     kw_reason = _matches_keywords(title, include_keywords, exclude_keywords)
@@ -1522,6 +1629,8 @@ async def fetch_xhamster_video_detail(
             referer_url=final_url,
             uploader_username=uploader_name,
             uploader_type=uploader_type,
+            uploader_display_name=uploader_display_name,
+            uploader_avatar_url=uploader_avatar_url,
             page_num=page_num,
             item_num=item_num,
             error=kw_reason,
@@ -1597,6 +1706,8 @@ async def fetch_xhamster_video_detail(
             video_format="hls",
             uploader_username=uploader_name,
             uploader_type=uploader_type,
+            uploader_display_name=uploader_display_name,
+            uploader_avatar_url=uploader_avatar_url,
             page_num=page_num,
             item_num=item_num,
             mp4_sources=mp4_sources_tuple,
@@ -1616,6 +1727,8 @@ async def fetch_xhamster_video_detail(
             referer_url=final_url,
             uploader_username=uploader_name,
             uploader_type=uploader_type,
+            uploader_display_name=uploader_display_name,
+            uploader_avatar_url=uploader_avatar_url,
             page_num=page_num,
             item_num=item_num,
             error=f"无偏好画质 ({q_str}p)",
@@ -1641,6 +1754,8 @@ async def fetch_xhamster_video_detail(
                 video_format="mp4",
                 uploader_username=uploader_name,
                 uploader_type=uploader_type,
+                uploader_display_name=uploader_display_name,
+                uploader_avatar_url=uploader_avatar_url,
                 page_num=page_num,
                 item_num=item_num,
                 mp4_sources=mp4_sources_tuple,
@@ -1656,6 +1771,8 @@ async def fetch_xhamster_video_detail(
             referer_url=final_url,
             uploader_username=uploader_name,
             uploader_type=uploader_type,
+            uploader_display_name=uploader_display_name,
+            uploader_avatar_url=uploader_avatar_url,
             page_num=page_num,
             item_num=item_num,
             error=sel_err or "筛选后无可用链接",
@@ -1674,6 +1791,8 @@ async def fetch_xhamster_video_detail(
         referer_url=final_url,
         uploader_username=uploader_name,
         uploader_type=uploader_type,
+        uploader_display_name=uploader_display_name,
+        uploader_avatar_url=uploader_avatar_url,
         page_num=page_num,
         item_num=item_num,
         error="无可用 HLS/MP4 媒体源",

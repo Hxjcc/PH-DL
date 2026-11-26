@@ -43,7 +43,7 @@ from ..parsers.xhamster import (
     detect_site_from_url,
     extract_xhamster_subscribe_action_from_html,
     is_xhamster_url,
-    resolve_xhamster_target,
+    resolve_xhamster_target_with_profile,
 )
 from ..services.cookie import (
     check_cookie_valid,
@@ -1497,7 +1497,7 @@ class TaskManager:
                                                     f"视频解析失败 [{detail.viewkey or spec.page_url}]: {err_msg}",
                                                     job_id=job_id,
                                                 )
-                                                folder = _target_folder_name(spec.default_uploader, spec.default_type)
+                                                folder = _target_folder_name(spec.default_uploader, spec.default_type, site=spec.site)
                                                 _record_failed_url(folder, spec.page_url)
                                                 await _refresh_job_progress()
                                                 continue
@@ -1939,6 +1939,8 @@ class TaskManager:
             self.events.broadcast("targets_changed", {})
             self.events.broadcast("overview_changed", {})
         else:
+            if avatar_url.strip() or display_name.strip():
+                self.events.broadcast("targets_changed", {})
             self.events.emit_log("INFO", f"已在自动追更列表中: {shown} ({utype})", job_id=job_id)
 
     async def _maybe_subscribe_creator(
@@ -2004,6 +2006,8 @@ class TaskManager:
         subscribe_creator = bool(params.get("subscribe_creator", False))
 
         targets: List[Tuple[str, str]] = []
+        resolved_profile_names: Dict[str, str] = {}
+        resolved_profile_avatars: Dict[str, str] = {}
         if raw_type == "liked":
             targets.append(("_currentUser_", "liked"))
         elif site == "xhamster" and raw_type == "favorites":
@@ -2025,9 +2029,15 @@ class TaskManager:
                     resolved = raw_type
                     resolved_uname = uname
                 elif site == "xhamster":
-                    detected = await resolve_xhamster_target(site_ctx, uname, timeout=settings.request_timeout)
+                    detected = await resolve_xhamster_target_with_profile(
+                        site_ctx, uname, timeout=settings.request_timeout
+                    )
                     if detected:
-                        resolved, resolved_uname = detected
+                        resolved, resolved_uname, det_name, det_avatar = detected
+                        if det_name:
+                            resolved_profile_names[resolved_uname] = det_name
+                        if det_avatar:
+                            resolved_profile_avatars[resolved_uname] = det_avatar
                     else:
                         resolved, resolved_uname = "creator", uname
                     if resolved_uname.casefold() != uname.casefold():
@@ -2059,8 +2069,8 @@ class TaskManager:
         all_details: List[VideoDetail] = []
         scoped_listed: Dict[str, Tuple[ListedVideo, str, str]] = {}
         scan_errors: List[str] = []
-        profile_avatars: Dict[str, str] = dict(params.get("profile_avatars") or {})
-        profile_names: Dict[str, str] = dict(params.get("profile_names") or {})
+        profile_avatars: Dict[str, str] = {**resolved_profile_avatars, **(params.get("profile_avatars") or {})}
+        profile_names: Dict[str, str] = {**resolved_profile_names, **(params.get("profile_names") or {})}
         tracked_keys: Set[Tuple[str, str]] = set()
         subscribed_keys: Set[str] = set()
 
@@ -2397,7 +2407,12 @@ class TaskManager:
                 uploader_type = (
                     detail.uploader_type or ("creator" if detail_site == "xhamster" else "model")
                 ).strip().lower()
-                creator_label = uploader_name or (detail.subscribe_action.creator_id if detail.subscribe_action else "") or detail.viewkey
+                creator_label = (
+                    (detail.uploader_display_name or "").strip()
+                    or uploader_name
+                    or (detail.subscribe_action.creator_id if detail.subscribe_action else "")
+                    or detail.viewkey
+                )
                 if subscribe_creator:
                     dedup_key = (
                         f"{detail_site}:{uploader_type}:{uploader_name.lower()}"
@@ -2415,11 +2430,16 @@ class TaskManager:
                         timeout=settings.request_timeout,
                     )
                 if add_to_auto_track and uploader_name:
+                    resolved_avatar = (
+                        (sub_res.avatar_url if sub_res and sub_res.avatar_url else "")
+                        or (detail.uploader_avatar_url or "").strip()
+                    )
                     await self._maybe_track_creator(
                         job_id,
                         uploader_name,
                         uploader_type,
-                        avatar_url=sub_res.avatar_url if sub_res else "",
+                        display_name=(detail.uploader_display_name or "").strip(),
+                        avatar_url=resolved_avatar,
                         tracked_keys=tracked_keys,
                         site=detail_site,
                     )
@@ -3316,93 +3336,84 @@ class TaskManager:
 
         include_kw = _split_csv_set(params.get("keywords"), lower=True)
         exclude_kw = _split_csv_set(params.get("exclude_keywords"), lower=True)
-        lookup_groups: Dict[Tuple[str, Optional[Tuple[str, ...]]], List[str]] = defaultdict(list)
-        lookup_urls_set: Set[str] = set()
-        for _, _, old, _, old_site in annotated:
-            if not old.get("download_url") and not old.get("local_path") and old.get("page_url"):
-                purl = old["page_url"]
-                if purl in lookup_urls_set:
-                    continue
-                lookup_urls_set.add(purl)
-                q_set = _item_default_qualities(old, old_site)
-                q_key = tuple(sorted(q_set)) if q_set else None
-                lookup_groups[(old_site, q_key)].append(purl)
-        resolved: Dict[str, VideoDetail] = {}
-        for (grp_site, q_key), urls_in_group in lookup_groups.items():
-            details = await fetch_video_details_batch(
-                self._ctx_for_site(ctx, grp_site),
-                [(url, 0, idx + 1) for idx, url in enumerate(urls_in_group)],
-                settings.selectors,
-                concurrency=settings.max_concurrent_video_details,
-                preferred_qualities=set(q_key) if q_key else None,
-                include_keywords=include_kw,
-                exclude_keywords=exclude_kw,
-                xh_preferred_codec=settings.xh_preferred_codec,
-                timeout=settings.request_timeout,
-            )
-            for detail in details:
-                resolved[detail.page_url] = detail
-        retry_qualities: Dict[int, Optional[Set[str]]] = {}
+
+        deduped_entries: List[Tuple[Dict[str, Any], int, str]] = []
         seen: Set[str] = set()
-        new_item_ids: List[int] = []
         for _, _, old, tmp_size, old_site in annotated:
             key = old["viewkey"] or old["page_url"]
             if key in seen:
                 continue
             seen.add(key)
+            deduped_entries.append((old, tmp_size, old_site))
+
+        item_specs: List[Dict[str, Any]] = []
+        for old, tmp_size, old_site in deduped_entries:
             opt_in = old.get("upload_requested")
             wanted_upload = auto_upload and (bool(opt_in) if opt_in is not None else original_opt_in is True)
-            detail = resolved.get(old["page_url"])
-            status, error = "pending", ""
-            if ctx.cancel_event.is_set():
-                status, error = "cancelled", "已取消"
-            elif detail and detail.filtered_out:
-                status, error = "skipped", detail.error or "不符合原任务的筛选条件"
-            elif detail and (not detail.download_url or detail.error):
-                status, error = "failed", detail.error or "重新解析视频失败"
-            elif detail:
-                old = {
-                    **old,
-                    "viewkey": detail.viewkey,
-                    "title": detail.title,
-                    "download_url": detail.download_url,
-                    "referer_url": detail.referer_url,
-                    "quality": detail.quality,
-                    "published_at": detail.published_at or old.get("published_at") or "",
-                    "duration_seconds": detail.duration_seconds or int(old.get("duration_seconds") or 0),
+            status = "cancelled" if ctx.cancel_event.is_set() else "pending"
+            error = "已取消" if ctx.cancel_event.is_set() else ""
+            item_specs.append(
+                {
+                    "site": old_site,
+                    "viewkey": old["viewkey"],
+                    "title": old["title"],
+                    "uploader": old["uploader"],
+                    "target_type": old["target_type"],
+                    "page_url": old["page_url"],
+                    "download_url": old.get("download_url") or "",
+                    "referer_url": old.get("referer_url") or old.get("page_url") or "",
+                    "quality": old.get("quality") or "",
+                    "temp_path": old.get("temp_path") or "",
+                    "local_path": old.get("local_path") or "",
+                    "bytes_downloaded": tmp_size,
+                    "upload_requested": wanted_upload,
+                    "status": status,
+                    "error_message": error,
+                    "published_at": str(old.get("published_at") or ""),
+                    "duration_seconds": int(old.get("duration_seconds") or 0),
                 }
-            elif old["page_url"] in lookup_urls_set:
-                status, error = "failed", "重新解析视频没有返回结果"
-            row = await self.repo.add_job_item(
-                job_id,
-                site=old_site,
-                viewkey=old["viewkey"],
-                title=old["title"],
-                uploader=old["uploader"],
-                target_type=old["target_type"],
-                page_url=old["page_url"],
-                download_url=old["download_url"],
-                referer_url=old["referer_url"],
-                quality=old["quality"],
-                temp_path=old.get("temp_path") or "",
-                local_path=old.get("local_path") or "",
-                bytes_downloaded=tmp_size,
-                upload_requested=wanted_upload,
-                status=status,
-                error_message=error,
-                published_at=str(old.get("published_at") or ""),
-                duration_seconds=int(old.get("duration_seconds") or 0),
             )
-            if status == "pending":
-                new_item_ids.append(int(row["id"]))
-            previous_quality = normalized_quality(old["quality"])
+
+        rows = await self.repo.add_job_items_batch(job_id, item_specs)
+        retry_qualities: Dict[int, Optional[Set[str]]] = {}
+        new_item_ids: List[int] = []
+        parse_specs: Dict[int, _PendingParseSpec] = {}
+        for idx, (row, (old, _, old_site)) in enumerate(zip(rows, deduped_entries), start=1):
+            iid = int(row["id"])
+            if row["status"] == "pending":
+                new_item_ids.append(iid)
+                if not old.get("download_url") and not old.get("local_path") and old.get("page_url"):
+                    parse_specs[iid] = _PendingParseSpec(
+                        item_id=iid,
+                        page_url=old["page_url"],
+                        page_num=0,
+                        item_num=idx,
+                        default_uploader=old.get("uploader") or "",
+                        default_type=old.get("target_type") or ("creator" if old_site == "xhamster" else "model"),
+                        group_by_uploader=False,
+                        uploader_hint=(
+                            (old.get("uploader") or "", old.get("target_type") or ("creator" if old_site == "xhamster" else "model"))
+                            if old.get("uploader")
+                            else None
+                        ),
+                        site=old_site,
+                    )
+            previous_quality = normalized_quality(old.get("quality") or "")
             item_q = _item_default_qualities(old, old_site)
-            retry_qualities[int(row["id"])] = item_q or ({previous_quality} if previous_quality else None)
+            retry_qualities[iid] = item_q or ({previous_quality} if previous_quality else None)
             self.events.broadcast("item_updated", row)
 
         updated_job = await self.repo.recalculate_job_counts(job_id)
         if updated_job:
             self.events.broadcast("job_updated", updated_job)
+
+        self.events.emit_log(
+            "INFO",
+            f"已入队 {len(new_item_ids)} 条重试/续传项"
+            + (f"（其中 {len(parse_specs)} 条按需流式解析）" if parse_specs else "")
+            + "，开始下载与上传...",
+            job_id=job_id,
+        )
 
         await self._run_download_upload_pipeline(
             job_id,
@@ -3413,6 +3424,9 @@ class TaskManager:
             redownload=bool(params.get("redownload", False)),
             preferred_qualities=qualities,
             item_preferred_qualities=retry_qualities,
+            parse_specs=parse_specs or None,
+            include_keywords=include_kw,
+            exclude_keywords=exclude_kw,
         )
 
     async def _exec_resume_temp(
