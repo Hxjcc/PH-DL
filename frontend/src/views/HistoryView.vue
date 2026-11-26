@@ -34,6 +34,45 @@ const store = useAppStore()
 const route = useRoute()
 const router = useRouter()
 
+const VALID_HISTORY_SITES = new Set(['pornhub', 'xhamster'])
+const VALID_HISTORY_STATUSES = new Set(['uploaded', 'downloaded', 'baseline'])
+const VALID_HISTORY_TIME_RANGES = new Set(['published_7d', 'published_30d', 'activity_7d'])
+const VALID_HISTORY_SORTS = new Set(['activity', 'published'])
+
+function firstQueryStr(val) {
+  const raw = Array.isArray(val) ? val[0] : val
+  return typeof raw === 'string' ? raw.trim() : ''
+}
+
+function parseHistoryRouteQuery(query = {}) {
+  const rawSite = firstQueryStr(query.site).toLowerCase()
+  const rawStatus = firstQueryStr(query.status).toLowerCase()
+  const rawTime = firstQueryStr(query.time_range)
+  const rawSort = firstQueryStr(query.sort)
+  const rawPage = Number.parseInt(firstQueryStr(query.page), 10)
+  return {
+    site: VALID_HISTORY_SITES.has(rawSite) ? rawSite : '',
+    search: firstQueryStr(query.q),
+    uploader: firstQueryStr(query.uploader),
+    status: VALID_HISTORY_STATUSES.has(rawStatus) ? rawStatus : '',
+    quality: firstQueryStr(query.quality),
+    time_range: VALID_HISTORY_TIME_RANGES.has(rawTime) ? rawTime : '',
+    sort_by: VALID_HISTORY_SORTS.has(rawSort) ? rawSort : 'activity',
+    page: Number.isFinite(rawPage) && rawPage > 1 ? rawPage : 1,
+  }
+}
+
+const initialRouteFilters = route.name === 'history' ? parseHistoryRouteQuery(route.query) : parseHistoryRouteQuery({})
+const initialIsDefault =
+  !initialRouteFilters.site &&
+  !initialRouteFilters.search &&
+  !initialRouteFilters.uploader &&
+  !initialRouteFilters.status &&
+  !initialRouteFilters.quality &&
+  !initialRouteFilters.time_range &&
+  initialRouteFilters.sort_by === 'activity' &&
+  initialRouteFilters.page === 1
+
 const cached = store.hasRouteCache('history') ? store.historyCache : null
 const loading = ref(false)
 const fetching = ref(false)
@@ -47,8 +86,8 @@ const deleteLocalSingle = ref(false)
 const deleteLocalBatch = ref(false)
 const activeDeleteKey = ref('')
 const deletePopoverDefaultOpen = ref(false)
-const items = shallowRef(cached ? [...cached.items] : [])
-const total = ref(cached ? cached.total : 0)
+const items = shallowRef(cached && initialIsDefault ? [...cached.items] : [])
+const total = ref(cached && initialIsDefault ? cached.total : 0)
 const facets = ref(
   cached
     ? {
@@ -67,14 +106,7 @@ const stats = ref(
 )
 
 const filters = reactive({
-  site: '',
-  search: '',
-  uploader: '',
-  status: '',
-  quality: '',
-  time_range: '',
-  sort_by: 'activity',
-  page: 1,
+  ...initialRouteFilters,
   page_size: store.historyPageSize,
 })
 
@@ -455,6 +487,15 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
     writeQueryCache(cacheKey, nextItems, nextTotal)
     if (res.facets) {
       facets.value = res.facets
+      if (filters.uploader) {
+        const matchedUploader = (res.facets.uploaders || []).find(
+          (u) => u.toLowerCase() === filters.uploader.toLowerCase()
+        )
+        if (matchedUploader && matchedUploader !== filters.uploader) {
+          filters.uploader = matchedUploader
+          syncHistoryQueryToUrl()
+        }
+      }
     }
     if (res.stats) {
       stats.value = res.stats
@@ -481,17 +522,53 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
   }
 }
 
+function buildHistoryRouteQuery() {
+  const q = {}
+  if (filters.site) q.site = filters.site
+  if (filters.uploader) q.uploader = filters.uploader
+  if (filters.status) q.status = filters.status
+  if (filters.quality) q.quality = filters.quality
+  if (filters.time_range) q.time_range = filters.time_range
+  if (filters.search.trim()) q.q = filters.search.trim()
+  if (filters.sort_by && filters.sort_by !== 'activity') q.sort = filters.sort_by
+  if (filters.page > 1) q.page = String(filters.page)
+  return q
+}
+
+function historyQueriesEqual(a, b) {
+  const keysA = Object.keys(a)
+  const keysB = Object.keys(b)
+  if (keysA.length !== keysB.length) return false
+  return keysA.every((k) => String(a[k]) === String(b[k]))
+}
+
+function syncHistoryQueryToUrl() {
+  if (route.name !== 'history') return
+  const nextQuery = buildHistoryRouteQuery()
+  const currentRaw = {}
+  for (const [k, v] of Object.entries(route.query || {})) {
+    const s = firstQueryStr(v)
+    if (s) currentRaw[k] = s
+  }
+  if (historyQueriesEqual(nextQuery, currentRaw)) return
+  router.replace({ name: 'history', query: nextQuery }).catch(() => {})
+}
+
 function triggerSearch() {
   filters.page = 1
   cancelAllPrefetches()
   clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(() => loadVideos({ includeMeta: false, useCache: true }), 180)
+  debounceTimer = setTimeout(() => {
+    syncHistoryQueryToUrl()
+    loadVideos({ includeMeta: false, useCache: true })
+  }, 180)
 }
 
 function changeFilter() {
   filters.page = 1
   cancelAllPrefetches()
   clearTimeout(debounceTimer)
+  syncHistoryQueryToUrl()
   loadVideos({ includeMeta: false, useCache: true })
 }
 
@@ -500,6 +577,7 @@ function changeSiteFilter() {
   filters.page = 1
   cancelAllPrefetches()
   clearTimeout(debounceTimer)
+  syncHistoryQueryToUrl()
   loadVideos({ includeMeta: true, useCache: false })
 }
 
@@ -510,6 +588,7 @@ function changePageSize(value) {
   clearSelection()
   cancelAllPrefetches()
   clearTimeout(debounceTimer)
+  syncHistoryQueryToUrl()
   loadVideos({ includeMeta: false, useCache: true })
 }
 
@@ -564,6 +643,7 @@ function goPage(p) {
   activeDeleteKey.value = ''
   deletePopoverDefaultOpen.value = false
   filters.page = p
+  syncHistoryQueryToUrl()
   loadVideos({ includeMeta: false, useCache: true })
 }
 
@@ -678,28 +758,52 @@ watch(
   }
 )
 
-function applyRouteUploaderQuery() {
-  const raw = typeof route.query.uploader === 'string' ? route.query.uploader.trim() : ''
-  const rawSite = typeof route.query.site === 'string' ? route.query.site.trim().toLowerCase() : ''
-  if (!raw && !rawSite) return false
-  const exact = raw
-    ? (facets.value.uploaders || []).find((u) => u.toLowerCase() === raw.toLowerCase())
+function applyRouteQueryFilters() {
+  const parsed = parseHistoryRouteQuery(route.query)
+  const exactUploader = parsed.uploader
+    ? (facets.value.uploaders || []).find((u) => u.toLowerCase() === parsed.uploader.toLowerCase()) ||
+      parsed.uploader
     : ''
-  filters.site = rawSite === 'xhamster' || rawSite === 'pornhub' ? rawSite : ''
-  filters.uploader = exact || raw
-  filters.status = ''
-  filters.quality = ''
-  filters.time_range = ''
-  filters.search = ''
-  filters.page = 1
+  const next = { ...parsed, uploader: exactUploader }
+  const siteChanged = filters.site !== next.site
+  const changed =
+    siteChanged ||
+    filters.search !== next.search ||
+    filters.uploader !== next.uploader ||
+    filters.status !== next.status ||
+    filters.quality !== next.quality ||
+    filters.time_range !== next.time_range ||
+    filters.sort_by !== next.sort_by ||
+    filters.page !== next.page
+
+  if (!changed) return { changed: false, siteChanged: false }
+  filters.site = next.site
+  filters.search = next.search
+  filters.uploader = next.uploader
+  filters.status = next.status
+  filters.quality = next.quality
+  filters.time_range = next.time_range
+  filters.sort_by = next.sort_by
+  filters.page = next.page
   sortBeforeTimeRange = null
-  router.replace({ name: 'history', query: {} }).catch(() => {})
-  return true
+  return { changed: true, siteChanged }
 }
 
+watch(
+  () => [route.name, route.fullPath],
+  ([name]) => {
+    if (name !== 'history' || !activatedOnce) return
+    const { changed, siteChanged } = applyRouteQueryFilters()
+    if (!changed) return
+    clearTimeout(debounceTimer)
+    cancelAllPrefetches()
+    loadVideos({ silent: false, includeMeta: siteChanged, useCache: !siteChanged })
+  }
+)
+
 onActivated(() => {
-  const appliedUploader = applyRouteUploaderQuery()
-  if (appliedUploader) {
+  const { changed } = applyRouteQueryFilters()
+  if (changed) {
     activatedOnce = true
     invalidateQueryCache()
     loadVideos({ silent: false, includeMeta: true })
@@ -707,6 +811,10 @@ onActivated(() => {
   }
   if (!activatedOnce) {
     activatedOnce = true
+    if (!isDefaultFilters()) {
+      loadVideos({ silent: false, includeMeta: true })
+      return
+    }
     if (store.hydratedFromCache && store.hasRouteCache('history')) {
       scheduleAdjacentPrefetch()
       return

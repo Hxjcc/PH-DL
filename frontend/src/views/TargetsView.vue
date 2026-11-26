@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onActivated, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   Plus,
   RefreshCw,
@@ -50,7 +50,23 @@ import SiteBadge from '../components/SiteBadge.vue'
 import SegmentedControl from '../components/ui/SegmentedControl.vue'
 
 const store = useAppStore()
+const route = useRoute()
 const router = useRouter()
+
+const VALID_TARGET_SITES = new Set(['all', 'pornhub', 'xhamster'])
+function parseTargetsRouteQuery(query = {}) {
+  const rawSite = Array.isArray(query.site) ? query.site[0] : query.site
+  const normSite = typeof rawSite === 'string' ? rawSite.trim().toLowerCase() : ''
+  const rawPage = Array.isArray(query.page) ? query.page[0] : query.page
+  const parsedPage = Number.parseInt(typeof rawPage === 'string' ? rawPage : '', 10)
+  return {
+    site: VALID_TARGET_SITES.has(normSite) ? normSite : 'all',
+    page: Number.isFinite(parsedPage) && parsedPage > 1 ? parsedPage : 1,
+  }
+}
+
+const initialTargetsQuery =
+  route.name === 'targets' ? parseTargetsRouteQuery(route.query) : { site: 'all', page: 1 }
 
 const VIEW_MODE_KEY = 'phdl-targets-view'
 const SORT_BY_KEY = 'phdl-targets-sort'
@@ -84,11 +100,11 @@ function loadInitialSortBy() {
 const targets = ref(store.targetsCache ? [...store.targetsCache] : [])
 const loading = ref(false)
 const search = ref('')
-const siteFilter = ref('all')
+const siteFilter = ref(initialTargetsQuery.site)
 const statusFilter = ref('all')
 const sortBy = ref(loadInitialSortBy())
 const pageSize = ref(readListPreference('targets', TARGETS_PAGE_SIZES, 24))
-const currentPage = ref(1)
+const currentPage = ref(initialTargetsQuery.page)
 const viewMode = ref(loadInitialViewMode())
 const subsModalOpen = ref(false)
 const addModalOpen = ref(false)
@@ -377,11 +393,46 @@ const pagedTargets = computed(() => {
   return filteredTargets.value.slice(start, start + pageSize.value)
 })
 
+let applyingRouteQuery = false
+
+function syncTargetsQueryToUrl() {
+  if (route.name !== 'targets' || applyingRouteQuery) return
+  const nextQuery = {}
+  if (siteFilter.value !== 'all') nextQuery.site = siteFilter.value
+  if (currentPage.value > 1) nextQuery.page = String(currentPage.value)
+  const curSite = Array.isArray(route.query.site) ? route.query.site[0] : route.query.site
+  const curPage = Array.isArray(route.query.page) ? route.query.page[0] : route.query.page
+  if ((curSite || undefined) === nextQuery.site && (curPage || undefined) === nextQuery.page) return
+  router.replace({ name: 'targets', query: nextQuery }).catch(() => {})
+}
+
 watch([search, siteFilter, statusFilter, sortBy, pageSize], () => {
-  currentPage.value = 1
+  if (!applyingRouteQuery) {
+    currentPage.value = 1
+  }
 })
 
+watch([siteFilter, currentPage], () => {
+  syncTargetsQueryToUrl()
+})
+
+watch(
+  () => [route.name, route.query.site, route.query.page],
+  ([name]) => {
+    if (name !== 'targets') return
+    const parsed = parseTargetsRouteQuery(route.query)
+    if (parsed.site === siteFilter.value && parsed.page === currentPage.value) return
+    applyingRouteQuery = true
+    siteFilter.value = parsed.site
+    currentPage.value = parsed.page
+    Promise.resolve().then(() => {
+      applyingRouteQuery = false
+    })
+  }
+)
+
 watch(totalPages, (maxPage) => {
+  if (targets.value.length === 0 && store.targetsCache === null) return
   if (currentPage.value > maxPage) {
     currentPage.value = maxPage
   }

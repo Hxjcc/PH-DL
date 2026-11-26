@@ -1143,68 +1143,20 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <div class="p-4 sm:p-5 space-y-4">
-          <!-- Section 1: Core Common Settings (4x2 Compact Grid) -->
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">Remote 名称</label>
-              <Input v-model="form.rclone_remote" placeholder="pikpak 或 gd" />
+        <!-- Section 1: Remote Targets & Multi-Remote Failover -->
+        <div class="p-4 sm:p-5 space-y-3.5">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex flex-wrap items-center gap-2">
+              <h4 class="text-xs font-semibold text-foreground">远端目标与多盘接力</h4>
+              <span
+                v-if="activeRemoteChain.length > 1"
+                class="inline-flex items-center rounded-full bg-brand/10 dark:bg-brand/15 px-2 py-0.5 font-mono text-[11px] font-medium text-brand"
+              >
+                {{ activeRemoteChain.join(' → ') }}
+              </span>
             </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">PornHub 远端基础目录</label>
-              <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">xHamster 远端基础目录</label>
-              <Input v-model="form.rclone_xh_remote_base_dir" placeholder="xHamster" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">并行上传 Worker 数</label>
-              <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">单批触发上传数（1=即传）</label>
-              <Input v-model="form.upload_batch_size" type="number" :min="1" :max="100" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">单 Worker transfers（建议 1）</label>
-              <Input v-model="form.rclone_transfers" type="number" :min="1" :max="16" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">检查并发 (checkers)</label>
-              <Input v-model="form.rclone_checkers" type="number" :min="1" :max="32" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">单次执行超时（秒）</label>
-              <Input v-model="form.rclone_timeout_seconds" type="number" :min="30" :max="86400" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">TPS 限制 / 突发（0不限）</label>
-              <div class="grid grid-cols-2 gap-1.5">
-                <Input v-model="form.rclone_tpslimit" type="number" :min="0" :max="100" placeholder="0" />
-                <Input v-model="form.rclone_tpslimit_burst" type="number" :min="0" :max="100" placeholder="0" />
-              </div>
-            </div>
-          </div>
-
-          <!-- Multi-Remote Auto-Failover -->
-          <div class="rounded-xl border border-border/80 bg-surface-subtle/40 p-3.5 space-y-2.5">
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div class="space-y-1 md:col-span-2">
-                <label class="text-xs font-medium text-foreground">备用 Remote 列表（限额自动切换，逗号分隔）</label>
-                <Input
-                  v-model="form.rclone_backup_remotes"
-                  placeholder="留空表示单盘；例如 gd2, gd3（填好后触发每日 750GB 或空间满自动接力）"
-                />
-              </div>
-              <div class="space-y-1">
-                <label class="text-xs font-medium text-foreground">多盘调度策略</label>
-                <Select v-model="form.rclone_remote_strategy" :options="RCLONE_STRATEGY_OPTIONS" />
-              </div>
-            </div>
-
             <div v-if="backupCandidateRemotes.length > 0" class="flex flex-wrap items-center gap-1.5">
-              <span class="text-[11px] text-muted-foreground mr-0.5">快捷加入备用：</span>
+              <span class="text-[11px] text-muted-foreground">快捷加入备用：</span>
               <Button
                 v-for="r in backupCandidateRemotes"
                 :key="r.name"
@@ -1226,18 +1178,77 @@ async function handleTestNotify() {
                 <span class="text-[10px] opacity-75">{{ formatRemoteType(r.type) }}</span>
               </Button>
             </div>
-
-            <p v-if="activeRemoteChain.length > 1" class="text-[11px] text-muted-foreground">
-              当前上传链路：<span class="font-mono text-foreground">{{ activeRemoteChain.join(' → ') }}</span>
-              （单个账号触发每日 750GB 上限或空间已满时自动无缝切换重试，不中断任务；「测试连接」会同时校验所有远端）
-            </p>
-            <p v-else class="text-[11px] text-muted-foreground">
-              多个人盘接力技巧：在各 Google Drive 账号中共享同一文件夹并在 <span class="font-mono">rclone.conf</span> 指向相同 <span class="font-mono">root_folder_id</span>，再把新远端名填入上方备用列表即可自动接力突破单号 750GB/天 上限。
-            </p>
           </div>
 
-          <!-- Switches -->
-          <div class="flex flex-wrap items-center gap-x-5 gap-y-2 pt-0.5">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+            <div class="space-y-1 sm:order-1 lg:order-none">
+              <label class="text-xs font-medium text-foreground">主 Remote 名称</label>
+              <Input v-model="form.rclone_remote" placeholder="pikpak 或 gd" />
+            </div>
+            <div class="space-y-1 sm:col-span-2 sm:order-3 lg:order-none">
+              <label class="text-xs font-medium text-foreground">备用 Remote（限额自动切换，逗号分隔）</label>
+              <Input
+                v-model="form.rclone_backup_remotes"
+                placeholder="留空表示单盘；例如 gd2, gd3"
+              />
+            </div>
+            <div class="space-y-1 sm:order-2 lg:order-none">
+              <label class="text-xs font-medium text-foreground">多盘调度策略</label>
+              <Select v-model="form.rclone_remote_strategy" :options="RCLONE_STRATEGY_OPTIONS" />
+            </div>
+            <div class="space-y-1 sm:order-4 lg:order-none lg:col-span-2">
+              <label class="text-xs font-medium text-foreground">PornHub 远端基础目录</label>
+              <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
+            </div>
+            <div class="space-y-1 sm:order-5 lg:order-none lg:col-span-2">
+              <label class="text-xs font-medium text-foreground">xHamster 远端基础目录</label>
+              <Input v-model="form.rclone_xh_remote_base_dir" placeholder="xHamster" />
+            </div>
+          </div>
+
+          <p v-if="activeRemoteChain.length > 1" class="text-[11px] text-muted-foreground">
+            单个远端触发每日 750GB 上限或空间已满时会自动切到下一顺位重试，不中断任务；「测试连接」会同时校验全部远端。
+          </p>
+          <p v-else class="text-[11px] text-muted-foreground">
+            多盘提示：多个个人 Google Drive 共享同一文件夹并在各远端指向相同 <span class="font-mono">root_folder_id</span>，填入备用列表即可自动接力突破单号 750GB/天 上限。
+          </p>
+        </div>
+
+        <!-- Section 2: Concurrency & Transfer Options (Balanced 3x2 Grid) -->
+        <div class="p-4 sm:p-5 space-y-3.5">
+          <h4 class="text-xs font-semibold text-foreground">并发与传输策略</h4>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">并行上传 Worker 数</label>
+              <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">单批触发上传数（1 = 即传）</label>
+              <Input v-model="form.upload_batch_size" type="number" :min="1" :max="100" />
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">单 Worker transfers（建议 1）</label>
+              <Input v-model="form.rclone_transfers" type="number" :min="1" :max="16" />
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">检查并发 (checkers)</label>
+              <Input v-model="form.rclone_checkers" type="number" :min="1" :max="32" />
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">单次执行超时（秒）</label>
+              <Input v-model="form.rclone_timeout_seconds" type="number" :min="30" :max="86400" />
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">TPS 限制 / 突发（0 不限）</label>
+              <div class="grid grid-cols-2 gap-1.5">
+                <Input v-model="form.rclone_tpslimit" type="number" :min="0" :max="100" placeholder="0" />
+                <Input v-model="form.rclone_tpslimit_burst" type="number" :min="0" :max="100" placeholder="0" />
+              </div>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-x-6 gap-y-2 pt-0.5">
             <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
               <Switch v-model="form.rclone_ignore_checksum" />
               <span>跳过 rclone 校验和检查</span>
@@ -1254,131 +1265,131 @@ async function handleTestNotify() {
               <span>无校验和时回下比对</span>
             </label>
           </div>
+        </div>
 
-          <!-- Section 2: Provider-Specific Tuning (Compact Single-Row Cards) -->
-          <div class="rounded-xl border border-border bg-surface-subtle/40 overflow-hidden">
-            <div class="px-4 py-2.5 border-b border-border/80 flex flex-wrap items-center justify-between gap-2 bg-surface-subtle/70">
-              <div class="flex items-center gap-2">
-                <h4 class="text-xs font-semibold text-foreground">网盘专属调优参数</h4>
-                <span class="hidden sm:inline text-[11px] text-muted-foreground">按当前 Remote 类型自动匹配，独立保存</span>
-              </div>
-              <div class="flex flex-wrap items-center gap-1.5">
-                <Button
-                  v-for="pt in PROVIDER_TABS"
-                  :key="pt.value"
-                  variant="outline"
-                  size="xs"
-                  :aria-pressed="providerTab === pt.value"
-                  :class="[
-                    'h-6 gap-1.5 px-2.5 rounded-full text-[11px] font-medium shadow-none hover:shadow-none',
-                    providerTab === pt.value
-                      ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                      : 'border-border bg-card text-muted-foreground hover:text-foreground',
-                  ]"
-                  @click="providerTab = pt.value"
+        <!-- Section 3: Provider-Specific Tuning (Flat Integrated Section) -->
+        <div class="p-4 sm:p-5 space-y-3.5 bg-surface-subtle/30">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <h4 class="text-xs font-semibold text-foreground">网盘专属调优参数</h4>
+              <span class="hidden sm:inline text-[11px] text-muted-foreground">按当前 Remote 类型自动匹配，独立保存</span>
+            </div>
+            <div class="flex flex-wrap items-center gap-1.5">
+              <Button
+                v-for="pt in PROVIDER_TABS"
+                :key="pt.value"
+                variant="outline"
+                size="xs"
+                :aria-pressed="providerTab === pt.value"
+                :class="[
+                  'h-6 gap-1.5 px-2.5 rounded-full text-[11px] font-medium shadow-none hover:shadow-none',
+                  providerTab === pt.value
+                    ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
+                    : 'border-border bg-card text-muted-foreground hover:text-foreground',
+                ]"
+                @click="providerTab = pt.value"
+              >
+                <span>{{ pt.label }}</span>
+                <span
+                  v-if="(pt.value === 'pikpak' && activeRemoteType === 'pikpak') || (pt.value === 'drive' && activeRemoteType === 'drive')"
+                  class="rounded-full bg-emerald-500/15 px-1.5 text-[10px] text-emerald-700 dark:text-emerald-300"
                 >
-                  <span>{{ pt.label }}</span>
-                  <span
-                    v-if="(pt.value === 'pikpak' && activeRemoteType === 'pikpak') || (pt.value === 'drive' && activeRemoteType === 'drive')"
-                    class="rounded-full bg-emerald-500/15 px-1.5 text-[10px] text-emerald-700 dark:text-emerald-300"
-                  >
-                    当前生效
-                  </span>
-                </Button>
-              </div>
+                  当前生效
+                </span>
+              </Button>
             </div>
+          </div>
 
-            <!-- PikPak -->
-            <div v-if="providerTab === 'pikpak'" class="p-3.5 space-y-2.5">
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5 items-end">
-                <div class="space-y-1">
-                  <label class="text-xs font-medium text-foreground">PikPak 分块并发（--pikpak-upload-concurrency）</label>
-                  <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
-                </div>
-                <div class="flex flex-col sm:flex-row sm:items-end gap-2">
-                  <div class="space-y-1 flex-1 min-w-0">
-                    <label class="text-xs font-medium text-foreground">PikPak 分块大小（--pikpak-chunk-size）</label>
-                    <Input v-model="form.rclone_pikpak_chunk_size" placeholder="16Mi" />
-                  </div>
-                  <div class="flex items-center gap-1 pb-0.5 shrink-0">
-                    <Button
-                      v-for="sz in ['16Mi', '32Mi', '64Mi']"
-                      :key="sz"
-                      variant="outline"
-                      size="xs"
-                      :aria-pressed="form.rclone_pikpak_chunk_size === sz"
-                      :class="[
-                        'h-9 px-2.5 rounded-lg font-mono text-[11px] shadow-none hover:shadow-none',
-                        form.rclone_pikpak_chunk_size === sz
-                          ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                          : 'border-border bg-card text-muted-foreground hover:text-foreground',
-                      ]"
-                      @click="form.rclone_pikpak_chunk_size = sz"
-                    >
-                      {{ sz }}
-                    </Button>
-                  </div>
-                </div>
-              </div>
-              <p class="text-[11px] text-muted-foreground">
-                建议策略：多 Worker + 小分块（千兆 / 4G 内存推荐 <span class="font-mono text-foreground">Worker = 6</span>、<span class="font-mono text-foreground">分块并发 = 3</span>、<span class="font-mono text-foreground">16Mi</span>）。
-              </p>
-            </div>
-
-            <!-- Google Drive -->
-            <div v-else-if="providerTab === 'drive'" class="p-3.5 space-y-2.5">
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5 items-end">
-                <div class="flex flex-col sm:flex-row sm:items-end gap-2">
-                  <div class="space-y-1 flex-1 min-w-0">
-                    <label class="text-xs font-medium text-foreground">GD 分块大小（--drive-chunk-size，2 的幂）</label>
-                    <Input v-model="form.rclone_drive_chunk_size" placeholder="64Mi" />
-                  </div>
-                  <div class="flex items-center gap-1 pb-0.5 shrink-0">
-                    <Button
-                      v-for="sz in ['32Mi', '64Mi', '128Mi']"
-                      :key="sz"
-                      variant="outline"
-                      size="xs"
-                      :aria-pressed="form.rclone_drive_chunk_size === sz"
-                      :class="[
-                        'h-9 px-2.5 rounded-lg font-mono text-[11px] shadow-none hover:shadow-none',
-                        form.rclone_drive_chunk_size === sz
-                          ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                          : 'border-border bg-card text-muted-foreground hover:text-foreground',
-                      ]"
-                      @click="form.rclone_drive_chunk_size = sz"
-                    >
-                      {{ sz }}
-                    </Button>
-                  </div>
-                </div>
-                <label
-                  class="inline-flex items-center gap-2 h-9 text-xs text-foreground/85 cursor-pointer"
-                  title="Google Drive 单号每日 750GB 上传上限触发时立即终止当前远端上传；若已配置备用 Remote 将自动切换重试，否则暂停任务并保留本地文件"
-                >
-                  <Switch v-model="form.rclone_drive_stop_on_upload_limit" />
-                  <span>达每日 750GB 上限时立即停止重试（配合备用盘自动切换）</span>
-                </label>
-              </div>
-              <p class="text-[11px] text-muted-foreground">
-                建议策略：少 Worker + 大分块（切到 GD 时建议上方 <span class="font-mono text-foreground">Worker = 2~3</span>、分块 <span class="font-mono text-foreground">64Mi / 128Mi</span>，建议自建 OAuth Client ID）。
-              </p>
-            </div>
-
-            <!-- Other / Custom -->
-            <div v-else class="p-3.5 space-y-2">
+          <!-- PikPak -->
+          <div v-if="providerTab === 'pikpak'" class="space-y-2.5">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5 items-end">
               <div class="space-y-1">
-                <label class="text-xs font-medium text-foreground">附加 rclone copy 调优参数（任意网盘生效）</label>
-                <Input
-                  v-model="form.rclone_extra_flags"
-                  placeholder="如 --onedrive-chunk-size=60M 或 --s3-chunk-size=32Mi --s3-upload-concurrency=4"
-                  class="font-mono text-xs"
-                />
+                <label class="text-xs font-medium text-foreground">PikPak 分块并发（--pikpak-upload-concurrency）</label>
+                <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
               </div>
-              <p class="text-[11px] text-muted-foreground">
-                接入 OneDrive / S3 / R2 / WebDAV / Alist 等网盘时可直接填写官方调优参数（仅允许安全 <span class="font-mono">--*</span> 选项，自动过滤危险参数）。
-              </p>
+              <div class="flex flex-col sm:flex-row sm:items-end gap-2">
+                <div class="space-y-1 flex-1 min-w-0">
+                  <label class="text-xs font-medium text-foreground">PikPak 分块大小（--pikpak-chunk-size）</label>
+                  <Input v-model="form.rclone_pikpak_chunk_size" placeholder="16Mi" />
+                </div>
+                <div class="flex items-center gap-1 pb-0.5 shrink-0">
+                  <Button
+                    v-for="sz in ['16Mi', '32Mi', '64Mi']"
+                    :key="sz"
+                    variant="outline"
+                    size="xs"
+                    :aria-pressed="form.rclone_pikpak_chunk_size === sz"
+                    :class="[
+                      'h-9 px-2.5 rounded-lg font-mono text-[11px] shadow-none hover:shadow-none',
+                      form.rclone_pikpak_chunk_size === sz
+                        ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
+                        : 'border-border bg-card text-muted-foreground hover:text-foreground',
+                    ]"
+                    @click="form.rclone_pikpak_chunk_size = sz"
+                  >
+                    {{ sz }}
+                  </Button>
+                </div>
+              </div>
             </div>
+            <p class="text-[11px] text-muted-foreground">
+              建议策略：多 Worker + 小分块（千兆 / 4G 内存推荐 <span class="font-mono text-foreground">Worker = 6</span>、<span class="font-mono text-foreground">分块并发 = 3</span>、<span class="font-mono text-foreground">16Mi</span>）。
+            </p>
+          </div>
+
+          <!-- Google Drive -->
+          <div v-else-if="providerTab === 'drive'" class="space-y-2.5">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5 items-end">
+              <div class="flex flex-col sm:flex-row sm:items-end gap-2">
+                <div class="space-y-1 flex-1 min-w-0">
+                  <label class="text-xs font-medium text-foreground">GD 分块大小（--drive-chunk-size，2 的幂）</label>
+                  <Input v-model="form.rclone_drive_chunk_size" placeholder="64Mi" />
+                </div>
+                <div class="flex items-center gap-1 pb-0.5 shrink-0">
+                  <Button
+                    v-for="sz in ['32Mi', '64Mi', '128Mi']"
+                    :key="sz"
+                    variant="outline"
+                    size="xs"
+                    :aria-pressed="form.rclone_drive_chunk_size === sz"
+                    :class="[
+                      'h-9 px-2.5 rounded-lg font-mono text-[11px] shadow-none hover:shadow-none',
+                      form.rclone_drive_chunk_size === sz
+                        ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
+                        : 'border-border bg-card text-muted-foreground hover:text-foreground',
+                    ]"
+                    @click="form.rclone_drive_chunk_size = sz"
+                  >
+                    {{ sz }}
+                  </Button>
+                </div>
+              </div>
+              <label
+                class="inline-flex items-center gap-2 h-9 text-xs text-foreground/85 cursor-pointer"
+                title="Google Drive 单号每日 750GB 上传上限触发时立即终止当前远端上传；若已配置备用 Remote 将自动切换重试，否则暂停任务并保留本地文件"
+              >
+                <Switch v-model="form.rclone_drive_stop_on_upload_limit" />
+                <span>达每日 750GB 上限时立即停止重试（配合备用盘自动切换）</span>
+              </label>
+            </div>
+            <p class="text-[11px] text-muted-foreground">
+              建议策略：少 Worker + 大分块（切到 GD 时建议上方 <span class="font-mono text-foreground">Worker = 2~3</span>、分块 <span class="font-mono text-foreground">64Mi / 128Mi</span>，建议自建 OAuth Client ID）。
+            </p>
+          </div>
+
+          <!-- Other / Custom -->
+          <div v-else class="space-y-2">
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">附加 rclone copy 调优参数（任意网盘生效）</label>
+              <Input
+                v-model="form.rclone_extra_flags"
+                placeholder="如 --onedrive-chunk-size=60M 或 --s3-chunk-size=32Mi --s3-upload-concurrency=4"
+                class="font-mono text-xs"
+              />
+            </div>
+            <p class="text-[11px] text-muted-foreground">
+              接入 OneDrive / S3 / R2 / WebDAV / Alist 等网盘时可直接填写官方调优参数（仅允许安全 <span class="font-mono">--*</span> 选项，自动过滤危险参数）。
+            </p>
           </div>
         </div>
       </Card>
