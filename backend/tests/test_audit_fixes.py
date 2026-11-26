@@ -631,3 +631,120 @@ def test_videos_stats_site_filter_and_case_insensitive_uploader_facets(tmp_path:
 def test_xhamster_favorites_folder_name():
     assert engine._target_folder_name("_currentUser_", "favorites", site="xhamster") == "My_Favorites"
     assert engine._target_folder_name("alice", "favorites", site="pornhub") == "alice_favorites"
+
+
+# ---------------------------------------------------------------------------
+# HLS duration-weighted size estimation without in-flight inflation
+# ---------------------------------------------------------------------------
+async def test_hls_estimation_uses_duration_and_excludes_inflight_inflation(tmp_path: Path):
+    m3u8 = (
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:3\n"
+        "#EXTINF:10.0,\n"
+        "seg0.ts\n"
+        "#EXTINF:10.0,\n"
+        "seg1.ts\n"
+        "#EXTINF:2.0,\n"
+        "seg2.ts\n"
+        "#EXT-X-ENDLIST\n"
+    )
+    pl = hls_mod.parse_hls_media_playlist(m3u8, "https://cdn.xhcdn.com/hls/index.m3u8")
+    assert pl.segment_durations == (10.0, 10.0, 2.0)
+    assert pytest.approx(pl.total_duration) == 22.0
+
+    # Segment sizes proportional to duration: 1000B/s -> 10000B, 10000B, 2000B (actual total = 22000B).
+    # While seg1 is half-downloaded in-flight when seg0 completes, duration-weighted estimate must stay near 22000B
+    # rather than inflating to (10000 + in_flight) * 3!
+    seg_payloads = {
+        "https://cdn.xhcdn.com/hls/seg0.ts": b"A" * 10_000,
+        "https://cdn.xhcdn.com/hls/seg1.ts": b"B" * 10_000,
+        "https://cdn.xhcdn.com/hls/seg2.ts": b"C" * 2_000,
+    }
+    seg0_done = asyncio.Event()
+    allow_seg1_finish = asyncio.Event()
+
+    class _FakeContent:
+        def __init__(self, url: str, data: bytes):
+            self._url = url
+            self._data = data
+
+        async def iter_chunked(self, _n: int):
+            if self._url.endswith("seg1.ts"):
+                yield self._data[:8_000]
+                await seg0_done.wait()
+                await allow_seg1_finish.wait()
+                yield self._data[8_000:]
+            else:
+                yield self._data
+                if self._url.endswith("seg0.ts"):
+                    seg0_done.set()
+
+    class _FakeResp:
+        def __init__(self, url: str, text_body: str = "", raw: bytes = b""):
+            self.status = 200
+            self.url = url
+            self._text = text_body
+            self.content_length = len(raw) if raw else None
+            self.content = _FakeContent(url, raw)
+
+        async def text(self, errors="replace"):
+            return self._text
+
+        def __await__(self):
+            async def _self():
+                return self
+
+            return _self().__await__()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class _FakeSession:
+        connector = None
+
+        def get(self, url: str, **kwargs):
+            if url.endswith(".m3u8"):
+                return _FakeResp(url, text_body=m3u8)
+            return _FakeResp(url, raw=seg_payloads[url])
+
+    ticks: List[tuple[int, int, float]] = []
+
+    def _on_tick(dl: int, tot: int, spd: float) -> None:
+        ticks.append((dl, tot, spd))
+
+    async def _release_soon() -> None:
+        await asyncio.wait_for(seg0_done.wait(), timeout=2.0)
+        await asyncio.sleep(0.3)
+        allow_seg1_finish.set()
+
+    releaser = asyncio.create_task(_release_soon())
+    try:
+        res = await hls_mod._download_hls_aiohttp(
+            session=_FakeSession(),  # type: ignore[arg-type]
+            playlist_url="https://cdn.xhcdn.com/hls/index.m3u8",
+            hls_dir=tmp_path / "hls_est",
+            viewkey="xh_est",
+            quality="1080p",
+            referer="https://xhamster.com/",
+            cookie_str="",
+            proxy_url=None,
+            segment_concurrency=3,
+            request_timeout=10.0,
+            stop=asyncio.Event(),
+            prepare_write=lambda _n: None,
+            on_tick=_on_tick,
+        )
+    finally:
+        await releaser
+
+    assert res.ok is True
+    stream_file = hls_mod._find_downloaded_stream(tmp_path / "hls_est")
+    assert stream_file is not None and stream_file.stat().st_size == 22_000
+    # None of the intermediate estimates should wildly overshoot true total (22,000B)
+    non_zero_totals = [tot for _, tot, _ in ticks if tot > 0]
+    assert non_zero_totals
+    assert max(non_zero_totals) <= 23_000
+    assert non_zero_totals[-1] == 22_000

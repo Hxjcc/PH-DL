@@ -73,8 +73,10 @@ class EventBus:
         bytes_total: int,
         speed_bps: float,
         phase: str = "downloading",
+        *,
+        estimated_total: bool = False,
     ) -> None:
-        payload = {
+        payload: Dict[str, Any] = {
             "job_id": job_id,
             "item_id": item_id,
             "bytes_downloaded": int(bytes_downloaded),
@@ -82,6 +84,8 @@ class EventBus:
             "speed_bps": round(float(speed_bps), 1),
             "phase": (phase or "downloading").strip().lower(),
         }
+        if estimated_total:
+            payload["estimated_total"] = True
         self._live_progress[item_id] = payload
         self.broadcast("item_progress", payload)
 

@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -190,6 +190,14 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE job_items ADD COLUMN site TEXT NOT NULL DEFAULT 'pornhub';",
             "CREATE INDEX IF NOT EXISTS idx_videos_site_activity "
             "ON videos(site, COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
+        ],
+    ),
+    (
+        10,
+        [
+            "ALTER TABLE targets ADD COLUMN today_new_date TEXT NOT NULL DEFAULT '';",
+            "ALTER TABLE targets ADD COLUMN today_new_count INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE targets ADD COLUMN today_new_viewkeys TEXT NOT NULL DEFAULT '[]';",
         ],
     ),
 ]

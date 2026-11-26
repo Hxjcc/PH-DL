@@ -36,6 +36,11 @@ def local_day_start_utc(now: Optional[datetime] = None) -> datetime:
     return local_midnight.astimezone(timezone.utc)
 
 
+def local_today_date(now: Optional[datetime] = None) -> str:
+    local_now = (now or datetime.now().astimezone()).astimezone()
+    return local_now.date().isoformat()
+
+
 def local_date_days_ago(days: int, now: Optional[datetime] = None) -> str:
     local_now = (now or datetime.now().astimezone()).astimezone()
     return (local_now.date() - timedelta(days=days)).isoformat()
@@ -168,8 +173,7 @@ class Repository:
             return rows
 
         today_start_dt = local_day_start_utc()
-        today_start_iso = today_start_dt.isoformat(timespec="seconds")
-        recent_publish_cutoff = local_date_days_ago(30)
+        today_str = local_today_date()
         video_rows = await self.db.fetch_all(
             """
             SELECT LOWER(site) AS site_lower,
@@ -177,29 +181,19 @@ class Repository:
                    LOWER(target_type) AS target_type_lower,
                    COUNT(*) AS total_cnt,
                    SUM(CASE WHEN status IN ('downloaded', 'uploaded') THEN 1 ELSE 0 END) AS saved_cnt,
-                   SUM(CASE WHEN status = 'baseline' THEN 1 ELSE 0 END) AS baseline_cnt,
-                   SUM(
-                       CASE
-                           WHEN status IN ('downloaded', 'uploaded')
-                            AND COALESCE(downloaded_at, uploaded_at, created_at) >= ?
-                            AND (published_at = '' OR published_at >= ?)
-                           THEN 1 ELSE 0
-                       END
-                   ) AS today_cnt
+                   SUM(CASE WHEN status = 'baseline' THEN 1 ELSE 0 END) AS baseline_cnt
             FROM videos
             GROUP BY LOWER(site), LOWER(uploader), LOWER(target_type)
-            """,
-            (today_start_iso, recent_publish_cutoff),
+            """
         )
 
         def _empty_counts() -> Dict[str, int]:
-            return {"total": 0, "saved": 0, "baseline": 0, "today": 0}
+            return {"total": 0, "saved": 0, "baseline": 0}
 
-        def _add_counts(bucket: Dict[str, int], total_c: int, saved_c: int, base_c: int, today_c: int) -> None:
+        def _add_counts(bucket: Dict[str, int], total_c: int, saved_c: int, base_c: int) -> None:
             bucket["total"] += total_c
             bucket["saved"] += saved_c
             bucket["baseline"] += base_c
-            bucket["today"] += today_c
 
         counts_by_pair: Dict[Tuple[str, str, str], Dict[str, int]] = {}
         non_special_counts_by_uploader: Dict[Tuple[str, str], Dict[str, int]] = {}
@@ -212,17 +206,16 @@ class Repository:
             total_c = int(item.get("total_cnt") or 0)
             saved_c = int(item.get("saved_cnt") or 0)
             base_c = int(item.get("baseline_cnt") or 0)
-            today_c = int(item.get("today_cnt") or 0)
             pair_bucket = counts_by_pair.setdefault((s_low, u_low, t_low), _empty_counts())
-            _add_counts(pair_bucket, total_c, saved_c, base_c, today_c)
+            _add_counts(pair_bucket, total_c, saved_c, base_c)
             if t_low == "liked" or u_low == "my_liked":
                 liked_bucket = liked_counts_by_site.setdefault(s_low, _empty_counts())
-                _add_counts(liked_bucket, total_c, saved_c, base_c, today_c)
+                _add_counts(liked_bucket, total_c, saved_c, base_c)
             elif s_low == "xhamster" and (t_low == "favorites" or u_low == "my_favorites"):
-                _add_counts(xh_favorites_counts, total_c, saved_c, base_c, today_c)
+                _add_counts(xh_favorites_counts, total_c, saved_c, base_c)
             elif t_low != "favorites" and u_low:
                 user_bucket = non_special_counts_by_uploader.setdefault((s_low, u_low), _empty_counts())
-                _add_counts(user_bucket, total_c, saved_c, base_c, today_c)
+                _add_counts(user_bucket, total_c, saved_c, base_c)
 
         non_special_targets_per_user: Dict[Tuple[str, str], int] = {}
         for r in rows:
@@ -251,12 +244,17 @@ class Repository:
             else:
                 matched = counts_by_pair.get((s_low, u_low, t_low)) or _empty_counts()
 
-            downloaded_today = matched["today"]
-            checked_dt = _parse_iso_utc(r.get("last_checked_at"))
-            checked_today = bool(checked_dt and checked_dt >= today_start_dt)
-            last_new_today = int(r.get("last_new_count") or 0) if checked_today else 0
-            r["today_downloaded_count"] = downloaded_today
-            r["today_new_count"] = max(downloaded_today, last_new_today)
+            r.pop("today_new_viewkeys", None)
+            row_date = str(r.get("today_new_date") or "").strip()
+            if row_date == today_str:
+                today_new = max(0, int(r.get("today_new_count") or 0))
+            elif not row_date:
+                checked_dt = _parse_iso_utc(r.get("last_checked_at"))
+                checked_today = bool(checked_dt and checked_dt >= today_start_dt)
+                today_new = max(0, int(r.get("last_new_count") or 0)) if checked_today else 0
+            else:
+                today_new = 0
+            r["today_new_count"] = today_new
             r["video_total_count"] = matched["total"]
             r["video_saved_count"] = matched["saved"]
             r["video_baseline_count"] = matched["baseline"]
@@ -557,14 +555,77 @@ class Repository:
                 )
         return await self.get_target(target_id)
 
-    async def mark_target_checked(self, target_id: int, new_count: int, error: str = "") -> None:
+    async def mark_target_checked(
+        self,
+        target_id: int,
+        new_count: int,
+        error: str = "",
+        *,
+        new_viewkeys: Optional[Iterable[str]] = None,
+    ) -> None:
+        today_str = local_today_date()
+        today_start_dt = local_day_start_utc()
+        existing = await self.db.fetch_one(
+            """
+            SELECT last_checked_at, last_new_count, today_new_date, today_new_count, today_new_viewkeys
+            FROM targets
+            WHERE id = ?
+            """,
+            (target_id,),
+        )
+        prev_count = 0
+        prev_vkeys: List[str] = []
+        if existing:
+            row_date = str(existing.get("today_new_date") or "").strip()
+            if row_date == today_str:
+                prev_count = max(0, int(existing.get("today_new_count") or 0))
+                try:
+                    parsed = json.loads(existing.get("today_new_viewkeys") or "[]")
+                    if isinstance(parsed, list):
+                        prev_vkeys = [str(k).strip() for k in parsed if str(k or "").strip()]
+                except (ValueError, TypeError):
+                    prev_vkeys = []
+            elif not row_date:
+                checked_dt = _parse_iso_utc(existing.get("last_checked_at"))
+                if checked_dt and checked_dt >= today_start_dt:
+                    prev_count = max(0, int(existing.get("last_new_count") or 0))
+
+        clean_new_count = max(0, int(new_count))
+        if new_viewkeys is not None:
+            merged_vkeys = list(prev_vkeys)
+            seen = set(merged_vkeys)
+            added = 0
+            for raw_k in new_viewkeys:
+                vk = str(raw_k or "").strip()
+                if vk and vk not in seen:
+                    seen.add(vk)
+                    merged_vkeys.append(vk)
+                    added += 1
+            next_today_count = max(len(merged_vkeys), prev_count + added)
+        else:
+            merged_vkeys = prev_vkeys
+            next_today_count = prev_count + clean_new_count
+
         await self.db.execute(
             """
             UPDATE targets
-            SET last_checked_at = ?, last_new_count = ?, last_error = ?
+            SET last_checked_at = ?,
+                last_new_count = ?,
+                last_error = ?,
+                today_new_date = ?,
+                today_new_count = ?,
+                today_new_viewkeys = ?
             WHERE id = ?
             """,
-            (utc_now_iso(), int(new_count), error, target_id),
+            (
+                utc_now_iso(),
+                clean_new_count,
+                error,
+                today_str,
+                next_today_count,
+                json.dumps(merged_vkeys, ensure_ascii=False),
+                target_id,
+            ),
         )
 
     async def delete_target(self, target_id: int) -> bool:

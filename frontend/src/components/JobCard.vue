@@ -251,10 +251,15 @@ const transferProgressMap = computed(() => {
         ? Math.min(isUploading ? 100 : 99.9, Math.round((done / total) * 1000) / 10)
         : 0
     const hasProgress = phase === 'verifying' || phase === 'remuxing' || done > 0 || speed > 0
+    const isEstimatedTotal =
+      !isUploading &&
+      phase === 'downloading' &&
+      (Boolean(live?.estimated_total) || String(item.download_url || '').toLowerCase().includes('.m3u8'))
     map[item.id] = {
       phase,
       doneText: formatBytes(done),
-      totalText: total > 0 ? formatBytes(total) : '',
+      totalText: total > 0 ? `${isEstimatedTotal ? '≈ ' : ''}${formatBytes(total)}` : '',
+      isEstimatedTotal,
       speedText: speed > 0 ? formatSpeed(speed) : '',
       pct,
       hasProgress,
@@ -959,7 +964,10 @@ function downloadExportTxt() {
                       <span class="text-muted-foreground text-[11px]">等待响应...</span>
                     </template>
                     <template v-else>
-                      <span class="text-muted-foreground font-mono text-[10px] sm:text-[11px]">
+                      <span
+                        class="text-muted-foreground font-mono text-[10px] sm:text-[11px]"
+                        :title="transferProgressMap[item.id]?.isEstimatedTotal ? 'HLS 分片流无固定文件头大小，总大小为按已下载分片码率动态估算' : undefined"
+                      >
                         {{ transferProgressMap[item.id]?.doneText || '0 B' }}
                         <template v-if="transferProgressMap[item.id]?.totalText"> / {{ transferProgressMap[item.id].totalText }}</template>
                       </span>

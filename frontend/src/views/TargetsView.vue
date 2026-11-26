@@ -261,11 +261,11 @@ function isUpdatedToday(t) {
 
 function targetNewBadgeTitle(t) {
   const today = targetTodayNewCount(t)
-  const downloaded = Number(t?.today_downloaded_count || 0)
   const lastNew = Number(t?.last_new_count || 0)
-  const parts = [`今日新增 ${today} 个视频（按当天统计，次日自动重置）`]
-  if (downloaded > 0) parts.push(`今日已入库 ${downloaded} 个`)
-  if (lastNew > 0) parts.push(`上次检查发现 ${lastNew} 个`)
+  const parts = [`今日扫描新增 ${today} 个视频（仅统计当天追更/检查更新发现，次日自动清零）`]
+  if (lastNew > 0 && lastNew !== today && isLocalToday(t?.last_checked_at)) {
+    parts.push(`最近一次扫描 +${lastNew}`)
+  }
   return parts.join(' · ')
 }
 
@@ -1158,13 +1158,6 @@ async function handleDelete(t) {
               >
                 今日 +{{ targetTodayNewCount(t) }}
               </span>
-              <span
-                v-else-if="t.last_new_count > 0"
-                class="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-muted-foreground shrink-0"
-                :title="`上次检查发现 ${t.last_new_count} 个新视频（非今日）`"
-              >
-                上次 +{{ t.last_new_count }}
-              </span>
             </div>
 
             <div class="inline-flex items-center gap-0.5 sm:gap-1 shrink-0 ml-auto">
@@ -1236,7 +1229,7 @@ async function handleDelete(t) {
                 <th class="h-11 px-5 w-28">类型</th>
                 <th class="h-11 px-5 w-28">视频数</th>
                 <th class="h-11 px-5 w-44">上次检查</th>
-                <th class="h-11 px-5 w-32">今日 / 上次新增</th>
+                <th class="h-11 px-5 w-32">今日新增</th>
                 <th class="h-11 px-5 w-36 text-right">操作</th>
               </tr>
             </thead>
@@ -1309,13 +1302,6 @@ async function handleDelete(t) {
                   >
                     今日 +{{ targetTodayNewCount(t) }}
                   </Badge>
-                  <span
-                    v-else-if="t.last_new_count > 0"
-                    class="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-[11px] text-muted-foreground"
-                    :title="`上次检查发现 ${t.last_new_count} 个新视频（非今日）`"
-                  >
-                    上次 +{{ t.last_new_count }}
-                  </span>
                   <span v-else class="text-muted-foreground">0</span>
                 </td>
                 <td class="px-5 py-3.5 text-right whitespace-nowrap">

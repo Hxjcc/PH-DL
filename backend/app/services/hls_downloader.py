@@ -71,6 +71,7 @@ class HlsMediaPlaylist:
     segment_urls: Tuple[str, ...]
     total_duration: float
     is_fmp4: bool
+    segment_durations: Tuple[float, ...] = ()
     encrypted_method: str = ""
     is_master: bool = False
     has_byterange: bool = False
@@ -81,6 +82,8 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
     """Parse an HLS media playlist (MPEG-TS or fMP4 with ``#EXT-X-MAP``)."""
     init_url: Optional[str] = None
     segments: List[str] = []
+    durations: List[float] = []
+    pending_duration: Optional[float] = None
     total_duration = 0.0
     encrypted_method = ""
     is_master = False
@@ -116,11 +119,15 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
             m_dur = _EXTINF_RE.match(line)
             if m_dur:
                 with contextlib.suppress(ValueError):
-                    total_duration += float(m_dur.group(1))
+                    dur = max(0.0, float(m_dur.group(1)))
+                    pending_duration = dur
+                    total_duration += dur
             continue
         if line.startswith("#"):
             continue
         segments.append(urllib.parse.urljoin(base_url, line))
+        durations.append(pending_duration if pending_duration is not None else 0.0)
+        pending_duration = None
 
     is_fmp4 = bool(init_url) or any(
         urllib.parse.urlparse(u).path.lower().endswith((".m4s", ".mp4", ".cmfv", ".cmfa"))
@@ -131,6 +138,7 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
         segment_urls=tuple(segments),
         total_duration=total_duration,
         is_fmp4=is_fmp4,
+        segment_durations=tuple(durations),
         encrypted_method=encrypted_method,
         is_master=is_master,
         has_byterange=has_byterange,
@@ -734,13 +742,28 @@ async def _download_hls_aiohttp(
     _write_hls_manifest_atomic(hls_dir, _build_meta())
 
     # 3. Real-time progress & rolling 2s speed tracker
+    seg_durations = playlist.segment_durations
+    has_durations = (
+        len(seg_durations) == total_segments
+        and playlist.total_duration > 0.0
+        and all(d > 0.0 for d in seg_durations)
+    )
+    prefix_dur: List[float] = [0.0] * (total_segments + 1)
+    if has_durations:
+        running_dur = 0.0
+        for idx, dur in enumerate(seg_durations):
+            running_dur += dur
+            prefix_dur[idx + 1] = running_dur
+
     in_flight_bytes = 0
+    init_bytes = 0
     best_reported_bytes = stream_bytes
     speed_window: Deque[Tuple[float, int]] = collections.deque()
     speed_window_bytes = 0
     last_tick_at = 0.0
     ready_buffers: Dict[int, bytes] = {}
     ready_buffered_bytes = 0
+    ready_buffered_duration = 0.0
 
     def _record_speed_delta(delta: int, *, force_tick: bool = False) -> None:
         nonlocal speed_window_bytes, best_reported_bytes, last_tick_at
@@ -759,14 +782,24 @@ async def _download_hls_aiohttp(
         reported_dl = max(best_reported_bytes, stream_bytes + max(0, in_flight_bytes))
         best_reported_bytes = reported_dl
         done_count = completed_segments + len(ready_buffers)
-        if done_count > 0 and done_count < total_segments:
-            known_done_bytes = stream_bytes + ready_buffered_bytes
-            avg_seg = max(known_done_bytes, reported_dl) / done_count
-            est_total = max(reported_dl + 1, int(avg_seg * total_segments))
-        elif completed_segments >= total_segments:
+        known_done_bytes = stream_bytes + ready_buffered_bytes
+        if completed_segments >= total_segments:
             est_total = max(reported_dl, stream_bytes)
+        elif done_count > 0 and known_done_bytes > 0:
+            # Estimate strictly from completed segments (never include partial in-flight bytes
+            # in the numerator) and weight by #EXTINF duration when available.
+            if has_durations:
+                done_dur = prefix_dur[completed_segments] + ready_buffered_duration
+                if done_dur > 0.0:
+                    media_done_bytes = max(0, known_done_bytes - init_bytes)
+                    raw_est = int(init_bytes + (media_done_bytes / done_dur) * playlist.total_duration)
+                else:
+                    raw_est = int((known_done_bytes / done_count) * total_segments)
+            else:
+                raw_est = int((known_done_bytes / done_count) * total_segments)
+            est_total = max(reported_dl + 1, raw_est)
         else:
-            est_total = max(reported_dl + 1, 1)
+            est_total = 0
 
         if speed_window:
             span = max(0.25, now - speed_window[0][0])
@@ -861,6 +894,7 @@ async def _download_hls_aiohttp(
                 return _AiohttpHlsOutcome(disk_error=derr, error=str(derr))
             await asyncio.to_thread(_write_stream_blocks, fh, [init_data], flush=True)
             in_flight_bytes = max(0, in_flight_bytes - len(init_data))
+            init_bytes = len(init_data)
             stream_bytes += len(init_data)
             init_written = True
             _write_hls_manifest_atomic(hls_dir, _build_meta())
@@ -887,7 +921,7 @@ async def _download_hls_aiohttp(
                         ft.cancel()
 
             async def _fetcher() -> None:
-                nonlocal next_fetch_idx, fatal_outcome, ready_buffered_bytes
+                nonlocal next_fetch_idx, fatal_outcome, ready_buffered_bytes, ready_buffered_duration
                 while not abort_event.is_set() and not stop.is_set():
                     async with window_cv:
                         while (
@@ -918,12 +952,14 @@ async def _download_hls_aiohttp(
                     async with window_cv:
                         ready_buffers[seg_idx] = data
                         ready_buffered_bytes += len(data)
+                        if has_durations:
+                            ready_buffered_duration += seg_durations[seg_idx]
                         if seg_idx == next_write_idx:
                             window_cv.notify_all()
 
             async def _writer() -> None:
                 nonlocal next_write_idx, completed_segments, stream_bytes
-                nonlocal in_flight_bytes, ready_buffered_bytes, fatal_outcome
+                nonlocal in_flight_bytes, ready_buffered_bytes, ready_buffered_duration, fatal_outcome
                 nonlocal last_manifest_seg, last_manifest_at
                 while next_write_idx < total_segments:
                     async with window_cv:
@@ -938,6 +974,8 @@ async def _download_hls_aiohttp(
                         while next_write_idx in ready_buffers:
                             blk = ready_buffers.pop(next_write_idx)
                             ready_buffered_bytes -= len(blk)
+                            if has_durations:
+                                ready_buffered_duration = max(0.0, ready_buffered_duration - seg_durations[next_write_idx])
                             blocks.append(blk)
                             next_write_idx += 1
 

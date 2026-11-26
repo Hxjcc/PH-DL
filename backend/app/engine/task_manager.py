@@ -1470,20 +1470,28 @@ class TaskManager:
                             if it:
                                 self.events.broadcast("item_updated", it)
 
+                            use_hls = is_hls_url(item["download_url"]) or (
+                                partial_path is not None and partial_path.name.endswith(".hls")
+                            )
+
                             def _on_progress(
                                 dl_bytes: int,
                                 tot_bytes: int,
                                 speed_bps: float,
                                 phase: str = "downloading",
                             ) -> None:
+                                norm_phase = (phase or "downloading").strip().lower()
                                 self.events.emit_item_progress(
-                                    job_id, item_id, dl_bytes, tot_bytes, speed_bps, phase=phase,
+                                    job_id,
+                                    item_id,
+                                    dl_bytes,
+                                    tot_bytes,
+                                    speed_bps,
+                                    phase=norm_phase,
+                                    estimated_total=(use_hls and norm_phase == "downloading"),
                                 )
                                 scheduler.emit_status()
 
-                            use_hls = is_hls_url(item["download_url"]) or (
-                                partial_path is not None and partial_path.name.endswith(".hls")
-                            )
                             if use_hls:
                                 outcome = await download_hls_to_mp4(
                                     session=dl_session,
@@ -3067,7 +3075,7 @@ class TaskManager:
                     )
                 except Exception as err:
                     target_error_count += 1
-                    await self.repo.mark_target_checked(tid, 0, error=str(err))
+                    await self.repo.mark_target_checked(tid, 0, error=str(err), new_viewkeys=[])
                     self.events.emit_log("WARNING", f"检查 '{display}' 失败: {err}", job_id=job_id)
                     completed_targets += 1
                     self.events.emit_scan_status(
@@ -3097,7 +3105,12 @@ class TaskManager:
                     errors.append(f"{len(detail_failures)} 个视频解析失败")
                 if errors:
                     target_error_count += 1
-                await self.repo.mark_target_checked(tid, len(valid_new), error="；".join(errors[:3]))
+                await self.repo.mark_target_checked(
+                    tid,
+                    len(valid_new),
+                    error="；".join(errors[:3]),
+                    new_viewkeys=[d.viewkey for d in valid_new],
+                )
 
                 folder = _target_folder_name(uname, utype, site=tsite)
                 if valid_new:
@@ -3362,7 +3375,7 @@ class TaskManager:
 
         error = f"{len(page_errors)} 页基线未扫描完成：{page_errors[0]}" if page_errors else ""
         if not ctx.cancel_event.is_set():
-            await self.repo.mark_target_checked(int(target["id"]), 0, error=error)
+            await self.repo.mark_target_checked(int(target["id"]), 0, error=error, new_viewkeys=[])
         await self.repo.update_job(job_id, total_items=count, done_items=count, error_message=error)
         self.events.emit_log("WARNING" if error else "INFO", f"目标 '{uname}' 已登记 {count} 个历史视频。{error}", job_id=job_id)
 

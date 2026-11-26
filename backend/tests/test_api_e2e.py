@@ -528,7 +528,7 @@ def test_delete_video_optionally_removes_local_file_inside_downloads_only(tmp_pa
 
 def test_list_targets_tracks_today_new_count_across_downloads_and_rechecks(tmp_path: Path):
     from datetime import datetime, timedelta, timezone
-    from app.db.repo import utc_now_iso
+    from app.db.repo import local_date_days_ago, utc_now_iso
 
     with _make_client(tmp_path) as client:
         assert client.post("/api/auth/login", json={"password": "super-secret-password"}).status_code == 200
@@ -537,13 +537,14 @@ def test_list_targets_tracks_today_new_count_across_downloads_and_rechecks(tmp_p
         alice = client.post("/api/targets", json={"username": "alice", "target_type": "model"}).json()["target"]
         bob = client.post("/api/targets", json={"username": "bob", "target_type": "model"}).json()["target"]
         carol = client.post("/api/targets", json={"username": "carol", "target_type": "model"}).json()["target"]
-        liked = client.post("/api/targets", json={"username": "_currentUser_", "target_type": "liked"}).json()["target"]
+        dave = client.post("/api/targets", json={"username": "dave", "target_type": "model"}).json()["target"]
 
         now_iso = utc_now_iso()
         old_iso = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds")
+        yesterday_date = local_date_days_ago(1)
 
         async def _seed():
-            # Alice downloaded 2 videos today, then later re-checked with 0 new
+            # Alice had 2 videos downloaded manually today, but scan found 0 new -> today_new_count stays 0
             await container.repo.upsert_video(
                 "vk_a1",
                 title="Alice 1",
@@ -561,57 +562,55 @@ def test_list_targets_tracks_today_new_count_across_downloads_and_rechecks(tmp_p
                 status="downloaded",
                 downloaded_at=now_iso,
             )
-            await container.repo.mark_target_checked(alice["id"], 0)
+            await container.repo.mark_target_checked(alice["id"], 0, new_viewkeys=[])
 
-            # Bob had check_updates today finding 3 new videos (not downloaded yet)
-            await container.repo.mark_target_checked(bob["id"], 3)
+            # Bob: scan #1 found 2 new, scan #2 (check_updates repeat) found the SAME 2,
+            # scan #3 found 1 additional new, scan #4 found 0 -> deduplicated daily total is 3
+            await container.repo.mark_target_checked(bob["id"], 2, new_viewkeys=["vk_b1", "vk_b2"])
+            await container.repo.mark_target_checked(bob["id"], 2, new_viewkeys=["vk_b1", "vk_b2"])
+            await container.repo.mark_target_checked(bob["id"], 1, new_viewkeys=["vk_b3"])
+            await container.repo.mark_target_checked(bob["id"], 0, new_viewkeys=[])
 
-            # Carol only had activity 2 days ago
-            await container.repo.upsert_video(
-                "vk_c1",
-                title="Carol Old",
-                uploader="carol",
-                target_type="model",
-                status="uploaded",
-                downloaded_at=old_iso,
-                uploaded_at=old_iso,
-            )
+            # Carol only had scan discoveries on a previous day -> auto-resets to 0 today
             await container.db.execute(
-                "UPDATE targets SET last_checked_at = ?, last_new_count = 4 WHERE id = ?",
-                (old_iso, carol["id"]),
+                """
+                UPDATE targets
+                SET last_checked_at = ?, last_new_count = 4,
+                    today_new_date = ?, today_new_count = 4, today_new_viewkeys = '["vk_c1"]'
+                WHERE id = ?
+                """,
+                (old_iso, yesterday_date, carol["id"]),
             )
 
-            # Liked target received 1 video today
-            await container.repo.upsert_video(
-                "vk_l1",
-                title="Liked Today",
-                uploader="My_Liked",
-                target_type="liked",
-                status="uploaded",
-                downloaded_at=now_iso,
-                uploaded_at=now_iso,
+            # Dave had yesterday's count of 4, then a fresh scan today finds 1 new -> resets to 1 (not 5)
+            await container.db.execute(
+                """
+                UPDATE targets
+                SET last_checked_at = ?, last_new_count = 4,
+                    today_new_date = ?, today_new_count = 4, today_new_viewkeys = '["vk_d_old"]'
+                WHERE id = ?
+                """,
+                (old_iso, yesterday_date, dave["id"]),
             )
-            await container.repo.mark_target_checked(liked["id"], 0)
+            await container.repo.mark_target_checked(dave["id"], 1, new_viewkeys=["vk_d_today"])
 
         client.portal.call(_seed)
 
         items = client.get("/api/targets").json()["items"]
         by_user = {(item["username"], item["target_type"]): item for item in items}
 
-        assert by_user[("alice", "model")]["today_downloaded_count"] == 2
-        assert by_user[("alice", "model")]["today_new_count"] == 2
+        assert by_user[("alice", "model")]["today_new_count"] == 0
         assert by_user[("alice", "model")]["last_new_count"] == 0
+        assert by_user[("alice", "model")]["video_saved_count"] == 2
 
-        assert by_user[("bob", "model")]["today_downloaded_count"] == 0
         assert by_user[("bob", "model")]["today_new_count"] == 3
-        assert by_user[("bob", "model")]["last_new_count"] == 3
+        assert by_user[("bob", "model")]["last_new_count"] == 0
 
-        assert by_user[("carol", "model")]["today_downloaded_count"] == 0
         assert by_user[("carol", "model")]["today_new_count"] == 0
         assert by_user[("carol", "model")]["last_new_count"] == 4
 
-        assert by_user[("_currentUser_", "liked")]["today_downloaded_count"] == 1
-        assert by_user[("_currentUser_", "liked")]["today_new_count"] == 1
+        assert by_user[("dave", "model")]["today_new_count"] == 1
+        assert by_user[("dave", "model")]["last_new_count"] == 1
 
 
 def test_account_avatar_upload_serve_delete_and_batch_targets_with_quality(tmp_path: Path, monkeypatch):

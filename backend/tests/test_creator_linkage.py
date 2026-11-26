@@ -421,8 +421,8 @@ async def test_list_targets_today_count_excludes_old_published_backfills(linkage
     assert len(rows) == 1
     assert rows[0]["video_total_count"] == 3
     assert rows[0]["video_saved_count"] == 3
-    assert rows[0]["today_downloaded_count"] == 2
-    assert rows[0]["today_new_count"] == 2
+    # Manual/non-scan downloads must NOT inflate auto-tracking today_new_count
+    assert rows[0]["today_new_count"] == 0
 
 
 async def test_query_videos_time_range_and_stats_published_7d(linkage_engine):
