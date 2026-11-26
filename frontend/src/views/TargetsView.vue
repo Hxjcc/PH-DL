@@ -121,7 +121,16 @@ const schedule = reactive({
     store.settingsCache?.schedule_time ||
     store.overview?.schedule?.time ||
     '04:00',
+  scan_mode:
+    store.settingsCache?.update_scan_mode ||
+    store.overview?.schedule?.scan_mode ||
+    'catch_up',
 })
+
+const UPDATE_SCAN_MODES = [
+  { value: 'catch_up', label: '智能衔接', title: '从首页开始，衔接已知视频后停止（速度快，适合高频追更）' },
+  { value: 'full', label: '全量翻页', title: '每次翻完目标全部列表页，不错过重新公开或补漏的旧视频（已知视频直接跳过，不重复解析详情）' },
+]
 
 const newTarget = reactive({
   username: '',
@@ -342,6 +351,7 @@ async function loadData({ silent = false } = {}) {
     if (settings) {
       schedule.enabled = Boolean(settings.schedule_enabled)
       schedule.time = settings.schedule_time || '04:00'
+      schedule.scan_mode = settings.update_scan_mode === 'full' ? 'full' : 'catch_up'
     }
   } catch (err) {
     store.notify(err.message, 'error')
@@ -366,6 +376,7 @@ watch(
     if (val) {
       schedule.enabled = Boolean(val.schedule_enabled)
       schedule.time = val.schedule_time || '04:00'
+      schedule.scan_mode = val.update_scan_mode === 'full' ? 'full' : 'catch_up'
     }
   }
 )
@@ -389,19 +400,32 @@ onUnmounted(() => {
 })
 
 async function saveSchedule() {
-  if (!schedule.time) return
+  if (!schedule.time) return false
   try {
     const res = await api.saveSettings({
       schedule_enabled: schedule.enabled,
       schedule_time: schedule.time,
+      update_scan_mode: schedule.scan_mode,
     })
     if (res?.settings) {
       store.setSettingsCache(res.settings)
     }
-    store.notify('定时追更策略已保存', 'success')
+    store.notify('追更策略已保存', 'success')
     await store.refreshOverview()
+    return true
   } catch (err) {
     store.notify(err.message, 'error')
+    return false
+  }
+}
+
+async function setScanMode(mode) {
+  if (schedule.scan_mode === mode) return
+  const prev = schedule.scan_mode
+  schedule.scan_mode = mode
+  const ok = await saveSchedule()
+  if (!ok) {
+    schedule.scan_mode = prev
   }
 }
 
@@ -659,6 +683,29 @@ async function handleDelete(t) {
         <span class="text-xs text-muted-foreground">
           {{ schedule.enabled ? `每天 ${schedule.time} 自动运行` : '定时调度已暂停' }}
         </span>
+        <span class="hidden sm:inline-block h-4 w-px bg-border" aria-hidden="true" />
+        <div
+          class="inline-flex items-center rounded-lg border border-border bg-surface-subtle/60 p-0.5"
+          role="group"
+          aria-label="追更扫描模式"
+        >
+          <button
+            v-for="opt in UPDATE_SCAN_MODES"
+            :key="opt.value"
+            type="button"
+            :title="opt.title"
+            :aria-pressed="schedule.scan_mode === opt.value"
+            :class="[
+              'h-7 px-2.5 rounded-md text-xs font-medium transition-colors cursor-pointer select-none',
+              schedule.scan_mode === opt.value
+                ? 'bg-card text-foreground shadow-xs ring-1 ring-border/70'
+                : 'text-muted-foreground hover:text-foreground',
+            ]"
+            @click="setScanMode(opt.value)"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
       </div>
 
       <div class="grid grid-cols-2 w-full sm:flex sm:w-auto items-center gap-2">

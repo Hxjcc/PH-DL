@@ -2126,10 +2126,13 @@ class TaskManager:
         target_error_count = 0
 
         target_concurrency = max(1, min(6, int(getattr(settings, "update_target_concurrency", 2) or 1)))
+        raw_scan_mode = str(params.get("scan_mode") or getattr(settings, "update_scan_mode", "catch_up") or "catch_up").strip().lower()
+        full_scan = raw_scan_mode == "full"
         if targets:
+            mode_label = "全量翻页" if full_scan else "智能衔接"
             self.events.emit_log(
                 "INFO",
-                f"开始检查 {len(targets)} 个追更目标的更新（目标并发 {target_concurrency}）...",
+                f"开始检查 {len(targets)} 个追更目标的更新（{mode_label}，目标并发 {target_concurrency}）...",
                 job_id=job_id,
             )
 
@@ -2207,7 +2210,7 @@ class TaskManager:
                         list_url=list_url,
                         target_type=utype,
                         settings=settings,
-                        catch_up=not needs_rescan,
+                        catch_up=(not full_scan and not needs_rescan),
                         skip_vkeys=known_vkeys,
                         preferred_qualities=qual_set,
                         uploader_hint=(uname if uname != "_currentUser_" else "My_Liked", utype),

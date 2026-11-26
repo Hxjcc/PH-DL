@@ -1716,3 +1716,114 @@ async def test_check_updates_scans_targets_concurrently_up_to_limit(tmp_path: Pa
     finally:
         await tm.stop()
         await db.close()
+
+
+async def test_update_scan_mode_full_scans_past_known_page1_tail_for_restored_videos(
+    tmp_path: Path, monkeypatch
+):
+    """update_scan_mode='full' disables catch-up cutoff so restored videos on page 2+ are discovered."""
+    from urllib.parse import parse_qs, urlparse
+    from app.engine import task_manager as tm_mod
+    from app.parsers.http_session import PowFetchResult, TaskHttpContext
+
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": False,
+                "max_concurrent_list_pages": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        await repo.upsert_target("martinpaola", "model")
+        await repo.upsert_video("knownp1a", title="P1 A", uploader="martinpaola", status="baseline")
+        await repo.upsert_video("knownp1b", title="P1 B", uploader="martinpaola", status="baseline")
+        await repo.upsert_video("knownp2a", title="P2 A", uploader="martinpaola", status="baseline")
+
+        requested_pages: list[int] = []
+        detail_vkeys: list[str] = []
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_fetch(_ctx, url, **kwargs):
+            page_num = int(parse_qs(urlparse(url).query).get("page", ["1"])[0])
+            requested_pages.append(page_num)
+            if page_num == 1:
+                keys = ["knownp1a", "knownp1b"]
+            elif page_num == 2:
+                keys = ["restoredp2", "knownp2a"]
+            else:
+                return PowFetchResult("", url, 404, 0, False), None
+            items = "".join(
+                f'<li class="videoBox" data-video-vkey="{k}">'
+                f'<a href="/view_video.php?viewkey={k}" title="{k}"></a></li>'
+                for k in keys
+            )
+            html = f'<div class="profileVids"><ul id="mostRecentVideosSection" class="videos">{items}</ul></div>'
+            return PowFetchResult(html, url, 200, 0, False), None
+
+        async def fake_details(_ctx, items, *args, **kwargs):
+            for url, _, _ in items:
+                detail_vkeys.append(url.split("viewkey=")[1])
+            return [
+                VideoDetail(
+                    viewkey=url.split("viewkey=")[1],
+                    title=url.split("viewkey=")[1],
+                    page_url=url,
+                    referer_url=url,
+                    download_url=f"https://cdn.example/{url.split('viewkey=')[1]}.mp4",
+                    quality="1080p",
+                    uploader_username="martinpaola",
+                    uploader_type="model",
+                    page_num=p,
+                    item_num=i,
+                )
+                for url, p, i in items
+            ]
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(TaskHttpContext, "fetch_with_pow", fake_fetch)
+        monkeypatch.setattr(tm_mod, "fetch_video_details_batch", fake_details)
+
+        tm.start()
+
+        # 1. Default 'catch_up' stops at page 1 because knownp1b is already in the database.
+        job1 = await tm.enqueue_job("check_updates", "默认智能衔接检查", {"target_ids": None})
+        done1 = await _wait_job_done(repo, job1["id"], timeout=5.0)
+        assert done1 is not None and done1["status"] == "completed"
+        assert requested_pages == [1]
+        assert done1["total_items"] == 0
+        assert detail_vkeys == []
+
+        # 2. Switching to 'full' scans past page 1 and catches restoredp2 on page 2 without re-fetching known details.
+        await repo.update_settings_patch({"update_scan_mode": "full"})
+        requested_pages.clear()
+        job2 = await tm.enqueue_job("check_updates", "全量翻页检查", {"target_ids": None})
+        done2 = await _wait_job_done(repo, job2["id"], timeout=5.0)
+        assert done2 is not None and done2["status"] == "completed"
+        assert requested_pages == [1, 2, 3]
+        assert done2["total_items"] == 1
+        assert detail_vkeys == ["restoredp2"]
+        assert any("restoredp2" in entry["message"] for entry in events.recent_logs())
+        updated_targets = await repo.list_targets()
+        assert updated_targets[0]["last_new_count"] == 1
+
+        # 3. Invalid scan mode value is rejected by settings validation.
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            await repo.update_settings_patch({"update_scan_mode": "invalid_mode"})
+    finally:
+        await tm.stop()
+        await db.close()

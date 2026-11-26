@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -220,6 +220,7 @@ class RuntimeSettings(BaseModel):
     schedule_enabled: bool = True
     schedule_time: str = "04:00"  # HH:MM local time
     update_target_concurrency: int = Field(default=2, ge=1, le=6)
+    update_scan_mode: Literal["catch_up", "full"] = "catch_up"  # catch_up | full
     notify_if_no_updates: bool = False
 
     # ServerChan Notification

@@ -55,6 +55,7 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
         "schedule": {
             "enabled": settings.schedule_enabled,
             "time": settings.schedule_time,
+            "scan_mode": settings.update_scan_mode,
             "next_run_at": next_run,
         },
         "uploader_enabled": settings.uploader_enabled,

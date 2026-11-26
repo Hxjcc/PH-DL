@@ -34,7 +34,7 @@ import Select from '../components/ui/Select.vue'
 
 const DEFAULT_SELECTORS = Object.freeze({
   list_page_main_containers:
-    'ul.videos#videoSearchResult, div#videoCategory ul.videos, ul#searchResults.videos.video-listing.clear, ul.videos[data-type="pornstar"], ul.videos.row-5-thumbs#mostRecentVideosSection, ul.videos.section-listing, ul.videos.video-listing.clear.profileContent, ul.videos.video-listing.clear.playlistContent, div.container > ul.videos, ul#moreData.videos, ul#likedVideosSection.videos',
+    'ul.videos#videoSearchResult, div#videoCategory ul.videos, ul#searchResults.videos.video-listing.clear, ul.videos[data-type="pornstar"], ul.videos.row-5-thumbs#mostRecentVideosSection, ul#mostRecentVideosSection, ul.videos.section-listing, ul#showAllChanelVideos, ul.videos.video-listing.clear.profileContent, ul.videos.video-listing.clear.playlistContent, div.container > ul.videos, ul#moreData.videos, ul#likedVideosSection.videos',
   list_page_li_in_container:
     'li.videoBox[data-video-vkey], li.pcVideoListItem[data-video-vkey], li.js-pop.videoblock.videoBox, li.pcVideoListItem.videoBox, li.videoBox, li.pcVideoListItem',
   list_page_li_fallback:
@@ -83,6 +83,11 @@ const YESCAPTCHA_TASK_TYPES = [
   { label: 'reCAPTCHA v2 企业版（推荐，PornHub 使用 enterprise.js）', value: 'RecaptchaV2EnterpriseTaskProxyless' },
   { label: 'reCAPTCHA v2 普通版（15 点/次，低价）', value: 'NoCaptchaTaskProxyless' },
   { label: 'reCAPTCHA v2 备用线路（20 点/次）', value: 'RecaptchaV2TaskProxyless' },
+]
+
+const UPDATE_SCAN_MODE_OPTIONS = [
+  { label: '智能衔接（快 · 衔接已知视频即止）', value: 'catch_up' },
+  { label: '全量翻页（全 · 扫完所有分页不漏老片）', value: 'full' },
 ]
 
 function cloneSettings(src) {
@@ -937,14 +942,23 @@ async function handleTestNotify() {
           <div>
             <h3 class="text-sm font-semibold text-foreground">追更调度与网络代理</h3>
             <p class="text-xs text-muted-foreground mt-0.5">
-              控制每日定时追更时间与出口代理；追更内置智能增量补扫（从首页检查，未衔接历史记录时自动向后翻页，异常页下次自动补齐）
+              控制每日定时追更时间、扫描深度与出口代理；「智能衔接」在接上历史记录后即停，「全量翻页」会扫描全部列表分页以捕获重新公开的旧视频
             </p>
           </div>
 
-          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div class="space-y-1.5">
               <label class="text-xs font-medium text-foreground">每日定时追更时间</label>
               <Input v-model="form.schedule_time" type="time" />
+            </div>
+            <div class="space-y-1.5">
+              <label
+                class="text-xs font-medium text-foreground"
+                title="智能衔接：默认从首页扫描并在衔接已知记录后停止；全量翻页：每次翻完目标全部列表页，彻底不漏重新上架/公开的老视频（已知视频会自动跳过，不重复解析详情）"
+              >
+                追更扫描模式
+              </label>
+              <Select v-model="form.update_scan_mode" :options="UPDATE_SCAN_MODE_OPTIONS" />
             </div>
             <div class="space-y-1.5">
               <label
