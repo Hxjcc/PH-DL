@@ -1145,9 +1145,14 @@ class TaskManager:
                             if it:
                                 self.events.broadcast("item_updated", it)
 
-                            def _on_progress(dl_bytes: int, tot_bytes: int, speed_bps: float) -> None:
+                            def _on_progress(
+                                dl_bytes: int,
+                                tot_bytes: int,
+                                speed_bps: float,
+                                phase: str = "downloading",
+                            ) -> None:
                                 self.events.emit_item_progress(
-                                    job_id, item_id, dl_bytes, tot_bytes, speed_bps, phase="downloading",
+                                    job_id, item_id, dl_bytes, tot_bytes, speed_bps, phase=phase,
                                 )
                                 scheduler.emit_status()
 
@@ -3168,7 +3173,7 @@ class TaskManager:
             if p.is_dir():
                 total = 0
                 for child in p.iterdir():
-                    if child.is_file():
+                    if child.is_file() and child.name != "manifest.json" and not child.name.endswith(".ytdl"):
                         with contextlib.suppress(OSError):
                             total += child.stat().st_size
                 return total

@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Minimal certs & tzdata; copy static rclone and ffmpeg binaries (ffmpeg is used for xHamster HLS remuxing)
+# Minimal certs & tzdata; copy static rclone and ffmpeg/ffprobe binaries (used with yt-dlp for HLS remuxing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tzdata \
@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
 
 WORKDIR /app
 

@@ -539,3 +539,49 @@ test('resolveJobVisual distinguishes xHamster favorites, site-scoped same userna
     'xHamster_Favorites.txt'
   )
 })
+
+test('computeJobLiveMetrics handles HLS remuxing phase without stalling overall job bar at 98%', () => {
+  // Single-video job entering remuxing switches to indeterminate pulsing bar with explicit phase text
+  const singleJob = { id: 100, kind: 'manual_target', status: 'running', total_items: 1, done_items: 0 }
+  const singleItems = [{ id: 501, status: 'downloading', progress_phase: 'remuxing' }]
+  const singleLive = {
+    501: { job_id: 100, item_id: 501, bytes_downloaded: 500_000_000, bytes_total: 500_000_000, speed_bps: 0, phase: 'remuxing' },
+  }
+  const singleMetrics = computeJobLiveMetrics(singleJob, singleLive, singleItems)
+  assert.equal(singleMetrics.downloadingCount, 0)
+  assert.equal(singleMetrics.remuxingCount, 1)
+  assert.equal(singleMetrics.indeterminate, true)
+  assert.equal(singleMetrics.phaseText, '正在封装 MP4 (1 个视频)...')
+
+  // Multi-video job with downloading + remuxing + uploading shows composite phase and determinate progress
+  const multiJob = { id: 101, kind: 'manual_target', status: 'running', total_items: 4, done_items: 1 }
+  const multiItems = [
+    { id: 601, status: 'uploading' },
+    { id: 602, status: 'downloading' },
+    { id: 603, status: 'downloading' },
+    { id: 604, status: 'pending' },
+  ]
+  const multiLive = {
+    601: { job_id: 101, item_id: 601, bytes_downloaded: 50, bytes_total: 100, speed_bps: 80_000_000, phase: 'uploading' },
+    602: { job_id: 101, item_id: 602, bytes_downloaded: 100, bytes_total: 100, speed_bps: 0, phase: 'remuxing' },
+    603: { job_id: 101, item_id: 603, bytes_downloaded: 50, bytes_total: 100, speed_bps: 20_000_000, phase: 'downloading' },
+  }
+  const multiMetrics = computeJobLiveMetrics(multiJob, multiLive, multiItems)
+  assert.equal(multiMetrics.downloadingCount, 1)
+  assert.equal(multiMetrics.remuxingCount, 1)
+  assert.equal(multiMetrics.uploadingCount, 1)
+  assert.equal(multiMetrics.indeterminate, false)
+  assert.equal(multiMetrics.phaseText, '正在并发下载 (1) · 封装 MP4 (1) · 云端上传 (1)')
+  assert.equal(multiMetrics.downloadSpeedBps, 20_000_000)
+  assert.equal(multiMetrics.uploadSpeedBps, 80_000_000)
+
+  // Last remaining item of a multi-video job enters remuxing -> switches to indeterminate remuxing bar
+  const lastRemuxJob = { id: 102, kind: 'manual_target', status: 'running', total_items: 5, done_items: 4 }
+  const lastRemuxLive = {
+    701: { job_id: 102, item_id: 701, bytes_downloaded: 300_000_000, bytes_total: 300_000_000, speed_bps: 0, phase: 'remuxing' },
+  }
+  const lastMetrics = computeJobLiveMetrics(lastRemuxJob, lastRemuxLive, null)
+  assert.equal(lastMetrics.indeterminate, true)
+  assert.equal(lastMetrics.remuxingCount, 1)
+  assert.equal(lastMetrics.phaseText, '正在封装 MP4 (1 个视频)...')
+})

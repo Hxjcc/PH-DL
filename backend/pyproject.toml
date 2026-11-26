@@ -16,6 +16,7 @@ dependencies = [
     "aiohttp>=3.10.0",
     "curl-cffi>=0.7.0",
     "selectolax>=0.3.21",
+    "yt-dlp>=2025.1.15",
 ]
 
 [project.optional-dependencies]

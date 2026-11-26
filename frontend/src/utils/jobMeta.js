@@ -424,6 +424,7 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
   let skipped = Number(job?.skipped_items || 0)
   let failed = Number(job?.failed_items || 0)
   let downloadingCount = 0
+  let remuxingCount = 0
   let uploadingCount = 0
 
   if (Array.isArray(jobItemsList) && jobItemsList.length > 0) {
@@ -439,7 +440,12 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
         iDone += 1
         if (it.status === 'uploading') uploadingCount += 1
       } else if (it.status === 'downloading') {
-        downloadingCount += 1
+        const livePhase = String(liveProgressMap?.[it.id]?.phase || it.progress_phase || 'downloading').toLowerCase()
+        if (livePhase === 'remuxing') {
+          remuxingCount += 1
+        } else {
+          downloadingCount += 1
+        }
       } else if (it.status === 'skipped') {
         iSkipped += 1
       } else if (it.status === 'failed') {
@@ -457,6 +463,7 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
   let uploadSpeedBps = 0
   let fractional = 0
   let liveDlCount = 0
+  let liveRemuxCount = 0
   let liveUpCount = 0
   const jobIdNum = Number(job?.id)
   if (liveProgressMap && jobIdNum > 0) {
@@ -471,6 +478,11 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
         }
         continue
       }
+      if (phase === 'remuxing') {
+        liveRemuxCount += 1
+        fractional += 0.99
+        continue
+      }
       liveDlCount += 1
       if (spd > 0) {
         downloadSpeedBps += spd
@@ -478,11 +490,12 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
       const bDone = Number(prog.bytes_downloaded || 0)
       const bTotal = Number(prog.bytes_total || 0)
       if (bTotal > 0 && bDone > 0) {
-        fractional += Math.min(0.98, Math.max(0, bDone / bTotal))
+        fractional += Math.min(0.99, Math.max(0, bDone / bTotal))
       }
     }
   }
   downloadingCount = Math.max(downloadingCount, liveDlCount)
+  remuxingCount = Math.max(remuxingCount, liveRemuxCount)
   uploadingCount = Math.max(uploadingCount, liveUpCount)
   const speedBps = downloadSpeedBps
 
@@ -494,7 +507,7 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
       : null
   const useScanOverlay =
     Boolean(scanState) &&
-    (job?.status === 'scanning' || (total === 0 && downloadingCount === 0 && uploadingCount === 0))
+    (job?.status === 'scanning' || (total === 0 && downloadingCount === 0 && remuxingCount === 0 && uploadingCount === 0))
 
   let percent = 0
   let hasScanProgress = false
@@ -513,11 +526,26 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
     percent = 100
   }
 
+  const allRemainingRemuxing =
+    isActive &&
+    total > 0 &&
+    remuxingCount > 0 &&
+    downloadingCount === 0 &&
+    finishedCount + remuxingCount >= total
+  const allRemainingUploading =
+    isActive &&
+    total > 0 &&
+    uploadingCount > 0 &&
+    downloadingCount === 0 &&
+    remuxingCount === 0 &&
+    finishedCount >= total
+
   const indeterminate =
     !hasScanProgress && (
       (job?.status === 'scanning' && total === 0) ||
       (useScanOverlay && (scanState.mode === 'pages' || scanState.mode === 'baseline')) ||
-      (isActive && total > 0 && uploadingCount > 0 && downloadingCount === 0 && finishedCount >= total)
+      allRemainingRemuxing ||
+      allRemainingUploading
     )
 
   let phaseText = ''
@@ -555,12 +583,20 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
         total > 0
           ? `正在补全基线元数据 (${finishedCount}/${total})...`
           : '正在解析基线视频元数据...'
-    } else if (downloadingCount > 0 && uploadingCount > 0) {
-      phaseText = `正在并发下载 (${downloadingCount}) · 云端上传 (${uploadingCount})`
-    } else if (downloadingCount > 0) {
-      phaseText = `正在下载 ${downloadingCount} 个视频`
-    } else if (uploadingCount > 0) {
-      phaseText = `正在校验上传 ${uploadingCount} 个视频至云端...`
+    } else if (downloadingCount > 0 || remuxingCount > 0 || uploadingCount > 0) {
+      const parts = []
+      if (downloadingCount > 0) parts.push(`下载 (${downloadingCount})`)
+      if (remuxingCount > 0) parts.push(`封装 MP4 (${remuxingCount})`)
+      if (uploadingCount > 0) parts.push(`云端上传 (${uploadingCount})`)
+      if (parts.length > 1) {
+        phaseText = `正在并发${parts.join(' · ')}`
+      } else if (downloadingCount > 0) {
+        phaseText = `正在下载 ${downloadingCount} 个视频`
+      } else if (remuxingCount > 0) {
+        phaseText = `正在封装 MP4 (${remuxingCount} 个视频)...`
+      } else {
+        phaseText = `正在校验上传 ${uploadingCount} 个视频至云端...`
+      }
     } else {
       phaseText = '正在准备下载队列...'
     }
@@ -579,6 +615,7 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
     downloadSpeedBps,
     uploadSpeedBps,
     downloadingCount,
+    remuxingCount,
     uploadingCount,
     indeterminate,
     phaseText,

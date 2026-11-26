@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -70,10 +71,12 @@ class DownloadDiskBudget:
         self.path = path
         self.keep_free_bytes = max(0, int(keep_free_bytes))
         self._reserved = 0
+        self._lock = threading.Lock()
 
     @property
     def reserved_bytes(self) -> int:
-        return self._reserved
+        with self._lock:
+            return self._reserved
 
     def free_bytes(self) -> int:
         return int(shutil.disk_usage(self.path).free)
@@ -85,42 +88,46 @@ class DownloadDiskBudget:
             return
 
         remaining = max(0, expected_bytes)
-        initial_free = shutil.disk_usage(self.path).free
-        if initial_free < self.keep_free_bytes + self._reserved + remaining:
-            raise _DiskSpaceError("磁盘余量不足，无法为此下载预留空间", required_bytes=remaining)
-        self._reserved += remaining
+        with self._lock:
+            initial_free = shutil.disk_usage(self.path).free
+            if initial_free < self.keep_free_bytes + self._reserved + remaining:
+                raise _DiskSpaceError("磁盘余量不足，无法为此下载预留空间", required_bytes=remaining)
+            self._reserved += remaining
         last_free = initial_free
         written_since_check = 0
         try:
             def before_write(size: int) -> None:
                 nonlocal last_free, written_since_check
-                others = self._reserved - remaining
-                projected_free = last_free - written_since_check - size
-                need_check = (
-                    written_since_check + size >= self._CHECK_INTERVAL_BYTES
-                    or projected_free < self.keep_free_bytes + others + self._STRICT_NEAR_FLOOR_BYTES
-                )
-                if need_check:
-                    last_free = shutil.disk_usage(self.path).free
-                    written_since_check = 0
-                    if last_free < self.keep_free_bytes + others + size:
-                        raise _DiskSpaceError(
-                            "写入会低于磁盘保留空间，已保留下载断点",
-                            required_bytes=max(size, remaining),
-                            during_write=True,
-                        )
-                written_since_check += size
+                with self._lock:
+                    others = self._reserved - remaining
+                    projected_free = last_free - written_since_check - size
+                    need_check = (
+                        written_since_check + size >= self._CHECK_INTERVAL_BYTES
+                        or projected_free < self.keep_free_bytes + others + self._STRICT_NEAR_FLOOR_BYTES
+                    )
+                    if need_check:
+                        last_free = shutil.disk_usage(self.path).free
+                        written_since_check = 0
+                        if last_free < self.keep_free_bytes + others + size:
+                            raise _DiskSpaceError(
+                                "写入会低于磁盘保留空间，已保留下载断点",
+                                required_bytes=max(size, remaining),
+                                during_write=True,
+                            )
+                    written_since_check += size
 
             def consume(size: int) -> None:
                 nonlocal remaining
                 before_write(size)
-                used = min(size, remaining)
-                remaining -= used
-                self._reserved -= used
+                with self._lock:
+                    used = min(size, remaining)
+                    remaining -= used
+                    self._reserved -= used
 
             yield consume
         finally:
-            self._reserved -= remaining
+            with self._lock:
+                self._reserved -= remaining
 
 
 @dataclass(frozen=True)

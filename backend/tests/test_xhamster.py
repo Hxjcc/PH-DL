@@ -384,61 +384,70 @@ def test_parse_hls_media_playlist_ts_and_fmp4():
     assert pl_av1.segment_urls == ("https://video-nss.xhcdn.com/a/2160p.av1.mp4/seg-1-v1-a1.m4s",)
 
 
-async def test_download_hls_to_mp4_resumes_completed_segments_and_remuxes(tmp_path: Path, monkeypatch):
-    playlist_url = "https://video-nss.xhcdn.com/tok/2160p.av1.mp4.m3u8"
-    playlist_body = (
-        "#EXTM3U\n#EXT-X-VERSION:6\n"
-        '#EXT-X-MAP:URI="init.mp4"\n'
-        "#EXTINF:4.000,\nseg1.m4s\n"
-        "#EXTINF:4.000,\nseg2.m4s\n"
+async def test_download_hls_to_mp4_ytdlp_cancel_resume_remux_and_403_refresh(tmp_path: Path, monkeypatch):
+    import http.server
+    import socketserver
+    import threading
+    import time
+
+    from app.parsers.video import VideoDetail
+    from app.services.downloader import DownloadDiskBudget
+
+    # Build deterministic valid MPEG-TS packets (188-byte sync 0x47 frames) & fMP4 bytes
+    ts_packet = bytes([0x47]) + bytes(187)
+    ts_seg_bytes = ts_packet * 16  # 3008 bytes per segment, passes _looks_like_ts
+    fmp4_init = mp4_payload(b"init")[:64]
+    fmp4_seg = b"moof" + bytes(2044)
+
+    srv_dir = tmp_path / "hls_srv"
+    srv_dir.mkdir()
+    for idx in range(4):
+        (srv_dir / f"seg{idx}.ts").write_bytes(ts_seg_bytes)
+    ts_playlist = (
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n"
+        + "".join(f"#EXTINF:4.000,\nseg{idx}.ts\n" for idx in range(4))
+        + "#EXT-X-ENDLIST\n"
     )
-    fetched_urls: List[str] = []
+    (srv_dir / "v1.m3u8").write_text(ts_playlist, encoding="utf-8")
+    (srv_dir / "v2.m3u8").write_text(ts_playlist, encoding="utf-8")
 
-    class FakeResp:
-        def __init__(self, url: str, data: bytes, status: int = 200):
-            self.url = url
-            self._data = data
-            self.status = status
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        def raise_for_status(self):
-            if self.status >= 400:
-                raise RuntimeError(f"HTTP {self.status}")
-
-        async def text(self, errors: str = "replace"):
-            return self._data.decode("utf-8", errors=errors)
-
-        async def read(self):
-            return self._data
-
-    class FakeSession:
-        def get(self, url: str, **kwargs):
-            fetched_urls.append(url)
-            if url.endswith(".m3u8"):
-                return FakeResp(url, playlist_body.encode())
-            if url.endswith("init.mp4"):
-                return FakeResp(url, b"INITDATA")
-            if url.endswith("seg1.m4s"):
-                return FakeResp(url, b"SEG1DATA")
-            if url.endswith("seg2.m4s"):
-                return FakeResp(url, b"SEG2DATA")
-            return FakeResp(url, b"", status=404)
-
-    dl_dir = tmp_path / "downloads" / "xHamster" / "creator1"
-    tmp_dir = tmp_path / "temp" / "xHamster" / "creator1"
-    hls_dir = tmp_dir / "Demo Clip [xhOwQIZ].hls"
-    hls_dir.mkdir(parents=True)
-    # Pre-seed manifest + seg_00000 to verify segment-level resume skips already completed segments!
-    (hls_dir / "manifest.json").write_text(
-        json.dumps({"viewkey": "xhOwQIZ", "quality": "2160", "segment_count": 2, "is_fmp4": True}),
+    (srv_dir / "init.mp4").write_bytes(fmp4_init)
+    (srv_dir / "av1_0.m4s").write_bytes(fmp4_seg)
+    (srv_dir / "av1.m3u8").write_text(
+        '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI="init.mp4"\n'
+        "#EXTINF:4.000,\nav1_0.m4s\n#EXT-X-ENDLIST\n",
         encoding="utf-8",
     )
-    (hls_dir / "seg_00000.bin").write_bytes(b"SEG1DATA")
+
+    hits: List[str] = []
+    loop = asyncio.get_running_loop()
+    state: Dict[str, Any] = {"fail_403_v1_seg2": False, "cancel_on_seg2": None}
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(srv_dir), **kw)
+
+        def do_GET(self):
+            hits.append(self.path)
+            if state["fail_403_v1_seg2"] and self.path == "/seg2.ts":
+                self.send_error(403, "Expired signed URL")
+                return
+            if state["cancel_on_seg2"] is not None and self.path == "/seg2.ts":
+                ev = state["cancel_on_seg2"]
+                loop.call_soon_threadsafe(ev.set)
+                time.sleep(0.08)
+            return super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+
+    httpd = ThreadedServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    srv_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    srv_thread.start()
 
     monkeypatch.setattr(hls_mod.shutil, "which", lambda name: "/usr/local/bin/ffmpeg")
     remux_calls: List[List[str]] = []
@@ -451,30 +460,175 @@ async def test_download_hls_to_mp4_resumes_completed_segments_and_remuxes(tmp_pa
 
     monkeypatch.setattr(hls_mod, "_run_ffmpeg", fake_run_ffmpeg)
 
-    ctx = TaskHttpContext(concurrency=1)
-    outcome = await hls_mod.download_hls_to_mp4(
-        session=FakeSession(),
-        parse_ctx=ctx,
-        selectors=SelectorSettings(),
-        viewkey="xhOwQIZ",
-        title="Demo Clip",
-        playlist_url=playlist_url,
-        page_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
-        referer_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
-        quality="2160p",
-        download_dir=dl_dir,
-        temp_dir=tmp_dir,
-        min_file_size_bytes=16,
-    )
+    try:
+        dl_dir = tmp_path / "downloads" / "xHamster" / "creator1"
+        tmp_dir = tmp_path / "temp" / "xHamster" / "creator1"
+        hls_dir = tmp_dir / "Demo Clip [xhOwQIZ].hls"
+        ctx = TaskHttpContext(concurrency=1)
 
-    assert outcome.success is True
-    assert outcome.local_path is not None and outcome.local_path.is_file()
-    assert not hls_dir.exists()  # cleaned up after remux
-    assert "https://video-nss.xhcdn.com/tok/seg1.m4s" not in fetched_urls  # resumed!
-    assert "https://video-nss.xhcdn.com/tok/init.mp4" in fetched_urls
-    assert "https://video-nss.xhcdn.com/tok/seg2.m4s" in fetched_urls
-    assert len(remux_calls) == 1
-    assert "-movflags" in remux_calls[0] and "+faststart" in remux_calls[0]
+        # 1. Cancel mid-download via cancel_event on seg2 -> preserves .hls dir with yt-dlp manifest & .ytdl
+        cancel_ev = asyncio.Event()
+        state["cancel_on_seg2"] = cancel_ev
+        phases_run1: List[str] = []
+
+        cancelled = await hls_mod.download_hls_to_mp4(
+            session=None,  # type: ignore[arg-type]
+            parse_ctx=ctx,
+            selectors=SelectorSettings(),
+            viewkey="xhOwQIZ",
+            title="Demo Clip",
+            playlist_url=f"http://127.0.0.1:{port}/v1.m3u8",
+            page_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
+            referer_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
+            quality="2160p",
+            download_dir=dl_dir,
+            temp_dir=tmp_dir,
+            segment_concurrency=1,
+            min_file_size_bytes=16,
+            cancel_event=cancel_ev,
+            on_progress=lambda dl, tot, spd, phase="downloading": phases_run1.append(phase),
+        )
+        assert cancelled.cancelled is True
+        assert cancelled.success is False
+        assert cancelled.temp_path == hls_dir
+        assert hls_dir.is_dir()
+        manifest = json.loads((hls_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["engine"] == "yt-dlp" and manifest["viewkey"] == "xhOwQIZ"
+        assert (hls_dir / "stream.mp4.ytdl").is_file()
+
+        # 2. Resume against refreshed URL (v2.m3u8) -> skips seg0.ts & seg1.ts, emits downloading & remuxing phases, TS remuxes
+        hits.clear()
+        state["cancel_on_seg2"] = None
+        phases_run2: List[str] = []
+        outcome = await hls_mod.download_hls_to_mp4(
+            session=None,  # type: ignore[arg-type]
+            parse_ctx=ctx,
+            selectors=SelectorSettings(),
+            viewkey="xhOwQIZ",
+            title="Demo Clip",
+            playlist_url=f"http://127.0.0.1:{port}/v2.m3u8",
+            page_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
+            referer_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
+            quality="2160p",
+            download_dir=dl_dir,
+            temp_dir=tmp_dir,
+            partial_path=hls_dir,
+            segment_concurrency=2,
+            min_file_size_bytes=16,
+            on_progress=lambda dl, tot, spd, phase="downloading": phases_run2.append(phase),
+        )
+        assert outcome.success is True
+        assert outcome.local_path is not None and outcome.local_path.is_file()
+        assert not hls_dir.exists()
+        assert "/seg0.ts" not in hits  # resumed past already appended first fragment!
+        assert "remuxing" in phases_run2
+        assert len(remux_calls) == 1
+        assert "-bsf:a" in remux_calls[0] and "aac_adtstoasc" in remux_calls[0]
+        assert "-movflags" in remux_calls[0] and "+faststart" in remux_calls[0]
+
+        # 3. HTTP 403 on expired URL refreshes playlist URL and recovers seamlessly
+        hits.clear()
+        remux_calls.clear()
+        state["fail_403_v1_seg2"] = True
+        refresh_calls = 0
+
+        async def fake_fetch_single(*args, **kwargs):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            state["fail_403_v1_seg2"] = False
+            return VideoDetail(
+                viewkey="xh403ok",
+                title="Refresh Clip",
+                page_url="https://xhamster.com/videos/refresh-clip-xh403ok",
+                referer_url="https://xhamster.com/videos/refresh-clip-xh403ok",
+                download_url=f"http://127.0.0.1:{port}/v2.m3u8",
+                quality="1080p",
+                video_format="hls",
+            )
+
+        monkeypatch.setattr(hls_mod, "fetch_single_video_detail", fake_fetch_single)
+        outcome_403 = await hls_mod.download_hls_to_mp4(
+            session=None,  # type: ignore[arg-type]
+            parse_ctx=ctx,
+            selectors=SelectorSettings(),
+            viewkey="xh403ok",
+            title="Refresh Clip",
+            playlist_url=f"http://127.0.0.1:{port}/v1.m3u8",
+            page_url="https://xhamster.com/videos/refresh-clip-xh403ok",
+            referer_url="https://xhamster.com/videos/refresh-clip-xh403ok",
+            quality="1080p",
+            download_dir=dl_dir,
+            temp_dir=tmp_dir,
+            max_attempts=2,
+            segment_concurrency=2,
+            retry_delay_base=0.0,
+            retry_delay_max=0.0,
+            min_file_size_bytes=16,
+        )
+        assert outcome_403.success is True
+        assert refresh_calls == 1
+        assert outcome_403.download_url.endswith("/v2.m3u8")
+
+        # 4. fMP4/AV1 stream remuxes with +faststart without aac_adtstoasc, and low disk pauses before remux without losing stream.mp4
+        remux_calls.clear()
+        orig_disk_usage = hls_mod.shutil.disk_usage
+        from app.services import downloader as dl_mod
+
+        fake_free = [500]  # too small for remux reservation when keep_free_bytes=400 and raw_size ~2100
+        monkeypatch.setattr(dl_mod.shutil, "disk_usage", lambda _p: SimpleNamespace(free=fake_free[0]))
+        budget = DownloadDiskBudget(tmp_dir, keep_free_bytes=400)
+        # Allow download (keep_free checked at 4MB or near 64MB -> let's test pre-remux reservation directly by
+        # keeping free > 400 + 2100 during download, then tightening right before remux, OR simply pre-seeding stream.mp4!)
+        fmp4_hls_dir = tmp_dir / "AV1 Clip [xhAv100].hls"
+        fmp4_hls_dir.mkdir(parents=True)
+        (fmp4_hls_dir / "manifest.json").write_text(
+            json.dumps({"engine": "yt-dlp", "version": 2, "viewkey": "xhAv100", "quality": "2160"}),
+            encoding="utf-8",
+        )
+        (fmp4_hls_dir / "stream.mp4").write_bytes(fmp4_init + fmp4_seg)
+        paused = await hls_mod.download_hls_to_mp4(
+            session=None,  # type: ignore[arg-type]
+            parse_ctx=ctx,
+            selectors=SelectorSettings(),
+            viewkey="xhAv100",
+            title="AV1 Clip",
+            playlist_url=f"http://127.0.0.1:{port}/av1.m3u8",
+            page_url="https://xhamster.com/videos/av1-clip-xhAv100",
+            referer_url="https://xhamster.com/videos/av1-clip-xhAv100",
+            quality="2160p",
+            download_dir=dl_dir,
+            temp_dir=tmp_dir,
+            disk_budget=budget,
+            min_file_size_bytes=16,
+        )
+        assert paused.success is False
+        assert paused.disk_wait_bytes == len(fmp4_init + fmp4_seg)
+        assert (fmp4_hls_dir / "stream.mp4").is_file()
+
+        # Once space is freed, retry skips re-downloading av1.m3u8 and remuxes fMP4 cleanly!
+        hits.clear()
+        monkeypatch.setattr(dl_mod.shutil, "disk_usage", orig_disk_usage)
+        finished_av1 = await hls_mod.download_hls_to_mp4(
+            session=None,  # type: ignore[arg-type]
+            parse_ctx=ctx,
+            selectors=SelectorSettings(),
+            viewkey="xhAv100",
+            title="AV1 Clip",
+            playlist_url=f"http://127.0.0.1:{port}/av1.m3u8",
+            page_url="https://xhamster.com/videos/av1-clip-xhAv100",
+            referer_url="https://xhamster.com/videos/av1-clip-xhAv100",
+            quality="2160p",
+            download_dir=dl_dir,
+            temp_dir=tmp_dir,
+            min_file_size_bytes=16,
+        )
+        assert finished_av1.success is True
+        assert hits == []  # did NOT re-download a single byte!
+        assert len(remux_calls) == 1
+        assert "-bsf:a" not in remux_calls[0]
+        assert "-movflags" in remux_calls[0] and "+faststart" in remux_calls[0]
+    finally:
+        httpd.shutdown()
 
 
 # ---------------------------------------------------------------------------

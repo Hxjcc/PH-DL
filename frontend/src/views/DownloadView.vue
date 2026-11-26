@@ -1354,6 +1354,12 @@ async function handleClearTemp() {
                     >
                       {{ formatSpeed(entry.metrics.speedBps) }}
                     </span>
+                    <span
+                      v-else-if="entry.isActive && entry.metrics.remuxingCount > 0"
+                      class="ml-auto font-medium text-violet-600 dark:text-violet-400"
+                    >
+                      封装 MP4
+                    </span>
                     <span v-else class="ml-auto">{{ formatDateTime(entry.job.created_at) }}</span>
                   </div>
                 </div>

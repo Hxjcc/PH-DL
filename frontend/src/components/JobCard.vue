@@ -245,12 +245,12 @@ const transferProgressMap = computed(() => {
       ? Number(live.bytes_total)
       : Number(item.bytes_total || 0)
     const speed = live ? Number(live.speed_bps || 0) : 0
-    const pct = phase === 'verifying'
+    const pct = phase === 'verifying' || phase === 'remuxing'
       ? 100
       : total > 0
-        ? Math.min(100, Math.round((done / total) * 1000) / 10)
+        ? Math.min(isUploading ? 100 : 99.9, Math.round((done / total) * 1000) / 10)
         : 0
-    const hasProgress = phase === 'verifying' || done > 0 || speed > 0
+    const hasProgress = phase === 'verifying' || phase === 'remuxing' || done > 0 || speed > 0
     map[item.id] = {
       phase,
       doneText: formatBytes(done),
@@ -941,7 +941,18 @@ function downloadExportTxt() {
                   </span>
 
                   <template v-if="item.status === 'downloading'">
-                    <template v-if="!transferProgressMap[item.id]?.hasProgress && !transferProgressMap[item.id]?.totalText">
+                    <template v-if="transferProgressMap[item.id]?.phase === 'remuxing'">
+                      <span
+                        v-if="transferProgressMap[item.id]?.totalText || transferProgressMap[item.id]?.doneText"
+                        class="text-muted-foreground font-mono text-[10px] sm:text-[11px]"
+                      >
+                        {{ transferProgressMap[item.id].totalText || transferProgressMap[item.id].doneText }}
+                      </span>
+                      <span class="rounded-full bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-600 dark:text-violet-400">
+                        封装 MP4
+                      </span>
+                    </template>
+                    <template v-else-if="!transferProgressMap[item.id]?.hasProgress && !transferProgressMap[item.id]?.totalText">
                       <span class="text-muted-foreground text-[11px]">等待响应...</span>
                     </template>
                     <template v-else>
@@ -1032,7 +1043,11 @@ function downloadExportTxt() {
                 class="relative h-1 w-full overflow-hidden rounded-full bg-secondary"
               >
                 <div
-                  v-if="item.status === 'uploading' && !transferProgressMap[item.id]?.hasProgress"
+                  v-if="item.status === 'downloading' && transferProgressMap[item.id]?.phase === 'remuxing'"
+                  class="h-full w-full bg-violet-500/75 animate-pulse"
+                />
+                <div
+                  v-else-if="item.status === 'uploading' && !transferProgressMap[item.id]?.hasProgress"
                   class="h-full w-full bg-primary/80 animate-pulse"
                 />
                 <div
