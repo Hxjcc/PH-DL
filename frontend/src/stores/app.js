@@ -232,6 +232,7 @@ function schedulePersistSessionCache(store) {
         subscriptionsCache: store.subscriptionsCache,
         subscriptionsLastSource: store.subscriptionsLastSource,
         settingsCache: store.settingsCache,
+        rcloneRemotesCache: store.rcloneRemotesCache,
         historyCache: store.historyCache,
         jobItems: compactJobItems,
         logs: store.logsLoaded ? store.logs.slice(-200) : null,
@@ -305,6 +306,8 @@ export const useAppStore = defineStore('app', {
       targetsLoadedAt: 0,
       settingsCache: hasCache && cached.settingsCache ? cached.settingsCache : null,
       settingsLoadedAt: 0,
+      rcloneRemotesCache:
+        hasCache && Array.isArray(cached.rcloneRemotesCache) ? cached.rcloneRemotesCache : null,
       historyCache: hasCache && cached.historyCache ? cached.historyCache : null,
       historyLoadedAt: 0,
       historyPageSize: readListPreference('history', HISTORY_PAGE_SIZES),
@@ -523,6 +526,7 @@ export const useAppStore = defineStore('app', {
       this.targetsLoadedAt = 0
       this.settingsCache = null
       this.settingsLoadedAt = 0
+      this.rcloneRemotesCache = null
       this.historyCache = null
       this.historyLoadedAt = 0
       this.jobItems = {}
@@ -836,6 +840,39 @@ export const useAppStore = defineStore('app', {
       })
     },
 
+    setRcloneRemotesCache(remotes) {
+      this.rcloneRemotesCache = Array.isArray(remotes) ? remotes : []
+      this.persistCache()
+    },
+
+    async refreshRcloneRemotes() {
+      if (!this.authenticated) return []
+      return runRequest('rclone_remotes', async ({ isLatest }) => {
+        const res = await api.listRcloneRemotes()
+        const remotes = Array.isArray(res?.remotes) ? res.remotes : []
+        if (isLatest()) {
+          this.setRcloneRemotesCache(remotes)
+        }
+        return remotes
+      })
+    },
+
+    ensureRcloneRemotes() {
+      if (!this.authenticated) return Promise.resolve()
+      return ensureRequest(
+        'rclone_remotes',
+        () => this.rcloneRemotesCache !== null,
+        async ({ isLatest }) => {
+          try {
+            const res = await api.listRcloneRemotes()
+            if (isLatest()) {
+              this.setRcloneRemotesCache(Array.isArray(res?.remotes) ? res.remotes : [])
+            }
+          } catch {}
+        }
+      )
+    },
+
     setHistoryCache(data) {
       if (!data) return
       const pageSize = Number(data.page_size || this.historyPageSize)
@@ -932,7 +969,7 @@ export const useAppStore = defineStore('app', {
       } else if (routeName === 'logs') {
         tasks.push(this.ensureLogs())
       } else if (routeName === 'settings') {
-        tasks.push(this.ensureSettings())
+        tasks.push(this.ensureSettings(), this.ensureRcloneRemotes())
       }
       await Promise.all(tasks)
 
@@ -953,6 +990,7 @@ export const useAppStore = defineStore('app', {
         this.ensureTempFiles(),
         this.ensureTargets(),
         this.ensureSettings(),
+        this.ensureRcloneRemotes(),
         this.ensureHistory(),
         this.ensureLogs(),
       ])

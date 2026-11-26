@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onActivated, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   Save,
   Cookie,
@@ -15,7 +16,6 @@ import {
   Code2,
   RotateCcw,
   ShieldCheck,
-  ChevronDown,
   Camera,
   UserRound,
   Trash2,
@@ -159,8 +159,16 @@ async function waitForLoginResult(fetchStatus) {
   throw new Error('等待登录结果超时，请稍后点击「检测有效性」查看 Cookie 是否已更新')
 }
 
+const VALID_SETTINGS_TABS = new Set(['cookie', 'download', 'rclone', 'notify', 'selectors'])
+function resolveSettingsTab(raw) {
+  const val = Array.isArray(raw) ? raw[0] : raw
+  return VALID_SETTINGS_TABS.has(val) ? val : 'cookie'
+}
+
+const route = useRoute()
+const router = useRouter()
 const store = useAppStore()
-const activeTab = ref('cookie')
+const activeTab = ref(resolveSettingsTab(route.query.tab))
 const loading = ref(!store.settingsCache)
 const saving = ref(false)
 const busyTool = ref('')
@@ -197,7 +205,7 @@ const currentYescaptchaTaskType = computed({
 let authModesSynced = Boolean(store.settingsCache)
 const avatarInputRef = ref(null)
 const avatarLoadError = ref(false)
-const rcloneRemotes = ref([])
+const rcloneRemotes = computed(() => store.rcloneRemotesCache || [])
 const loadingRemotes = ref(false)
 
 watch(
@@ -206,9 +214,7 @@ watch(
     avatarLoadError.value = false
   }
 )
-const remotesLoadedOnce = ref(false)
 const providerTab = ref('pikpak')
-const showRcloneAdvanced = ref(false)
 
 const REMOTE_TYPE_LABELS = {
   pikpak: 'PikPak',
@@ -249,12 +255,14 @@ function syncProviderTabFromType(rtype) {
 }
 
 async function loadRcloneRemotes({ force = false } = {}) {
-  if (loadingRemotes.value || (remotesLoadedOnce.value && !force)) return
+  if (loadingRemotes.value || (store.rcloneRemotesCache !== null && !force)) return
   loadingRemotes.value = true
   try {
-    const res = await api.listRcloneRemotes()
-    rcloneRemotes.value = Array.isArray(res?.remotes) ? res.remotes : []
-    remotesLoadedOnce.value = true
+    if (force) {
+      await store.refreshRcloneRemotes()
+    } else {
+      await store.ensureRcloneRemotes()
+    }
     syncProviderTabFromType(activeRemoteType.value)
   } catch {
     // Keep manual remote input usable if rclone binary is not present locally
@@ -326,10 +334,35 @@ function selectRcloneRemote(remote) {
 }
 
 watch(activeTab, (tab) => {
-  if (tab === 'rclone') {
+  const nextTab = resolveSettingsTab(tab)
+  if (route.name === 'settings') {
+    const curQueryTab = resolveSettingsTab(route.query.tab)
+    if (nextTab !== curQueryTab || (nextTab === 'cookie' && route.query.tab !== undefined)) {
+      const nextQuery = { ...route.query }
+      if (nextTab === 'cookie') delete nextQuery.tab
+      else nextQuery.tab = nextTab
+      router.replace({ query: nextQuery })
+    }
+  }
+  if (nextTab === 'rclone') {
     loadRcloneRemotes()
   }
 })
+
+watch(
+  () => [route.name, route.query.tab],
+  ([name, tab]) => {
+    if (name !== 'settings') return
+    const resolved = resolveSettingsTab(tab)
+    if (resolved !== activeTab.value) {
+      activeTab.value = resolved
+    }
+  }
+)
+
+if (activeTab.value === 'rclone' && store.rcloneRemotesCache === null) {
+  loadRcloneRemotes()
+}
 
 watch(activeRemoteType, (rtype) => {
   syncProviderTabFromType(rtype)
@@ -1203,48 +1236,23 @@ async function handleTestNotify() {
             </p>
           </div>
 
-          <!-- Switches + Collapsible Advanced (bin / log level) -->
-          <div class="flex flex-wrap items-center justify-between gap-3 pt-0.5">
-            <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
-              <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
-                <Switch v-model="form.rclone_ignore_checksum" />
-                <span>跳过 rclone 校验和检查</span>
-              </label>
-              <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
-                <Switch v-model="form.rclone_ignore_size" />
-                <span>跳过 rclone 大小检查</span>
-              </label>
-              <label
-                class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer"
-                title="部分网盘（如 PikPak）不返回 MD5；开启后会在上传完成时重新从网盘下载整部视频做逐字节校验，耗时翻倍，通常应保持关闭"
-              >
-                <Switch v-model="form.rclone_verify_download" />
-                <span>无校验和时回下比对</span>
-              </label>
-            </div>
-
-            <button
-              type="button"
-              class="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none"
-              @click="showRcloneAdvanced = !showRcloneAdvanced"
+          <!-- Switches -->
+          <div class="flex flex-wrap items-center gap-x-5 gap-y-2 pt-0.5">
+            <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
+              <Switch v-model="form.rclone_ignore_checksum" />
+              <span>跳过 rclone 校验和检查</span>
+            </label>
+            <label class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer">
+              <Switch v-model="form.rclone_ignore_size" />
+              <span>跳过 rclone 大小检查</span>
+            </label>
+            <label
+              class="inline-flex items-center gap-2 text-xs text-foreground/85 cursor-pointer"
+              title="部分网盘（如 PikPak）不返回 MD5；开启后会在上传完成时重新从网盘下载整部视频做逐字节校验，耗时翻倍，通常应保持关闭"
             >
-              <span>高级（命令路径 / 日志）</span>
-              <ChevronDown :class="['w-3.5 h-3.5 transition-transform duration-200', showRcloneAdvanced ? 'rotate-180' : '']" />
-            </button>
-          </div>
-
-          <div
-            v-if="showRcloneAdvanced"
-            class="grid grid-cols-1 sm:grid-cols-2 gap-3.5 rounded-xl border border-border/75 bg-surface-subtle/50 p-3.5"
-          >
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">rclone 命令路径</label>
-              <Input v-model="form.rclone_bin" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">rclone 日志级别</label>
-              <Input v-model="form.rclone_log_level" placeholder="ERROR" />
-            </div>
+              <Switch v-model="form.rclone_verify_download" />
+              <span>无校验和时回下比对</span>
+            </label>
           </div>
 
           <!-- Section 2: Provider-Specific Tuning (Compact Single-Row Cards) -->
