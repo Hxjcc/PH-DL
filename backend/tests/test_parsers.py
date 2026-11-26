@@ -220,6 +220,187 @@ def test_list_page_extraction_chrome_fallback_and_dedup():
     assert [x[0] for x in bare_res] == ["dup1", "uni2"]
 
 
+def _header_dropdown_html() -> str:
+    """PornHub's global top-nav dropdown menus rendered on every page (4 unrelated videos)."""
+    return """
+    <header id="header">
+      <div id="headerMenuContainer">
+        <ul id="headerMainMenu">
+          <li id="menuItem2" class="menu item-2 videos">
+            <div class="wideDropdown videos js-dropdown">
+              <div id="dropdownHeaderSubMenu" class="headerSubMenu">
+                <div class="innerHeaderSubMenu langTextSubMenu">
+                  <ul id="hottestMenuSection" class="dropdownHottestVideos videos">
+                    <li class="pcVideoListItem videoBox" data-video-vkey="hdrhot1">
+                      <a href="/view_video.php?viewkey=hdrhot1" title="Header Hot 1"></a>
+                    </li>
+                    <li class="pcVideoListItem videoBox" data-video-vkey="hdrhot2">
+                      <a href="/view_video.php?viewkey=hdrhot2" title="Header Hot 2"></a>
+                    </li>
+                  </ul>
+                  <ul id="recommMenuSection" class="dropdownReccomendedVideos videos">
+                    <li class="pcVideoListItem videoBox" data-video-vkey="hdrrec1">
+                      <a href="/view_video.php?viewkey=hdrrec1" title="Header Rec 1"></a>
+                    </li>
+                    <li class="pcVideoListItem videoBox" data-video-vkey="hdrrec2">
+                      <a href="/view_video.php?viewkey=hdrrec2" title="Header Rec 2"></a>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </li>
+        </ul>
+      </div>
+    </header>
+    """
+
+
+def test_empty_model_profile_ignores_header_dropdown_and_recommended_videos():
+    selectors = SelectorSettings()
+    # Mirrors live https://www.pornhub.com/model/kagome/videos (0 uploads, 4 header dropdown videos)
+    empty_model_html = f"""
+    <html><body>
+      {_header_dropdown_html()}
+      <div class="container amateur-videos-page">
+        <div id="profileContent" class="claimed profileVideos">
+          <div class="profileContentLeft">
+            <section id="videosTab" class="clear-both">
+              <div class="sectionWrapper">
+                <div class="profileVids">
+                  <div class="nf-wrapper"></div>
+                  <div class="emptyBoxWrapper">
+                    <span class="emptyIcon video"></span>
+                    <p>There are no videos...</p>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+        <div class="recommendedVideos">
+          <ul class="videos">
+            <li class="videoBox" data-video-vkey="recbottom1">
+              <a href="/view_video.php?viewkey=recbottom1" title="Recommended Bottom"></a>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </body></html>
+    """
+    assert extract_video_links_from_list_page(empty_model_html, selectors, target_type="model") == []
+    assert extract_video_links_from_list_page(empty_model_html, selectors, target_type="pornstar") == []
+    assert extract_video_links_from_list_page(empty_model_html, selectors, target_type=None) == []
+
+    # Even without div.profileVids or emptyBoxWrapper (e.g. empty favorites/liked), header/rec videos are never scraped.
+    empty_liked_html = f"""
+    <html><body>
+      {_header_dropdown_html()}
+      <ul id="likedVideosSection" class="videos"></ul>
+      <div class="promo"><li data-video-vkey="stray1"><a href="/view_video.php?viewkey=stray1" title="Stray"></a></li></div>
+    </body></html>
+    """
+    assert extract_video_links_from_list_page(empty_liked_html, selectors, target_type="liked") == []
+
+    header_only_html = f"<html><body>{_header_dropdown_html()}</body></html>"
+    assert extract_video_links_from_list_page(header_only_html, selectors, target_type="favorites") == []
+
+    # Populated model page with header dropdowns extracts ONLY the model's real videos.
+    populated_model_html = f"""
+    <html><body>
+      {_header_dropdown_html()}
+      <div id="profileContent" class="claimed profileVideos">
+        <div class="profileVids">
+          <div class="videoUList">
+            <ul id="mostRecentVideosSection" class="full-row-thumbs videos row-5-thumbs">
+              <li class="pcVideoListItem videoBox" data-video-vkey="realvk1">
+                <a href="/view_video.php?viewkey=realvk1" title="Real Upload 1"></a>
+              </li>
+              <li class="pcVideoListItem videoBox" data-video-vkey="realvk2">
+                <a href="/view_video.php?viewkey=realvk2" title="Real Upload 2"></a>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </body></html>
+    """
+    assert [x[0] for x in extract_video_links_from_list_page(populated_model_html, selectors, target_type="model")] == [
+        "realvk1",
+        "realvk2",
+    ]
+
+
+async def test_list_scanner_rejects_off_target_redirect_and_allows_creator_promotion(monkeypatch):
+    selectors = SelectorSettings()
+    ctx = TaskHttpContext()
+    errors: list[str] = []
+    profile_calls: list[tuple[str, str]] = []
+    requested: list[str] = []
+
+    async def fake_redirect_to_directory(url, **kwargs):
+        requested.append(url)
+        # Deleted/non-existent model redirects to /pornstars with HTTP 200
+        html = f"""
+        <html><body>
+          {_header_dropdown_html()}
+          <img id="getAvatar" alt="Wrong Person" src="https://cdn.example/wrong.jpg" />
+          <ul class="videos"><li data-video-vkey="dirvk1"><a href="/view_video.php?viewkey=dirvk1" title="Dir"></a></li></ul>
+        </body></html>
+        """
+        return PowFetchResult(html, "https://www.pornhub.com/pornstars", 200, 0, False), None
+
+    async def on_profile(av: str, dn: str):
+        profile_calls.append((av, dn))
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fake_redirect_to_directory)
+    listed = await scan_list_pages(
+        ctx,
+        "https://www.pornhub.com/model/ghost-user/videos",
+        selectors,
+        target_type="model",
+        delay_min=0.0,
+        delay_max=0.0,
+        on_profile=on_profile,
+        on_error=errors.append,
+    )
+    assert listed == []
+    assert len(requested) == 1
+    assert profile_calls == []
+    assert len(errors) == 1 and "/pornstars" in errors[0]
+
+    # Valid model -> pornstar promotion redirect must still scan normally,
+    # and an off-target redirect on page 2 ends natural pagination without error.
+    promo_errors: list[str] = []
+
+    async def fake_promoted_creator(url, **kwargs):
+        if "page=2" in url:
+            return PowFetchResult(_header_dropdown_html(), "https://www.pornhub.com/pornstars", 200, 0, False), None
+        html = (
+            f"{_header_dropdown_html()}"
+            '<div class="profileVids"><ul id="moreData" class="videos">'
+            '<li class="videoBox" data-video-vkey="promovk1">'
+            '<a href="/view_video.php?viewkey=promovk1" title="Promoted"></a></li></ul></div>'
+        )
+        return (
+            PowFetchResult(html, "https://www.pornhub.com/pornstar/alice/videos/upload", 200, 0, False),
+            None,
+        )
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fake_promoted_creator)
+    promoted = await scan_list_pages(
+        ctx,
+        "https://www.pornhub.com/model/alice/videos",
+        selectors,
+        target_type="model",
+        delay_min=0.0,
+        delay_max=0.0,
+        on_error=promo_errors.append,
+    )
+    assert [v.viewkey for v in promoted] == ["promovk1"]
+    assert promo_errors == []
+
+
 def test_extract_target_avatar_prefers_profile_image_and_skips_default():
     html = """
     <div class="nav"><img class="smallAvatar" src="https://ei.phncdn.com/pics/users/default/pornhub/male.jpg" alt="Avatar"></div>

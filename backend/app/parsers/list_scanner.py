@@ -22,6 +22,133 @@ PH_BASE_URL = "https://www.pornhub.com"
 _MAX_SCOPE = 10_000
 _OFFLOAD_HTML_THRESHOLD = 32_768
 
+_EXCLUDED_ANCESTOR_TAGS = frozenset({"header", "nav", "footer", "aside"})
+_EXCLUDED_ANCESTOR_IDS = frozenset(
+    {
+        "header",
+        "headermenucontainer",
+        "headermainmenu",
+        "headermainmenuinner",
+        "dropdownheadersubmenu",
+        "hottestmenusection",
+        "recommmenusection",
+        "recommendedvideos",
+        "relatedvideos",
+        "footer",
+        "sidebar",
+    }
+)
+_EXCLUDED_ANCESTOR_CLASSES = frozenset(
+    {
+        "headerwrapper",
+        "headersubmenu",
+        "innerheadersubmenu",
+        "widedropdown",
+        "dropdownhottestvideos",
+        "dropdownreccomendedvideos",
+        "dropdownrecommendedvideos",
+        "underplayerthumbs",
+        "relatedvideos",
+        "recommendedvideos",
+    }
+)
+_EMPTY_LIST_STATE_SELECTORS = (
+    "div.emptyBoxWrapper",
+    ".emptyBoxWrapper",
+    ".noVideos",
+    ".emptyState",
+)
+_BUILTIN_MAIN_CONTAINERS = (
+    "ul#mostRecentVideosSection",
+    "ul#showAllChanelVideos",
+)
+
+
+def _is_non_content_video_node(node) -> bool:
+    """Return True if *node* lives inside site chrome/menus/recommendations rather than list content."""
+    cur = node
+    depth = 0
+    while cur is not None and depth < 32:
+        depth += 1
+        tag = (getattr(cur, "tag", None) or "").lower()
+        if tag in _EXCLUDED_ANCESTOR_TAGS:
+            return True
+        if tag in {"body", "html", "-root"}:
+            break
+        attrs = getattr(cur, "attributes", None) or {}
+        node_id = (attrs.get("id") or "").strip().lower()
+        if node_id and node_id in _EXCLUDED_ANCESTOR_IDS:
+            return True
+        cls_raw = (attrs.get("class") or "").strip().lower()
+        if cls_raw:
+            for token in cls_raw.split():
+                if token in _EXCLUDED_ANCESTOR_CLASSES:
+                    return True
+        cur = getattr(cur, "parent", None)
+    return False
+
+
+def _is_off_target_redirect(
+    initial_url: str,
+    final_url: str,
+    target_type: Optional[str] = None,
+) -> bool:
+    """Return True when the upstream HTTP response redirected away from the requested target list."""
+    if not initial_url or not final_url:
+        return False
+    req = urllib.parse.urlparse(initial_url)
+    fin = urllib.parse.urlparse(final_url)
+    req_path = req.path.strip("/").lower()
+    fin_path = fin.path.strip("/").lower()
+    if not req_path or fin_path == req_path:
+        return False
+
+    req_parts = [urllib.parse.unquote(p) for p in req_path.split("/") if p]
+    fin_parts = [urllib.parse.unquote(p) for p in fin_path.split("/") if p]
+    norm_type = (target_type or "").strip().lower()
+
+    if not norm_type and req_parts:
+        if req_parts[0] in {"model", "pornstar"}:
+            norm_type = req_parts[0]
+        elif req_parts[0] in {"channel", "channels"}:
+            norm_type = "channel"
+        elif req_parts[0] == "likedvideos":
+            norm_type = "liked"
+        elif req_parts[0] in {"users", "user"} and "favorites" in req_parts:
+            norm_type = "favorites"
+
+    if norm_type in {"model", "pornstar"}:
+        if len(fin_parts) < 3:
+            return True
+        if fin_parts[0] not in {"model", "pornstar", "channels", "channel"}:
+            return True
+        if "videos" not in fin_parts[2:]:
+            return True
+        return False
+
+    if norm_type == "channel":
+        if len(fin_parts) < 3:
+            return True
+        if fin_parts[0] not in {"channels", "channel"}:
+            return True
+        if "videos" not in fin_parts[2:]:
+            return True
+        return False
+
+    if norm_type == "favorites":
+        if len(fin_parts) < 3:
+            return True
+        if fin_parts[0] not in {"users", "user"} or "favorites" not in fin_parts:
+            return True
+        return False
+
+    if norm_type == "liked":
+        if not fin_parts or "liked" not in fin_parts[0]:
+            return True
+        return False
+
+    return False
+
 
 @dataclass(frozen=True)
 class ListedVideo:
@@ -128,13 +255,9 @@ def extract_video_cards_from_list_page(
     if not html:
         return []
     tree = HTMLParser(html)
+    norm_type = (target_type or "").strip().lower() or None
 
-    if target_type == "pornstar" and selectors.pornstar_page_video_container_check:
-        primary = select_one(tree, [selectors.pornstar_page_video_container_check])
-        if primary and not select_one(primary, ["li[data-video-vkey]"]):
-            return []
-
-    def _collect(element, sel_list: List[str]):
+    def _collect(element, sel_list: List[str], *, skip_chrome: bool = True):
         nodes = []
         seen = set()
         for sel in sel_list:
@@ -142,6 +265,8 @@ def extract_video_cards_from_list_page(
                 continue
             try:
                 for n in element.css(sel):
+                    if skip_chrome and _is_non_content_video_node(n):
+                        continue
                     nid = id(n)
                     if nid not in seen:
                         seen.add(nid)
@@ -150,22 +275,61 @@ def extract_video_cards_from_list_page(
                 continue
         return nodes
 
+    # PornHub renders `div.profileVids` on BOTH model and pornstar video tabs.
+    # When a creator has 0 videos, `div.profileVids` holds only an empty state while the
+    # page <header> still renders 4 site-wide trending/recommended cards in dropdown menus.
+    search_roots = [tree]
+    if norm_type in {None, "model", "pornstar"}:
+        vids_sels: List[str] = []
+        if selectors.pornstar_page_video_container_check:
+            vids_sels.append(selectors.pornstar_page_video_container_check)
+        if "div.profileVids" not in vids_sels:
+            vids_sels.append("div.profileVids")
+        primary_roots = _collect(tree, vids_sels)
+        if not primary_roots and norm_type in {"model", "pornstar"}:
+            primary_roots = _collect(tree, ["div#profileContent"])
+        if primary_roots:
+            search_roots = primary_roots
+
+    main_container_sels = list(selectors.split_list("list_page_main_containers"))
+    for extra_sel in _BUILTIN_MAIN_CONTAINERS:
+        if extra_sel not in main_container_sels:
+            main_container_sels.append(extra_sel)
+
+    li_in_container = list(selectors.split_list("list_page_li_in_container"))
+    if "li[data-video-vkey]" not in li_in_container:
+        li_in_container.append("li[data-video-vkey]")
+
     li_items = []
-    main_containers = _collect(tree, selectors.split_list("list_page_main_containers"))
-    li_in_container = selectors.split_list("list_page_li_in_container")
+    main_containers = []
+    for root in search_roots:
+        main_containers.extend(_collect(root, main_container_sels))
     for container in main_containers:
-        candidates = select_many(container, li_in_container)
+        candidates = [n for n in select_many(container, li_in_container) if not _is_non_content_video_node(n)]
         if len(candidates) > len(li_items):
             li_items = candidates
 
-    if not li_items:
-        li_items = _collect(tree, selectors.split_list("list_page_li_fallback"))
+    # If the page already rendered an explicit list container (with 0 items) or an explicit
+    # empty-state notice (e.g. "There are no videos..."), never fall back to scraping
+    # unrelated video cards elsewhere on the page.
+    has_explicit_empty = bool(main_containers) or any(
+        select_one(root, list(_EMPTY_LIST_STATE_SELECTORS)) is not None
+        for root in search_roots
+    )
 
-    if not li_items:
-        try:
-            li_items = list(tree.css("li[data-video-vkey]"))
-        except Exception:
-            li_items = []
+    if not li_items and not has_explicit_empty:
+        fallback_sels = selectors.split_list("list_page_li_fallback")
+        for root in search_roots:
+            li_items.extend(_collect(root, fallback_sels))
+
+    if not li_items and not has_explicit_empty:
+        for root in search_roots:
+            try:
+                li_items.extend(
+                    n for n in root.css("li[data-video-vkey]") if not _is_non_content_video_node(n)
+                )
+            except Exception:
+                continue
 
     link_sels = selectors.split_list("list_page_video_link_tag_primary")
     if selectors.list_page_video_link_tag_fallback_href:
@@ -411,11 +575,22 @@ async def scan_list_pages(
                 batch_failed = True
                 continue
 
-            # Detect server redirect back to page 1 or another page
+            # Detect server redirect back to page 1, login, or an unrelated non-target page
             final = urllib.parse.urlparse(res.final_url)
             if "/login" in final.path.lower():
                 report_error(current_page, "页面要求重新登录")
                 batch_failed = True
+                continue
+            if _is_off_target_redirect(initial_url, res.final_url, target_type):
+                if current_page > 1 and is_natural:
+                    ctx._emit("INFO", f"第 {current_page} 页重定向至非目标页面 {res.final_url}，判定为末页。")
+                    end_reached = True
+                    break
+                report_error(current_page, f"页面重定向至 {final.path or '/'}，目标可能已不存在或已变更")
+                batch_failed = True
+                if is_natural:
+                    end_reached = True
+                    break
                 continue
             final_qs = urllib.parse.parse_qs(final.query)
             final_page_str = final_qs.get("page", [None])[0]

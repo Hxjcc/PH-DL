@@ -1113,6 +1113,7 @@ async def test_upload_streams_per_file_and_cancel_marks_remaining_without_spurio
             {
                 "ph_cookie": "sess=valid",
                 "uploader_enabled": True,
+                "max_concurrent_downloads": 1,
                 "rclone_transfers": 1,
                 "upload_workers": 1,
                 "upload_batch_size": 3,

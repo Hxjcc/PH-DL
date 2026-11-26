@@ -119,7 +119,8 @@ class SelectorSettings(BaseModel):
     list_page_main_containers: str = (
         'ul.videos#videoSearchResult, div#videoCategory ul.videos, '
         'ul#searchResults.videos.video-listing.clear, ul.videos[data-type="pornstar"], '
-        'ul.videos.row-5-thumbs#mostRecentVideosSection, ul.videos.section-listing, '
+        'ul.videos.row-5-thumbs#mostRecentVideosSection, ul#mostRecentVideosSection, '
+        'ul.videos.section-listing, ul#showAllChanelVideos, '
         'ul.videos.video-listing.clear.profileContent, ul.videos.video-listing.clear.playlistContent, '
         'div.container > ul.videos, ul#moreData.videos, ul#likedVideosSection.videos'
     )
