@@ -123,7 +123,7 @@ export function siteMeta(site) {
     key: 'pornhub',
     code: 'PH',
     label: 'PornHub',
-    pillClass: 'border-zinc-900 bg-[#141414] text-[#ff9000] dark:border-[#ff9000]/40',
+    pillClass: 'border-[#ff9000]/35 bg-[#ff9000]/12 text-[#d97000] dark:bg-[#ff9000]/15 dark:text-[#ff9900]',
   }
 }
 
