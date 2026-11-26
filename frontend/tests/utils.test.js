@@ -485,3 +485,57 @@ test('siteMeta and targetTypeMeta format xHamster and PornHub labels', () => {
   assert.equal(targetTypeMeta('creator'), 'Creator')
   assert.equal(targetTypeMeta('channel'), 'Channel')
 })
+
+test('resolveJobVisual distinguishes xHamster favorites, site-scoped same usernames, and manual URL sites', () => {
+  const targets = [
+    { id: 1, site: 'pornhub', username: 'alice', display_name: 'PH Alice', target_type: 'model', avatar_url: '' },
+    { id: 2, site: 'xhamster', username: 'alice', display_name: 'XH Alice', target_type: 'creator', avatar_url: '' },
+    { id: 3, site: 'xhamster', username: '_currentUser_', display_name: 'xHamster Favorites', target_type: 'favorites', avatar_url: '' },
+  ]
+
+  const xhFav = resolveJobVisual(
+    { id: 90, kind: 'manual_target', params: { site: 'xhamster', target_type: 'favorites', usernames: [] } },
+    targets
+  )
+  assert.equal(xhFav.site, 'xhamster')
+  assert.equal(xhFav.title, '我的收藏视频')
+  assert.equal(xhFav.avatars[0].isFavorites, true)
+  assert.equal(xhFav.avatars[0].isLiked, false)
+
+  const xhSameName = resolveJobVisual(
+    { id: 91, kind: 'manual_target', params: { site: 'xhamster', target_type: 'creator', usernames: ['alice'] } },
+    targets
+  )
+  assert.equal(xhSameName.site, 'xhamster')
+  assert.equal(xhSameName.title, 'XH Alice')
+
+  const xhUrls = resolveJobVisual(
+    { id: 92, kind: 'manual_urls', params: { urls: ['https://xhamster.com/videos/demo-xhOwQIZ'] } },
+    targets
+  )
+  assert.equal(xhUrls.site, 'xhamster')
+
+  const mixedUrls = resolveJobVisual(
+    {
+      id: 93,
+      kind: 'manual_urls',
+      params: {
+        urls: [
+          'https://www.pornhub.com/view_video.php?viewkey=abc123',
+          'https://xhamster.com/videos/demo-xhOwQIZ',
+        ],
+      },
+    },
+    targets
+  )
+  assert.equal(mixedUrls.site, '')
+
+  assert.equal(
+    buildExportFilename({
+      id: 94,
+      kind: 'manual_target',
+      params: { site: 'xhamster', target_type: 'favorites', usernames: [] },
+    }),
+    'xHamster_Favorites.txt'
+  )
+})

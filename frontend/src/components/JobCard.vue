@@ -17,6 +17,7 @@ import {
   Link2,
   FileText,
   Heart,
+  Bookmark,
   Clock,
   CloudUpload,
 } from 'lucide-vue-next'
@@ -42,6 +43,7 @@ import Button from './ui/Button.vue'
 import Checkbox from './ui/Checkbox.vue'
 import ConfirmPopover from './ui/ConfirmPopover.vue'
 import AnimatedCollapse from './ui/AnimatedCollapse.vue'
+import SiteBadge from './SiteBadge.vue'
 
 const CATEGORY_ICONS = {
   download: DownloadIcon,
@@ -493,6 +495,12 @@ function downloadExportTxt() {
               >
                 <Heart class="w-4 h-4 fill-white/95" />
               </div>
+              <div
+                v-else-if="visual.avatars[0].isFavorites"
+                class="w-10 h-10 rounded-full bg-gradient-to-br from-red-500 to-rose-600 text-white flex items-center justify-center shadow-xs"
+              >
+                <Bookmark class="w-4 h-4 fill-white/95" />
+              </div>
               <img
                 v-else-if="isAvatarValid(visual.avatars[0])"
                 :src="visual.avatars[0].avatarUrl"
@@ -571,6 +579,7 @@ function downloadExportTxt() {
                 <component :is="categoryIcon" class="w-3 h-3 shrink-0" />
                 <span>{{ visual.category.label }}</span>
               </span>
+              <SiteBadge v-if="visual.site" :site="visual.site" size="xs" />
 
               <span
                 class="text-sm sm:text-[15px] font-semibold tracking-tight text-foreground truncate max-w-full sm:max-w-[340px]"

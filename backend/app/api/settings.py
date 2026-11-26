@@ -109,6 +109,11 @@ async def test_cookie(container: AppContainer = Depends(require_auth)):
         timeout=settings.request_timeout,
     )
     container.tasks.set_cookie_status(res.valid, res.message)
+    container.events.emit_log(
+        "INFO" if res.valid else "WARNING",
+        f"[PornHub Cookie] 有效性检测: {res.message}",
+    )
+    container.events.broadcast("overview_changed", {})
     return {"valid": res.valid, "message": res.message}
 
 
@@ -128,6 +133,11 @@ async def import_cookie(
         timeout=settings.request_timeout,
     )
     container.tasks.set_cookie_status(res.valid, res.message)
+    container.events.emit_log(
+        "INFO" if res.valid else "WARNING",
+        f"[PornHub Cookie] 已导入并测活: {res.message}",
+    )
+    container.events.broadcast("overview_changed", {})
     return {
         "saved": True,
         "valid": res.valid,
@@ -151,6 +161,7 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
     )
     if not res.success:
         container.tasks.set_cookie_status(False, res.message)
+        container.events.broadcast("overview_changed", {})
         return {"success": False, "message": res.message}
 
     patch: Dict[str, Any] = {"ph_cookie": res.cookie_str}
@@ -158,6 +169,7 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
         patch["ph_logged_in_username"] = res.logged_in_username
     await container.repo.update_settings_patch(patch)
     container.tasks.set_cookie_status(True, res.message)
+    container.events.broadcast("overview_changed", {})
     return {
         "success": True,
         "logged_in_username": res.logged_in_username,
@@ -176,6 +188,11 @@ async def test_xh_cookie(container: AppContainer = Depends(require_auth)):
     if valid and username and username != settings.xh_logged_in_username:
         await container.repo.update_settings_patch({"xh_logged_in_username": username})
     container.tasks.set_xh_cookie_status(valid, message)
+    container.events.emit_log(
+        "INFO" if valid else "WARNING",
+        f"[xHamster Cookie] 有效性检测: {message}",
+    )
+    container.events.broadcast("overview_changed", {})
     return {"valid": valid, "message": message, "logged_in_username": username}
 
 
@@ -197,6 +214,11 @@ async def import_xh_cookie(
     if valid and username:
         await container.repo.update_settings_patch({"xh_logged_in_username": username})
     container.tasks.set_xh_cookie_status(valid, message)
+    container.events.emit_log(
+        "INFO" if valid else "WARNING",
+        f"[xHamster Cookie] 已导入并测活: {message}",
+    )
+    container.events.broadcast("overview_changed", {})
     return {
         "saved": True,
         "valid": valid,
@@ -221,6 +243,7 @@ async def refresh_xh_cookie(container: AppContainer = Depends(require_auth)):
     )
     if not res.success:
         container.tasks.set_xh_cookie_status(False, res.message)
+        container.events.broadcast("overview_changed", {})
         return {"success": False, "message": res.message}
 
     patch: Dict[str, Any] = {"xh_cookie": res.cookie_str}

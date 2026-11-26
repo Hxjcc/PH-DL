@@ -15,6 +15,7 @@ import {
   LayoutGrid,
   List,
   Heart,
+  Bookmark,
   AlertCircle,
   CheckCircle2,
   PauseCircle,
@@ -1048,6 +1049,7 @@ async function handleDelete(t) {
                 ]"
               >
                 <Heart v-if="t.target_type === 'liked'" class="w-5 h-5 fill-white/90" />
+                <Bookmark v-else-if="t.site === 'xhamster' && t.target_type === 'favorites'" class="w-5 h-5 fill-white/90" />
                 <span v-else>{{ targetInitial(t) }}</span>
               </div>
 
@@ -1212,6 +1214,7 @@ async function handleDelete(t) {
                       ]"
                     >
                       <Heart v-if="t.target_type === 'liked'" class="w-3.5 h-3.5 fill-white/90" />
+                      <Bookmark v-else-if="t.site === 'xhamster' && t.target_type === 'favorites'" class="w-3.5 h-3.5 fill-white/90" />
                       <span v-else>{{ targetInitial(t) }}</span>
                     </div>
                     <div class="min-w-0">

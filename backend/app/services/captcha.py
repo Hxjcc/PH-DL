@@ -158,7 +158,6 @@ async def solve_recaptcha(
 
     base = normalize_api_base(api_base)
     started = time.perf_counter()
-    _emit(on_log, "INFO", f"YesCaptcha 创建解题任务（{task_type}）...")
 
     create_data = await _post_json(
         f"{base}/createTask",

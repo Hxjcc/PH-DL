@@ -18,6 +18,8 @@ export function buildExportFilename(job) {
     base = usernames.join('+')
   } else if (params.target_type === 'liked') {
     base = 'Liked_Videos'
+  } else if (params.site === 'xhamster' && params.target_type === 'favorites') {
+    base = 'xHamster_Favorites'
   } else if (params.batch_name) {
     base = String(params.batch_name)
   } else {

@@ -1,4 +1,5 @@
 import { targetTypeMeta } from './format.js'
+import { isXhamsterUrlText } from './targetInput.js'
 
 const CATEGORY_MAP = {
   target_download: {
@@ -95,7 +96,14 @@ function stripKnownPrefix(rawLabel = '') {
 }
 
 const targetLookupCache = new WeakMap()
-const EMPTY_TARGET_LOOKUP = Object.freeze({ byId: new Map(), byName: new Map() })
+const EMPTY_TARGET_LOOKUP = Object.freeze({ byId: new Map(), byName: new Map(), bySiteName: new Map() })
+
+function normalizeSiteKey(site) {
+  const s = String(site || '').trim().toLowerCase()
+  if (s === 'xhamster' || s === 'xh') return 'xhamster'
+  if (s === 'pornhub' || s === 'ph') return 'pornhub'
+  return ''
+}
 
 function buildTargetLookup(targetsList = []) {
   if (!Array.isArray(targetsList) || targetsList.length === 0) {
@@ -106,47 +114,73 @@ function buildTargetLookup(targetsList = []) {
 
   const byId = new Map()
   const byName = new Map()
+  const bySiteName = new Map()
   for (const t of targetsList) {
     if (!t) continue
     if (t.id != null) byId.set(Number(t.id), t)
+    const site = normalizeSiteKey(t.site) || 'pornhub'
     const uname = String(t.username || '').trim().toLowerCase()
     const dname = String(t.display_name || '').trim().toLowerCase()
-    if (uname && !byName.has(uname)) byName.set(uname, t)
-    if (dname && !byName.has(dname)) byName.set(dname, t)
+    if (uname) {
+      if (!byName.has(uname)) byName.set(uname, t)
+      const sk = `${site}:${uname}`
+      if (!bySiteName.has(sk)) bySiteName.set(sk, t)
+    }
+    if (dname) {
+      if (!byName.has(dname)) byName.set(dname, t)
+      const sk = `${site}:${dname}`
+      if (!bySiteName.has(sk)) bySiteName.set(sk, t)
+    }
   }
-  const lookup = { byId, byName }
+  const lookup = { byId, byName, bySiteName }
   targetLookupCache.set(targetsList, lookup)
   return lookup
 }
 
-function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames = {}) {
+function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames = {}, hint = {}) {
   if (target) {
-    const isLiked = target.target_type === 'liked' || target.username === '_currentUser_'
+    const site = normalizeSiteKey(target.site || hint.site) || 'pornhub'
+    const tType = String(target.target_type || hint.targetType || '').trim().toLowerCase()
+    const isFavorites = site === 'xhamster' && tType === 'favorites'
+    const isLiked = !isFavorites && (tType === 'liked' || target.username === '_currentUser_')
     const name = isLiked
       ? '我的点赞'
-      : String(target.display_name || profileNames[target.username] || target.username || fallbackName || '').trim()
-    const username = isLiked ? '' : String(target.username || '').trim()
-    const avatarUrl = String(target.avatar_url || profileAvatars[target.username] || '').trim()
+      : isFavorites
+        ? String(target.display_name || '').trim() || '我的收藏'
+        : String(target.display_name || profileNames[target.username] || target.username || fallbackName || '').trim()
+    const username = isLiked || isFavorites ? '' : String(target.username || '').trim()
+    const avatarUrl = isLiked || isFavorites ? '' : String(target.avatar_url || profileAvatars[target.username] || '').trim()
     return {
-      key: `target-${target.id || username || name}`,
+      key: `target-${target.id || `${site}:${username || name}`}`,
       name: name || username || '未知目标',
       username,
+      site,
       targetType: target.target_type || '',
       avatarUrl,
       isLiked,
+      isFavorites,
     }
   }
   const raw = String(fallbackName || '').trim()
-  const isLiked = raw.toLowerCase() === 'liked videos' || raw === '_currentUser_'
-  const displayName = isLiked ? '我的点赞' : String(profileNames[raw] || raw).trim()
-  const avatarUrl = isLiked ? '' : String(profileAvatars[raw] || '').trim()
+  const site = normalizeSiteKey(hint.site) || (raw.toLowerCase().includes('xhamster') ? 'xhamster' : '')
+  const tType = String(hint.targetType || '').trim().toLowerCase()
+  const isFavorites = (site === 'xhamster' && tType === 'favorites') || raw.toLowerCase() === 'xhamster favorites'
+  const isLiked = !isFavorites && (tType === 'liked' || raw.toLowerCase() === 'liked videos' || raw === '_currentUser_')
+  const displayName = isLiked
+    ? '我的点赞'
+    : isFavorites
+      ? '我的收藏'
+      : String(profileNames[raw] || raw).trim()
+  const avatarUrl = isLiked || isFavorites ? '' : String(profileAvatars[raw] || '').trim()
   return {
-    key: `raw-${raw}`,
+    key: `raw-${site || 'any'}-${raw}`,
     name: displayName || '未知目标',
-    username: isLiked ? '' : raw,
-    targetType: isLiked ? 'liked' : '',
+    username: isLiked || isFavorites ? '' : raw,
+    site: site || 'pornhub',
+    targetType: isLiked ? 'liked' : isFavorites ? 'favorites' : tType,
     avatarUrl,
     isLiked,
+    isFavorites,
   }
 }
 
@@ -178,11 +212,20 @@ export function resolveJobVisual(job, targetsList = []) {
   const params = job?.params || {}
   const profileAvatars = params.profile_avatars || {}
   const profileNames = params.profile_names || {}
-  const { byId, byName } = buildTargetLookup(targetsList)
+  const { byId, byName, bySiteName } = buildTargetLookup(targetsList)
 
   const avatars = []
   const capsules = []
   let title = ''
+  let site = normalizeSiteKey(params.site)
+
+  const lookupByName = (name, preferredSite = '') => {
+    const key = String(name || '').trim().toLowerCase()
+    if (!key) return null
+    const norm = normalizeSiteKey(preferredSite)
+    if (norm && bySiteName.has(`${norm}:${key}`)) return bySiteName.get(`${norm}:${key}`)
+    return byName.get(key) || null
+  }
 
   const pushUniqueAvatar = (entry) => {
     if (!entry || !entry.name) return
@@ -193,19 +236,27 @@ export function resolveJobVisual(job, targetsList = []) {
   const kind = job?.kind || ''
 
   if (kind === 'manual_target') {
+    const reqSite = normalizeSiteKey(params.site) || 'pornhub'
+    site = reqSite
     if (params.target_type === 'liked') {
       const likedTarget = Array.from(byId.values()).find((t) => t.target_type === 'liked')
-      pushUniqueAvatar(makeAvatarEntry(likedTarget, 'Liked Videos', profileAvatars, profileNames))
+      pushUniqueAvatar(makeAvatarEntry(likedTarget, 'Liked Videos', profileAvatars, profileNames, { site: 'pornhub', targetType: 'liked' }))
       title = '我的点赞视频'
+    } else if (reqSite === 'xhamster' && params.target_type === 'favorites') {
+      const favTarget = Array.from(byId.values()).find(
+        (t) => normalizeSiteKey(t.site) === 'xhamster' && t.target_type === 'favorites'
+      )
+      pushUniqueAvatar(makeAvatarEntry(favTarget, 'xHamster Favorites', profileAvatars, profileNames, { site: 'xhamster', targetType: 'favorites' }))
+      title = '我的收藏视频'
     } else {
       const usernames = Array.isArray(params.usernames) ? params.usernames.filter(Boolean) : []
       for (const u of usernames) {
-        const matched = byName.get(String(u).trim().toLowerCase())
-        pushUniqueAvatar(makeAvatarEntry(matched, u, profileAvatars, profileNames))
+        const matched = lookupByName(u, reqSite)
+        pushUniqueAvatar(makeAvatarEntry(matched, u, profileAvatars, profileNames, { site: reqSite, targetType: params.target_type }))
       }
       if (avatars.length === 1) {
         title = avatars[0].name
-        if (avatars[0].username && !avatars[0].isLiked) {
+        if (avatars[0].username && !avatars[0].isLiked && !avatars[0].isFavorites) {
           capsules.push({ text: `@${avatars[0].username}`, handle: true })
         }
         const tType = avatars[0].targetType || (params.target_type !== 'auto' ? params.target_type : '')
@@ -228,7 +279,14 @@ export function resolveJobVisual(job, targetsList = []) {
       capsules.push({ text: `指定序号 ${params.videos}`, mono: true })
     }
   } else if (kind === 'manual_urls') {
-    const urlCount = Array.isArray(params.urls) ? params.urls.length : 0
+    const urls = Array.isArray(params.urls) ? params.urls.filter(Boolean) : []
+    const urlCount = urls.length
+    if (urlCount > 0) {
+      const hasXh = urls.some((u) => isXhamsterUrlText(u))
+      const hasPh = urls.some((u) => !isXhamsterUrlText(u))
+      if (hasXh && !hasPh) site = 'xhamster'
+      else if (hasPh && !hasXh) site = 'pornhub'
+    }
     title = params.group_by_uploader === false && params.batch_name
       ? params.batch_name
       : '直链批量队列'
@@ -241,13 +299,20 @@ export function resolveJobVisual(job, targetsList = []) {
   } else if (kind === 'auto_update' || kind === 'check_updates') {
     const targetIds = Array.isArray(params.target_ids) ? params.target_ids : []
     if (targetIds.length > 0) {
+      const matchedSites = new Set()
       for (const tid of targetIds) {
         const matched = byId.get(Number(tid))
-        if (matched) pushUniqueAvatar(makeAvatarEntry(matched, matched.username, profileAvatars, profileNames))
+        if (matched) {
+          matchedSites.add(normalizeSiteKey(matched.site) || 'pornhub')
+          pushUniqueAvatar(makeAvatarEntry(matched, matched.username, profileAvatars, profileNames))
+        }
+      }
+      if (matchedSites.size === 1) {
+        site = Array.from(matchedSites)[0]
       }
       if (avatars.length === 1) {
         title = avatars[0].name
-        if (avatars[0].username && !avatars[0].isLiked) {
+        if (avatars[0].username && !avatars[0].isLiked && !avatars[0].isFavorites) {
           capsules.push({ text: `@${avatars[0].username}`, handle: true })
         }
         if (avatars[0].targetType) {
@@ -272,13 +337,16 @@ export function resolveJobVisual(job, targetsList = []) {
   } else if (kind === 'baseline_sync') {
     const matched = params.target_id != null ? byId.get(Number(params.target_id)) : null
     const rawClean = stripKnownPrefix(job?.label).replace(/\s*\([^)]+\)\s*$/, '').trim()
-    const fallbackMatch = !matched && rawClean ? byName.get(rawClean.toLowerCase()) : null
+    const fallbackMatch = !matched && rawClean ? lookupByName(rawClean, site) : null
     const targetObj = matched || fallbackMatch
+    if (targetObj) {
+      site = normalizeSiteKey(targetObj.site) || site || 'pornhub'
+    }
     if (targetObj || rawClean) {
-      pushUniqueAvatar(makeAvatarEntry(targetObj, rawClean, profileAvatars, profileNames))
+      pushUniqueAvatar(makeAvatarEntry(targetObj, rawClean, profileAvatars, profileNames, { site }))
     }
     title = avatars[0]?.name || rawClean || '基线初始化'
-    if (avatars[0]?.username && !avatars[0]?.isLiked) {
+    if (avatars[0]?.username && !avatars[0]?.isLiked && !avatars[0]?.isFavorites) {
       capsules.push({ text: `@${avatars[0].username}`, handle: true })
     }
     if (avatars[0]?.targetType) {
@@ -289,9 +357,12 @@ export function resolveJobVisual(job, targetsList = []) {
   } else if (kind === 'retry_items' || kind === 'resume_temp') {
     const baseLabel = stripKnownPrefix(params.origin_label || job?.label || '')
     const candidateName = baseLabel.split(',')[0]?.trim() || ''
-    const matched = candidateName ? byName.get(candidateName.toLowerCase()) : null
+    const matched = candidateName ? lookupByName(candidateName, site) : null
+    if (matched) {
+      site = normalizeSiteKey(matched.site) || site
+    }
     if (matched || (candidateName && kind === 'retry_items' && !candidateName.includes('条链接'))) {
-      pushUniqueAvatar(makeAvatarEntry(matched, candidateName, profileAvatars, profileNames))
+      pushUniqueAvatar(makeAvatarEntry(matched, candidateName, profileAvatars, profileNames, { site }))
     }
     title = avatars[0]?.name || baseLabel || category.label
   } else if (kind === 'enrich_metadata') {
@@ -328,6 +399,7 @@ export function resolveJobVisual(job, targetsList = []) {
     title: title || job?.label || job?.kind || '未命名任务',
     avatars,
     capsules,
+    site,
   }
 }
 

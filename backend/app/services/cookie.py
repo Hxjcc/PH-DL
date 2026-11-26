@@ -51,6 +51,34 @@ class CookieLoginResult:
     message: str = ""
 
 
+def _make_site_logger(site_label: str, on_log: Optional[LogCallback]) -> LogCallback:
+    """Prefix every login & captcha log line uniformly with ``[<Site> 登录]``."""
+    prefix = f"[{site_label} 登录] "
+
+    def emit(level: str, message: str) -> None:
+        if not on_log:
+            return
+        text = str(message or "").strip()
+        if not text:
+            return
+        if not text.startswith(prefix):
+            text = f"{prefix}{text}"
+        on_log(level, text)
+
+    return emit
+
+
+def _log_login_outcome(emit: LogCallback, result: CookieLoginResult) -> CookieLoginResult:
+    if result.success:
+        if result.logged_in_username:
+            emit("INFO", f"登录成功，Cookie 校验通过（当前账号: {result.logged_in_username}）")
+        else:
+            emit("INFO", "登录成功，Cookie 校验通过")
+    else:
+        emit("WARNING", f"登录失败: {result.message}")
+    return result
+
+
 def _iter_template_subtrees(tree: HTMLParser):
     """Yield parsed subtrees for <template> elements whose inner HTML is inert in lexbor."""
     for tpl in tree.css("template"):
@@ -461,7 +489,7 @@ async def _login_with_captcha(
     fresh_config = _extract_login_config(page_resp.text)
     page_url = str(page_resp.final_url or PORNHUB_LOGIN_URL)
     sitekey = fresh_config.sitekey or config.sitekey or PORNHUB_DEFAULT_SITEKEY
-    emit("INFO", "检测到 PornHub 要求 reCAPTCHA，正在调用 YesCaptcha 解题...")
+    emit("INFO", f"触发人机验证（reCAPTCHA），正在调用 YesCaptcha（{yescaptcha_task_type}）...")
 
     try:
         solution = await solve_recaptcha_v2(
@@ -476,13 +504,11 @@ async def _login_with_captcha(
             on_log=on_log,
         )
     except CaptchaError as err:
-        emit("WARNING", f"YesCaptcha 解题失败: {err}")
         return CookieLoginResult(success=False, message=f"YesCaptcha 解题失败: {err}")
     except Exception as err:  # pragma: no cover - defensive
-        emit("WARNING", f"YesCaptcha 调用异常: {type(err).__name__}: {err}")
         return CookieLoginResult(success=False, message=f"YesCaptcha 调用异常: {err}")
 
-    emit("INFO", "YesCaptcha 已返回 token，正在重新提交登录...")
+    emit("INFO", "已获取验证码 token，正在重新提交登录...")
     auth_resp, auth_err, data = await _submit_login(
         ctx,
         fresh_config,
@@ -542,16 +568,16 @@ async def login_and_get_cookies(
     yescaptcha_timeout_seconds: float = 180.0,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
+    emit = _make_site_logger("PornHub", on_log)
     if not (username or "").strip() or not (password or "").strip():
-        return CookieLoginResult(success=False, message="未配置 PornHub 账号或密码")
+        return _log_login_outcome(emit, CookieLoginResult(success=False, message="未配置 PornHub 账号或密码"))
 
     loop = asyncio.get_running_loop()
     inflight = _INFLIGHT_LOGINS.setdefault(loop, {})
     dedup_key = (username.strip().lower(), (proxy_url or "").strip())
     existing = inflight.get(dedup_key)
     if existing is not None and not existing.done():
-        if on_log:
-            on_log("INFO", "检测到已有正在进行的自动登录任务，复用本次登录结果...")
+        emit("INFO", "检测到已有正在进行的登录任务，复用本次结果...")
         return await asyncio.shield(existing)
 
     task = asyncio.create_task(
@@ -591,66 +617,95 @@ async def _login_and_get_cookies_once(
     yescaptcha_timeout_seconds: float = 180.0,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
+    emit = _make_site_logger("PornHub", on_log)
 
-    def emit(level: str, message: str) -> None:
-        if on_log:
-            on_log(level, message)
-
-    try:
-        ctx = TaskHttpContext(
-            cookie_str="",
-            proxy_url=proxy_url,
-            concurrency=1,
-            timeout=timeout,
-            max_retries=1,
-            retry_delay_base=1.0,
-            retry_delay_max=2.0,
-            on_log=on_log,
-        )
-        async with ctx:
-            page_resp, page_err = await ctx.fetch_with_pow(
-                PORNHUB_LOGIN_URL,
+    async def _run() -> CookieLoginResult:
+        try:
+            emit("INFO", "开始登录，正在加载登录页...")
+            ctx = TaskHttpContext(
+                cookie_str="",
+                proxy_url=proxy_url,
+                concurrency=1,
                 timeout=timeout,
                 max_retries=1,
-                log_label="登录页",
+                retry_delay_base=1.0,
+                retry_delay_max=2.0,
+                on_log=emit,
             )
-            if page_resp is None:
-                return CookieLoginResult(
-                    success=False,
-                    message=f"访问登录页失败: {page_err or '请求失败'}",
+            async with ctx:
+                page_resp, page_err = await ctx.fetch_with_pow(
+                    PORNHUB_LOGIN_URL,
+                    timeout=timeout,
+                    max_retries=1,
+                    log_label="登录页",
                 )
-            if page_resp.status_code >= 400:
-                return CookieLoginResult(success=False, message=f"访问登录页失败 (HTTP {page_resp.status_code})")
+                if page_resp is None:
+                    return CookieLoginResult(
+                        success=False,
+                        message=f"访问登录页失败: {page_err or '请求失败'}",
+                    )
+                if page_resp.status_code >= 400:
+                    return CookieLoginResult(success=False, message=f"访问登录页失败 (HTTP {page_resp.status_code})")
 
-            config = _extract_login_config(page_resp.text)
-            page_url = str(page_resp.final_url or PORNHUB_LOGIN_URL)
-            emit(
-                "INFO",
-                f"登录页已加载（reCAPTCHA sitekey: {'已获取' if config.sitekey else '未找到'}）",
-            )
-
-            auth_resp, auth_err, data = await _submit_login(
-                ctx,
-                config,
-                username,
-                password,
-                timeout=timeout,
-                page_url=page_url,
-            )
-            if auth_resp is None:
-                return CookieLoginResult(success=False, message=f"自动登录失败: {auth_err or '请求失败'}")
-            if auth_resp.status_code >= 400:
-                return CookieLoginResult(
-                    success=False,
-                    message=f"登录请求返回 HTTP {auth_resp.status_code}",
+                config = _extract_login_config(page_resp.text)
+                page_url = str(page_resp.final_url or PORNHUB_LOGIN_URL)
+                emit(
+                    "INFO",
+                    f"登录页已加载（reCAPTCHA sitekey: {'已获取' if config.sitekey else '未找到'}），正在提交凭据...",
                 )
 
-            if data is not None:
-                if _is_auth_json_success(data):
-                    logged_in_user = str(data.get("username") or "").strip()
-                    return await _finish_login(ctx, proxy_url, timeout, logged_in_user)
+                auth_resp, auth_err, data = await _submit_login(
+                    ctx,
+                    config,
+                    username,
+                    password,
+                    timeout=timeout,
+                    page_url=page_url,
+                )
+                if auth_resp is None:
+                    return CookieLoginResult(success=False, message=f"自动登录失败: {auth_err or '请求失败'}")
+                if auth_resp.status_code >= 400:
+                    return CookieLoginResult(
+                        success=False,
+                        message=f"登录请求返回 HTTP {auth_resp.status_code}",
+                    )
 
-                if _is_captcha_required(data):
+                if data is not None:
+                    if _is_auth_json_success(data):
+                        logged_in_user = str(data.get("username") or "").strip()
+                        return await _finish_login(ctx, proxy_url, timeout, logged_in_user)
+
+                    if _is_captcha_required(data):
+                        if not yescaptcha_enabled or not (yescaptcha_client_key or "").strip():
+                            return CookieLoginResult(
+                                success=False,
+                                message=(
+                                    "登录需要人机验证（reCAPTCHA）。请在【系统设置 → Cookie 与账号】"
+                                    "启用 YesCaptcha 并填写 ClientKey 后重试。"
+                                ),
+                            )
+                        return await _login_with_captcha(
+                            ctx,
+                            config,
+                            username,
+                            password,
+                            proxy_url=proxy_url,
+                            timeout=timeout,
+                            yescaptcha_client_key=yescaptcha_client_key,
+                            yescaptcha_api_base=yescaptcha_api_base,
+                            yescaptcha_task_type=yescaptcha_task_type,
+                            yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
+                            on_log=emit,
+                        )
+
+                    msg = _auth_message(data) or "认证失败"
+                    return CookieLoginResult(
+                        success=False,
+                        message=f"登录被拒绝: {_friendly_auth_failure(msg)}",
+                    )
+
+                body_lower = (auth_resp.text or "").lower()
+                if "captcha" in body_lower or "recaptcha" in body_lower:
                     if not yescaptcha_enabled or not (yescaptcha_client_key or "").strip():
                         return CookieLoginResult(
                             success=False,
@@ -670,53 +725,25 @@ async def _login_and_get_cookies_once(
                         yescaptcha_api_base=yescaptcha_api_base,
                         yescaptcha_task_type=yescaptcha_task_type,
                         yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
-                        on_log=on_log,
+                        on_log=emit,
                     )
 
-                msg = _auth_message(data) or "认证失败"
-                return CookieLoginResult(
-                    success=False,
-                    message=f"登录被拒绝: {_friendly_auth_failure(msg)}",
-                )
-
-            body_lower = (auth_resp.text or "").lower()
-            if "captcha" in body_lower or "recaptcha" in body_lower:
-                if not yescaptcha_enabled or not (yescaptcha_client_key or "").strip():
+                if "login" in str(auth_resp.final_url).lower():
                     return CookieLoginResult(
                         success=False,
                         message=(
-                            "登录需要人机验证（reCAPTCHA）。请在【系统设置 → Cookie 与账号】"
-                            "启用 YesCaptcha 并填写 ClientKey 后重试。"
+                            "自动登录失败，登录页未返回可解析的结果。"
+                            "请在设置中手动粘贴浏览器 Cookie。"
                         ),
                     )
-                return await _login_with_captcha(
-                    ctx,
-                    config,
-                    username,
-                    password,
-                    proxy_url=proxy_url,
-                    timeout=timeout,
-                    yescaptcha_client_key=yescaptcha_client_key,
-                    yescaptcha_api_base=yescaptcha_api_base,
-                    yescaptcha_task_type=yescaptcha_task_type,
-                    yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
-                    on_log=on_log,
-                )
-
-            if "login" in str(auth_resp.final_url).lower():
                 return CookieLoginResult(
                     success=False,
-                    message=(
-                        "自动登录失败，登录页未返回可解析的结果。"
-                        "请在设置中手动粘贴浏览器 Cookie。"
-                    ),
+                    message=f"自动登录失败，响应异常: {(auth_resp.text or '')[:200]}",
                 )
-            return CookieLoginResult(
-                success=False,
-                message=f"自动登录失败，响应异常: {(auth_resp.text or '')[:200]}",
-            )
-    except Exception as err:
-        return CookieLoginResult(success=False, message=f"自动登录异常: {err}")
+        except Exception as err:
+            return CookieLoginResult(success=False, message=f"自动登录异常: {err}")
+
+    return _log_login_outcome(emit, await _run())
 
 
 def _extract_xhamster_login_error(data: object) -> str:
@@ -872,16 +899,16 @@ async def login_xhamster_and_get_cookies(
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     """Authenticate against ``xhamster.com/api/front/user/login`` and return verified cookies."""
+    emit = _make_site_logger("xHamster", on_log)
     if not (username or "").strip() or not (password or "").strip():
-        return CookieLoginResult(success=False, message="未配置 xHamster 账号或密码")
+        return _log_login_outcome(emit, CookieLoginResult(success=False, message="未配置 xHamster 账号或密码"))
 
     loop = asyncio.get_running_loop()
     inflight = _INFLIGHT_LOGINS.setdefault(loop, {})
     dedup_key = (f"xh:{username.strip().lower()}", (proxy_url or "").strip())
     existing = inflight.get(dedup_key)
     if existing is not None and not existing.done():
-        if on_log:
-            on_log("INFO", "检测到已有正在进行的 xHamster 自动登录任务，复用本次登录结果...")
+        emit("INFO", "检测到已有正在进行的登录任务，复用本次结果...")
         return await asyncio.shield(existing)
 
     task = asyncio.create_task(
@@ -923,180 +950,184 @@ async def _login_xhamster_once(
 ) -> CookieLoginResult:
     from ..parsers.xhamster import check_xhamster_cookie_valid
 
-    def emit(level: str, message: str) -> None:
-        if on_log:
-            on_log(level, message)
+    emit = _make_site_logger("xHamster", on_log)
 
-    try:
-        # xHamster uses a double-submit CSRF cookie (`x_csrf_token` cookie == `X-CSRF-Token` header).
-        ctx = TaskHttpContext(
-            cookie_str=f"x_csrf_token={XHAMSTER_DEFAULT_CSRF}",
-            proxy_url=proxy_url,
-            concurrency=1,
-            timeout=timeout,
-            max_retries=1,
-            retry_delay_base=1.0,
-            retry_delay_max=2.0,
-            on_log=on_log,
-        )
-        async with ctx:
-            page_resp, page_err = await ctx.fetch_with_pow(
-                XHAMSTER_LOGIN_URL,
+    async def _run() -> CookieLoginResult:
+        try:
+            emit("INFO", "开始登录，正在加载登录页...")
+            # xHamster uses a double-submit CSRF cookie (`x_csrf_token` cookie == `X-CSRF-Token` header).
+            ctx = TaskHttpContext(
+                cookie_str=f"x_csrf_token={XHAMSTER_DEFAULT_CSRF}",
+                proxy_url=proxy_url,
+                concurrency=1,
                 timeout=timeout,
                 max_retries=1,
-                log_label="xHamster 登录页",
+                retry_delay_base=1.0,
+                retry_delay_max=2.0,
+                on_log=emit,
             )
-            if page_resp is None:
-                return CookieLoginResult(
-                    success=False,
-                    message=f"访问 xHamster 登录页失败: {page_err or '请求失败'}",
-                )
-            if page_resp.status_code >= 400:
-                return CookieLoginResult(
-                    success=False,
-                    message=f"访问 xHamster 登录页失败 (HTTP {page_resp.status_code})",
-                )
-
-            current_cookies = parse_cookie_string(ctx.cookie_string())
-            csrf_token = (current_cookies.get("x_csrf_token") or XHAMSTER_DEFAULT_CSRF).strip() or XHAMSTER_DEFAULT_CSRF
-            page_url = str(page_resp.final_url or XHAMSTER_LOGIN_URL)
-            parsed_page = urlparse(page_url)
-            origin = f"{parsed_page.scheme or 'https'}://{parsed_page.netloc or 'xhamster.com'}"
-            api_url = urljoin(origin, "/api/front/user/login")
-            page_v2_key = _extract_xhamster_v2_key(page_resp.text or "")
-
-            login_headers = {
-                "X-CSRF-Token": csrf_token,
-                "X-Requested-With": "XMLHttpRequest",
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Origin": origin,
-                "Referer": page_url,
-                "Accept": "*/*",
-            }
-
-            async def submit(
-                captcha_token: str = "",
-                captcha_version: str = "",
-            ) -> Tuple[Optional[object], Optional[str]]:
-                return await ctx.fetch_with_pow(
-                    _xhamster_login_url(
-                        api_url,
-                        captcha_token=captcha_token,
-                        captcha_version=captcha_version,
-                    ),
-                    method="POST",
-                    data=_xhamster_login_payload(username, password, page_url),
-                    headers=login_headers,
+            async with ctx:
+                page_resp, page_err = await ctx.fetch_with_pow(
+                    XHAMSTER_LOGIN_URL,
+                    headers={"Referer": "https://xhamster.com/"},
                     timeout=timeout,
                     max_retries=1,
-                    log_label="xHamster 登录提交",
+                    log_label="登录页",
                 )
-
-            async def finish() -> CookieLoginResult:
-                cookie_str = ctx.cookie_string()
-                if not cookie_str:
-                    return CookieLoginResult(success=False, message="xHamster 登录未返回任何 Cookie")
-                valid, verify_msg, logged_in_user = await check_xhamster_cookie_valid(
-                    cookie_str,
-                    proxy_url=proxy_url,
-                    timeout=timeout,
-                )
-                if not valid:
+                if page_resp is None:
                     return CookieLoginResult(
                         success=False,
-                        message=f"xHamster 登录后校验失败: {verify_msg}",
+                        message=f"访问 xHamster 登录页失败: {page_err or '请求失败'}",
                     )
-                resolved_user = logged_in_user or username.strip()
-                return CookieLoginResult(
-                    success=True,
-                    cookie_str=cookie_str,
-                    logged_in_username=resolved_user,
-                    message=f"xHamster 登录并更新 Cookie 成功（当前账号: {resolved_user}）",
-                )
-
-            emit("INFO", "正在提交 xHamster 登录凭据...")
-            auth_resp, auth_err = await submit()
-            if auth_resp is None:
-                return CookieLoginResult(
-                    success=False,
-                    message=f"xHamster 自动登录失败: {auth_err or '请求失败'}",
-                )
-
-            data = _parse_xhamster_response(auth_resp.text)
-            if _xhamster_login_succeeded(data):
-                return await finish()
-
-            if _xhamster_captcha_required(data):
-                if not yescaptcha_enabled or not (yescaptcha_client_key or "").strip():
+                if page_resp.status_code >= 400:
                     return CookieLoginResult(
                         success=False,
-                        message=(
-                            "xHamster 登录要求人机验证（reCAPTCHA v2）。"
-                            "请在【系统设置 → 自动登录】中启用 YesCaptcha 并填写 ClientKey，"
-                            "或改为粘贴浏览器 Cookie。"
+                        message=f"访问 xHamster 登录页失败 (HTTP {page_resp.status_code})",
+                    )
+
+                current_cookies = parse_cookie_string(ctx.cookie_string())
+                csrf_token = (current_cookies.get("x_csrf_token") or XHAMSTER_DEFAULT_CSRF).strip() or XHAMSTER_DEFAULT_CSRF
+                page_url = str(page_resp.final_url or XHAMSTER_LOGIN_URL)
+                parsed_page = urlparse(page_url)
+                origin = f"{parsed_page.scheme or 'https'}://{parsed_page.netloc or 'xhamster.com'}"
+                api_url = urljoin(origin, "/api/front/user/login")
+                page_v2_key = _extract_xhamster_v2_key(page_resp.text or "")
+
+                login_headers = {
+                    "X-CSRF-Token": csrf_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Origin": origin,
+                    "Referer": page_url,
+                    "Accept": "*/*",
+                }
+
+                async def submit(
+                    captcha_token: str = "",
+                    captcha_version: str = "",
+                ) -> Tuple[Optional[object], Optional[str]]:
+                    return await ctx.fetch_with_pow(
+                        _xhamster_login_url(
+                            api_url,
+                            captcha_token=captcha_token,
+                            captcha_version=captcha_version,
                         ),
+                        method="POST",
+                        data=_xhamster_login_payload(username, password, page_url),
+                        headers=login_headers,
+                        timeout=timeout,
+                        max_retries=1,
+                        log_label="登录提交",
                     )
 
-                v2_key = page_v2_key or XHAMSTER_RECAPTCHA_V2_KEY
-                xh_task_type = (
-                    yescaptcha_task_type
-                    if yescaptcha_task_type in XHAMSTER_CAPTCHA_V2_TASK_TYPES
-                    else XHAMSTER_DEFAULT_CAPTCHA_V2_TASK_TYPE
-                )
-                emit("INFO", f"正在调用 YesCaptcha 解 xHamster reCAPTCHA v2（{xh_task_type}）...")
-                try:
-                    solution = await solve_recaptcha(
-                        yescaptcha_client_key,
-                        page_url,
-                        v2_key,
-                        api_base=yescaptcha_api_base,
-                        task_type=xh_task_type,
-                        timeout=yescaptcha_timeout_seconds,
-                        proxy=proxy_url,
-                        cancel_event=ctx.cancel_event,
-                        on_log=on_log,
+                async def finish() -> CookieLoginResult:
+                    cookie_str = ctx.cookie_string()
+                    if not cookie_str:
+                        return CookieLoginResult(success=False, message="xHamster 登录未返回任何 Cookie")
+                    valid, verify_msg, logged_in_user = await check_xhamster_cookie_valid(
+                        cookie_str,
+                        proxy_url=proxy_url,
+                        timeout=timeout,
                     )
-                except CaptchaError as err:
-                    emit("WARNING", f"xHamster v2 验证码解题失败: {err}")
+                    if not valid:
+                        return CookieLoginResult(
+                            success=False,
+                            message=f"xHamster 登录后校验失败: {verify_msg}",
+                        )
+                    resolved_user = logged_in_user or username.strip()
                     return CookieLoginResult(
-                        success=False,
-                        message=(
-                            f"xHamster 登录需要人机验证，YesCaptcha 解题失败: {err}。"
-                            "请检查 YesCaptcha 配置/余额，或粘贴浏览器 Cookie。"
-                        ),
-                    )
-                except Exception as err:  # pragma: no cover - defensive
-                    emit("WARNING", f"xHamster v2 验证码调用异常: {type(err).__name__}: {err}")
-                    return CookieLoginResult(
-                        success=False,
-                        message=f"xHamster 登录需要人机验证，YesCaptcha 调用异常: {err}",
+                        success=True,
+                        cookie_str=cookie_str,
+                        logged_in_username=resolved_user,
+                        message=f"xHamster 登录并更新 Cookie 成功（当前账号: {resolved_user}）",
                     )
 
-                emit("INFO", "YesCaptcha 已返回 v2 token，正在提交 xHamster 登录...")
-                auth_resp, auth_err = await submit(
-                    captcha_token=solution.token,
-                    captcha_version="v2",
+                emit(
+                    "INFO",
+                    f"登录页已加载（reCAPTCHA sitekey: {'已获取' if page_v2_key else '未找到'}），正在提交凭据...",
                 )
+                auth_resp, auth_err = await submit()
                 if auth_resp is None:
                     return CookieLoginResult(
                         success=False,
-                        message=f"验证码已通过，但 xHamster 登录请求失败: {auth_err or '请求失败'}",
+                        message=f"xHamster 自动登录失败: {auth_err or '请求失败'}",
                     )
+
                 data = _parse_xhamster_response(auth_resp.text)
                 if _xhamster_login_succeeded(data):
                     return await finish()
-                if _xhamster_captcha_required(data) or _xhamster_captcha_rejected(data):
-                    return CookieLoginResult(
-                        success=False,
-                        message=(
-                            "xHamster 拒绝了 YesCaptcha v2 token。"
-                            "请在设置中切换另一个标准 v2 线路"
-                            "（NoCaptchaTaskProxyless / RecaptchaV2TaskProxyless）后重试，"
-                            "或粘贴浏览器 Cookie。"
-                        ),
-                    )
-                return _xhamster_login_failure(data, auth_resp)
 
-            return _xhamster_login_failure(data, auth_resp)
-    except Exception as err:
-        return CookieLoginResult(success=False, message=f"xHamster 自动登录异常: {err}")
+                if _xhamster_captcha_required(data):
+                    if not yescaptcha_enabled or not (yescaptcha_client_key or "").strip():
+                        return CookieLoginResult(
+                            success=False,
+                            message=(
+                                "xHamster 登录要求人机验证（reCAPTCHA v2）。"
+                                "请在【系统设置 → Cookie 与账号】中启用 YesCaptcha 并填写 ClientKey，"
+                                "或改为粘贴浏览器 Cookie。"
+                            ),
+                        )
+
+                    v2_key = page_v2_key or XHAMSTER_RECAPTCHA_V2_KEY
+                    xh_task_type = (
+                        yescaptcha_task_type
+                        if yescaptcha_task_type in XHAMSTER_CAPTCHA_V2_TASK_TYPES
+                        else XHAMSTER_DEFAULT_CAPTCHA_V2_TASK_TYPE
+                    )
+                    emit("INFO", f"触发人机验证（reCAPTCHA），正在调用 YesCaptcha（{xh_task_type}）...")
+                    try:
+                        solution = await solve_recaptcha(
+                            yescaptcha_client_key,
+                            page_url,
+                            v2_key,
+                            api_base=yescaptcha_api_base,
+                            task_type=xh_task_type,
+                            timeout=yescaptcha_timeout_seconds,
+                            proxy=proxy_url,
+                            cancel_event=ctx.cancel_event,
+                            on_log=emit,
+                        )
+                    except CaptchaError as err:
+                        return CookieLoginResult(
+                            success=False,
+                            message=(
+                                f"xHamster 登录需要人机验证，YesCaptcha 解题失败: {err}。"
+                                "请检查 YesCaptcha 配置/余额，或粘贴浏览器 Cookie。"
+                            ),
+                        )
+                    except Exception as err:  # pragma: no cover - defensive
+                        return CookieLoginResult(
+                            success=False,
+                            message=f"xHamster 登录需要人机验证，YesCaptcha 调用异常: {err}",
+                        )
+
+                    emit("INFO", "已获取验证码 token，正在重新提交登录...")
+                    auth_resp, auth_err = await submit(
+                        captcha_token=solution.token,
+                        captcha_version="v2",
+                    )
+                    if auth_resp is None:
+                        return CookieLoginResult(
+                            success=False,
+                            message=f"验证码已通过，但 xHamster 登录请求失败: {auth_err or '请求失败'}",
+                        )
+                    data = _parse_xhamster_response(auth_resp.text)
+                    if _xhamster_login_succeeded(data):
+                        return await finish()
+                    if _xhamster_captcha_required(data) or _xhamster_captcha_rejected(data):
+                        return CookieLoginResult(
+                            success=False,
+                            message=(
+                                "xHamster 拒绝了 YesCaptcha v2 token。"
+                                "请在设置中切换另一个标准 v2 线路"
+                                "（NoCaptchaTaskProxyless / RecaptchaV2TaskProxyless）后重试，"
+                                "或粘贴浏览器 Cookie。"
+                            ),
+                        )
+                    return _xhamster_login_failure(data, auth_resp)
+
+                return _xhamster_login_failure(data, auth_resp)
+        except Exception as err:
+            return CookieLoginResult(success=False, message=f"xHamster 自动登录异常: {err}")
+
+    return _log_login_outcome(emit, await _run())

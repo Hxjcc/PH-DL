@@ -25,6 +25,7 @@ import {
   Link2,
   FileText,
   Heart,
+  Bookmark,
   Info,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
@@ -1292,6 +1293,12 @@ async function handleClearTemp() {
                       <Heart class="w-3.5 h-3.5 fill-white/95" />
                     </div>
                     <div
+                      v-else-if="entry.visual.avatars[0].isFavorites"
+                      class="w-8 h-8 rounded-full bg-gradient-to-br from-red-500 to-rose-600 text-white flex items-center justify-center"
+                    >
+                      <Bookmark class="w-3.5 h-3.5 fill-white/95" />
+                    </div>
+                    <div
                       v-else
                       :class="[
                         'relative w-8 h-8 rounded-full overflow-hidden bg-gradient-to-br text-white flex items-center justify-center text-[11px] font-semibold ring-1 ring-border/70',
@@ -1328,6 +1335,7 @@ async function handleClearTemp() {
                     >
                       {{ entry.visual.category.label }}
                     </span>
+                    <SiteBadge v-if="entry.visual.site" :site="entry.visual.site" size="xs" />
                     <span class="truncate text-xs font-semibold text-foreground" :title="entry.visual.title">
                       {{ entry.visual.title }}
                     </span>

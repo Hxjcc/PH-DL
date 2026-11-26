@@ -78,8 +78,8 @@ const SELECTOR_FIELDS = [
 ]
 
 const YESCAPTCHA_SITE_OPTIONS = [
-  { label: 'PornHub', value: 'pornhub' },
-  { label: 'xHamster', value: 'xhamster' },
+  { label: 'PornHub', value: 'pornhub', dot: 'bg-[#ff9000]' },
+  { label: 'xHamster', value: 'xhamster', dot: 'bg-red-500' },
 ]
 
 const YESCAPTCHA_TASK_TYPES = {
@@ -829,47 +829,50 @@ async function handleTestNotify() {
                 </p>
               </div>
             </div>
-            <Button
-              variant="outline"
-              size="xs"
-              :disabled="busyTool !== ''"
-              @click="handleTestYescaptcha"
-            >
-              <PlugZap class="w-3.5 h-3.5" />
-              测试 YesCaptcha
-            </Button>
+            <div class="flex flex-wrap items-center gap-2">
+              <SegmentedControl
+                v-model="yescaptchaTaskSite"
+                :options="YESCAPTCHA_SITE_OPTIONS"
+                aria-label="验证码任务站点"
+                size="sm"
+              />
+              <Button
+                variant="outline"
+                size="xs"
+                :disabled="busyTool !== ''"
+                @click="handleTestYescaptcha"
+              >
+                <PlugZap class="w-3.5 h-3.5" />
+                测试 YesCaptcha
+              </Button>
+            </div>
           </div>
 
-          <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
             <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">ClientKey（已脱敏）</label>
+              <label class="block text-xs font-medium text-foreground">ClientKey（已脱敏）</label>
               <Input
                 v-model="form.yescaptcha_client_key"
                 type="password"
                 placeholder="从 yescaptcha.com 后台复制"
               />
+              <p class="text-[11px] text-muted-foreground">两个站点共用此 ClientKey。</p>
             </div>
             <div class="space-y-1.5">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <label class="text-xs font-medium text-foreground">识别任务类型</label>
-                <SegmentedControl
-                  v-model="yescaptchaTaskSite"
-                  :options="YESCAPTCHA_SITE_OPTIONS"
-                  aria-label="验证码任务站点"
-                  size="sm"
-                />
-              </div>
+              <label class="block text-xs font-medium text-foreground">
+                识别任务类型（{{ yescaptchaTaskSite === 'pornhub' ? 'PornHub' : 'xHamster' }}）
+              </label>
               <Select v-model="currentYescaptchaTaskType" :options="yescaptchaTaskTypeOptions" />
               <p class="text-[11px] text-muted-foreground">
                 {{
                   yescaptchaTaskSite === 'pornhub'
-                    ? 'PornHub 使用企业版 v2 线路。'
-                    : '两个标准 v2 线路参数相同，可互相切换。'
+                    ? 'PornHub 固定使用企业版 v2 线路。'
+                    : '标准 v2 两个线路参数相同，可按需切换。'
                 }}
               </p>
             </div>
             <div class="space-y-1.5">
-              <label class="text-xs font-medium text-foreground">解题超时（秒）</label>
+              <label class="block text-xs font-medium text-foreground">解题超时（秒）</label>
               <Input v-model="form.yescaptcha_timeout_seconds" type="number" :min="30" :max="600" />
               <p class="text-[11px] text-muted-foreground">两个站点共用此超时。</p>
             </div>

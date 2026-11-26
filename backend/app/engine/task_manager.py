@@ -289,7 +289,7 @@ class TaskManager:
         *,
         notify_on_failure: bool = False,
     ) -> Optional[RuntimeSettings]:
-        self.events.emit_log("INFO", "正在验证 Cookie 有效性...", job_id=job_id)
+        self.events.emit_log("INFO", "[PornHub Cookie] 正在验证有效性...", job_id=job_id)
         if settings.ph_cookie.strip():
             check = await check_cookie_valid(
                 settings.ph_cookie,
@@ -298,11 +298,15 @@ class TaskManager:
             )
             if check.valid:
                 self.set_cookie_status(True, check.message)
-                self.events.emit_log("INFO", "Cookie 有效。", job_id=job_id)
+                self.events.emit_log("INFO", f"[PornHub Cookie] {check.message}。", job_id=job_id)
                 return settings
-            self.events.emit_log("WARNING", f"当前 Cookie 无效 ({check.message})，尝试自动登录刷新...", job_id=job_id)
+            self.events.emit_log(
+                "WARNING",
+                f"[PornHub Cookie] 校验未通过 ({check.message})，尝试自动登录刷新...",
+                job_id=job_id,
+            )
         else:
-            self.events.emit_log("WARNING", "未配置 Cookie，尝试使用账号密码自动登录...", job_id=job_id)
+            self.events.emit_log("WARNING", "[PornHub Cookie] 未配置 Cookie，尝试自动登录刷新...", job_id=job_id)
 
         if settings.ph_username.strip() and settings.ph_password.strip():
             login_res = await login_and_get_cookies(
@@ -322,14 +326,13 @@ class TaskManager:
                     patch["ph_logged_in_username"] = login_res.logged_in_username
                 updated_settings = await self.repo.update_settings_patch(patch)
                 self.set_cookie_status(True, "自动登录刷新成功")
-                self.events.emit_log("INFO", "自动登录并更新 Cookie 成功。", job_id=job_id)
                 return updated_settings
             err_msg = login_res.message
         else:
             err_msg = "未配置有效 Cookie，且未填写 PornHub 账号密码"
 
         self.set_cookie_status(False, err_msg)
-        self.events.emit_log("ERROR", f"Cookie 准备失败: {err_msg}", job_id=job_id)
+        self.events.emit_log("ERROR", f"[PornHub Cookie] 准备失败: {err_msg}", job_id=job_id)
         if notify_on_failure:
             await send_serverchan(
                 "PH-DL 告警：Cookie 失效",
@@ -436,7 +439,7 @@ class TaskManager:
         settings: RuntimeSettings,
         job_id: int,
     ) -> Optional[RuntimeSettings]:
-        self.events.emit_log("INFO", "正在验证 xHamster Cookie 有效性...", job_id=job_id)
+        self.events.emit_log("INFO", "[xHamster Cookie] 正在验证有效性...", job_id=job_id)
         if settings.xh_cookie.strip():
             valid, msg, username = await check_xhamster_cookie_valid(
                 settings.xh_cookie,
@@ -447,12 +450,17 @@ class TaskManager:
                 self.set_xh_cookie_status(True, msg)
                 if username and username != settings.xh_logged_in_username:
                     settings = await self.repo.update_settings_patch({"xh_logged_in_username": username})
-                self.events.emit_log("INFO", f"xHamster {msg}。", job_id=job_id)
+                self.events.emit_log("INFO", f"[xHamster Cookie] {msg}。", job_id=job_id)
                 return settings
-            self.events.emit_log("WARNING", f"xHamster Cookie 校验未通过: {msg}", job_id=job_id)
+            self.events.emit_log(
+                "WARNING",
+                f"[xHamster Cookie] 校验未通过 ({msg})，尝试自动登录刷新...",
+                job_id=job_id,
+            )
+        else:
+            self.events.emit_log("WARNING", "[xHamster Cookie] 未配置 Cookie，尝试自动登录刷新...", job_id=job_id)
 
         if settings.xh_username.strip() and settings.xh_password.strip():
-            self.events.emit_log("INFO", "尝试使用 xHamster 账号自动登录刷新 Cookie...", job_id=job_id)
             login_res = await login_xhamster_and_get_cookies(
                 settings.xh_username,
                 settings.xh_password,
@@ -470,7 +478,6 @@ class TaskManager:
                     patch["xh_logged_in_username"] = login_res.logged_in_username
                 settings = await self.repo.update_settings_patch(patch)
                 self.set_xh_cookie_status(True, login_res.message)
-                self.events.emit_log("INFO", f"{login_res.message}。", job_id=job_id)
                 return settings
             err_msg = login_res.message or "xHamster 自动登录失败"
         elif settings.xh_cookie.strip():
@@ -479,7 +486,7 @@ class TaskManager:
             err_msg = "xHamster 收藏夹需要登录 xHamster 账号或粘贴有效 Cookie，请在【系统设置 → Cookie 与账号】中配置"
 
         self.set_xh_cookie_status(False, err_msg)
-        self.events.emit_log("ERROR", f"xHamster 认证失败: {err_msg}", job_id=job_id)
+        self.events.emit_log("ERROR", f"[xHamster Cookie] 准备失败: {err_msg}", job_id=job_id)
         return None
 
     async def _run_job(self, job_id: int) -> None:

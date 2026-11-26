@@ -677,14 +677,14 @@ async def scan_xhamster_list_pages(
     known_max_pages: Optional[int] = None
 
     def report_error(page: int, reason: str) -> None:
-        message = f"列表第 {page} 页: {reason}"
+        message = f"[xHamster 扫描] 列表第 {page} 页: {reason}"
         ctx._emit("WARNING", message)
         if on_error:
             on_error(message)
 
     async def _fetch_page(page_num: int):
         page_url = _build_xhamster_paged_url(active_list_url, effective_target_type, page_num)
-        ctx._emit("INFO", f"正在扫描 xHamster 列表第 {page_num} 页: {page_url}")
+        ctx._emit("INFO", f"[xHamster 扫描] 正在扫描列表第 {page_num} 页: {page_url}")
         res, err = await ctx.fetch_with_pow(
             page_url,
             headers=_xh_headers(),
@@ -732,7 +732,7 @@ async def scan_xhamster_list_pages(
                 continue
 
             if res.status_code == 404 and current_page > 1 and is_natural:
-                ctx._emit("INFO", f"xHamster 列表第 {current_page} 页返回 404，已到达末页。")
+                ctx._emit("INFO", f"[xHamster 扫描] 第 {current_page} 页返回 404，已到达末页。")
                 end_reached = True
                 break
             if res.status_code >= 400:
@@ -748,7 +748,7 @@ async def scan_xhamster_list_pages(
                 break
             if _is_xhamster_off_target(initial_url, res.final_url, effective_target_type):
                 if current_page > 1 and is_natural:
-                    ctx._emit("INFO", f"第 {current_page} 页重定向至非目标页面 {res.final_url}，判定为末页。")
+                    ctx._emit("INFO", f"[xHamster 扫描] 第 {current_page} 页重定向至非目标页面 {res.final_url}，判定为末页。")
                     end_reached = True
                     break
                 report_error(current_page, f"页面重定向至 {final.path or '/'}，目标可能已不存在或已变更")
@@ -795,9 +795,9 @@ async def scan_xhamster_list_pages(
             if not raw_items:
                 if is_natural and current_page == 1:
                     if (effective_target_type or "").lower() == "favorites":
-                        ctx._emit("WARNING", "xHamster Favorites 首页为空，可能无收藏或 Cookie 无权访问。")
+                        ctx._emit("WARNING", "[xHamster 扫描] Favorites 首页为空，可能无收藏或 Cookie 无权访问。")
                     else:
-                        ctx._emit("WARNING", "xHamster 列表首页未找到视频项。")
+                        ctx._emit("WARNING", "[xHamster 扫描] 列表首页未找到视频项。")
                 if is_natural:
                     end_reached = True
                     break
@@ -841,7 +841,7 @@ async def scan_xhamster_list_pages(
 
             ctx._emit(
                 "INFO",
-                f"xHamster 第 {current_page} 页解析到 {total_on_page} 个视频，筛选后待处理 {added_this_page} 个。",
+                f"[xHamster 扫描] 第 {current_page} 页解析到 {total_on_page} 个视频，筛选后待处理 {added_this_page} 个。",
             )
             if on_page_progress:
                 on_page_progress(current_page, total_on_page, len(collected))
@@ -851,12 +851,12 @@ async def scan_xhamster_list_pages(
                 break
 
             if is_natural and current_page > 1 and new_unique_on_page == 0:
-                ctx._emit("INFO", f"xHamster 第 {current_page} 页无新增唯一视频，结束扫描。")
+                ctx._emit("INFO", f"[xHamster 扫描] 第 {current_page} 页无新增唯一视频，结束扫描。")
                 end_reached = True
                 break
 
             if catch_up and raw_items[-1][0] in skip_set and not batch_failed:
-                ctx._emit("INFO", f"xHamster 第 {current_page} 页已衔接已知视频，结束补扫。")
+                ctx._emit("INFO", f"[xHamster 扫描] 第 {current_page} 页已衔接已知视频，结束补扫。")
                 end_reached = True
                 break
 

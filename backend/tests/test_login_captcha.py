@@ -223,3 +223,43 @@ async def test_concurrent_login_calls_coalesce_single_captcha_solve(monkeypatch)
     assert r1.cookie_str == r2.cookie_str
     assert solver_calls == 1
     assert len(FakeLoginContext.instances) == 1
+
+
+async def test_pornhub_login_emits_uniform_site_prefixed_logs(monkeypatch):
+    FakeLoginContext.instances = []
+    FakeLoginContext.responses = [
+        {"success": "0", "message": "Invalid credentials.", "requireCaptcha": True},
+        {"success": "1", "username": "Hxiay"},
+    ]
+    monkeypatch.setattr(cookie_mod, "TaskHttpContext", FakeLoginContext)
+
+    async def fake_check(cookie_str, proxy_url=None, timeout=20.0):
+        return cookie_mod.CookieCheckResult(valid=True, message="Cookie 有效")
+
+    async def fake_solver(*args, **kwargs):
+        on_log = kwargs.get("on_log")
+        if on_log:
+            on_log("INFO", "YesCaptcha 任务已创建: tid-1")
+            on_log("INFO", "YesCaptcha 解题完成，耗时 1.2s")
+        return CaptchaSolution(token="03A-solved", task_id="tid-1", task_type="RecaptchaV2EnterpriseTaskProxyless")
+
+    monkeypatch.setattr(cookie_mod, "check_cookie_valid", fake_check)
+    monkeypatch.setattr(cookie_mod, "solve_recaptcha_v2", fake_solver)
+
+    logs = []
+    res = await cookie_mod.login_and_get_cookies(
+        "user@example.com",
+        "password",
+        yescaptcha_enabled=True,
+        yescaptcha_client_key="client-key",
+        on_log=lambda lvl, msg: logs.append((lvl, msg)),
+    )
+    assert res.success is True
+    assert logs
+    assert all(msg.startswith("[PornHub 登录] ") for _, msg in logs)
+    assert any("开始登录，正在加载登录页" in msg for _, msg in logs)
+    assert any("登录页已加载" in msg and "正在提交凭据" in msg for _, msg in logs)
+    assert any("触发人机验证" in msg for _, msg in logs)
+    assert any("YesCaptcha 任务已创建: tid-1" in msg for _, msg in logs)
+    assert any("已获取验证码 token，正在重新提交登录" in msg for _, msg in logs)
+    assert any("登录成功，Cookie 校验通过（当前账号: Hxiay）" in msg for _, msg in logs)

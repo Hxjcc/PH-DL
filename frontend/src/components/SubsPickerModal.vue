@@ -357,8 +357,8 @@ function confirm() {
               @change="handleAvatarPicked"
             />
             <div class="min-w-0">
-              <div class="text-[10px] text-muted-foreground">{{ activeSite === 'xhamster' ? 'xHamster 订阅账号' : '订阅账号' }}</div>
-              <div class="max-w-44 truncate text-sm font-medium" :title="sourceUser">{{ sourceUser || (activeSite === 'xhamster' ? '当前 xHamster 账号' : '当前登录账号') }}</div>
+              <div class="text-[10px] text-muted-foreground">{{ activeSite === 'xhamster' ? 'xHamster 订阅账号' : 'PornHub 订阅账号' }}</div>
+              <div class="max-w-44 truncate text-sm font-medium" :title="sourceUser">{{ sourceUser || (activeSite === 'xhamster' ? '当前 xHamster 账号' : '当前 PornHub 账号') }}</div>
             </div>
             <Button v-if="activeSite === 'pornhub'" variant="ghost" size="xs" :disabled="loading" class="text-muted-foreground" @click="editSource">更换</Button>
           </div>

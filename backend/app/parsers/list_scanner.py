@@ -585,15 +585,15 @@ async def scan_list_pages(
     effective_profile_username = profile_username
 
     def report_error(page: int, reason: str) -> None:
-        message = f"列表第 {page} 页: {reason}"
+        message = f"[PornHub 扫描] 列表第 {page} 页: {reason}"
         ctx._emit("WARNING", message)
         if on_error:
             on_error(message)
 
     async def _fetch_page(page_num: int):
         page_url = _build_paged_url(active_list_url, page_num)
-        ctx._emit("INFO", f"正在扫描列表第 {page_num} 页: {page_url}")
-        res, err = await ctx.fetch_with_pow(page_url, timeout=max(5.0, float(timeout)), log_label=f"列表第 {page_num} 页")
+        ctx._emit("INFO", f"[PornHub 扫描] 正在扫描列表第 {page_num} 页: {page_url}")
+        res, err = await ctx.fetch_with_pow(page_url, timeout=max(5.0, float(timeout)), log_label=f"PornHub 列表第 {page_num} 页")
         return page_num, page_url, res, err
 
     while not end_reached and not ctx.cancel_event.is_set():
@@ -632,7 +632,7 @@ async def scan_list_pages(
 
             # 404 = beyond last page (PornHub returns a 690KB generic recommendations page on 404!)
             if res.status_code == 404 and current_page > 1 and is_natural:
-                ctx._emit("INFO", f"列表第 {current_page} 页返回 404，已到达末页。")
+                ctx._emit("INFO", f"[PornHub 扫描] 第 {current_page} 页返回 404，已到达末页。")
                 end_reached = True
                 break
             if res.status_code >= 400:
@@ -648,7 +648,7 @@ async def scan_list_pages(
                 continue
             if _is_off_target_redirect(initial_url, res.final_url, target_type):
                 if current_page > 1 and is_natural:
-                    ctx._emit("INFO", f"第 {current_page} 页重定向至非目标页面 {res.final_url}，判定为末页。")
+                    ctx._emit("INFO", f"[PornHub 扫描] 第 {current_page} 页重定向至非目标页面 {res.final_url}，判定为末页。")
                     end_reached = True
                     break
                 report_error(current_page, f"页面重定向至 {final.path or '/'}，目标可能已不存在或已变更")
@@ -667,7 +667,7 @@ async def scan_list_pages(
                 page_mismatch = True
 
             if page_mismatch:
-                ctx._emit("INFO", f"第 {current_page} 页重定向至 {res.final_url}，判定为末页。")
+                ctx._emit("INFO", f"[PornHub 扫描] 第 {current_page} 页重定向至 {res.final_url}，判定为末页。")
                 if is_natural:
                     end_reached = True
                     break
@@ -730,9 +730,9 @@ async def scan_list_pages(
             if not raw_items:
                 if is_natural and current_page == 1:
                     if target_type == "favorites":
-                        ctx._emit("WARNING", "Favorites 首页为空，可能无收藏、未公开或 Cookie 无权访问。")
+                        ctx._emit("WARNING", "[PornHub 扫描] Favorites 首页为空，可能无收藏、未公开或 Cookie 无权访问。")
                     else:
-                        ctx._emit("WARNING", "列表首页未找到视频项。")
+                        ctx._emit("WARNING", "[PornHub 扫描] 列表首页未找到视频项。")
                 if is_natural:
                     end_reached = True
                     break
@@ -776,18 +776,18 @@ async def scan_list_pages(
 
             ctx._emit(
                 "INFO",
-                f"第 {current_page} 页解析到 {total_on_page} 个视频，筛选后待处理 {added_this_page} 个。",
+                f"[PornHub 扫描] 第 {current_page} 页解析到 {total_on_page} 个视频，筛选后待处理 {added_this_page} 个。",
             )
             if on_page_progress:
                 on_page_progress(current_page, total_on_page, len(collected))
 
             if is_natural and current_page > 1 and new_unique_on_page == 0:
-                ctx._emit("INFO", f"第 {current_page} 页无新增唯一视频，结束扫描。")
+                ctx._emit("INFO", f"[PornHub 扫描] 第 {current_page} 页无新增唯一视频，结束扫描。")
                 end_reached = True
                 break
 
             if catch_up and raw_items[-1][0] in skip_set and not batch_failed:
-                ctx._emit("INFO", f"第 {current_page} 页已衔接已知视频，结束补扫。")
+                ctx._emit("INFO", f"[PornHub 扫描] 第 {current_page} 页已衔接已知视频，结束补扫。")
                 end_reached = True
                 break
 
