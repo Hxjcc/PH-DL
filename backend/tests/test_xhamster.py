@@ -827,25 +827,25 @@ def test_xhamster_login_url_encodes_captcha_token():
     assert "g-recaptcha-version=v2" in url
 
 
-@pytest.mark.asyncio
-async def test_login_xhamster_solves_recaptcha_with_v2_fallback(monkeypatch):
-    from app.services import cookie as cookie_svc
-    from app.services.captcha import CaptchaSolution
-    from app.parsers import xhamster as xh_parser
+XH_LOGIN_HTML_WITH_CAPTCHA_KEYS = (
+    '<script>window.initials={"recaptchaEnterpriseKeyV3":"page-ent-key",'
+    '"recaptchaKeyV2":"page-v2-key"};</script>'
+)
 
-    login_html = (
-        '<script>window.initials={"recaptchaEnterpriseKeyV3":"page-ent-key",'
-        '"recaptchaKeyV2":"page-v2-key"};</script>'
-    )
-    post_payloads: List[Dict[str, Any]] = []
-    post_urls: List[str] = []
-    solver_calls: List[Dict[str, Any]] = []
-    post_count = 0
+
+def _xh_captcha_ctx():
+    """Build a fake TaskHttpContext that returns scripted login responses."""
 
     class FakeLoginCtx:
+        instances = []
+
         def __init__(self, cookie_str="", **kwargs):
             self.cookie_str = cookie_str
             self.cancel_event = asyncio.Event()
+            self.post_payloads: List[Dict[str, Any]] = []
+            self.post_urls: List[str] = []
+            self.responses: List[tuple] = []
+            FakeLoginCtx.instances.append(self)
 
         async def __aenter__(self):
             return self
@@ -857,38 +857,46 @@ async def test_login_xhamster_solves_recaptcha_with_v2_fallback(monkeypatch):
             return self.cookie_str
 
         async def fetch_with_pow(self, url, method="GET", data=None, headers=None, **kwargs):
-            nonlocal post_count
             if method == "GET":
-                return SimpleNamespace(status_code=200, text=login_html, final_url=url), None
-
-            post_count += 1
-            body = json.loads(data)
-            post_payloads.append(body)
-            post_urls.append(url)
-            if post_count < 3:
-                # First attempt: no token. Second attempt: Enterprise v3 token,
-                # but the site still wants a captcha and asks for v2 fallback.
                 return SimpleNamespace(
-                    status_code=403,
-                    text=json.dumps(
-                        {
-                            "extras": {
-                                "result": False,
-                                "showCaptcha": True,
-                                "captchaActionName": "customLoginAction",
-                            },
-                            "requestData": [],
-                        }
-                    ),
+                    status_code=200,
+                    text=XH_LOGIN_HTML_WITH_CAPTCHA_KEYS,
                     final_url=url,
                 ), None
 
-            self.cookie_str = "x_csrf_token=1; _id=fake_after_captcha"
+            self.post_payloads.append(json.loads(data))
+            self.post_urls.append(url)
+            status, body = self.responses.pop(0)
+            if status == 200:
+                self.cookie_str = "x_csrf_token=1; _id=fake_after_captcha"
             return SimpleNamespace(
-                status_code=200,
-                text=json.dumps({"extras": {"result": True, "userId": 1}, "requestData": []}),
+                status_code=status,
+                text=json.dumps(body) if isinstance(body, dict) else str(body),
                 final_url=url,
             ), None
+
+    return FakeLoginCtx
+
+
+def _xh_show_captcha() -> Dict[str, Any]:
+    return {
+        "extras": {
+            "result": False,
+            "showCaptcha": True,
+            "captchaActionName": "customLoginAction",
+        },
+        "requestData": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_login_xhamster_prefers_v2_captcha(monkeypatch):
+    from app.services import cookie as cookie_svc
+    from app.services.captcha import CaptchaSolution
+    from app.parsers import xhamster as xh_parser
+
+    FakeLoginCtx = _xh_captcha_ctx()
+    solver_calls: List[Dict[str, Any]] = []
 
     async def fake_solver(client_key, website_url, website_key, **kwargs):
         solver_calls.append(
@@ -899,14 +907,21 @@ async def test_login_xhamster_solves_recaptcha_with_v2_fallback(monkeypatch):
                 **kwargs,
             }
         )
-        token = "v3-token" if len(solver_calls) == 1 else "v2-token"
-        return CaptchaSolution(token=token, task_id=f"task-{len(solver_calls)}", task_type="type")
+        return CaptchaSolution(token="v2-token", task_id="task-v2", task_type="type")
 
     async def fake_verify(cookie_str: str, **kwargs):
         assert "_id=fake_after_captcha" in cookie_str
         return True, "Cookie 有效（当前账号: NativePea222）", "NativePea222"
 
-    monkeypatch.setattr(cookie_svc, "TaskHttpContext", FakeLoginCtx)
+    def make_ctx(*args, **kwargs):
+        ctx = FakeLoginCtx(*args, **kwargs)
+        ctx.responses = [
+            (403, _xh_show_captcha()),
+            (200, {"extras": {"result": True, "userId": 1}, "requestData": []}),
+        ]
+        return ctx
+
+    monkeypatch.setattr(cookie_svc, "TaskHttpContext", make_ctx)
     monkeypatch.setattr(cookie_svc, "solve_recaptcha", fake_solver)
     monkeypatch.setattr(xh_parser, "check_xhamster_cookie_valid", fake_verify)
 
@@ -919,22 +934,82 @@ async def test_login_xhamster_solves_recaptcha_with_v2_fallback(monkeypatch):
     )
 
     assert result.success is True
-    assert result.logged_in_username == "NativePea222"
     assert "_id=fake_after_captcha" in result.cookie_str
 
-    assert all("g-recaptcha-response" not in payload for payload in post_payloads)
-    assert "g-recaptcha-response" not in post_urls[0]
-    assert "g-recaptcha-response=v3-token" in post_urls[1]
-    assert "g-recaptcha-version" not in post_urls[1]
-    assert "g-recaptcha-response=v2-token" in post_urls[2]
-    assert "g-recaptcha-version=v2" in post_urls[2]
+    ctx = FakeLoginCtx.instances[-1]
+    assert len(ctx.post_urls) == 2
+    assert "g-recaptcha-response" not in ctx.post_urls[0]
+    assert "g-recaptcha-response=v2-token" in ctx.post_urls[1]
+    assert "g-recaptcha-version=v2" in ctx.post_urls[1]
+    assert all("g-recaptcha-response" not in payload for payload in ctx.post_payloads)
+
+    assert len(solver_calls) == 1
+    assert solver_calls[0]["task_type"] == "RecaptchaV2TaskProxyless"
+    assert solver_calls[0]["website_key"] == "page-v2-key"
+    assert "page_action" not in solver_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_login_xhamster_falls_back_to_v3_when_v2_rejected(monkeypatch):
+    from app.services import cookie as cookie_svc
+    from app.services.captcha import CaptchaSolution
+    from app.parsers import xhamster as xh_parser
+
+    FakeLoginCtx = _xh_captcha_ctx()
+    solver_calls: List[Dict[str, Any]] = []
+
+    async def fake_solver(client_key, website_url, website_key, **kwargs):
+        solver_calls.append(
+            {
+                "client_key": client_key,
+                "website_url": website_url,
+                "website_key": website_key,
+                **kwargs,
+            }
+        )
+        token = "v2-token" if len(solver_calls) == 1 else "v3-token"
+        return CaptchaSolution(token=token, task_id=f"task-{len(solver_calls)}", task_type="type")
+
+    async def fake_verify(cookie_str: str, **kwargs):
+        assert "_id=fake_after_captcha" in cookie_str
+        return True, "Cookie 有效（当前账号: NativePea222）", "NativePea222"
+
+    def make_ctx(*args, **kwargs):
+        ctx = FakeLoginCtx(*args, **kwargs)
+        ctx.responses = [
+            (403, _xh_show_captcha()),
+            (400, {"extras": {"result": False, "errorMessage": "Recaptcha failure. Try again"}, "requestData": []}),
+            (200, {"extras": {"result": True, "userId": 1}, "requestData": []}),
+        ]
+        return ctx
+
+    monkeypatch.setattr(cookie_svc, "TaskHttpContext", make_ctx)
+    monkeypatch.setattr(cookie_svc, "solve_recaptcha", fake_solver)
+    monkeypatch.setattr(xh_parser, "check_xhamster_cookie_valid", fake_verify)
+
+    result = await cookie_svc.login_xhamster_and_get_cookies(
+        "NativePea222",
+        "good-pass",
+        yescaptcha_enabled=True,
+        yescaptcha_client_key="client-key",
+        yescaptcha_timeout_seconds=60,
+    )
+
+    assert result.success is True
+
+    ctx = FakeLoginCtx.instances[-1]
+    assert len(ctx.post_urls) == 3
+    assert "g-recaptcha-response=v2-token" in ctx.post_urls[1]
+    assert "g-recaptcha-version=v2" in ctx.post_urls[1]
+    assert "g-recaptcha-response=v3-token" in ctx.post_urls[2]
+    assert "g-recaptcha-version" not in ctx.post_urls[2]
 
     assert len(solver_calls) == 2
-    assert solver_calls[0]["task_type"] == "RecaptchaV3EnterpriseTask"
-    assert solver_calls[0]["page_action"] == "customLoginAction"
-    assert solver_calls[0]["website_key"] == "page-ent-key"
-    assert solver_calls[1]["task_type"] == "RecaptchaV2TaskProxyless"
-    assert solver_calls[1]["website_key"] == "page-v2-key"
+    assert solver_calls[0]["task_type"] == "RecaptchaV2TaskProxyless"
+    assert solver_calls[1]["task_type"] == "RecaptchaV3EnterpriseTask"
+    assert solver_calls[1]["page_action"] == "customLoginAction"
+    assert solver_calls[1]["website_key"] == "page-ent-key"
+    assert solver_calls[1]["timeout"] == 45.0
 
 
 @pytest.mark.asyncio

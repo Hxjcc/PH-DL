@@ -841,7 +841,7 @@ async function handleTestNotify() {
 
           <p class="text-xs text-muted-foreground">
             国内服务器若无法访问国际节点，可切换到 cn.yescaptcha.com。若 token 提交后仍要求验证码，可尝试切换识别任务类型。
-            xHamster 会自动使用 reCAPTCHA Enterprise v3，失败后降级 v2，不受上方任务类型影响。
+            xHamster 会优先使用 reCAPTCHA v2，失败后再尝试 Enterprise v3，不受上方任务类型影响。
           </p>
         </div>
       </Card>

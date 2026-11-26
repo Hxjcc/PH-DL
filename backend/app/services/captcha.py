@@ -211,7 +211,8 @@ async def solve_recaptcha(
             return CaptchaSolution(token=token, task_id=task_id, task_type=task_type)
         if status and status != "processing":
             raise CaptchaError(f"YesCaptcha 任务状态异常: {status}", "ERROR_BAD_STATUS")
-        _emit(on_log, "INFO", f"YesCaptcha 识别中...（第 {polls} 次查询）")
+        elapsed = time.perf_counter() - started
+        _emit(on_log, "INFO", f"YesCaptcha 识别中...（第 {polls} 次查询，已等待 {elapsed:.0f}s）")
 
     raise CaptchaError("YesCaptcha 解题超时", "ERROR_TASK_TIMEOUT")
 

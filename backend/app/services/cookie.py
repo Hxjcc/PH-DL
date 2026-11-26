@@ -800,6 +800,13 @@ def _xhamster_captcha_required(data: object) -> bool:
     return bool(val)
 
 
+def _xhamster_captcha_rejected(data: object) -> bool:
+    """True when xHamster rejected the submitted captcha token itself."""
+
+    message = _extract_xhamster_login_error(data).lower()
+    return "recaptcha" in message or "captcha" in message
+
+
 def _xhamster_login_payload(
     username: str,
     password: str,
@@ -1029,7 +1036,7 @@ async def _login_xhamster_once(
                     return CookieLoginResult(
                         success=False,
                         message=(
-                            "xHamster 登录要求人机验证（reCAPTCHA Enterprise）。"
+                            "xHamster 登录要求人机验证（reCAPTCHA）。"
                             "请在【系统设置 → 自动登录】中启用 YesCaptcha 并填写 ClientKey，"
                             "或改为粘贴浏览器 Cookie。"
                         ),
@@ -1042,45 +1049,12 @@ async def _login_xhamster_once(
                 v2_key = page_v2_key or XHAMSTER_RECAPTCHA_V2_KEY
                 captcha_errors: list[str] = []
 
-                if enterprise_key:
-                    emit("INFO", "检测到 xHamster 要求 reCAPTCHA Enterprise，正在调用 YesCaptcha 解题...")
-                    try:
-                        solution = await solve_recaptcha(
-                            yescaptcha_client_key,
-                            page_url,
-                            enterprise_key,
-                            api_base=yescaptcha_api_base,
-                            task_type=XHAMSTER_CAPTCHA_V3_TASK_TYPE,
-                            timeout=yescaptcha_timeout_seconds,
-                            page_action=action,
-                            proxy=proxy_url,
-                            cancel_event=ctx.cancel_event,
-                            on_log=on_log,
-                        )
-                    except CaptchaError as err:
-                        captcha_errors.append(f"v3: {err}")
-                        emit("WARNING", f"xHamster v3 验证码解题失败: {err}")
-                    except Exception as err:  # pragma: no cover - defensive
-                        captcha_errors.append(f"v3: {type(err).__name__}: {err}")
-                        emit("WARNING", f"xHamster v3 验证码调用异常: {type(err).__name__}: {err}")
-                    else:
-                        emit("INFO", "YesCaptcha 已返回 v3 token，正在重新提交 xHamster 登录...")
-                        auth_resp, auth_err = await submit(captcha_token=solution.token)
-                        if auth_resp is None:
-                            return CookieLoginResult(
-                                success=False,
-                                message=f"验证码已通过，但 xHamster 登录请求失败: {auth_err or '请求失败'}",
-                            )
-                        data = _parse_xhamster_response(auth_resp.text)
-                        extras = _xhamster_extras(data)
-                        if _xhamster_login_succeeded(data):
-                            return await finish()
-                        if not _xhamster_captcha_required(data):
-                            return _xhamster_login_failure(data, auth_resp)
-                        emit("WARNING", "xHamster 仍要求人机验证，尝试降级到 reCAPTCHA v2...")
-
+                # xHamster accepts a standard v2 token via ``g-recaptcha-version=v2``.
+                # The v2 route is much faster and more reliable with YesCaptcha than
+                # the Enterprise v3 route, so try v2 first.  The browser tries v3
+                # first, but the server verifies whichever version we declare.
                 if v2_key:
-                    emit("INFO", "正在调用 YesCaptcha 解 xHamster reCAPTCHA v2（降级）...")
+                    emit("INFO", "正在调用 YesCaptcha 解 xHamster reCAPTCHA v2...")
                     try:
                         solution = await solve_recaptcha(
                             yescaptcha_client_key,
@@ -1100,11 +1074,52 @@ async def _login_xhamster_once(
                         captcha_errors.append(f"v2: {type(err).__name__}: {err}")
                         emit("WARNING", f"xHamster v2 验证码调用异常: {type(err).__name__}: {err}")
                     else:
-                        emit("INFO", "YesCaptcha 已返回 v2 token，正在重新提交 xHamster 登录...")
+                        emit("INFO", "YesCaptcha 已返回 v2 token，正在提交 xHamster 登录...")
                         auth_resp, auth_err = await submit(
                             captcha_token=solution.token,
                             captcha_version="v2",
                         )
+                        if auth_resp is None:
+                            return CookieLoginResult(
+                                success=False,
+                                message=f"验证码已通过，但 xHamster 登录请求失败: {auth_err or '请求失败'}",
+                            )
+                        data = _parse_xhamster_response(auth_resp.text)
+                        extras = _xhamster_extras(data)
+                        if _xhamster_login_succeeded(data):
+                            return await finish()
+                        if not _xhamster_captcha_required(data) and not _xhamster_captcha_rejected(data):
+                            return _xhamster_login_failure(data, auth_resp)
+                        emit("WARNING", "xHamster 未接受 v2 token，尝试 v3 Enterprise...")
+
+                if enterprise_key:
+                    # Keep the fallback bounded: the Enterprise route is the slow
+                    # one (it often never returns for this site), and a long block
+                    # also makes the HTTP refresh request hit reverse-proxy timeouts.
+                    v3_timeout = min(float(yescaptcha_timeout_seconds), 45.0)
+                    emit("INFO", "正在调用 YesCaptcha 解 xHamster reCAPTCHA Enterprise v3（降级）...")
+                    try:
+                        solution = await solve_recaptcha(
+                            yescaptcha_client_key,
+                            page_url,
+                            enterprise_key,
+                            api_base=yescaptcha_api_base,
+                            task_type=XHAMSTER_CAPTCHA_V3_TASK_TYPE,
+                            timeout=v3_timeout,
+                            page_action=action,
+                            proxy=proxy_url,
+                            cancel_event=ctx.cancel_event,
+                            on_log=on_log,
+                        )
+                    except CaptchaError as err:
+                        captcha_errors.append(f"v3: {err}")
+                        emit("WARNING", f"xHamster v3 验证码解题失败: {err}")
+                    except Exception as err:  # pragma: no cover - defensive
+                        captcha_errors.append(f"v3: {type(err).__name__}: {err}")
+                        emit("WARNING", f"xHamster v3 验证码调用异常: {type(err).__name__}: {err}")
+                    else:
+                        emit("INFO", "YesCaptcha 已返回 v3 token，正在提交 xHamster 登录...")
+                        auth_resp, auth_err = await submit(captcha_token=solution.token)
                         if auth_resp is None:
                             return CookieLoginResult(
                                 success=False,
