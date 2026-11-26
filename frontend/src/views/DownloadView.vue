@@ -29,7 +29,7 @@ import {
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
-import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta, siteMeta } from '../utils/format'
+import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta } from '../utils/format'
 import { computeJobLiveMetrics, resolveJobVisual } from '../utils/jobMeta'
 import { parseVideoLinks } from '../utils/videoLinks'
 import { extractTargetFromInput, parseTargetUsernames } from '../utils/targetInput'
@@ -46,6 +46,7 @@ import Tabs from '../components/ui/Tabs.vue'
 import TagsInput from '../components/ui/TagsInput.vue'
 import ConfirmPopover from '../components/ui/ConfirmPopover.vue'
 import SubsPickerModal from '../components/SubsPickerModal.vue'
+import SiteBadge from '../components/SiteBadge.vue'
 
 const store = useAppStore()
 
@@ -274,7 +275,7 @@ const showTempBanner = computed(
 )
 const legacyTempCount = computed(() => store.tempFiles.filter((file) => !file.verified_checkpoint).length)
 
-const recentJobs = computed(() => store.jobs.slice(0, 5))
+const recentJobs = computed(() => store.jobs.slice(0, 6))
 const isRouteActive = ref(true)
 const brokenRecentAvatars = ref(new Set())
 const RECENT_CATEGORY_ICONS = {
@@ -892,26 +893,33 @@ async function handleClearTemp() {
                 :inert="sourceTab !== 'target'"
                 :aria-hidden="sourceTab !== 'target'"
               >
-                <div class="flex flex-wrap items-center justify-between gap-2">
-                  <div class="inline-flex items-center rounded-lg border border-border bg-surface-subtle/70 p-0.5" role="group" aria-label="目标站点">
+                <div class="site-bar">
+                  <span class="site-bar-label">来源站点</span>
+                  <div class="site-segmented" role="group" aria-label="目标站点">
                     <button
                       v-for="opt in SITE_OPTIONS"
                       :key="opt.value"
                       type="button"
                       :aria-pressed="form.site === opt.value"
                       :class="[
-                        'h-7 px-3 rounded-md text-xs font-medium transition-colors cursor-pointer select-none',
-                        form.site === opt.value
-                          ? 'bg-card text-foreground shadow-xs ring-1 ring-border/70'
-                          : 'text-muted-foreground hover:text-foreground',
+                        'site-segmented-btn',
+                        form.site === opt.value ? 'site-segmented-btn-active' : '',
                       ]"
                       @click="form.site = opt.value"
                     >
-                      {{ opt.label }}
+                      <span
+                        :class="[
+                          'site-dot',
+                          opt.value === 'xhamster' ? 'bg-red-500' : 'bg-[#ff9000]',
+                          form.site === opt.value ? 'opacity-100' : 'opacity-40',
+                        ]"
+                        aria-hidden="true"
+                      />
+                      <span>{{ opt.label }}</span>
                     </button>
                   </div>
-                  <span v-if="form.site === 'xhamster'" class="text-[11px] text-muted-foreground">
-                    公开博主/频道免 Cookie · 4K HLS 自动封装 MP4
+                  <span v-if="form.site === 'xhamster'" class="site-bar-hint">
+                    公开主页免 Cookie · 4K HLS 自动封装 MP4
                   </span>
                 </div>
 
@@ -997,12 +1005,7 @@ async function handleClearTemp() {
                           />
                         </span>
                         <span class="max-w-24 truncate">{{ targetName(target) }}</span>
-                        <span
-                          v-if="target.site === 'xhamster'"
-                          :class="['rounded px-1 py-0 text-[9px] font-semibold border leading-3.5', siteMeta('xhamster').pillClass]"
-                        >
-                          XH
-                        </span>
+                        <SiteBadge :site="target.site" size="xs" />
                       </Button>
                     </div>
 
@@ -1052,37 +1055,36 @@ async function handleClearTemp() {
                 :inert="sourceTab !== 'urls'"
                 :aria-hidden="sourceTab !== 'urls'"
               >
-                <div class="url-source">
-                  <div class="field min-w-0">
-                    <div class="field-heading">
-                      <label for="download-urls">视频链接</label>
-                      <Badge variant="secondary" class="px-2 py-0 text-[10px] tabular-nums" aria-live="polite">已识别 {{ parsedUrls.length }}</Badge>
-                      <button v-if="form.urlsText" type="button" class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer" @click="clearUrls">清空</button>
-                    </div>
+                <div class="field min-w-0">
+                  <div class="field-heading">
+                    <label for="download-urls">视频链接</label>
+                    <Badge variant="secondary" class="px-2 py-0 text-[10px] tabular-nums" aria-live="polite">已识别 {{ parsedUrls.length }}</Badge>
+                    <button v-if="form.urlsText" type="button" class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer" @click="clearUrls">清空</button>
+                  </div>
+                  <div class="url-source">
                     <Textarea
                       id="download-urls"
                       v-model="form.urlsText"
-                      :rows="2"
+                      :rows="5"
                       placeholder="每行粘贴一个视频页链接（支持 PornHub 与 xHamster 混合粘贴）&#10;https://www.pornhub.com/view_video.php?viewkey=...&#10;https://xhamster.com/videos/...-xhOwQIZ"
                       class="url-textarea font-mono text-xs"
                     />
-                    <p class="source-note">
-                      {{ ignoredLinksText ? `已忽略 ${ignoredLinksText}。` : '支持 PornHub（view_video/embed/shorties）与 xHamster 视频链接，重复视频自动去重。' }}
-                    </p>
+                    <Button
+                      variant="outline"
+                      :class="['txt-dropzone', urlDropping ? 'border-brand/50 bg-brand/5' : 'border-dashed bg-surface-subtle']"
+                      @click="txtInputRef?.click()"
+                      @dragover.prevent="urlDropping = true"
+                      @dragleave.prevent="urlDropping = false"
+                      @drop.prevent="handleTxtDrop"
+                    >
+                      <Upload class="w-4 h-4 text-muted-foreground" />
+                      <span class="text-xs font-medium">导入 TXT 文件</span>
+                      <span class="text-[10px] text-muted-foreground">拖入文件或点击选择</span>
+                    </Button>
                   </div>
-
-                  <Button
-                    variant="outline"
-                    :class="['txt-dropzone', urlDropping ? 'border-brand/50 bg-brand/5' : 'border-dashed bg-surface-subtle']"
-                    @click="txtInputRef?.click()"
-                    @dragover.prevent="urlDropping = true"
-                    @dragleave.prevent="urlDropping = false"
-                    @drop.prevent="handleTxtDrop"
-                  >
-                    <Upload class="w-4 h-4 text-muted-foreground" />
-                    <span class="text-xs font-medium">导入 TXT 文件</span>
-                    <span class="text-[10px] text-muted-foreground">拖入文件或点击选择</span>
-                  </Button>
+                  <p class="source-note">
+                    {{ ignoredLinksText ? `已忽略 ${ignoredLinksText}。` : '支持 PornHub（view_video/embed/shorties）与 xHamster 视频链接，重复视频自动去重。' }}
+                  </p>
                   <input ref="txtInputRef" type="file" accept=".txt" class="hidden" @change="handleTxtFileChange" />
                 </div>
 
@@ -1284,13 +1286,23 @@ async function handleClearTemp() {
             </RouterLink>
           </div>
 
-          <div v-if="recentJobCards.length > 0" class="recent-list flex-1 flex flex-col gap-2">
-            <RouterLink
-              v-for="entry in recentJobCards"
+          <div v-if="recentJobCards.length > 0" class="recent-list flex-1 flex flex-col">
+            <div
+              v-for="(entry, index) in recentJobCards"
               :key="entry.job.id"
-              :to="{ name: 'jobs', query: { job: entry.job.id } }"
-              class="recent-job flex flex-col justify-center min-w-0 rounded-xl border border-border bg-card px-3 py-2.5 no-underline transition-colors hover:border-brand/30 hover:bg-accent/40"
+              :class="[
+                'min-w-0',
+                index >= 5 ? 'recent-extra-slot' : '',
+                index >= 5 && !showAdvanced ? 'recent-extra-slot-collapsed' : '',
+              ]"
+              :inert="index >= 5 && !showAdvanced"
+              :aria-hidden="index >= 5 && !showAdvanced"
             >
+              <div :class="index >= 5 ? 'recent-extra-clip' : 'min-w-0'">
+                <RouterLink
+                  :to="{ name: 'jobs', query: { job: entry.job.id } }"
+                  class="recent-job flex flex-col justify-center min-w-0 rounded-xl border border-border bg-card px-3 py-2.5 no-underline transition-colors hover:border-brand/30 hover:bg-accent/40"
+                >
               <div class="flex items-center gap-2.5 min-w-0">
                 <div class="w-8 h-8 shrink-0 relative">
                   <template v-if="entry.visual.avatars.length >= 1">
@@ -1360,13 +1372,15 @@ async function handleClearTemp() {
                 </div>
               </div>
 
-              <Progress
-                v-if="entry.isActive"
-                :model-value="entry.metrics.percent"
-                :indeterminate="entry.metrics.indeterminate"
-                class="mt-2 h-1"
-              />
-            </RouterLink>
+                  <Progress
+                    v-if="entry.isActive"
+                    :model-value="entry.metrics.percent"
+                    :indeterminate="entry.metrics.indeterminate"
+                    class="mt-2 h-1"
+                  />
+                </RouterLink>
+              </div>
+            </div>
           </div>
 
           <div v-else class="recent-empty m-4 flex-1 flex items-center justify-center rounded-xl border border-dashed border-border px-4 py-6 text-center text-xs text-muted-foreground">
@@ -1509,6 +1523,73 @@ async function handleClearTemp() {
   font-size: 12px;
   font-weight: 500;
   color: var(--foreground);
+}
+
+.site-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-bottom: 12px;
+}
+
+.site-bar-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--foreground);
+}
+
+.site-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 10px;
+  background: var(--muted);
+}
+
+.site-segmented-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.site-segmented-btn:hover {
+  color: var(--foreground);
+}
+
+.site-segmented-btn-active {
+  background: var(--card);
+  color: var(--foreground);
+  box-shadow: 0 1px 2px rgba(9, 9, 11, 0.06);
+}
+
+.site-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+  transition: opacity 150ms ease;
+}
+
+.site-bar-hint {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--muted-foreground);
 }
 
 .target-source {
@@ -1662,13 +1743,16 @@ async function handleClearTemp() {
 .url-source {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
   gap: 12px;
 }
 
 .url-textarea {
-  height: 64px;
-  min-height: 64px;
-  resize: none;
+  min-height: 124px;
+  max-height: 320px;
+  line-height: 1.65;
+  overflow-y: auto;
+  resize: vertical;
   transition-property: border-color, box-shadow;
 }
 
@@ -1856,7 +1940,29 @@ async function handleClearTemp() {
 }
 
 .recent-list {
+  --recent-gap: 8px;
+  gap: var(--recent-gap);
   padding: 14px;
+}
+
+.recent-extra-slot {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition: grid-template-rows 180ms, opacity 180ms, margin-top 180ms;
+}
+
+.recent-extra-slot-collapsed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  margin-top: calc(var(--recent-gap) * -1);
+  pointer-events: none;
+}
+
+.recent-extra-clip {
+  overflow: hidden;
+  min-height: 0;
+  min-width: 0;
 }
 
 .recent-job {
@@ -1949,11 +2055,14 @@ async function handleClearTemp() {
     padding: 12px 16px;
   }
 
+  .site-bar {
+    margin-bottom: 10px;
+  }
+
   .url-textarea {
-    height: 56px;
-    min-height: 56px;
-    padding-top: 6px;
-    padding-bottom: 6px;
+    min-height: 108px;
+    padding-top: 8px;
+    padding-bottom: 8px;
   }
 
   .quick-targets {
@@ -1974,7 +2083,7 @@ async function handleClearTemp() {
   }
 
   .recent-list {
-    gap: 6px;
+    --recent-gap: 6px;
     padding: 10px;
   }
 
@@ -2064,7 +2173,8 @@ async function handleClearTemp() {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .advanced-filters {
+  .advanced-filters,
+  .recent-extra-slot {
     transition: none;
   }
 }

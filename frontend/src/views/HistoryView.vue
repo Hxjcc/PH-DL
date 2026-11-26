@@ -18,7 +18,7 @@ import {
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
-import { formatBytes, formatDateTime, formatPublishedDate, formatVideoDuration, siteMeta, videoStatusMeta } from '../utils/format'
+import { formatBytes, formatDateTime, formatPublishedDate, formatVideoDuration, videoStatusMeta } from '../utils/format'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
@@ -27,6 +27,7 @@ import Select from '../components/ui/Select.vue'
 import Checkbox from '../components/ui/Checkbox.vue'
 import ConfirmPopover from '../components/ui/ConfirmPopover.vue'
 import VideoPlaybackDialog from '../components/VideoPlaybackDialog.vue'
+import SiteBadge from '../components/SiteBadge.vue'
 import { HISTORY_PAGE_SIZES } from '../utils/listPreferences'
 
 const store = useAppStore()
@@ -981,12 +982,7 @@ onDeactivated(() => {
                   </div>
 
                   <div class="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
-                    <span
-                      v-if="v.site === 'xhamster'"
-                      :class="['inline-flex items-center rounded border px-1 py-0 text-[9px] font-semibold leading-3.5', siteMeta('xhamster').pillClass]"
-                    >
-                      XH
-                    </span>
+                    <SiteBadge :site="v.site" size="xs" />
                     <span v-if="v.uploader_display_name || v.uploader" class="font-medium text-foreground/80 truncate max-w-[140px]">
                       {{ v.uploader_display_name || v.uploader }}
                     </span>
@@ -1172,13 +1168,7 @@ onDeactivated(() => {
                     {{ v.title || v.viewkey }}
                   </div>
                   <div class="flex items-center gap-1.5 text-[11px] font-mono text-muted-foreground mt-0.5 tabular-nums">
-                    <span
-                      v-if="v.site === 'xhamster'"
-                      :class="['inline-flex items-center rounded border px-1 py-0 font-sans text-[9px] font-semibold leading-3.5', siteMeta('xhamster').pillClass]"
-                      title="xHamster"
-                    >
-                      XH
-                    </span>
+                    <SiteBadge :site="v.site" size="xs" />
                     <span>{{ v.viewkey }}</span>
                     <template v-if="formatPublishedDate(v.published_at)">
                       <span class="opacity-45 select-none">·</span>

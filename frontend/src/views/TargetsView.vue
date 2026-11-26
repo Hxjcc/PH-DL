@@ -45,6 +45,7 @@ import Dialog from '../components/ui/Dialog.vue'
 import ConfirmPopover from '../components/ui/ConfirmPopover.vue'
 import SubsPickerModal from '../components/SubsPickerModal.vue'
 import BaselineScopeFields from '../components/BaselineScopeFields.vue'
+import SiteBadge from '../components/SiteBadge.vue'
 
 const store = useAppStore()
 const router = useRouter()
@@ -1061,13 +1062,7 @@ async function handleDelete(t) {
                   {{ targetDisplayName(t) }}
                 </div>
                 <div class="mt-1 flex flex-wrap items-center gap-1.5">
-                  <span
-                    v-if="t.site === 'xhamster'"
-                    :class="['inline-flex items-center rounded-md border px-1.5 py-0 text-[10px] font-semibold leading-4', siteMeta('xhamster').pillClass]"
-                    title="xHamster 监控目标"
-                  >
-                    XH
-                  </span>
+                  <SiteBadge :site="t.site" size="sm" />
                   <Badge variant="secondary" class="text-[11px] px-2 py-0">
                     {{ targetTypeMeta(t.target_type) }}
                   </Badge>
@@ -1236,12 +1231,7 @@ async function handleDelete(t) {
                 </td>
                 <td class="px-5 py-3.5 whitespace-nowrap">
                   <div class="inline-flex items-center gap-1.5">
-                    <span
-                      v-if="t.site === 'xhamster'"
-                      :class="['inline-flex items-center rounded-md border px-1.5 py-0 text-[10px] font-semibold leading-4', siteMeta('xhamster').pillClass]"
-                    >
-                      XH
-                    </span>
+                    <SiteBadge :site="t.site" size="sm" />
                     <Badge variant="secondary">{{ targetTypeMeta(t.target_type) }}</Badge>
                   </div>
                 </td>
@@ -1378,23 +1368,33 @@ async function handleDelete(t) {
     >
       <form id="add-target-form" class="space-y-4" @submit.prevent="handleAddTarget">
         <div class="space-y-1.5">
-          <label class="text-xs font-medium text-foreground">目标站点</label>
-          <div class="inline-flex items-center rounded-lg border border-border bg-surface-subtle/70 p-0.5" role="group" aria-label="选择目标站点">
-            <button
-              v-for="opt in SITE_CHOICES"
-              :key="opt.value"
-              type="button"
-              :aria-pressed="newTarget.site === opt.value"
-              :class="[
-                'h-7 px-3 rounded-md text-xs font-medium transition-colors cursor-pointer select-none',
-                newTarget.site === opt.value
-                  ? 'bg-card text-foreground shadow-xs ring-1 ring-border/70'
-                  : 'text-muted-foreground hover:text-foreground',
-              ]"
-              @click="newTarget.site = opt.value"
-            >
-              {{ opt.label }}
-            </button>
+          <label class="text-xs font-medium text-foreground">来源站点</label>
+          <div>
+            <div class="inline-flex items-center rounded-lg bg-muted p-0.5 gap-0.5" role="group" aria-label="选择目标站点">
+              <button
+                v-for="opt in SITE_CHOICES"
+                :key="opt.value"
+                type="button"
+                :aria-pressed="newTarget.site === opt.value"
+                :class="[
+                  'inline-flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium transition-all cursor-pointer select-none',
+                  newTarget.site === opt.value
+                    ? 'bg-card text-foreground shadow-xs'
+                    : 'text-muted-foreground hover:text-foreground',
+                ]"
+                @click="newTarget.site = opt.value"
+              >
+                <span
+                  :class="[
+                    'w-1.5 h-1.5 rounded-full shrink-0 transition-opacity',
+                    opt.value === 'xhamster' ? 'bg-red-500' : 'bg-[#ff9000]',
+                    newTarget.site === opt.value ? 'opacity-100' : 'opacity-40',
+                  ]"
+                  aria-hidden="true"
+                />
+                <span>{{ opt.label }}</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1498,9 +1498,7 @@ async function handleDelete(t) {
       <form id="edit-target-form" class="space-y-4" @submit.prevent="handleSaveTargetEdit">
         <div class="flex items-center gap-2 text-xs text-muted-foreground">
           <span>所属站点：</span>
-          <span :class="['inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium', siteMeta(editForm.site).pillClass]">
-            {{ siteMeta(editForm.site).label }}
-          </span>
+          <SiteBadge :site="editForm.site" full />
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div class="space-y-1.5">

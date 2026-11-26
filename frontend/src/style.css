@@ -162,6 +162,50 @@
   }
 }
 
+.ph-textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(113, 113, 122, 0.24) transparent;
+}
+
+.ph-textarea::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.ph-textarea::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 6px 0;
+}
+
+.ph-textarea::-webkit-scrollbar-thumb {
+  background: rgba(113, 113, 122, 0.24);
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.ph-textarea::-webkit-scrollbar-thumb:hover {
+  background: rgba(113, 113, 122, 0.44);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.dark .ph-textarea {
+  scrollbar-color: rgba(161, 161, 170, 0.24) transparent;
+}
+
+.dark .ph-textarea::-webkit-scrollbar-thumb {
+  background: rgba(161, 161, 170, 0.24);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.dark .ph-textarea::-webkit-scrollbar-thumb:hover {
+  background: rgba(161, 161, 170, 0.4);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
