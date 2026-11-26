@@ -61,6 +61,7 @@ class TargetBatchCreateRequest(BaseModel):
 
 class TargetUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
+    username: Optional[str] = None
     target_type: Optional[str] = None
     preferred_quality: Optional[str] = None
     display_name: Optional[str] = None
@@ -225,12 +226,30 @@ async def update_target(
     payload: TargetUpdateRequest,
     container: AppContainer = Depends(require_auth),
 ):
+    existing = await container.repo.get_target(target_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="目标不存在")
+
     patch = payload.model_dump(exclude_none=True)
-    if "target_type" in patch:
-        t = patch["target_type"].strip().lower()
-        if t not in {"model", "pornstar", "favorites", "liked"}:
-            raise HTTPException(status_code=400, detail=f"不支持的目标类型: {t}")
-        patch["target_type"] = t
+    if existing.get("target_type") == "liked":
+        if "username" in patch and patch["username"].strip() != str(existing.get("username") or ""):
+            raise HTTPException(status_code=400, detail="Liked 目标不支持修改标识")
+        if "target_type" in patch and patch["target_type"].strip().lower() != "liked":
+            raise HTTPException(status_code=400, detail="Liked 目标不支持修改类型")
+        patch.pop("username", None)
+        patch.pop("target_type", None)
+    else:
+        if "username" in patch:
+            uname = patch["username"].strip()
+            if not uname:
+                raise HTTPException(status_code=400, detail="请输入用户名")
+            _validate_target_username(uname)
+            patch["username"] = uname
+        if "target_type" in patch:
+            t = patch["target_type"].strip().lower()
+            if t not in {"model", "pornstar", "favorites"}:
+                raise HTTPException(status_code=400, detail=f"不支持的目标类型: {t}")
+            patch["target_type"] = t
 
     try:
         updated = await container.repo.update_target(target_id, patch)

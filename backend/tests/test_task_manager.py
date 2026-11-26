@@ -1827,3 +1827,107 @@ async def test_update_scan_mode_full_scans_past_known_page1_tail_for_restored_vi
     finally:
         await tm.stop()
         await db.close()
+
+
+async def test_auto_update_syncs_redirected_creator_username_and_migrates_history(
+    tmp_path: Path, monkeypatch
+):
+    """When PornHub redirects /model/webtolove/videos -> /model/fragile-tempt/videos, target & videos update cleanly."""
+    import sqlite3
+    import pytest
+    from app.engine import task_manager as tm_mod
+    from app.parsers.http_session import PowFetchResult, TaskHttpContext
+
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": False,
+                "max_concurrent_list_pages": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        target = await repo.upsert_target("webtolove", "model", display_name="Fragile Tempt")
+        await repo.upsert_video("oldvk1", title="Old 1", uploader="webtolove", target_type="model", status="baseline")
+        await repo.upsert_video("oldvk2", title="Old 2", uploader="webtolove", target_type="model", status="uploaded")
+        # Favorites record for same username must NOT be touched by model rename
+        await repo.upsert_video("favvk1", title="Fav 1", uploader="webtolove", target_type="favorites", status="uploaded")
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        async def fake_fetch(_ctx, url, **kwargs):
+            html = (
+                '<div class="profileVids"><ul id="mostRecentVideosSection" class="videos">'
+                '<li class="videoBox" data-video-vkey="newvk1">'
+                '<a href="/view_video.php?viewkey=newvk1" title="Brand New"></a></li>'
+                '<li class="videoBox" data-video-vkey="oldvk1">'
+                '<a href="/view_video.php?viewkey=oldvk1" title="Old 1"></a></li>'
+                "</ul></div>"
+            )
+            return (
+                PowFetchResult(html, "https://www.pornhub.com/model/fragile-tempt/videos", 200, 0, False),
+                None,
+            )
+
+        captured_hints: list[tuple[str, str]] = []
+
+        async def fake_details(_ctx, items, *args, uploader_hint=None, **kwargs):
+            if uploader_hint:
+                captured_hints.append(uploader_hint)
+            return [
+                VideoDetail(
+                    viewkey="newvk1",
+                    title="Brand New",
+                    page_url=items[0][0],
+                    referer_url=items[0][0],
+                    download_url="https://cdn.example/newvk1.mp4",
+                    quality="1080p",
+                    uploader_username=uploader_hint[0] if uploader_hint else "fragile-tempt",
+                    uploader_type=uploader_hint[1] if uploader_hint else "model",
+                    page_num=1,
+                    item_num=1,
+                )
+            ]
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(TaskHttpContext, "fetch_with_pow", fake_fetch)
+        monkeypatch.setattr(tm_mod, "fetch_video_details_batch", fake_details)
+
+        tm.start()
+        job = await tm.enqueue_job("check_updates", "重命名自动同步检查", {"target_ids": [target["id"]]})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+        assert done is not None and done["status"] == "completed"
+        assert done["total_items"] == 1
+        assert captured_hints == [("fragile-tempt", "model")]
+
+        # Target username updated and historical videos migrated cleanly
+        targets = await repo.list_targets()
+        assert len(targets) == 1
+        assert targets[0]["username"] == "fragile-tempt"
+        assert targets[0]["video_total_count"] == 2
+        assert (await repo.get_video("oldvk1"))["uploader"] == "fragile-tempt"
+        assert (await repo.get_video("oldvk2"))["uploader"] == "fragile-tempt"
+        assert (await repo.get_video("favvk1"))["uploader"] == "webtolove"
+
+        # Manual rename via update_target also migrates history and rejects cross-type conflicts
+        other = await repo.upsert_target("existing-star", "pornstar")
+        with pytest.raises(sqlite3.IntegrityError):
+            await repo.update_target(target["id"], {"username": "existing-star", "target_type": "model"})
+        renamed = await repo.update_target(target["id"], {"username": "fragile-new", "target_type": "pornstar"})
+        assert renamed is not None and renamed["username"] == "fragile-new" and renamed["target_type"] == "pornstar"
+        assert (await repo.get_video("oldvk1"))["uploader"] == "fragile-new"
+        assert (await repo.get_video("oldvk1"))["target_type"] == "pornstar"
+        assert other["id"] != target["id"]
+    finally:
+        await tm.stop()
+        await db.close()

@@ -401,6 +401,51 @@ async def test_list_scanner_rejects_off_target_redirect_and_allows_creator_promo
     assert promo_errors == []
 
 
+async def test_list_scanner_notifies_canonical_target_and_uses_renamed_url_for_next_pages(monkeypatch):
+    selectors = SelectorSettings()
+    ctx = TaskHttpContext()
+    canonical_events: list[tuple[str, str]] = []
+    requested_urls: list[str] = []
+
+    async def fake_fetch(url, **kwargs):
+        requested_urls.append(url)
+        if "page=2" in url:
+            html = (
+                '<div class="profileVids"><ul id="mostRecentVideosSection" class="videos">'
+                '<li class="videoBox" data-video-vkey="vkpage2">'
+                '<a href="/view_video.php?viewkey=vkpage2" title="Page 2"></a></li></ul></div>'
+            )
+            return PowFetchResult(html, "https://www.pornhub.com/model/fragile-tempt/videos?page=2", 200, 0, False), None
+        if "page=3" in url:
+            return PowFetchResult("", url, 404, 0, False), None
+        html = (
+            '<div class="profileVids"><ul id="mostRecentVideosSection" class="videos">'
+            '<li class="videoBox" data-video-vkey="vkpage1">'
+            '<a href="/view_video.php?viewkey=vkpage1" title="Page 1"></a></li></ul></div>'
+        )
+        return PowFetchResult(html, "https://www.pornhub.com/model/fragile-tempt/videos", 200, 0, False), None
+
+    async def on_canonical(canon_type: str, canon_user: str):
+        canonical_events.append((canon_type, canon_user))
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fake_fetch)
+    items = await scan_list_pages(
+        ctx,
+        "https://www.pornhub.com/model/webtolove/videos",
+        selectors,
+        target_type="model",
+        profile_username="webtolove",
+        page_concurrency=1,
+        delay_min=0.0,
+        delay_max=0.0,
+        on_canonical_target=on_canonical,
+    )
+    assert [v.viewkey for v in items] == ["vkpage1", "vkpage2"]
+    assert canonical_events == [("model", "fragile-tempt")]
+    assert requested_urls[0] == "https://www.pornhub.com/model/webtolove/videos"
+    assert requested_urls[1] == "https://www.pornhub.com/model/fragile-tempt/videos?page=2"
+
+
 def test_extract_target_avatar_prefers_profile_image_and_skips_default():
     html = """
     <div class="nav"><img class="smallAvatar" src="https://ei.phncdn.com/pics/users/default/pornhub/male.jpg" alt="Avatar"></div>

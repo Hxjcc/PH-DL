@@ -101,6 +101,8 @@ const editingSubmitting = ref(false)
 const editForm = reactive({
   id: null,
   username: '',
+  original_username: '',
+  original_type: 'model',
   display_name: '',
   target_type: 'model',
   preferred_quality: '',
@@ -551,6 +553,8 @@ function openBaselineDialog(target) {
 function openEditDialog(target) {
   editForm.id = target.id
   editForm.username = target.username
+  editForm.original_username = target.username
+  editForm.original_type = target.target_type
   editForm.display_name = target.display_name || ''
   editForm.target_type = target.target_type
   editForm.preferred_quality = target.preferred_quality || ''
@@ -580,25 +584,41 @@ function isEditQualitySelected(q) {
 
 async function handleSaveTargetEdit() {
   if (!editForm.id || editingSubmitting.value) return
+  const payload = {
+    display_name: editForm.display_name.trim(),
+    preferred_quality: editForm.preferred_quality.trim(),
+  }
+  let identityChanged = false
+  if (editForm.target_type !== 'liked') {
+    const rawUsername = String(editForm.username || '').trim()
+    const parsed = parseTargetUsernames(rawUsername)
+    const normalizedUsername = parsed.length === 1 ? parsed[0] : rawUsername
+    if (!normalizedUsername || /[/\\:?#\s]/.test(normalizedUsername)) {
+      store.notify('请输入有效的博主用户名（或直接粘贴主页链接）', 'warning')
+      return
+    }
+    payload.username = normalizedUsername
+    payload.target_type = editForm.target_type
+    identityChanged =
+      normalizedUsername.toLowerCase() !== String(editForm.original_username || '').toLowerCase() ||
+      editForm.target_type !== editForm.original_type
+  }
   editingSubmitting.value = true
   try {
-    const payload = {
-      display_name: editForm.display_name.trim(),
-      preferred_quality: editForm.preferred_quality.trim(),
-    }
-    if (editForm.target_type !== 'liked') {
-      payload.target_type = editForm.target_type
-    }
     const res = await api.updateTarget(editForm.id, payload)
-    const idx = targets.value.findIndex((x) => x.id === editForm.id)
-    if (idx >= 0 && res?.target) {
-      targets.value[idx] = { ...targets.value[idx], ...res.target }
-      store.setTargetsCache(targets.value)
-    } else {
+    if (identityChanged) {
       await loadData({ silent: true })
+    } else {
+      const idx = targets.value.findIndex((x) => x.id === editForm.id)
+      if (idx >= 0 && res?.target) {
+        targets.value[idx] = { ...targets.value[idx], ...res.target }
+        store.setTargetsCache(targets.value)
+      } else {
+        await loadData({ silent: true })
+      }
     }
     editModalOpen.value = false
-    store.notify('监控目标配置已更新', 'success')
+    store.notify(identityChanged ? '监控目标标识与历史归属已更新' : '监控目标配置已更新', 'success')
   } catch (err) {
     store.notify(err.message, 'error')
   } finally {
@@ -1335,14 +1355,25 @@ async function handleDelete(t) {
     <Dialog
       :open="editModalOpen"
       title="编辑监控目标"
-      description="自定义目标显示名称、专属画质偏好或修正目标类型"
+      description="修改用户名、目标类型、显示名称或画质偏好；改名时自动同步历史归属"
       @close="editModalOpen = false"
     >
       <form id="edit-target-form" class="space-y-4" @submit.prevent="handleSaveTargetEdit">
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div class="space-y-1.5">
-            <label class="text-xs font-medium text-foreground">目标标识（只读）</label>
-            <Input :model-value="editForm.target_type === 'liked' ? 'Liked Videos' : editForm.username" disabled />
+            <label class="text-xs font-medium text-foreground">
+              {{ editForm.target_type === 'liked' ? '目标标识（只读）' : '目标标识（用户名）' }}
+            </label>
+            <Input
+              v-if="editForm.target_type === 'liked'"
+              model-value="Liked Videos"
+              disabled
+            />
+            <Input
+              v-else
+              v-model="editForm.username"
+              placeholder="如 fragile-tempt（支持粘贴主页链接）"
+            />
           </div>
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">目标类型</label>

@@ -8,6 +8,7 @@ import inspect
 import json
 import random
 import shutil
+import sqlite3
 import time
 import urllib.parse
 from collections import defaultdict
@@ -1439,6 +1440,7 @@ class TaskManager:
         exclude_keywords: Optional[Set[str]] = None,
         uploader_hint: Optional[Tuple[str, str]] = None,
         on_profile: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_canonical_target: Optional[Callable[[str, str], Awaitable[None]]] = None,
         on_subscribe_action: Optional[Callable[[SubscribeAction, str], Awaitable[None]]] = None,
         on_page_progress: Optional[Callable[[int, int, int], None]] = None,
         on_scan_error: Optional[Callable[[str], None]] = None,
@@ -1446,6 +1448,14 @@ class TaskManager:
         """Scan list pages with 4-way prefetch and stream details through one concurrency limit."""
         detail_semaphore = asyncio.Semaphore(max(1, settings.max_concurrent_video_details))
         page_detail_tasks: List[asyncio.Task] = []
+        active_hint: Optional[Tuple[str, str]] = uploader_hint
+
+        async def _handle_canonical(canon_type: str, canon_user: str) -> None:
+            nonlocal active_hint
+            if active_hint is not None and active_hint[0] != "My_Liked":
+                active_hint = (canon_user, canon_type)
+            if on_canonical_target is not None:
+                await on_canonical_target(canon_type, canon_user)
 
         async def _parse_page_details(page_items: List[ListedVideo]) -> List[VideoDetail]:
             return await fetch_video_details_batch(
@@ -1456,7 +1466,7 @@ class TaskManager:
                 preferred_qualities=preferred_qualities,
                 include_keywords=include_keywords,
                 exclude_keywords=exclude_keywords,
-                uploader_hint=uploader_hint,
+                uploader_hint=active_hint,
                 semaphore=detail_semaphore,
                 timeout=settings.request_timeout,
             )
@@ -1486,6 +1496,8 @@ class TaskManager:
                 "on_page": _on_page,
                 "on_error": on_scan_error,
             }
+            if on_canonical_target is not None:
+                scan_kwargs["on_canonical_target"] = _handle_canonical
             if on_subscribe_action is not None:
                 scan_kwargs["on_subscribe_action"] = on_subscribe_action
             if on_page_progress is not None:
@@ -1684,12 +1696,16 @@ class TaskManager:
 
             _emit_manual_page_progress(1, 0, len(scoped_listed))
 
+            active_uname = uname
+            active_utype = utype
+            resolved_user = uname if uname != "_currentUser_" else "My_Liked"
+
             async def _save_target_profile(
                 url: str,
                 display_name: str,
-                target_user: str = uname,
-                target_type: str = utype,
             ) -> None:
+                target_user = active_uname
+                target_type = active_utype
                 await self.repo.update_target_profile_by_username(
                     target_user,
                     target_type,
@@ -1699,12 +1715,13 @@ class TaskManager:
                 if target_user == "_currentUser_":
                     return
                 changed = False
-                if url and profile_avatars.get(target_user) != url:
-                    profile_avatars[target_user] = url
-                    changed = True
-                if display_name and profile_names.get(target_user) != display_name:
-                    profile_names[target_user] = display_name
-                    changed = True
+                for key in dict.fromkeys((target_user, uname)):
+                    if url and profile_avatars.get(key) != url:
+                        profile_avatars[key] = url
+                        changed = True
+                    if display_name and profile_names.get(key) != display_name:
+                        profile_names[key] = display_name
+                        changed = True
                 if changed:
                     updated_job = await self.repo.merge_job_params(
                         job_id,
@@ -1719,11 +1736,11 @@ class TaskManager:
             async def _handle_list_subscribe(
                 action: SubscribeAction,
                 referer_url: str,
-                target_user: str = uname,
-                target_type: str = utype,
             ) -> None:
                 nonlocal subscribe_attempted
                 subscribe_attempted = True
+                target_user = active_uname
+                target_type = active_utype
                 label = profile_names.get(target_user) or target_user
                 sub_res = await self._maybe_subscribe_creator(
                     job_id,
@@ -1740,7 +1757,24 @@ class TaskManager:
 
             on_sub_cb = _handle_list_subscribe if (subscribe_creator and can_link_creator) else None
             page_errors: List[str] = []
-            resolved_user = uname if uname != "_currentUser_" else "My_Liked"
+
+            async def _handle_manual_canonical(canon_type: str, canon_user: str) -> None:
+                nonlocal active_uname, active_utype, resolved_user
+                if active_uname == "_currentUser_":
+                    return
+                prev_uname, prev_utype = active_uname, active_utype
+                active_uname, active_utype = canon_user, canon_type
+                resolved_user = canon_user
+                if prev_uname in profile_avatars and canon_user not in profile_avatars:
+                    profile_avatars[canon_user] = profile_avatars[prev_uname]
+                if prev_uname in profile_names and canon_user not in profile_names:
+                    profile_names[canon_user] = profile_names[prev_uname]
+                self.events.emit_log(
+                    "INFO",
+                    f"目标 '{prev_uname}' ({prev_utype}) 重定向至新标识 '{canon_user}' ({canon_type})。",
+                    job_id=job_id,
+                )
+
             if export_only:
                 listed, details = await self._scan_target_with_details(
                     job_id,
@@ -1756,11 +1790,12 @@ class TaskManager:
                     exclude_keywords=exclude_kw,
                     uploader_hint=(resolved_user, utype),
                     on_profile=_save_target_profile,
+                    on_canonical_target=_handle_manual_canonical if can_link_creator else None,
                     on_subscribe_action=on_sub_cb,
                     on_page_progress=_emit_manual_page_progress,
                     on_scan_error=page_errors.append,
                 )
-                scan_errors.extend(f"{uname}: {error}" for error in page_errors)
+                scan_errors.extend(f"{active_uname}: {error}" for error in page_errors)
             else:
                 scan_kwargs: Dict[str, Any] = {
                     "target_type": utype,
@@ -1777,6 +1812,8 @@ class TaskManager:
                     "on_page_progress": _emit_manual_page_progress,
                     "on_error": page_errors.append,
                 }
+                if can_link_creator:
+                    scan_kwargs["on_canonical_target"] = _handle_manual_canonical
                 if on_sub_cb is not None:
                     scan_kwargs["on_subscribe_action"] = on_sub_cb
                 listed = await scan_list_pages(
@@ -1786,16 +1823,16 @@ class TaskManager:
                     **scan_kwargs,
                 )
                 details = []
-                scan_errors.extend(f"{uname}: {error}" for error in page_errors)
+                scan_errors.extend(f"{active_uname}: {error}" for error in page_errors)
 
             if subscribe_creator and can_link_creator and not subscribe_attempted and not ctx.cancel_event.is_set():
                 # Fallback to profile homepage only if list pages yielded no subscribe button.
-                profile_url = f"{PH_ORIGIN}/{utype}/{urllib.parse.quote(uname, safe='')}"
+                profile_url = f"{PH_ORIGIN}/{active_utype}/{urllib.parse.quote(active_uname, safe='')}"
                 prof_res, _ = await ctx.fetch_with_pow(
                     profile_url,
                     timeout=max(5.0, float(settings.request_timeout)),
                     max_retries=1,
-                    log_label=f"获取博主主页 {uname}",
+                    log_label=f"获取博主主页 {active_uname}",
                 )
                 fallback_action = (
                     extract_subscribe_action(prof_res.text)
@@ -1810,16 +1847,16 @@ class TaskManager:
             if add_to_auto_track and can_link_creator and not ctx.cancel_event.is_set():
                 await self._maybe_track_creator(
                     job_id,
-                    uname,
-                    utype,
-                    display_name=profile_names.get(uname) or "",
-                    avatar_url=profile_avatars.get(uname) or "",
+                    active_uname,
+                    active_utype,
+                    display_name=profile_names.get(active_uname) or profile_names.get(uname) or "",
+                    avatar_url=profile_avatars.get(active_uname) or profile_avatars.get(uname) or "",
                     tracked_keys=tracked_keys,
                 )
 
             if not listed:
                 if not page_errors and not ctx.cancel_event.is_set():
-                    self.events.emit_log("INFO", f"目标 '{uname}' ({utype}) 未发现待处理的视频。", job_id=job_id)
+                    self.events.emit_log("INFO", f"目标 '{active_uname}' ({active_utype}) 未发现待处理的视频。", job_id=job_id)
                 continue
 
             if export_only:
@@ -1828,7 +1865,7 @@ class TaskManager:
                 for lv in listed:
                     key = lv.viewkey or lv.url
                     if key not in scoped_listed:
-                        scoped_listed[key] = (lv, resolved_user, utype)
+                        scoped_listed[key] = (lv, resolved_user, active_utype)
 
         if scan_errors:
             await self.repo.update_job(job_id, error_message=f"{len(scan_errors)} 页扫描未完成：{scan_errors[0]}")
@@ -2185,6 +2222,37 @@ class TaskManager:
                         display_name=display_name,
                     )
 
+                async def _sync_canonical_target(
+                    canon_type: str,
+                    canon_user: str,
+                    target_id: int = tid,
+                ) -> None:
+                    nonlocal uname, utype, display
+                    if utype == "liked" or uname == "_currentUser_":
+                        return
+                    prev_uname, prev_utype = uname, utype
+                    try:
+                        await self.repo.update_target(
+                            target_id,
+                            {"username": canon_user, "target_type": canon_type},
+                        )
+                        uname, utype = canon_user, canon_type
+                        display = canon_user
+                        self.events.broadcast("overview_changed", {})
+                        self.events.emit_log(
+                            "INFO",
+                            f"目标 '{prev_uname}' ({prev_utype}) 已重定向至新标识 '{canon_user}' ({canon_type})，已自动更新监控目标及历史归属。",
+                            job_id=job_id,
+                        )
+                    except sqlite3.IntegrityError:
+                        uname, utype = canon_user, canon_type
+                        display = canon_user
+                        self.events.emit_log(
+                            "WARNING",
+                            f"目标 '{prev_uname}' 已重定向至 '{canon_user}' ({canon_type})，但监控列表中已存在同名目标，未自动覆盖（请清理重复目标）。",
+                            job_id=job_id,
+                        )
+
                 list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
                 page_errors: List[str] = []
                 previous_error = str(target.get("last_error") or "")
@@ -2215,6 +2283,7 @@ class TaskManager:
                         preferred_qualities=qual_set,
                         uploader_hint=(uname if uname != "_currentUser_" else "My_Liked", utype),
                         on_profile=_save_profile,
+                        on_canonical_target=_sync_canonical_target if utype != "liked" else None,
                         on_scan_error=page_errors.append,
                     )
                 except Exception as err:
@@ -2416,6 +2485,31 @@ class TaskManager:
                 display_name=display_name,
             )
 
+        async def _sync_baseline_canonical(canon_type: str, canon_user: str) -> None:
+            nonlocal uname, utype
+            if utype == "liked" or uname == "_currentUser_":
+                return
+            prev_uname, prev_utype = uname, utype
+            try:
+                await self.repo.update_target(
+                    int(target["id"]),
+                    {"username": canon_user, "target_type": canon_type},
+                )
+                uname, utype = canon_user, canon_type
+                self.events.broadcast("overview_changed", {})
+                self.events.emit_log(
+                    "INFO",
+                    f"目标 '{prev_uname}' ({prev_utype}) 已重定向至新标识 '{canon_user}' ({canon_type})，已自动更新监控目标及历史归属。",
+                    job_id=job_id,
+                )
+            except sqlite3.IntegrityError:
+                uname, utype = canon_user, canon_type
+                self.events.emit_log(
+                    "WARNING",
+                    f"目标 '{prev_uname}' 已重定向至 '{canon_user}' ({canon_type})，但监控列表中已存在同名目标，未自动覆盖。",
+                    job_id=job_id,
+                )
+
         target_label = "Liked Videos" if utype == "liked" else ((target.get("display_name") or "").strip() or uname)
 
         def _emit_baseline_page_progress(page_num: int, _page_total: int, found_count: int) -> None:
@@ -2432,20 +2526,25 @@ class TaskManager:
         _emit_baseline_page_progress(1, 0, 0)
 
         page_errors: List[str] = []
+        scan_kwargs: Dict[str, Any] = {
+            "target_type": utype,
+            "pages_spec": pages_spec,
+            "delay_min": settings.page_delay_min,
+            "delay_max": settings.page_delay_max,
+            "page_concurrency": settings.max_concurrent_list_pages,
+            "timeout": settings.request_timeout,
+            "profile_username": uname,
+            "on_profile": _save_profile,
+            "on_page_progress": _emit_baseline_page_progress,
+            "on_error": page_errors.append,
+        }
+        if utype != "liked":
+            scan_kwargs["on_canonical_target"] = _sync_baseline_canonical
         listed = await scan_list_pages(
             ctx,
             list_url,
             settings.selectors,
-            target_type=utype,
-            pages_spec=pages_spec,
-            delay_min=settings.page_delay_min,
-            delay_max=settings.page_delay_max,
-            page_concurrency=settings.max_concurrent_list_pages,
-            timeout=settings.request_timeout,
-            profile_username=uname,
-            on_profile=_save_profile,
-            on_page_progress=_emit_baseline_page_progress,
-            on_error=page_errors.append,
+            **scan_kwargs,
         )
 
         batch_records = []

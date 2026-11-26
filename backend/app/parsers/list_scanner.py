@@ -150,6 +150,35 @@ def _is_off_target_redirect(
     return False
 
 
+def extract_canonical_target_from_url(
+    final_url: str,
+    target_type: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """Extract canonical ``(target_type, username)`` from a redirected list page URL."""
+    if not final_url:
+        return None
+    parts = [
+        urllib.parse.unquote(p).strip()
+        for p in urllib.parse.urlparse(final_url).path.strip("/").split("/")
+        if p
+    ]
+    if len(parts) < 3:
+        return None
+    head = parts[0].lower()
+    slug = parts[1].strip()
+    if not slug:
+        return None
+    rest_lower = [p.lower() for p in parts[2:]]
+    norm_type = (target_type or "").strip().lower()
+    if head in {"model", "pornstar"} and "videos" in rest_lower:
+        if norm_type in {"", "model", "pornstar"}:
+            return head, slug
+    if head in {"users", "user"} and "favorites" in rest_lower:
+        if norm_type in {"", "favorites"}:
+            return "favorites", slug
+    return None
+
+
 @dataclass(frozen=True)
 class ListedVideo:
     viewkey: str
@@ -492,6 +521,7 @@ async def scan_list_pages(
     timeout: float = 20.0,
     profile_username: Optional[str] = None,
     on_profile: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    on_canonical_target: Optional[Callable[[str, str], Awaitable[None]]] = None,
     on_subscribe_action: Optional[Callable[[SubscribeAction, str], Awaitable[None]]] = None,
     on_page: Optional[Callable[[List[ListedVideo]], Awaitable[None]]] = None,
     on_page_progress: Optional[Callable[[int, int, int], None]] = None,
@@ -517,7 +547,11 @@ async def scan_list_pages(
     pages_scanned = 0
     end_reached = False
     profile_found = False
+    canonical_notified = False
     subscribe_notified = False
+    active_list_url = initial_url
+    effective_target_type = target_type
+    effective_profile_username = profile_username
 
     def report_error(page: int, reason: str) -> None:
         message = f"列表第 {page} 页: {reason}"
@@ -526,7 +560,7 @@ async def scan_list_pages(
             on_error(message)
 
     async def _fetch_page(page_num: int):
-        page_url = _build_paged_url(initial_url, page_num)
+        page_url = _build_paged_url(active_list_url, page_num)
         ctx._emit("INFO", f"正在扫描列表第 {page_num} 页: {page_url}")
         res, err = await ctx.fetch_with_pow(page_url, timeout=max(5.0, float(timeout)), log_label=f"列表第 {page_num} 页")
         return page_num, page_url, res, err
@@ -609,6 +643,28 @@ async def scan_list_pages(
                 report_error(current_page, "上游重定向，没有返回指定页")
                 continue
 
+            if not canonical_notified:
+                canonical = extract_canonical_target_from_url(res.final_url, effective_target_type)
+                if canonical is not None:
+                    canonical_notified = True
+                    canon_type, canon_user = canonical
+                    req_type = (effective_target_type or "").strip().lower()
+                    req_user = (effective_profile_username or "").strip()
+                    user_changed = bool(
+                        req_user and req_user != "_currentUser_" and canon_user.lower() != req_user.lower()
+                    )
+                    type_changed = bool(
+                        req_type in {"model", "pornstar"}
+                        and canon_type in {"model", "pornstar"}
+                        and canon_type != req_type
+                    )
+                    if user_changed or type_changed:
+                        effective_target_type = canon_type
+                        effective_profile_username = canon_user
+                        active_list_url = build_target_list_url(canon_user, canon_type)
+                        if on_canonical_target is not None:
+                            await on_canonical_target(canon_type, canon_user)
+
             want_profile = bool(on_profile and not profile_found)
             want_subscribe = bool(on_subscribe_action and not subscribe_notified)
             if len(res.text) >= _OFFLOAD_HTML_THRESHOLD:
@@ -616,19 +672,21 @@ async def scan_list_pages(
                     html_body: str = res.text,
                     fetch_profile: bool = want_profile,
                     fetch_subscribe: bool = want_subscribe,
+                    prof_user: Optional[str] = effective_profile_username,
+                    parse_type: Optional[str] = effective_target_type,
                 ) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[SubscribeAction]]:
-                    av = extract_target_avatar(html_body, profile_username) if fetch_profile else ""
-                    dn = extract_target_display_name(html_body, profile_username) if fetch_profile else ""
+                    av = extract_target_avatar(html_body, prof_user) if fetch_profile else ""
+                    dn = extract_target_display_name(html_body, prof_user) if fetch_profile else ""
                     sub = extract_subscribe_action(html_body) if fetch_subscribe else None
-                    items = extract_video_cards_from_list_page(html_body, selectors, target_type=target_type)
+                    items = extract_video_cards_from_list_page(html_body, selectors, target_type=parse_type)
                     return items, av, dn, sub
 
                 raw_items, avatar_url, display_name, subscribe_action = await asyncio.to_thread(_parse_page_sync)
             else:
-                avatar_url = extract_target_avatar(res.text, profile_username) if want_profile else ""
-                display_name = extract_target_display_name(res.text, profile_username) if want_profile else ""
+                avatar_url = extract_target_avatar(res.text, effective_profile_username) if want_profile else ""
+                display_name = extract_target_display_name(res.text, effective_profile_username) if want_profile else ""
                 subscribe_action = extract_subscribe_action(res.text) if want_subscribe else None
-                raw_items = extract_video_cards_from_list_page(res.text, selectors, target_type=target_type)
+                raw_items = extract_video_cards_from_list_page(res.text, selectors, target_type=effective_target_type)
 
             if want_profile and (avatar_url or display_name):
                 profile_found = True

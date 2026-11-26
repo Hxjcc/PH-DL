@@ -390,11 +390,13 @@ class Repository:
         existing = await self.get_target(target_id)
         if not existing:
             return None
+        old_username = str(existing.get("username") or "").strip()
+        old_type = str(existing.get("target_type") or "model").strip().lower()
         allowed = {"enabled", "target_type", "preferred_quality", "username", "display_name"}
         sets = []
         params: List[Any] = []
-        next_username = str(existing.get("username") or "").strip()
-        next_type = str(existing.get("target_type") or "model").strip().lower()
+        next_username = old_username
+        next_type = old_type
         for k, v in patch.items():
             if k not in allowed:
                 continue
@@ -411,10 +413,16 @@ class Repository:
                 sets.append(f"{k} = ?")
                 params.append(val)
         if "username" in patch or "target_type" in patch:
-            conflict = await self.db.fetch_one(
-                "SELECT id FROM targets WHERE LOWER(username) = LOWER(?) AND target_type = ? AND id != ?",
-                (next_username, next_type, target_id),
-            )
+            if next_type in ("model", "pornstar"):
+                conflict = await self.db.fetch_one(
+                    "SELECT id FROM targets WHERE LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar') AND id != ?",
+                    (next_username, target_id),
+                )
+            else:
+                conflict = await self.db.fetch_one(
+                    "SELECT id FROM targets WHERE LOWER(username) = LOWER(?) AND target_type = ? AND id != ?",
+                    (next_username, next_type, target_id),
+                )
             if conflict:
                 raise sqlite3.IntegrityError(
                     "UNIQUE constraint failed: targets.username, targets.target_type"
@@ -422,6 +430,30 @@ class Repository:
         if sets:
             params.append(target_id)
             await self.db.execute(f"UPDATE targets SET {', '.join(sets)} WHERE id = ?", params)
+
+        username_changed = bool(old_username and next_username and old_username.lower() != next_username.lower())
+        type_changed = old_type != next_type
+        if old_type != "liked" and next_type != "liked" and (username_changed or type_changed):
+            if old_type == "favorites" and next_type == "favorites" and username_changed:
+                await self.db.execute(
+                    """
+                    UPDATE videos
+                    SET uploader = ?
+                    WHERE LOWER(uploader) = LOWER(?) AND LOWER(target_type) = 'favorites'
+                    """,
+                    (next_username, old_username),
+                )
+            elif old_type in ("model", "pornstar") and next_type in ("model", "pornstar"):
+                await self.db.execute(
+                    """
+                    UPDATE videos
+                    SET uploader = ?,
+                        target_type = CASE WHEN LOWER(target_type) IN ('model', 'pornstar') THEN ? ELSE target_type END
+                    WHERE LOWER(uploader) = LOWER(?)
+                      AND LOWER(target_type) NOT IN ('favorites', 'liked')
+                    """,
+                    (next_username, next_type, old_username),
+                )
         return await self.get_target(target_id)
 
     async def mark_target_checked(self, target_id: int, new_count: int, error: str = "") -> None:
