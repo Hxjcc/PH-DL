@@ -31,6 +31,9 @@ class SubscribeAction:
     already_subscribed: bool = False
     login_required: bool = False
     creator_id: str = ""
+    site: str = "pornhub"
+    entity_model: str = ""
+    entity_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,17 @@ async def subscribe_from_action(
     label: str = "",
     timeout: float = 15.0,
 ) -> SubscribeResult:
-    """Invoke PornHub's JSON subscribe endpoint using the task's authenticated HTTP context."""
+    """Invoke the site's JSON subscribe endpoint using the task's authenticated HTTP context."""
+    if action is not None and action.site == "xhamster":
+        from .xhamster import subscribe_xhamster_from_action
+
+        return await subscribe_xhamster_from_action(
+            ctx,
+            action,
+            referer_url=referer_url,
+            label=label,
+            timeout=timeout,
+        )
     if action is None or not action.subscribe_url:
         return SubscribeResult(ok=False, status="not_found", message="页面未找到订阅按钮")
     if action.already_subscribed:

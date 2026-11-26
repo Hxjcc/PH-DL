@@ -236,7 +236,7 @@ async def test_fetch_xhamster_video_detail_respects_codec_and_direct_mp4_optimiz
 
     vid_url = "https://xhamster.com/videos/test-4k-video-xhOwQIZ"
 
-    # 1. Default h264 picks 2160p H.264 HLS and exposes 720p MP4 for playback
+    # 1. Default h264 picks 2160p H.264 HLS and exposes HLS variants for playback
     d_h264 = await fetch_single_video_detail(
         ctx, vid_url, SelectorSettings(), include_mp4_sources=True, xh_preferred_codec="h264"
     )
@@ -251,6 +251,10 @@ async def test_fetch_xhamster_video_detail_respects_codec_and_direct_mp4_optimiz
     assert d_h264.duration_seconds == 460
     assert len(d_h264.mp4_sources) == 1
     assert d_h264.mp4_sources[0].url == mp4_720_url
+    assert [(s.quality, s.url) for s in d_h264.hls_sources] == [
+        ("2160p", "https://video-nss.xhcdn.com/tok/2160p.h264.mp4.m3u8"),
+        ("720p", "https://video-nss.xhcdn.com/tok/720p.h264.mp4.m3u8"),
+    ]
 
     # 2. AV1 preference picks 2160p AV1 HLS
     d_av1 = await fetch_single_video_detail(
@@ -260,14 +264,14 @@ async def test_fetch_xhamster_video_detail_respects_codec_and_direct_mp4_optimiz
     assert d_av1.quality == "2160p"
     assert d_av1.download_url == "https://video-nss.xhcdn.com/tok/2160p.av1.mp4.m3u8"
 
-    # 3. Requesting 720p with H.264 uses direct progressive MP4 instead of HLS
+    # 3. Requesting 720p with H.264 stays on HLS (xHamster progressive MP4 endpoints return 403 Wrong key)
     d_720 = await fetch_single_video_detail(
         ctx, vid_url, SelectorSettings(), preferred_qualities={"720"}, xh_preferred_codec="h264"
     )
     assert d_720.error is None
     assert d_720.quality == "720p"
-    assert d_720.video_format == "mp4"
-    assert d_720.download_url == mp4_720_url
+    assert d_720.video_format == "hls"
+    assert d_720.download_url == "https://video-nss.xhcdn.com/tok/720p.h264.mp4.m3u8"
 
 
 async def test_fetch_xhamster_subscriptions_filters_unsubscribed_recommendations(monkeypatch):
@@ -1385,5 +1389,264 @@ async def test_task_manager_auto_renews_expired_xhamster_cookie(tmp_path: Path, 
         assert "_id=fresh" in refreshed.xh_cookie
         assert refreshed.xh_logged_in_username == "NativePea222"
         assert tm.xh_cookie_status["valid"] is True
+    finally:
+        await db.close()
+
+
+def test_xhamster_uploader_prefers_landing_creator_and_channel_over_author():
+    from app.parsers.xhamster import _extract_xhamster_uploader
+
+    creator_model = {
+        "author": {"name": "SweetHot69", "pageURL": "https://xhamster.com/users/sweethot69"},
+        "landing": {"type": "person", "name": "SweetGirl69", "link": "https://xhamster.com/creators/sweetgirl69"},
+    }
+    assert _extract_xhamster_uploader(creator_model, None) == ("sweetgirl69", "creator")
+
+    channel_model = {
+        "author": {"name": "BLACKED", "pageURL": "https://xhamster.com/users/blacked"},
+        "landing": {"type": "channel", "name": "VIXEN", "link": "https://xhamster.com/channels/vixen"},
+        "channelModel": {"id": 42846, "channelURL": "https://xhamster.com/channels/vixen"},
+    }
+    assert _extract_xhamster_uploader(channel_model, None) == ("vixen", "channel")
+
+    plain_user_model = {
+        "author": {"name": "PlainUser", "pageURL": "https://xhamster.com/users/plainuser"},
+        "landing": None,
+    }
+    assert _extract_xhamster_uploader(plain_user_model, None) == ("plainuser", "users")
+
+
+@pytest.mark.asyncio
+async def test_xhamster_subscribe_action_extraction_and_xapi_execution(monkeypatch):
+    from app.parsers.target import subscribe_from_action
+    from app.parsers.xhamster import extract_xhamster_subscribe_action
+
+    creator_action = extract_xhamster_subscribe_action(
+        {
+            "infoComponent": {
+                "subscribeButtonsProps": {
+                    "subscribeButtonProps": {
+                        "modelName": "pornstarModel",
+                        "id": 227768,
+                        "subscribed": False,
+                    }
+                }
+            }
+        }
+    )
+    assert creator_action is not None
+    assert creator_action.site == "xhamster"
+    assert creator_action.entity_model == "pornstarModel"
+    assert creator_action.entity_id == 227768
+    assert creator_action.already_subscribed is False
+
+    channel_action = extract_xhamster_subscribe_action(
+        {
+            "layoutPage": {
+                "channelLandingInfoProps": {
+                    "subscribeButtonsProps": {
+                        "subscribeButtonProps": {"modelName": "channelModel", "id": 42846, "subscribed": True}
+                    }
+                }
+            }
+        }
+    )
+    assert channel_action is not None
+    assert channel_action.entity_model == "channelModel"
+    assert channel_action.entity_id == 42846
+    assert channel_action.already_subscribed is True
+
+    user_action = extract_xhamster_subscribe_action({"profile": {"modelName": "userModel", "id": 78837540}})
+    assert user_action is not None
+    assert user_action.entity_model == "userModel"
+    assert user_action.entity_id == 78837540
+
+    # 1. Missing cookie cleanly returns login_required without hitting network
+    ctx_anon = TaskHttpContext(cookie_str="", concurrency=1)
+    res_anon = await subscribe_from_action(ctx_anon, creator_action)
+    assert res_anon.ok is False and res_anon.status == "login_required"
+
+    # 2. Already subscribed skips network call
+    res_already = await subscribe_from_action(ctx_anon, channel_action)
+    assert res_already.ok is True and res_already.status == "already_subscribed"
+
+    # 3. Authenticated context invokes POST /x-api with entitySubscriptionModelSync
+    ctx_auth = TaskHttpContext(cookie_str="UID=411169334; _id=tok", concurrency=1)
+    captured: List[Dict[str, Any]] = []
+
+    async def fake_post(url: str, **kwargs):
+        captured.append({"url": url, **kwargs})
+        body = json.dumps(
+            [
+                {
+                    "name": "entitySubscriptionModelSync",
+                    "extras": {"result": True, "message": "Subscribed!", "userId": 411169334, "userType": "user"},
+                }
+            ]
+        )
+        return PowFetchResult(body, url, 200, 0, False), None
+
+    monkeypatch.setattr(ctx_auth, "fetch_with_pow", fake_post)
+    res_ok = await subscribe_from_action(
+        ctx_auth,
+        creator_action,
+        referer_url="https://xhamster.com/creators/sweetgirl69/newest",
+        label="SweetGirl69",
+    )
+    assert res_ok.ok is True and res_ok.status == "subscribed"
+    assert len(captured) == 1
+    assert captured[0]["url"] == "https://xhamster.com/x-api"
+    assert captured[0]["method"] == "POST"
+    sent_payload = json.loads(captured[0]["data"])
+    assert sent_payload[0]["name"] == "entitySubscriptionModelSync"
+    assert sent_payload[0]["requestData"]["model"]["entityModel"] == "pornstarModel"
+    assert sent_payload[0]["requestData"]["model"]["entityID"] == 227768
+    assert sent_payload[0]["requestData"]["model"]["state"] is True
+
+
+@pytest.mark.asyncio
+async def test_task_manager_xhamster_auto_subscribe_in_target_and_url_modes(tmp_path: Path, monkeypatch):
+    env = EnvSettings(data_dir=tmp_path, admin_password="secret", secret_key="k" * 40)
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    await repo.update_settings_patch(
+        {
+            "schedule_enabled": False,
+            "ph_cookie": "ph_sess=only-ph",
+            "xh_cookie": "UID=411169334; _id=only-xh",
+            "page_delay_min": 0.0,
+            "page_delay_max": 0.0,
+        }
+    )
+    events = EventBus()
+    tm = TaskManager(env, repo, events)
+
+    master_url = "https://video-nss-h.xhcdn.com/tok/master.m3u8"
+    list_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "infoComponent": {
+                    "pageTitle": "SweetGirl69 Porn Videos",
+                    "subscribeButtonsProps": {
+                        "subscribeButtonProps": {"modelName": "pornstarModel", "id": 227768, "subscribed": False}
+                    },
+                },
+                "paginationComponent": {"lastPageNumber": 1},
+                "trendingVideoSectionComponent": {
+                    "videoListProps": {
+                        "videoThumbProps": [
+                            {
+                                "id": 1,
+                                "title": "Sweet Clip",
+                                "pageURL": "https://xhamster.com/videos/sweet-clip-xhAAA11",
+                                "duration": 120,
+                                "created": 1767225600,
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+        + ";</script>"
+    )
+    video_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "videoModel": {
+                    "id": 1,
+                    "idHashSlug": "xhAAA11",
+                    "title": "Sweet Clip",
+                    "duration": 120,
+                    "created": 1767225600,
+                    "author": {"name": "SweetHot69", "pageURL": "https://xhamster.com/users/sweethot69"},
+                    "landing": {"type": "person", "name": "SweetGirl69", "link": "https://xhamster.com/creators/sweetgirl69"},
+                },
+                "subscriptionComponent": {
+                    "subscribeButtonsProps": {
+                        "subscribeButtonProps": {"modelName": "pornstarModel", "id": 227768, "subscribed": False}
+                    }
+                },
+                "xplayerSettings": {
+                    "sources": {"hls": {"h264": {"url": _encode_xhamster_hex(master_url, 2, 1234)}}}
+                },
+            }
+        )
+        + ";</script>"
+    )
+    master_m3u8 = (
+        "#EXTM3U\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="mp4a.40.2,avc1.4d4015"\n'
+        "1080p.h264.mp4.m3u8\n"
+    )
+
+    subscribe_calls: List[Dict[str, Any]] = []
+
+    async def fake_fetch(self_ctx: TaskHttpContext, url: str, **kwargs):
+        if url == "https://xhamster.com/x-api":
+            subscribe_calls.append({"cookie": self_ctx.cookie_string(), "data": json.loads(kwargs["data"])})
+            body = json.dumps(
+                [
+                    {
+                        "name": "entitySubscriptionModelSync",
+                        "extras": {"result": True, "message": "Subscribed!", "userId": 411169334, "userType": "user"},
+                    }
+                ]
+            )
+            return PowFetchResult(body, url, 200, 0, False), None
+        if "/creators/sweetgirl69/newest" in url:
+            return PowFetchResult(list_html, url, 200, 0, False), None
+        if "/videos/sweet-clip-xhAAA11" in url:
+            return PowFetchResult(video_html, url, 200, 0, False), None
+        if url == master_url:
+            return PowFetchResult(master_m3u8, url, 200, 0, False), None
+        return PowFetchResult("", url, 404, 0, False), None
+
+    monkeypatch.setattr(TaskHttpContext, "fetch_with_pow", fake_fetch)
+
+    try:
+        # 1. manual_target mode with subscribe_creator=True
+        j1 = await repo.create_job(
+            "manual_target",
+            "xh sub target",
+            {
+                "site": "xhamster",
+                "usernames": ["sweetgirl69"],
+                "target_type": "creator",
+                "export_only": True,
+                "subscribe_creator": True,
+            },
+        )
+        await tm._run_job(j1["id"])
+        assert len(subscribe_calls) == 1
+        assert "_id=only-xh" in subscribe_calls[0]["cookie"]
+        assert "ph_sess" not in subscribe_calls[0]["cookie"]
+        assert subscribe_calls[0]["data"][0]["requestData"]["model"]["entityID"] == 227768
+
+        # 2. manual_urls mode with subscribe_creator=True & add_to_auto_track=True
+        subscribe_calls.clear()
+        j2 = await repo.create_job(
+            "manual_urls",
+            "xh sub urls",
+            {
+                "urls": ["https://xhamster.com/videos/sweet-clip-xhAAA11"],
+                "export_only": True,
+                "subscribe_creator": True,
+                "add_to_auto_track": True,
+            },
+        )
+        await tm._run_job(j2["id"])
+        assert len(subscribe_calls) == 1
+        assert "_id=only-xh" in subscribe_calls[0]["cookie"]
+        assert subscribe_calls[0]["data"][0]["requestData"]["model"]["entityModel"] == "pornstarModel"
+        assert subscribe_calls[0]["data"][0]["requestData"]["model"]["entityID"] == 227768
+        targets = await repo.list_targets()
+        assert any(
+            t["site"] == "xhamster" and t["username"] == "sweetgirl69" and t["target_type"] == "creator"
+            for t in targets
+        )
     finally:
         await db.close()

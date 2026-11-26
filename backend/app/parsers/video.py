@@ -136,6 +136,7 @@ class VideoDetail:
     error: Optional[str] = None
     filtered_out: bool = False
     mp4_sources: Tuple[MediaSource, ...] = ()
+    hls_sources: Tuple[MediaSource, ...] = ()
     published_at: str = ""
     duration_seconds: int = 0
     subscribe_action: Optional[SubscribeAction] = None

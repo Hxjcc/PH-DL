@@ -13,6 +13,7 @@ const emit = defineEmits(['close'])
 const mountPoint = ref(null)
 const fullscreenTarget = shallowRef(null)
 const sources = shallowRef([])
+const sourceFormat = ref('mp4')
 const activeIndex = ref(0)
 const phase = ref('resolving')
 const error = ref('')
@@ -34,6 +35,7 @@ const pageUrl = computed(() => {
 
 let player = null
 let Player = null
+let HlsCtor = null
 let controller = null
 let timer = null
 let bufferTimer = null
@@ -96,10 +98,12 @@ function connect(index, previous) {
 
   timer = setTimeout(failed, 35_000)
   try {
-    const instance = new Player({
+    const isHls = sourceFormat.value === 'hls'
+    let usedHlsJs = false
+    const playerOptions = {
       container: mountPoint.value,
       url: source.relay_url,
-      type: 'mp4',
+      type: isHls ? 'm3u8' : 'mp4',
       lang: 'zh-cn',
       theme: '#e4e4e7',
       volume: previous.volume,
@@ -111,7 +115,51 @@ function connect(index, previous) {
       hotkey: false,
       cssVar: { '--art-progress-height': '5px', '--art-control-height': '42px' },
       moreVideoAttr: { playsInline: true, preload: 'auto', 'aria-label': props.video.title || '视频播放器' },
-    })
+    }
+    if (isHls) {
+      playerOptions.customType = {
+        m3u8(video, url, art) {
+          if (HlsCtor && HlsCtor.isSupported()) {
+            usedHlsJs = true
+            let mediaRecoveryTries = 0
+            const hls = new HlsCtor({
+              enableWorker: true,
+              lowLatencyMode: false,
+              maxBufferLength: 30,
+              maxMaxBufferLength: 60,
+              startPosition: previous.time > 0 ? previous.time : -1,
+              xhrSetup(xhr) {
+                xhr.withCredentials = true
+              },
+            })
+            hls.loadSource(url)
+            hls.attachMedia(video)
+            hls.on(HlsCtor.Events.ERROR, (_evt, data) => {
+              if (!isCurrent() || !data?.fatal) return
+              if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR && mediaRecoveryTries < 2) {
+                mediaRecoveryTries += 1
+                hls.recoverMediaError()
+                return
+              }
+              hls.destroy()
+              queueMicrotask(failed)
+            })
+            art.hls = hls
+            art.on('destroy', () => {
+              hls.destroy()
+              art.hls = null
+            })
+          } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = url
+          } else {
+            queueMicrotask(() => {
+              if (isCurrent()) showError('当前浏览器不支持 HLS 在线播放。')
+            })
+          }
+        },
+      }
+    }
+    const instance = new Player(playerOptions)
     player = instance
     const media = instance.video
     function onBuffering() {
@@ -128,7 +176,7 @@ function connect(index, previous) {
     }
     instance.once('video:loadedmetadata', () => {
       if (!isCurrent()) return
-      if (previous.time > 0 && Number.isFinite(media.duration)) {
+      if (!usedHlsJs && previous.time > 0 && Number.isFinite(media.duration)) {
         media.currentTime = Math.min(previous.time, Math.max(0, media.duration - 0.1))
       }
       media.playbackRate = previous.rate
@@ -178,6 +226,12 @@ async function loadSources() {
     // The dialog handles retry by getting a fresh playback URL.
     Player.RECONNECT_TIME_MAX = 0
     Player.LOG_VERSION = false
+    sourceFormat.value = response?.format === 'hls' ? 'hls' : 'mp4'
+    if (sourceFormat.value === 'hls' && !HlsCtor) {
+      const hlsMod = await import('hls.js')
+      if (closed || request.signal.aborted) return
+      HlsCtor = hlsMod.default
+    }
     sources.value = (response?.sources || []).filter((source) => source.relay_url)
     if (!sources.value.length) {
       showError('当前没有可播放的视频。')

@@ -38,8 +38,10 @@ from ..parsers.video import (
     fetch_video_details_batch,
 )
 from ..parsers.xhamster import (
+    build_xhamster_profile_url,
     check_xhamster_cookie_valid,
     detect_site_from_url,
+    extract_xhamster_subscribe_action_from_html,
     is_xhamster_url,
     resolve_xhamster_target_type,
 )
@@ -562,6 +564,25 @@ class TaskManager:
                         self.events.broadcast("job_updated", failed)
                     return
                 settings = checked_xh
+            elif (
+                needs_xh_ctx
+                and bool(params.get("subscribe_creator", False))
+                and not settings.xh_cookie.strip()
+                and settings.xh_username.strip()
+                and settings.xh_password.strip()
+            ):
+                # Best-effort login refresh for xHamster auto-subscribe; never block public downloads if login fails.
+                checked_xh = await until_stopped(
+                    self._ensure_valid_xh_cookie(settings, job_id), cancel_event,
+                )
+                if checked_xh is not None:
+                    settings = checked_xh
+                else:
+                    self.events.emit_log(
+                        "WARNING",
+                        "[xHamster Cookie] 自动登录未成功，将继续公开下载但跳过自动订阅。",
+                        job_id=job_id,
+                    )
         except StopRequested:
             stopped = await self.repo.update_job(job_id, status="cancelled", error_message="已取消", finished_at=utc_now_iso())
             if stopped:
@@ -1934,7 +1955,9 @@ class TaskManager:
     ) -> Optional[SubscribeResult]:
         if ctx.cancel_event.is_set():
             return None
-        key = (action.creator_id if action and action.creator_id else dedup_key).strip().lower()
+        site_prefix = (action.site if action and action.site else "").strip().lower()
+        raw_key = (action.creator_id if action and action.creator_id else dedup_key).strip().lower()
+        key = f"{site_prefix}:{raw_key}" if (site_prefix and raw_key and not raw_key.startswith(f"{site_prefix}:")) else raw_key
         if not key or key in subscribed_keys:
             return None
         subscribed_keys.add(key)
@@ -1978,7 +2001,7 @@ class TaskManager:
         export_only = bool(params.get("export_only", False))
         auto_upload = bool(params.get("auto_upload", settings.uploader_enabled))
         add_to_auto_track = bool(params.get("add_to_auto_track", False))
-        subscribe_creator = (site == "pornhub") and bool(params.get("subscribe_creator", False))
+        subscribe_creator = bool(params.get("subscribe_creator", False))
 
         targets: List[Tuple[str, str]] = []
         if raw_type == "liked":
@@ -2201,20 +2224,26 @@ class TaskManager:
 
             if subscribe_creator and can_link_creator and not subscribe_attempted and not ctx.cancel_event.is_set():
                 # Fallback to profile homepage only if list pages yielded no subscribe button.
-                profile_url = f"{PH_ORIGIN}/{active_utype}/{urllib.parse.quote(active_uname, safe='')}"
+                if site == "xhamster":
+                    profile_url = build_xhamster_profile_url(active_uname, active_utype)
+                else:
+                    profile_url = f"{PH_ORIGIN}/{active_utype}/{urllib.parse.quote(active_uname, safe='')}"
                 prof_res, _ = await site_ctx.fetch_with_pow(
                     profile_url,
                     timeout=max(5.0, float(settings.request_timeout)),
                     max_retries=1,
                     log_label=f"获取博主主页 {active_uname}",
                 )
-                fallback_action = (
-                    extract_subscribe_action(prof_res.text)
-                    if prof_res is not None and prof_res.status_code < 400
-                    else None
-                )
+                if prof_res is not None and prof_res.status_code < 400:
+                    fallback_action = (
+                        extract_xhamster_subscribe_action_from_html(prof_res.text)
+                        if site == "xhamster"
+                        else extract_subscribe_action(prof_res.text)
+                    )
+                else:
+                    fallback_action = None
                 await _handle_list_subscribe(
-                    fallback_action or SubscribeAction(),
+                    fallback_action or SubscribeAction(site=site),
                     (prof_res.final_url if prof_res is not None else profile_url),
                 )
 
@@ -2356,12 +2385,16 @@ class TaskManager:
                     detail.uploader_type or ("creator" if detail_site == "xhamster" else "model")
                 ).strip().lower()
                 creator_label = uploader_name or (detail.subscribe_action.creator_id if detail.subscribe_action else "") or detail.viewkey
-                if subscribe_creator and detail_site == "pornhub":
-                    dedup_key = f"{uploader_type}:{uploader_name.lower()}" if uploader_name else (detail.viewkey or detail.page_url)
+                if subscribe_creator:
+                    dedup_key = (
+                        f"{detail_site}:{uploader_type}:{uploader_name.lower()}"
+                        if uploader_name
+                        else f"{detail_site}:{detail.viewkey or detail.page_url}"
+                    )
                     sub_res = await self._maybe_subscribe_creator(
                         job_id,
-                        ctx,
-                        detail.subscribe_action,
+                        self._ctx_for_site(ctx, detail_site),
+                        detail.subscribe_action or SubscribeAction(site=detail_site),
                         referer_url=detail.referer_url or detail.page_url,
                         creator_label=creator_label,
                         dedup_key=dedup_key,

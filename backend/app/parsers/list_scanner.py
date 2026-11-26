@@ -555,6 +555,7 @@ async def scan_list_pages(
             profile_username=profile_username,
             on_profile=on_profile,
             on_canonical_target=on_canonical_target,
+            on_subscribe_action=on_subscribe_action,
             on_page=on_page,
             on_page_progress=on_page_progress,
             on_error=on_error,

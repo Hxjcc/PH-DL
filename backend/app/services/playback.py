@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import re
 import secrets
 import time
 from collections import OrderedDict
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urljoin, urlsplit
 
@@ -30,6 +31,18 @@ _REDIRECTS = {301, 302, 303, 307, 308}
 _REQUEST_RANGE = re.compile(r"bytes=(?:([0-9]{1,18})-([0-9]{0,18})|-([0-9]{1,18}))")
 _REPLY_RANGE = re.compile(r"bytes ([0-9]{1,18})-([0-9]{1,18})/([0-9]{1,18})")
 _MP4_TYPES = {"video/mp4", "application/mp4", "application/octet-stream", "binary/octet-stream"}
+_HLS_SEGMENT_TYPES = _MP4_TYPES | {
+    "video/mp2t",
+    "audio/mp4",
+    "audio/aac",
+    "video/iso.segment",
+    "video/webm",
+    "application/vnd.apple.mpegurl",
+    "application/x-mpegurl",
+}
+_HLS_URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
+_MAX_PLAYLIST_BYTES = 4 * 1024 * 1024
+_MAX_HLS_ASSETS = 12_000
 NO_CACHE = {"Cache-Control": "private, no-store"}
 
 
@@ -103,7 +116,7 @@ def _valid_content_range(value: str, length: Optional[str], requested: Optional[
     return start == int(requested[1]) and (not requested[2] or end <= int(requested[2]))
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Playback:
     viewkey: str
     sources: tuple[MediaSource, ...]
@@ -111,6 +124,22 @@ class _Playback:
     cookie: str
     proxy_url: Optional[str]
     expires_at: float
+    format: str = "mp4"
+    hls_asset_urls: dict[int, list[str]] = field(default_factory=dict)
+    hls_asset_index: dict[int, dict[str, int]] = field(default_factory=dict)
+
+    def register_hls_asset(self, index: int, url: str) -> int:
+        idx_map = self.hls_asset_index.setdefault(index, {})
+        existing = idx_map.get(url)
+        if existing is not None:
+            return existing
+        urls = self.hls_asset_urls.setdefault(index, [])
+        if len(urls) >= _MAX_HLS_ASSETS:
+            raise HTTPException(502, "播放列表分片数量超出限制")
+        seg_id = len(urls)
+        urls.append(url)
+        idx_map[url] = seg_id
+        return seg_id
 
 
 class _RelayResponse(StreamingResponse):
@@ -184,16 +213,32 @@ class PlaybackService:
                     ctx, page, settings.selectors, timeout=min(settings.request_timeout, 12),
                     skip_dom=True,
                     include_mp4_sources=True,
-                    xh_preferred_codec=settings.xh_preferred_codec,
+                    xh_preferred_codec="h264" if is_xh else settings.xh_preferred_codec,
                 )
                 cookie = ctx.cookie_string()
         except TimeoutError as err:
             raise HTTPException(504, "获取播放地址超时，请重试") from err
 
-        sources: dict[str, MediaSource] = {}
-        for source in detail.mp4_sources:
-            if _media_url(source.url):
-                sources.setdefault(source.quality, source)
+        def _collect_allowed(candidates: tuple[MediaSource, ...]) -> dict[str, MediaSource]:
+            collected: dict[str, MediaSource] = {}
+            for source in candidates:
+                if _media_url(source.url):
+                    collected.setdefault(source.quality, source)
+            return collected
+
+        selected_format = "mp4"
+        if is_xh:
+            sources = _collect_allowed(detail.hls_sources)
+            if sources:
+                selected_format = "hls"
+            else:
+                sources = _collect_allowed(detail.mp4_sources)
+        else:
+            sources = _collect_allowed(detail.mp4_sources)
+            if not sources:
+                sources = _collect_allowed(detail.hls_sources)
+                if sources:
+                    selected_format = "hls"
         if not sources:
             reason = detail.error or "源站未返回可播放的地址"
             raise HTTPException(502, reason)
@@ -208,16 +253,21 @@ class PlaybackService:
             viewkey=viewkey, sources=tuple(sources.values()),
             referer=detail.referer_url if _site_url(detail.referer_url) else page,
             cookie=cookie, proxy_url=settings.normalized_proxy, expires_at=now + 30 * 60,
+            format=selected_format,
         )
         self._sessions[ticket] = entry
         while len(self._sessions) > 128:
             self._sessions.popitem(last=False)
         return {
-            "format": "mp4",
+            "format": selected_format,
             "sources": [
                 {
                     "quality": source.quality,
-                    "relay_url": f"/api/videos/{viewkey}/playback/{ticket}/{index}",
+                    "relay_url": (
+                        f"/api/videos/{viewkey}/playback/{ticket}/{index}/playlist.m3u8"
+                        if selected_format == "hls"
+                        else f"/api/videos/{viewkey}/playback/{ticket}/{index}"
+                    ),
                 }
                 for index, source in enumerate(entry.sources)
             ],
@@ -233,54 +283,168 @@ class PlaybackService:
         entry = self._session(viewkey, ticket)
         if not 0 <= index < len(entry.sources):
             raise HTTPException(404, "没有找到该画质")
+        if entry.format == "hls":
+            return await self.playlist(viewkey, ticket, index)
         return await self._relay(entry, entry.sources[index].url, byte_range)
 
+    async def playlist(self, viewkey: str, ticket: str, index: int) -> Response:
+        entry = self._session(viewkey, ticket)
+        if entry.format != "hls" or not 0 <= index < len(entry.sources):
+            raise HTTPException(404, "没有找到该画质")
+        upstream_url = entry.sources[index].url
+        async with AsyncExitStack() as setup:
+            upstream, final_url = await self._open_upstream(
+                setup,
+                entry,
+                upstream_url,
+                byte_range=None,
+                extra_headers={"Accept-Encoding": "identity"},
+            )
+            if upstream.status != 200:
+                raise HTTPException(502, "视频源暂时不可用")
+            raw = await upstream.content.read(_MAX_PLAYLIST_BYTES + 1)
+            if len(raw) > _MAX_PLAYLIST_BYTES:
+                raise HTTPException(502, "播放列表体积异常")
+            encoding = upstream.headers.get("Content-Encoding", "identity").strip().lower()
+            if encoding == "gzip":
+                try:
+                    raw = gzip.decompress(raw)
+                except OSError as err:
+                    raise HTTPException(502, "无法解码播放列表") from err
+            elif encoding not in {"", "identity"}:
+                raise HTTPException(502, "视频源返回了不受支持的编码格式")
+
+        text = raw.decode("utf-8", errors="replace")
+        if "#EXTM3U" not in text:
+            raise HTTPException(502, "视频源没有返回有效的 HLS 播放列表")
+
+        def _rewrite_uri(raw_uri: str) -> str:
+            resolved = urljoin(final_url, raw_uri.strip())
+            if not _media_url(resolved):
+                raise HTTPException(502, "源站返回了不受支持的播放分片地址")
+            seg_id = entry.register_hls_asset(index, resolved)
+            return f"seg/{seg_id}"
+
+        rewritten_lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                rewritten_lines.append("")
+                continue
+            if stripped.startswith("#"):
+                if 'URI="' in stripped:
+                    rewritten = _HLS_URI_ATTR_RE.sub(
+                        lambda m: f'URI="{_rewrite_uri(m.group(1))}"',
+                        stripped,
+                    )
+                    rewritten_lines.append(rewritten)
+                else:
+                    rewritten_lines.append(stripped)
+            else:
+                rewritten_lines.append(_rewrite_uri(stripped))
+
+        body = "\n".join(rewritten_lines) + "\n"
+        return Response(
+            content=body,
+            status_code=200,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                **NO_CACHE,
+                "X-Accel-Buffering": "no",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            },
+        )
+
+    async def segment(
+        self,
+        viewkey: str,
+        ticket: str,
+        index: int,
+        seg_id: int,
+        byte_range: Optional[str],
+    ) -> Response:
+        entry = self._session(viewkey, ticket)
+        if entry.format != "hls" or not 0 <= index < len(entry.sources):
+            raise HTTPException(404, "没有找到该画质")
+        assets = entry.hls_asset_urls.get(index) or []
+        if not 0 <= seg_id < len(assets):
+            raise HTTPException(404, "没有找到该播放分片")
+        return await self._relay(
+            entry,
+            assets[seg_id],
+            byte_range,
+            allowed_types=_HLS_SEGMENT_TYPES,
+            forced_media_type=None,
+        )
+
+    async def _open_upstream(
+        self,
+        setup: AsyncExitStack,
+        entry: _Playback,
+        url: str,
+        byte_range: Optional[str],
+        *,
+        extra_headers: Optional[dict[str, str]] = None,
+    ) -> tuple[aiohttp.ClientResponse, str]:
+        try:
+            async with asyncio.timeout(6):
+                await setup.enter_async_context(self._stream_slots)
+        except TimeoutError as err:
+            raise HTTPException(503, "播放请求过多，请稍后重试") from err
+        client = await self._get_http_client()
+        upstream = None
+        current_url = url
+        try:
+            for _ in range(5):
+                if not _media_url(current_url):
+                    raise HTTPException(502, "源站返回了不受支持的播放地址")
+                headers = {**DOWNLOAD_HEADERS, "Referer": entry.referer}
+                if extra_headers:
+                    headers.update(extra_headers)
+                if byte_range:
+                    headers["Range"] = byte_range
+                if entry.cookie and _site_url(current_url):
+                    headers["Cookie"] = entry.cookie
+                candidate = await client.get(
+                    current_url, headers=headers, proxy=entry.proxy_url,
+                    allow_redirects=False,
+                )
+                if candidate.status not in _REDIRECTS:
+                    upstream = candidate
+                    setup.push_async_callback(upstream.release)
+                    break
+                try:
+                    current_url = urljoin(current_url, candidate.headers["Location"])
+                except (KeyError, ValueError) as err:
+                    candidate.close()
+                    raise HTTPException(502, "源站的播放跳转无效") from err
+                await candidate.release()
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise HTTPException(502, "无法连接视频源，请重新获取播放地址") from err
+
+        if upstream is None:
+            raise HTTPException(502, "视频源跳转次数过多")
+        if upstream.status in {401, 403, 404, 410}:
+            raise HTTPException(410, "视频源拒绝了此地址，请重新获取")
+        return upstream, current_url
+
     async def _relay(
-        self, entry: _Playback, url: str, byte_range: Optional[str],
+        self,
+        entry: _Playback,
+        url: str,
+        byte_range: Optional[str],
+        *,
+        allowed_types: Optional[set[str]] = None,
+        forced_media_type: Optional[str] = "video/mp4",
     ) -> Response:
         requested = _parse_range(byte_range)
+        valid_types = allowed_types if allowed_types is not None else _MP4_TYPES
         async with AsyncExitStack() as setup:
-            try:
-                async with asyncio.timeout(6):
-                    await setup.enter_async_context(self._stream_slots)
-            except TimeoutError as err:
-                raise HTTPException(503, "播放请求过多，请稍后重试") from err
-            client = await self._get_http_client()
-            upstream = None
-            try:
-                for _ in range(5):
-                    if not _media_url(url):
-                        raise HTTPException(502, "源站返回了不受支持的播放地址")
-                    headers = {**DOWNLOAD_HEADERS, "Referer": entry.referer}
-                    if byte_range:
-                        headers["Range"] = byte_range
-                    if entry.cookie and _site_url(url):
-                        headers["Cookie"] = entry.cookie
-                    candidate = await client.get(
-                        url, headers=headers, proxy=entry.proxy_url,
-                        allow_redirects=False,
-                    )
-                    if candidate.status not in _REDIRECTS:
-                        upstream = candidate
-                        setup.push_async_callback(upstream.release)
-                        break
-                    try:
-                        url = urljoin(url, candidate.headers["Location"])
-                    except (KeyError, ValueError) as err:
-                        candidate.close()
-                        raise HTTPException(502, "源站的播放跳转无效") from err
-                    await candidate.release()
-            except (aiohttp.ClientError, TimeoutError) as err:
-                raise HTTPException(502, "无法连接视频源，请重新获取播放地址") from err
-
-            if upstream is None:
-                raise HTTPException(502, "视频源跳转次数过多")
+            upstream, _ = await self._open_upstream(setup, entry, url, byte_range)
             if upstream.status == 416:
                 reply_range = upstream.headers.get("Content-Range", "")
                 headers = {"Content-Range": reply_range} if re.fullmatch(r"bytes \*/[0-9]{1,18}", reply_range) else {}
                 return Response(status_code=416, headers={**NO_CACHE, **headers})
-            if upstream.status in {401, 403, 404, 410}:
-                raise HTTPException(410, "视频源拒绝了此地址，请重新获取")
             if upstream.status not in {200, 206}:
                 raise HTTPException(502, "视频源暂时不可用")
             content_type = upstream.headers.get("Content-Type", "").partition(";")[0].strip().lower()
@@ -291,7 +455,7 @@ class PlaybackService:
                 "X-Accel-Buffering": "no",
                 "Cross-Origin-Resource-Policy": "same-origin",
             }
-            if content_type not in _MP4_TYPES or encoding not in {"", "identity"}:
+            if content_type not in valid_types or encoding not in {"", "identity"}:
                 raise HTTPException(502, "视频源没有返回可播放的媒体数据")
             if upstream.status == 206 and not _valid_content_range(
                 upstream.headers.get("Content-Range", ""), length, requested,
@@ -305,4 +469,5 @@ class PlaybackService:
             })
             if upstream.status == 206:
                 headers.setdefault("Accept-Ranges", "bytes")
-            return _RelayResponse(upstream, setup.pop_all(), headers, media_type="video/mp4")
+            media_type = forced_media_type or content_type or "application/octet-stream"
+            return _RelayResponse(upstream, setup.pop_all(), headers, media_type=media_type)

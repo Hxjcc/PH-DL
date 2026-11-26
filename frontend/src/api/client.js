@@ -92,7 +92,7 @@ export const api = {
     return request(`/api/videos?${sp.toString()}`, reqOpts)
   },
   videoPlayback: (viewkey, signal) =>
-    request(`/api/videos/${encodeURIComponent(viewkey)}/playback?format=mp4`, { signal, cache: 'no-store' }),
+    request(`/api/videos/${encodeURIComponent(viewkey)}/playback`, { signal, cache: 'no-store' }),
   deleteVideo: (viewkey, deleteLocalFile = false) =>
     request(
       `/api/videos/${encodeURIComponent(viewkey)}${deleteLocalFile ? '?delete_local_file=true' : ''}`,

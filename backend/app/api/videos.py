@@ -137,6 +137,21 @@ async def stream_video_playback(
     return await container.playback.stream(viewkey, ticket, index, request.headers.get("Range"))
 
 
+@router.get("/{viewkey}/playback/{ticket}/{index}/playlist.m3u8")
+async def stream_video_playback_playlist(
+    viewkey: str, ticket: str, index: int, container: AppContainer = Depends(require_auth),
+):
+    return await container.playback.playlist(viewkey, ticket, index)
+
+
+@router.get("/{viewkey}/playback/{ticket}/{index}/seg/{seg_id}")
+async def stream_video_playback_segment(
+    viewkey: str, ticket: str, index: int, seg_id: int, request: Request,
+    container: AppContainer = Depends(require_auth),
+):
+    return await container.playback.segment(viewkey, ticket, index, seg_id, request.headers.get("Range"))
+
+
 @router.delete("/{viewkey}")
 async def delete_video_record(
     viewkey: str,

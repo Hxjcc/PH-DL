@@ -306,7 +306,7 @@ class TaskHttpContext:
         cookies: Dict[str, str],
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
-        data: Optional[Dict[str, Any]] = None,
+        data: Optional[Any] = None,
     ) -> Tuple[str, str, List[str], int]:
         merged_headers = dict(DEFAULT_HEADERS)
         if headers:
@@ -362,7 +362,7 @@ class TaskHttpContext:
         self,
         url: str,
         cookies: Dict[str, str],
-        data: Optional[Dict[str, Any]] = None,
+        data: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
     ) -> Tuple[str, str, List[str], int]:
@@ -380,7 +380,7 @@ class TaskHttpContext:
         url: str,
         *,
         method: str = "GET",
-        data: Optional[Dict[str, Any]] = None,
+        data: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
         max_retries: Optional[int] = None,

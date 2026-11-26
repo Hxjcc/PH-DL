@@ -216,9 +216,7 @@ const creatorActionsDisabled = computed(
   () => sourceTab.value === 'target' && (form.target_type === 'liked' || form.target_type === 'favorites')
 )
 
-const subscribeCreatorDisabled = computed(
-  () => creatorActionsDisabled.value || (sourceTab.value === 'target' && form.site === 'xhamster')
-)
+const subscribeCreatorDisabled = computed(() => creatorActionsDisabled.value)
 
 watch(
   () => form.site,
@@ -1092,7 +1090,7 @@ async function handleClearTemp() {
               </label>
               <label
                 :class="{ 'download-option-disabled': subscribeCreatorDisabled }"
-                :title="subscribeCreatorDisabled ? '仅对 PornHub 博主目标或视频链接生效' : '使用当前登录 Cookie 自动在 PornHub 订阅该博主（已订阅自动跳过）'"
+                :title="subscribeCreatorDisabled ? '仅对博主目标或视频链接生效' : '使用当前站点已登录 Cookie 自动订阅该博主（已订阅自动跳过）'"
               >
                 <Switch v-model="form.subscribe_creator" :disabled="subscribeCreatorDisabled" />
                 <span>同时订阅博主</span>

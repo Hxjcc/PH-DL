@@ -9,6 +9,7 @@ import os
 import random
 import re
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, Tuple
@@ -16,6 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 from ..cancel import StopRequested, until_stopped
 from ..services.filename import normalize_published_date
 from .http_session import TaskHttpContext, parse_cookie_string
+from .target import SubscribeAction, SubscribeResult
 
 XH_ORIGIN = "https://xhamster.com"
 _XH_HOST_RE = re.compile(
@@ -300,6 +302,179 @@ def build_xhamster_list_url(username: Optional[str], target_type: str, page: int
         return f"{XH_ORIGIN}/channels/{quoted}/newest" if p == 1 else f"{XH_ORIGIN}/channels/{quoted}/newest/{p}"
     # Default: creator (including legacy "model" fallback)
     return f"{XH_ORIGIN}/creators/{quoted}/newest" if p == 1 else f"{XH_ORIGIN}/creators/{quoted}/newest/{p}"
+
+
+def build_xhamster_profile_url(username: Optional[str], target_type: str) -> str:
+    t = (target_type or "creator").strip().lower()
+    quoted = urllib.parse.quote((username or "").strip(), safe="")
+    if t in {"user", "users"}:
+        return f"{XH_ORIGIN}/users/{quoted}"
+    if t == "pornstar":
+        return f"{XH_ORIGIN}/pornstars/{quoted}"
+    if t == "channel":
+        return f"{XH_ORIGIN}/channels/{quoted}"
+    return f"{XH_ORIGIN}/creators/{quoted}"
+
+
+def _build_xh_subscribe_action_from_props(props: Any) -> Optional[SubscribeAction]:
+    if not isinstance(props, dict):
+        return None
+    model_name = str(props.get("modelName") or "").strip()
+    raw_id = props.get("id")
+    if isinstance(raw_id, bool):
+        return None
+    try:
+        entity_id = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+    if not model_name or entity_id <= 0:
+        return None
+    return SubscribeAction(
+        subscribe_url=f"{XH_ORIGIN}/x-api",
+        already_subscribed=bool(props.get("subscribed")),
+        login_required=False,
+        creator_id=f"{model_name}:{entity_id}",
+        site="xhamster",
+        entity_model=model_name,
+        entity_id=entity_id,
+    )
+
+
+def extract_xhamster_subscribe_action(initials: Optional[Dict[str, Any]]) -> Optional[SubscribeAction]:
+    """Extract xHamster subscribe button metadata from list, profile, or video ``window.initials``."""
+    if not isinstance(initials, dict):
+        return None
+
+    candidate_containers = (
+        initials.get("infoComponent"),
+        (initials.get("layoutPage") or {}).get("channelLandingInfoProps")
+        if isinstance(initials.get("layoutPage"), dict)
+        else None,
+        initials.get("subscriptionComponent"),
+    )
+    for container in candidate_containers:
+        if not isinstance(container, dict):
+            continue
+        buttons = container.get("subscribeButtonsProps")
+        if isinstance(buttons, dict):
+            action = _build_xh_subscribe_action_from_props(buttons.get("subscribeButtonProps"))
+            if action is not None:
+                return action
+        action = _build_xh_subscribe_action_from_props(container.get("subscribeButtonProps"))
+        if action is not None:
+            return action
+
+    # Fallback for /users/<slug>/videos profile pages where only `profile` carries userModel + id.
+    profile = initials.get("profile")
+    if isinstance(profile, dict) and str(profile.get("modelName") or "").strip() == "userModel":
+        raw_id = profile.get("id")
+        if not isinstance(raw_id, bool):
+            try:
+                user_id = int(raw_id)
+            except (TypeError, ValueError):
+                user_id = 0
+            if user_id > 0:
+                return SubscribeAction(
+                    subscribe_url=f"{XH_ORIGIN}/x-api",
+                    already_subscribed=bool(profile.get("isSubscribed") or profile.get("subscribed")),
+                    login_required=False,
+                    creator_id=f"userModel:{user_id}",
+                    site="xhamster",
+                    entity_model="userModel",
+                    entity_id=user_id,
+                )
+    return None
+
+
+def extract_xhamster_subscribe_action_from_html(html: str) -> Optional[SubscribeAction]:
+    return extract_xhamster_subscribe_action(extract_xhamster_initials(html))
+
+
+async def subscribe_xhamster_from_action(
+    ctx: TaskHttpContext,
+    action: Optional[SubscribeAction],
+    *,
+    referer_url: str = "",
+    label: str = "",
+    timeout: float = 15.0,
+) -> SubscribeResult:
+    """Invoke xHamster's ``/x-api`` ``entitySubscriptionModelSync`` endpoint."""
+    if action is None or not action.entity_model or action.entity_id <= 0:
+        return SubscribeResult(ok=False, status="not_found", message="页面未找到 xHamster 订阅信息")
+    if action.already_subscribed:
+        return SubscribeResult(ok=True, status="already_subscribed", message="已订阅")
+    if not ctx.cookie_string().strip():
+        return SubscribeResult(ok=False, status="login_required", message="未配置 xHamster Cookie，无法自动订阅")
+
+    payload = [
+        {
+            "name": "entitySubscriptionModelSync",
+            "requestData": {
+                "model": {
+                    "id": None,
+                    "$id": str(uuid.uuid4()),
+                    "modelName": "entitySubscriptionModel",
+                    "itemState": "unchanged",
+                    "entityModel": action.entity_model,
+                    "entityID": int(action.entity_id),
+                    "state": True,
+                }
+            },
+        }
+    ]
+    headers = {
+        "Content-Type": "text/plain",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": XH_ORIGIN,
+        "Referer": referer_url or f"{XH_ORIGIN}/",
+        "Accept": "*/*",
+    }
+    res, err = await ctx.fetch_with_pow(
+        f"{XH_ORIGIN}/x-api",
+        method="POST",
+        data=json.dumps(payload, separators=(",", ":")),
+        headers=headers,
+        timeout=max(5.0, float(timeout)),
+        max_retries=1,
+        log_label=f"xHamster 订阅 {label or action.creator_id or '博主'}",
+    )
+    if res is None:
+        return SubscribeResult(ok=False, status="failed", message=err or "xHamster 订阅请求失败")
+    if res.status_code in {401, 403}:
+        return SubscribeResult(ok=False, status="login_required", message="xHamster Cookie 未登录或已失效")
+    if res.status_code >= 400:
+        return SubscribeResult(ok=False, status="failed", message=f"HTTP {res.status_code}")
+
+    try:
+        parsed = json.loads(res.text)
+    except (ValueError, TypeError):
+        return SubscribeResult(ok=False, status="failed", message="订阅响应不是有效 JSON")
+
+    entries = parsed if isinstance(parsed, list) else ([parsed] if isinstance(parsed, dict) else [])
+    sync_entry = next(
+        (item for item in entries if isinstance(item, dict) and item.get("name") == "entitySubscriptionModelSync"),
+        entries[0] if entries and isinstance(entries[0], dict) else None,
+    )
+    if not isinstance(sync_entry, dict):
+        return SubscribeResult(ok=False, status="failed", message="订阅响应格式异常")
+
+    extras = sync_entry.get("extras") if isinstance(sync_entry.get("extras"), dict) else {}
+    raw_result = extras.get("result")
+    message = str(extras.get("message") or "").strip()
+    user_type = str(extras.get("userType") or "").strip().lower()
+    user_id = extras.get("userId")
+
+    if raw_result is True:
+        return SubscribeResult(ok=True, status="subscribed", message=message or "Subscribed.")
+
+    lower_msg = message.lower()
+    if "already" in lower_msg and "subscrib" in lower_msg:
+        return SubscribeResult(ok=True, status="already_subscribed", message=message or "已订阅")
+    if user_type == "guest" or user_id in (None, 0, "") or any(
+        tok in lower_msg for tok in ("login", "log in", "sign in", "authorized", "guest", "auth")
+    ):
+        return SubscribeResult(ok=False, status="login_required", message=message or "xHamster Cookie 未登录或已失效")
+    return SubscribeResult(ok=False, status="failed", message=message or "xHamster 订阅未成功")
 
 
 def parse_xhamster_target_from_url(url: str) -> Optional[Tuple[str, str]]:
@@ -609,15 +784,23 @@ def _extract_bound_user_from_initials(initials: Dict[str, Any]) -> Optional[Tupl
 def _extract_xhamster_page_data(
     html: str,
     target_type: Optional[str] = None,
-) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[int], Optional[Tuple[str, str]]]:
-    """Parse list HTML into ``(items, avatar_url, display_name, max_pages, bound_user)``."""
+) -> Tuple[
+    List[Tuple[str, str, str, str, int]],
+    str,
+    str,
+    Optional[int],
+    Optional[Tuple[str, str]],
+    Optional[SubscribeAction],
+]:
+    """Parse list HTML into ``(items, avatar_url, display_name, max_pages, bound_user, subscribe_action)``."""
     initials = extract_xhamster_initials(html)
     if not initials:
-        return [], "", "", None, None
+        return [], "", "", None, None, None
 
     avatar_url, display_name = _extract_profile_meta_from_initials(initials, target_type=target_type)
     raw_thumbs, max_pages = _extract_video_thumb_list_from_initials(initials, target_type=target_type)
     bound_user = _extract_bound_user_from_initials(initials)
+    subscribe_action = extract_xhamster_subscribe_action(initials)
 
     results: List[Tuple[str, str, str, str, int]] = []
     seen_vkeys: Set[str] = set()
@@ -643,7 +826,7 @@ def _extract_xhamster_page_data(
         seen_vkeys.add(vkey)
         results.append((vkey, page_url, title, published_at, duration_seconds))
 
-    return results, avatar_url, display_name, max_pages, bound_user
+    return results, avatar_url, display_name, max_pages, bound_user, subscribe_action
 
 
 def extract_xhamster_video_cards(
@@ -651,7 +834,7 @@ def extract_xhamster_video_cards(
     target_type: Optional[str] = None,
 ) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[int]]:
     """Parse list HTML into ``(items, avatar_url, display_name, max_pages)``."""
-    results, avatar_url, display_name, max_pages, _ = _extract_xhamster_page_data(html, target_type=target_type)
+    results, avatar_url, display_name, max_pages, _, _ = _extract_xhamster_page_data(html, target_type=target_type)
     return results, avatar_url, display_name, max_pages
 
 
@@ -687,6 +870,7 @@ async def scan_xhamster_list_pages(
     profile_username: Optional[str] = None,
     on_profile: Optional[Callable[[str, str], Awaitable[None]]] = None,
     on_canonical_target: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    on_subscribe_action: Optional[Callable[[SubscribeAction, str], Awaitable[None]]] = None,
     on_page: Optional[Callable[[List[Any]], Awaitable[None]]] = None,
     on_page_progress: Optional[Callable[[int, int, int], None]] = None,
     on_error: Optional[Callable[[str], None]] = None,
@@ -717,6 +901,7 @@ async def scan_xhamster_list_pages(
     end_reached = False
     profile_found = False
     canonical_notified = False
+    subscribe_notified = False
     active_list_url = initial_url
     effective_target_type = target_type
     effective_profile_username = profile_username
@@ -825,11 +1010,11 @@ async def scan_xhamster_list_pages(
                             await on_canonical_target(canon_type, canon_user)
 
             if len(res.text) >= _OFFLOAD_HTML_THRESHOLD:
-                raw_items, avatar_url, display_name, max_pages, page_bound_user = await asyncio.to_thread(
+                raw_items, avatar_url, display_name, max_pages, page_bound_user, subscribe_action = await asyncio.to_thread(
                     _extract_xhamster_page_data, res.text, effective_target_type
                 )
             else:
-                raw_items, avatar_url, display_name, max_pages, page_bound_user = _extract_xhamster_page_data(
+                raw_items, avatar_url, display_name, max_pages, page_bound_user, subscribe_action = _extract_xhamster_page_data(
                     res.text, effective_target_type
                 )
             any_page_succeeded = True
@@ -842,6 +1027,10 @@ async def scan_xhamster_list_pages(
             if on_profile and not profile_found and (avatar_url or display_name):
                 profile_found = True
                 await on_profile(avatar_url, display_name)
+
+            if on_subscribe_action and not subscribe_notified and subscribe_action is not None:
+                subscribe_notified = True
+                await on_subscribe_action(subscribe_action, res.final_url or page_url)
 
             if not raw_items:
                 if is_natural and current_page == 1:
@@ -1093,7 +1282,31 @@ def _extract_hls_master_candidates(sources: Dict[str, Any], preferred_codec: str
 def _extract_xhamster_uploader(video_model: Dict[str, Any], uploader_hint: Optional[Tuple[str, str]]) -> Tuple[str, str]:
     if uploader_hint and uploader_hint[0]:
         return uploader_hint
-    for key in ("author", "creator", "pornstar"):
+
+    # Prefer the public landing profile (creator / pornstar / channel) over the internal uploading user account.
+    landing_user_fallback: Optional[Tuple[str, str]] = None
+    landing = video_model.get("landing")
+    if isinstance(landing, dict):
+        parsed_landing = parse_xhamster_target_from_url(
+            str(landing.get("link") or landing.get("pageURL") or landing.get("url") or "")
+        )
+        if parsed_landing:
+            if parsed_landing[0] in {"creator", "pornstar", "channel"}:
+                return parsed_landing[1], parsed_landing[0]
+            landing_user_fallback = (parsed_landing[1], parsed_landing[0])
+
+    channel_model = video_model.get("channelModel")
+    if isinstance(channel_model, dict):
+        parsed_ch = parse_xhamster_target_from_url(
+            str(channel_model.get("channelURL") or channel_model.get("pageURL") or channel_model.get("url") or "")
+        )
+        if parsed_ch:
+            return parsed_ch[1], parsed_ch[0]
+
+    if landing_user_fallback is not None:
+        return landing_user_fallback
+
+    for key in ("creator", "pornstar", "author"):
         node = video_model.get(key)
         if isinstance(node, dict):
             parsed = parse_xhamster_target_from_url(str(node.get("pageURL") or node.get("url") or ""))
@@ -1196,6 +1409,7 @@ async def fetch_xhamster_video_detail(
     raw_dur = video_model.get("duration")
     duration_seconds = max(0, int(raw_dur)) if isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool) else 0
     uploader_name, uploader_type = _extract_xhamster_uploader(video_model, uploader_hint)
+    subscribe_action = extract_xhamster_subscribe_action(initials)
 
     kw_reason = _matches_keywords(title, include_keywords, exclude_keywords)
     if kw_reason:
@@ -1212,6 +1426,7 @@ async def fetch_xhamster_video_detail(
             filtered_out=True,
             published_at=published_at,
             duration_seconds=duration_seconds,
+            subscribe_action=subscribe_action,
         )
 
     xplayer = initials.get("xplayerSettings") if isinstance(initials.get("xplayerSettings"), dict) else {}
@@ -1234,8 +1449,8 @@ async def fetch_xhamster_video_detail(
     hls_candidates = _extract_hls_master_candidates(sources, preferred_codec=pref_codec)
 
     selected_variant: Optional[HlsVariant] = None
-    selected_codec = ""
     had_any_variants = False
+    hls_sources_tuple: Tuple[MediaSource, ...] = ()
 
     for codec, master_url in hls_candidates:
         if ctx.cancel_event.is_set():
@@ -1253,6 +1468,12 @@ async def fetch_xhamster_video_detail(
         if not variants:
             continue
         had_any_variants = True
+        if include_mp4_sources and not hls_sources_tuple:
+            deduped_hls: Dict[str, MediaSource] = {}
+            for variant in variants:
+                q_label = variant.quality or f"{variant.height}p" if variant.height > 0 else "auto"
+                deduped_hls.setdefault(q_label, MediaSource(variant.url, q_label))
+            hls_sources_tuple = tuple(deduped_hls.values())
         usable = variants
         if preferred_qualities:
             filtered = [v for v in variants if str(v.height) in preferred_qualities]
@@ -1261,32 +1482,9 @@ async def fetch_xhamster_video_detail(
                 continue
             usable = filtered
         selected_variant = usable[0]
-        selected_codec = codec
         break
 
     if selected_variant is not None:
-        # Optimization: for <=720p H.264, direct progressive MP4 avoids HLS remuxing altogether
-        if selected_codec == "h264" and selected_variant.height <= 720 and mp4_options:
-            for opt in mp4_options:
-                m_h = re.search(r"\d{1,4}", str(opt.get("quality") or ""))
-                if m_h and int(m_h.group(0)) == selected_variant.height:
-                    return VideoDetail(
-                        viewkey=vkey,
-                        title=title,
-                        page_url=page_url,
-                        referer_url=final_url,
-                        download_url=opt["videoUrl"],
-                        quality=selected_variant.quality or opt["quality"],
-                        video_format="mp4",
-                        uploader_username=uploader_name,
-                        uploader_type=uploader_type,
-                        page_num=page_num,
-                        item_num=item_num,
-                        mp4_sources=mp4_sources_tuple,
-                        published_at=published_at,
-                        duration_seconds=duration_seconds,
-                    )
-
         return VideoDetail(
             viewkey=vkey,
             title=title,
@@ -1300,8 +1498,10 @@ async def fetch_xhamster_video_detail(
             page_num=page_num,
             item_num=item_num,
             mp4_sources=mp4_sources_tuple,
+            hls_sources=hls_sources_tuple,
             published_at=published_at,
             duration_seconds=duration_seconds,
+            subscribe_action=subscribe_action,
         )
 
     # If HLS variants existed but none matched preferred_qualities, report filtered_out
@@ -1319,11 +1519,13 @@ async def fetch_xhamster_video_detail(
             error=f"无偏好画质 ({q_str}p)",
             filtered_out=True,
             mp4_sources=mp4_sources_tuple,
+            hls_sources=hls_sources_tuple,
             published_at=published_at,
             duration_seconds=duration_seconds,
+            subscribe_action=subscribe_action,
         )
 
-    # Fallback to direct MP4 sources if HLS master failed
+    # Fallback to direct MP4 sources only if HLS master failed
     if mp4_options:
         dl_url, quality, sel_err = select_best_mp4_option(mp4_options, preferred_qualities)
         if dl_url and not sel_err:
@@ -1340,8 +1542,10 @@ async def fetch_xhamster_video_detail(
                 page_num=page_num,
                 item_num=item_num,
                 mp4_sources=mp4_sources_tuple,
+                hls_sources=hls_sources_tuple,
                 published_at=published_at,
                 duration_seconds=duration_seconds,
+                subscribe_action=subscribe_action,
             )
         return VideoDetail(
             viewkey=vkey,
@@ -1355,8 +1559,10 @@ async def fetch_xhamster_video_detail(
             error=sel_err or "筛选后无可用链接",
             filtered_out=bool(preferred_qualities),
             mp4_sources=mp4_sources_tuple,
+            hls_sources=hls_sources_tuple,
             published_at=published_at,
             duration_seconds=duration_seconds,
+            subscribe_action=subscribe_action,
         )
 
     return VideoDetail(
@@ -1370,8 +1576,10 @@ async def fetch_xhamster_video_detail(
         item_num=item_num,
         error="无可用 HLS/MP4 媒体源",
         mp4_sources=mp4_sources_tuple,
+        hls_sources=hls_sources_tuple,
         published_at=published_at,
         duration_seconds=duration_seconds,
+        subscribe_action=subscribe_action,
     )
 
 
