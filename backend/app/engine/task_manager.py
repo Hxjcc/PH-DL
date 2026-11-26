@@ -43,7 +43,12 @@ from ..parsers.xhamster import (
     is_xhamster_url,
     resolve_xhamster_target_type,
 )
-from ..services.cookie import check_cookie_valid, login_and_get_cookies, login_xhamster_and_get_cookies
+from ..services.cookie import (
+    check_cookie_valid,
+    format_cookie_valid_message,
+    login_and_get_cookies,
+    login_xhamster_and_get_cookies,
+)
 from ..services.downloader import (
     DownloadDiskBudget,
     download_mp4_with_resume,
@@ -297,8 +302,12 @@ class TaskManager:
                 timeout=settings.request_timeout,
             )
             if check.valid:
-                self.set_cookie_status(True, check.message)
-                self.events.emit_log("INFO", f"[PornHub Cookie] {check.message}。", job_id=job_id)
+                resolved_user = (check.logged_in_username or settings.ph_logged_in_username or "").strip()
+                if check.logged_in_username and check.logged_in_username != settings.ph_logged_in_username:
+                    settings = await self.repo.update_settings_patch({"ph_logged_in_username": check.logged_in_username})
+                status_msg = format_cookie_valid_message(resolved_user)
+                self.set_cookie_status(True, status_msg)
+                self.events.emit_log("INFO", f"[PornHub Cookie] {status_msg}。", job_id=job_id)
                 return settings
             self.events.emit_log(
                 "WARNING",
@@ -325,7 +334,8 @@ class TaskManager:
                 if login_res.logged_in_username:
                     patch["ph_logged_in_username"] = login_res.logged_in_username
                 updated_settings = await self.repo.update_settings_patch(patch)
-                self.set_cookie_status(True, "自动登录刷新成功")
+                resolved_user = (login_res.logged_in_username or updated_settings.ph_logged_in_username or "").strip()
+                self.set_cookie_status(True, format_cookie_valid_message(resolved_user))
                 return updated_settings
             err_msg = login_res.message
         else:
@@ -447,10 +457,12 @@ class TaskManager:
                 timeout=settings.request_timeout,
             )
             if valid:
-                self.set_xh_cookie_status(True, msg)
+                resolved_user = (username or settings.xh_logged_in_username or "").strip()
                 if username and username != settings.xh_logged_in_username:
                     settings = await self.repo.update_settings_patch({"xh_logged_in_username": username})
-                self.events.emit_log("INFO", f"[xHamster Cookie] {msg}。", job_id=job_id)
+                status_msg = format_cookie_valid_message(resolved_user)
+                self.set_xh_cookie_status(True, status_msg)
+                self.events.emit_log("INFO", f"[xHamster Cookie] {status_msg}。", job_id=job_id)
                 return settings
             self.events.emit_log(
                 "WARNING",
@@ -477,7 +489,8 @@ class TaskManager:
                 if login_res.logged_in_username:
                     patch["xh_logged_in_username"] = login_res.logged_in_username
                 settings = await self.repo.update_settings_patch(patch)
-                self.set_xh_cookie_status(True, login_res.message)
+                resolved_user = (login_res.logged_in_username or settings.xh_logged_in_username or "").strip()
+                self.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
                 return settings
             err_msg = login_res.message or "xHamster 自动登录失败"
         elif settings.xh_cookie.strip():

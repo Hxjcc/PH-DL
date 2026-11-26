@@ -358,8 +358,8 @@ async function handleTestCookie() {
   busyTool.value = 'cookie_test'
   try {
     const res = await api.testCookie()
-    store.notify(res.message, res.valid ? 'success' : 'warning')
-    await store.refreshOverview()
+    store.notify(`PornHub ${res.message}`, res.valid ? 'success' : 'warning')
+    await Promise.all([loadSettings(), store.refreshOverview()])
   } catch (err) {
     store.notify(err.message, 'error')
   } finally {
@@ -377,7 +377,7 @@ async function handleImportCookie() {
     const res = await api.importCookie(pasteCookie.value.trim())
     store.clearSubscriptionsCache()
     pasteCookie.value = ''
-    store.notify(`Cookie 已保存：${res.message}`, res.valid ? 'success' : 'warning')
+    store.notify(`PornHub Cookie 已保存：${res.message}`, res.valid ? 'success' : 'warning')
     await Promise.all([loadSettings(), store.refreshOverview()])
   } catch (err) {
     store.notify(err.message, 'error')
@@ -414,7 +414,7 @@ async function handleTestXhCookie() {
   busyTool.value = 'xh_cookie_test'
   try {
     const res = await api.testXhCookie()
-    store.notify(res.message, res.valid ? 'success' : 'warning')
+    store.notify(`xHamster ${res.message}`, res.valid ? 'success' : 'warning')
     await Promise.all([loadSettings(), store.refreshOverview()])
   } catch (err) {
     store.notify(err.message, 'error')
@@ -603,12 +603,12 @@ async function handleTestNotify() {
               </div>
               <div class="space-y-1.5">
                 <label class="text-xs font-medium text-foreground">已登录用户名</label>
-                <Input v-model="form.ph_logged_in_username" placeholder="拉取订阅列表用（登录后自动填）" />
+                <Input v-model="form.ph_logged_in_username" placeholder="登录后自动识别（拉取订阅用）" />
               </div>
             </div>
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p class="text-xs text-muted-foreground">
-                点击登录会自动保存凭据并刷新 Cookie；遇 reCAPTCHA 时自动调用下方 YesCaptcha
+                点击登录会自动保存凭据并获取 Cookie，过期时后台任务自动续期；遇 reCAPTCHA 时自动调用下方 YesCaptcha
               </p>
               <Button
                 size="sm"
@@ -635,8 +635,8 @@ async function handleTestNotify() {
                 <label class="text-xs text-muted-foreground shrink-0">已登录用户名</label>
                 <Input
                   v-model="form.ph_logged_in_username"
-                  placeholder="拉取订阅用（可选）"
-                  class="h-8 w-44 text-xs"
+                  placeholder="测活后自动识别（可选）"
+                  class="h-8 w-48 text-xs"
                 />
               </div>
               <Button
@@ -645,7 +645,7 @@ async function handleTestNotify() {
                 @click="handleImportCookie"
               >
                 <Loader2 v-if="busyTool === 'cookie_import'" class="w-3.5 h-3.5 animate-spin" />
-                保存粘贴的 Cookie 并测活
+                保存 PornHub Cookie 并测活
               </Button>
             </div>
           </div>
@@ -707,7 +707,7 @@ async function handleTestNotify() {
             </div>
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p class="text-xs text-muted-foreground">
-                点击登录会自动保存凭据并获取长期 Cookie，Cookie 过期时后台任务也会自动续期
+                点击登录会自动保存凭据并获取 Cookie，过期时后台任务自动续期；遇 reCAPTCHA 时自动调用下方 YesCaptcha
               </p>
               <Button
                 size="sm"

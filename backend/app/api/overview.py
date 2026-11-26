@@ -11,7 +11,7 @@ from ..db.repo import normalize_site
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.target import fetch_subscriptions
 from ..parsers.xhamster import fetch_xhamster_subscriptions
-from ..services.cookie import login_xhamster_and_get_cookies
+from ..services.cookie import format_cookie_valid_message, login_xhamster_and_get_cookies
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api", tags=["overview"])
@@ -53,6 +53,7 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
         },
         "cookie": {
             "configured": bool(settings.ph_cookie.strip()),
+            "username": (settings.ph_logged_in_username or "").strip(),
             **container.tasks.cookie_status,
         },
         "xh_cookie": {
@@ -107,7 +108,8 @@ async def get_subscriptions(
                 if login_res.logged_in_username:
                     patch["xh_logged_in_username"] = login_res.logged_in_username
                 settings = await container.repo.update_settings_patch(patch)
-                container.tasks.set_xh_cookie_status(True, login_res.message)
+                resolved_user = (login_res.logged_in_username or settings.xh_logged_in_username or "").strip()
+                container.tasks.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
                 xh_cookie = settings.xh_cookie.strip()
             else:
                 container.tasks.set_xh_cookie_status(False, login_res.message)

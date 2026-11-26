@@ -255,6 +255,7 @@ async def test_pornhub_login_emits_uniform_site_prefixed_logs(monkeypatch):
         on_log=lambda lvl, msg: logs.append((lvl, msg)),
     )
     assert res.success is True
+    assert res.message == "PornHub 登录并更新 Cookie 成功（当前账号: Hxiay）"
     assert logs
     assert all(msg.startswith("[PornHub 登录] ") for _, msg in logs)
     assert any("开始登录，正在加载登录页" in msg for _, msg in logs)
@@ -263,3 +264,18 @@ async def test_pornhub_login_emits_uniform_site_prefixed_logs(monkeypatch):
     assert any("YesCaptcha 任务已创建: tid-1" in msg for _, msg in logs)
     assert any("已获取验证码 token，正在重新提交登录" in msg for _, msg in logs)
     assert any("登录成功，Cookie 校验通过（当前账号: Hxiay）" in msg for _, msg in logs)
+
+
+def test_pornhub_cookie_valid_message_extracts_username_and_formats_uniformly():
+    html = '<div id="topRightProfileMenu"><a href="/users/Hxiay">Hxiay</a></div>'
+    assert cookie_mod._extract_pornhub_logged_in_username(html) == "Hxiay"
+    assert cookie_mod.format_cookie_valid_message("Hxiay") == "Cookie 有效（当前账号: Hxiay）"
+    assert cookie_mod.format_cookie_valid_message("") == "Cookie 有效"
+    assert (
+        cookie_mod.format_login_success_message("PornHub", "Hxiay")
+        == "PornHub 登录并更新 Cookie 成功（当前账号: Hxiay）"
+    )
+    assert (
+        cookie_mod.format_login_success_message("xHamster", "NativePea222")
+        == "xHamster 登录并更新 Cookie 成功（当前账号: NativePea222）"
+    )

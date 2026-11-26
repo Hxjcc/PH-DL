@@ -1067,19 +1067,6 @@ async function handleClearTemp() {
                   </p>
                   <input ref="txtInputRef" type="file" accept=".txt" class="hidden" @change="handleTxtFileChange" />
                 </div>
-
-                <div v-if="parsedUrls.length > 0" class="url-preview">
-                  <div class="field-heading">
-                    <span>链接预览</span>
-                    <span v-if="parsedUrls.length > 4" class="ml-auto">另有 {{ parsedUrls.length - 4 }} 条链接</span>
-                  </div>
-                  <div class="preview-grid">
-                    <div v-for="(url, index) in parsedUrls.slice(0, 4)" :key="index" class="preview-url">
-                      <span class="shrink-0 tabular-nums">{{ index + 1 }}</span>
-                      <span class="truncate font-mono" :title="url">{{ url }}</span>
-                    </div>
-                  </div>
-                </div>
               </div>
             </div>
 
@@ -1714,30 +1701,6 @@ async function handleClearTemp() {
   flex-wrap: wrap;
   gap: 4px 8px;
   padding: 10px 12px;
-}
-
-.url-preview {
-  margin-top: 8px;
-}
-
-.preview-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px 8px;
-  margin-top: 4px;
-}
-
-.preview-url {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-  border-radius: 6px;
-  background: var(--surface-subtle);
-  padding: 4px 6px;
-  font-size: 10px;
-  line-height: 14px;
-  color: var(--muted-foreground);
 }
 
 .download-options {

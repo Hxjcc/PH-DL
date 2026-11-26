@@ -14,7 +14,12 @@ from pydantic import BaseModel
 from ..engine.scheduler import parse_hhmm
 from ..parsers.xhamster import check_xhamster_cookie_valid
 from ..services.captcha import CaptchaError, get_yescaptcha_balance
-from ..services.cookie import check_cookie_valid, login_and_get_cookies, login_xhamster_and_get_cookies
+from ..services.cookie import (
+    check_cookie_valid,
+    format_cookie_valid_message,
+    login_and_get_cookies,
+    login_xhamster_and_get_cookies,
+)
 from ..services.notifier import send_serverchan
 from ..services.uploader import list_rclone_remotes, test_rclone_connection
 from .deps import AppContainer, require_auth
@@ -108,13 +113,17 @@ async def test_cookie(container: AppContainer = Depends(require_auth)):
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
-    container.tasks.set_cookie_status(res.valid, res.message)
+    resolved_user = (res.logged_in_username or settings.ph_logged_in_username or "").strip() if res.valid else ""
+    if res.valid and res.logged_in_username and res.logged_in_username != settings.ph_logged_in_username:
+        await container.repo.update_settings_patch({"ph_logged_in_username": res.logged_in_username})
+    status_msg = format_cookie_valid_message(resolved_user) if res.valid else res.message
+    container.tasks.set_cookie_status(res.valid, status_msg)
     container.events.emit_log(
         "INFO" if res.valid else "WARNING",
-        f"[PornHub Cookie] 有效性检测: {res.message}",
+        f"[PornHub Cookie] 有效性检测: {status_msg}",
     )
     container.events.broadcast("overview_changed", {})
-    return {"valid": res.valid, "message": res.message}
+    return {"valid": res.valid, "message": status_msg, "logged_in_username": resolved_user}
 
 
 @router.post("/cookie/import")
@@ -132,16 +141,21 @@ async def import_cookie(
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
-    container.tasks.set_cookie_status(res.valid, res.message)
+    resolved_user = (res.logged_in_username or settings.ph_logged_in_username or "").strip() if res.valid else ""
+    if res.valid and res.logged_in_username and res.logged_in_username != settings.ph_logged_in_username:
+        await container.repo.update_settings_patch({"ph_logged_in_username": res.logged_in_username})
+    status_msg = format_cookie_valid_message(resolved_user) if res.valid else res.message
+    container.tasks.set_cookie_status(res.valid, status_msg)
     container.events.emit_log(
         "INFO" if res.valid else "WARNING",
-        f"[PornHub Cookie] 已导入并测活: {res.message}",
+        f"[PornHub Cookie] 已导入并测活: {status_msg}",
     )
     container.events.broadcast("overview_changed", {})
     return {
         "saved": True,
         "valid": res.valid,
-        "message": res.message,
+        "message": status_msg,
+        "logged_in_username": resolved_user,
     }
 
 
@@ -167,12 +181,13 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
     patch: Dict[str, Any] = {"ph_cookie": res.cookie_str}
     if res.logged_in_username:
         patch["ph_logged_in_username"] = res.logged_in_username
-    await container.repo.update_settings_patch(patch)
-    container.tasks.set_cookie_status(True, res.message)
+    updated = await container.repo.update_settings_patch(patch)
+    resolved_user = (res.logged_in_username or updated.ph_logged_in_username or "").strip()
+    container.tasks.set_cookie_status(True, format_cookie_valid_message(resolved_user))
     container.events.broadcast("overview_changed", {})
     return {
         "success": True,
-        "logged_in_username": res.logged_in_username,
+        "logged_in_username": resolved_user,
         "message": res.message,
     }
 
@@ -185,15 +200,17 @@ async def test_xh_cookie(container: AppContainer = Depends(require_auth)):
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
+    resolved_user = (username or settings.xh_logged_in_username or "").strip() if valid else ""
     if valid and username and username != settings.xh_logged_in_username:
         await container.repo.update_settings_patch({"xh_logged_in_username": username})
-    container.tasks.set_xh_cookie_status(valid, message)
+    status_msg = format_cookie_valid_message(resolved_user) if valid else message
+    container.tasks.set_xh_cookie_status(valid, status_msg)
     container.events.emit_log(
         "INFO" if valid else "WARNING",
-        f"[xHamster Cookie] 有效性检测: {message}",
+        f"[xHamster Cookie] 有效性检测: {status_msg}",
     )
     container.events.broadcast("overview_changed", {})
-    return {"valid": valid, "message": message, "logged_in_username": username}
+    return {"valid": valid, "message": status_msg, "logged_in_username": resolved_user}
 
 
 @router.post("/xh-cookie/import")
@@ -211,19 +228,21 @@ async def import_xh_cookie(
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
-    if valid and username:
+    resolved_user = (username or settings.xh_logged_in_username or "").strip() if valid else ""
+    if valid and username and username != settings.xh_logged_in_username:
         await container.repo.update_settings_patch({"xh_logged_in_username": username})
-    container.tasks.set_xh_cookie_status(valid, message)
+    status_msg = format_cookie_valid_message(resolved_user) if valid else message
+    container.tasks.set_xh_cookie_status(valid, status_msg)
     container.events.emit_log(
         "INFO" if valid else "WARNING",
-        f"[xHamster Cookie] 已导入并测活: {message}",
+        f"[xHamster Cookie] 已导入并测活: {status_msg}",
     )
     container.events.broadcast("overview_changed", {})
     return {
         "saved": True,
         "valid": valid,
-        "message": message,
-        "logged_in_username": username,
+        "message": status_msg,
+        "logged_in_username": resolved_user,
     }
 
 
@@ -249,12 +268,13 @@ async def refresh_xh_cookie(container: AppContainer = Depends(require_auth)):
     patch: Dict[str, Any] = {"xh_cookie": res.cookie_str}
     if res.logged_in_username:
         patch["xh_logged_in_username"] = res.logged_in_username
-    await container.repo.update_settings_patch(patch)
-    container.tasks.set_xh_cookie_status(True, res.message)
+    updated = await container.repo.update_settings_patch(patch)
+    resolved_user = (res.logged_in_username or updated.xh_logged_in_username or "").strip()
+    container.tasks.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
     container.events.broadcast("overview_changed", {})
     return {
         "success": True,
-        "logged_in_username": res.logged_in_username,
+        "logged_in_username": resolved_user,
         "message": res.message,
     }
 

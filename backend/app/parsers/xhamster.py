@@ -1295,9 +1295,11 @@ async def check_xhamster_cookie_valid(
     timeout: float = 20.0,
 ) -> Tuple[bool, str, str]:
     """Validate xHamster Cookie via ``/my/favorites/videos``. Returns ``(valid, message, username)``."""
+    from ..services.cookie import format_cookie_valid_message
+
     cookies = parse_cookie_string(cookie_str)
     if not cookies:
-        return False, "未配置 xHamster Cookie", ""
+        return False, "未配置 Cookie", ""
 
     try:
         async with TaskHttpContext(
@@ -1314,28 +1316,25 @@ async def check_xhamster_cookie_valid(
                 headers=_xh_headers(),
                 timeout=timeout,
                 max_retries=1,
-                log_label="xHamster Cookie 校验",
+                log_label="Cookie 校验",
             )
             if res is None:
-                return False, f"xHamster Cookie 校验失败: {err or '请求失败'}", ""
+                return False, f"Cookie 校验失败: {err or '请求失败'}", ""
             if res.status_code >= 400:
                 return False, f"校验请求返回 HTTP {res.status_code}", ""
             if "/login" in (res.final_url or "").lower():
-                return False, "xHamster Cookie 已失效（重定向到登录页）", ""
+                return False, "Cookie 已失效（重定向到登录页）", ""
             initials = extract_xhamster_initials(res.text)
             if not initials:
-                return False, "无法解析 xHamster 页面登录态", ""
+                return False, "无法解析页面登录态", ""
             user_id = initials.get("userId")
             profile = initials.get("profile") if isinstance(initials.get("profile"), dict) else {}
             username = str(profile.get("name") or initials.get("userName") or "").strip()
-            if isinstance(user_id, int) and user_id > 0:
-                msg = f"Cookie 有效（当前账号: {username}）" if username else "Cookie 有效"
-                return True, msg, username
-            if username:
-                return True, f"Cookie 有效（当前账号: {username}）", username
-            return False, "xHamster Cookie 未登录或已失效", ""
+            if (isinstance(user_id, int) and user_id > 0) or username:
+                return True, format_cookie_valid_message(username), username
+            return False, "Cookie 未登录或已失效", ""
     except Exception as err:
-        return False, f"xHamster Cookie 校验失败: {err}", ""
+        return False, f"Cookie 校验失败: {err}", ""
 
 
 async def fetch_xhamster_subscriptions(

@@ -41,6 +41,7 @@ _INFLIGHT_LOGINS: "WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[Tuple[str, 
 class CookieCheckResult:
     valid: bool
     message: str
+    logged_in_username: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,17 @@ class CookieLoginResult:
     cookie_str: str = ""
     logged_in_username: str = ""
     message: str = ""
+
+
+def format_cookie_valid_message(username: str = "") -> str:
+    user = (username or "").strip()
+    return f"Cookie 有效（当前账号: {user}）" if user else "Cookie 有效"
+
+
+def format_login_success_message(site_label: str, username: str = "") -> str:
+    user = (username or "").strip()
+    suffix = f"（当前账号: {user}）" if user else ""
+    return f"{site_label} 登录并更新 Cookie 成功{suffix}"
 
 
 def _make_site_logger(site_label: str, on_log: Optional[LogCallback]) -> LogCallback:
@@ -385,6 +397,54 @@ async def _submit_login(
     return resp, err, data
 
 
+def _extract_pornhub_logged_in_username(html: str) -> str:
+    """Best-effort extraction of the logged-in PornHub username from authenticated settings HTML."""
+    if not html:
+        return ""
+    ignore = {"", "null", "none", "guest", "anonymous", "login", "signup", "settings", "security", "subscriptions"}
+
+    def _clean(raw: str) -> str:
+        candidate = (raw or "").strip().strip("/")
+        if not candidate or len(candidate) > 64 or "/" in candidate or "?" in candidate:
+            return ""
+        if candidate.lower() in ignore:
+            return ""
+        return candidate
+
+    try:
+        tree = HTMLParser(html)
+        for sel in (
+            "#topRightProfileMenu a[href*='/users/']",
+            ".profileMenu a[href*='/users/']",
+            "a.usernameLink[href*='/users/']",
+            "a[data-mxptext='Profile'][href*='/users/']",
+            "[data-username]",
+        ):
+            for node in tree.css(sel):
+                data_user = _clean(node.attributes.get("data-username") or "")
+                if data_user:
+                    return data_user
+                href = (node.attributes.get("href") or "").strip()
+                m_href = re.search(r"/users/([^/?#]+)", href, re.I)
+                if m_href:
+                    user = _clean(m_href.group(1))
+                    if user:
+                        return user
+    except Exception:
+        pass
+
+    for pattern in (
+        r'data-username=["\']([^"\']{2,64})["\']',
+        r'(?:"username"|\'username\'|\buser_name\b|\bcurrentUsername\b)\s*[:=]\s*["\']([^"\'\\]{2,64})["\']',
+    ):
+        m = re.search(pattern, html, re.I)
+        if m:
+            user = _clean(m.group(1))
+            if user:
+                return user
+    return ""
+
+
 async def _finish_login(
     ctx: TaskHttpContext,
     proxy_url: Optional[str],
@@ -393,17 +453,18 @@ async def _finish_login(
 ) -> CookieLoginResult:
     cookie_str = ctx.cookie_string()
     if not cookie_str:
-        return CookieLoginResult(success=False, message="登录未返回任何 Cookie")
+        return CookieLoginResult(success=False, message="PornHub 登录未返回任何 Cookie")
 
     verify = await check_cookie_valid(cookie_str, proxy_url=proxy_url, timeout=timeout)
     if not verify.valid:
-        return CookieLoginResult(success=False, message=f"登录后验证失败: {verify.message}")
+        return CookieLoginResult(success=False, message=f"PornHub 登录后校验失败: {verify.message}")
 
+    resolved_user = (logged_in_username or verify.logged_in_username or "").strip()
     return CookieLoginResult(
         success=True,
         cookie_str=cookie_str,
-        logged_in_username=logged_in_username,
-        message="登录并更新 Cookie 成功",
+        logged_in_username=resolved_user,
+        message=format_login_success_message("PornHub", resolved_user),
     )
 
 
@@ -449,7 +510,12 @@ async def check_cookie_valid(
                 return CookieCheckResult(valid=False, message="Cookie 已失效（页面要求重新登录）")
             if not body.strip():
                 return CookieCheckResult(valid=False, message="校验响应为空，无法确认 Cookie 有效性")
-            return CookieCheckResult(valid=True, message="Cookie 有效")
+            detected_user = _extract_pornhub_logged_in_username(body)
+            return CookieCheckResult(
+                valid=True,
+                message=format_cookie_valid_message(detected_user),
+                logged_in_username=detected_user,
+            )
     except Exception as err:
         return CookieCheckResult(valid=False, message=f"Cookie 校验失败: {err}")
 
@@ -1034,12 +1100,12 @@ async def _login_xhamster_once(
                             success=False,
                             message=f"xHamster 登录后校验失败: {verify_msg}",
                         )
-                    resolved_user = logged_in_user or username.strip()
+                    resolved_user = (logged_in_user or username).strip()
                     return CookieLoginResult(
                         success=True,
                         cookie_str=cookie_str,
                         logged_in_username=resolved_user,
-                        message=f"xHamster 登录并更新 Cookie 成功（当前账号: {resolved_user}）",
+                        message=format_login_success_message("xHamster", resolved_user),
                     )
 
                 emit(
