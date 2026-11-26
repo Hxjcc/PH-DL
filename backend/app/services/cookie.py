@@ -52,6 +52,17 @@ class CookieLoginResult:
     message: str = ""
 
 
+def prefer_cased_username(detected: str, existing: str = "") -> str:
+    """Resolve username without downgrading an existing mixed-case username (e.g. ``Hxiay``) to lowercase."""
+    det = (detected or "").strip()
+    cur = (existing or "").strip()
+    if det and cur and det.lower() == cur.lower():
+        if det == det.lower() and cur != cur.lower():
+            return cur
+        return det
+    return det or cur
+
+
 def format_cookie_valid_message(username: str = "") -> str:
     user = (username or "").strip()
     return f"Cookie 有效（当前账号: {user}）" if user else "Cookie 有效"
@@ -398,7 +409,7 @@ async def _submit_login(
 
 
 def _extract_pornhub_logged_in_username(html: str) -> str:
-    """Best-effort extraction of the logged-in PornHub username from authenticated settings HTML."""
+    """Best-effort extraction of the logged-in PornHub username, preserving original capitalization."""
     if not html:
         return ""
     ignore = {"", "null", "none", "guest", "anonymous", "login", "signup", "settings", "security", "subscriptions"}
@@ -411,14 +422,15 @@ def _extract_pornhub_logged_in_username(html: str) -> str:
             return ""
         return candidate
 
+    fallback_slug = ""
     try:
         tree = HTMLParser(html)
         for sel in (
+            "[data-username]",
             "#topRightProfileMenu a[href*='/users/']",
             ".profileMenu a[href*='/users/']",
             "a.usernameLink[href*='/users/']",
             "a[data-mxptext='Profile'][href*='/users/']",
-            "[data-username]",
         ):
             for node in tree.css(sel):
                 data_user = _clean(node.attributes.get("data-username") or "")
@@ -427,9 +439,13 @@ def _extract_pornhub_logged_in_username(html: str) -> str:
                 href = (node.attributes.get("href") or "").strip()
                 m_href = re.search(r"/users/([^/?#]+)", href, re.I)
                 if m_href:
-                    user = _clean(m_href.group(1))
-                    if user:
-                        return user
+                    slug = _clean(m_href.group(1))
+                    if slug:
+                        label = _clean(node.text(strip=True) or "")
+                        if label and label.lower() == slug.lower():
+                            return label
+                        if not fallback_slug:
+                            fallback_slug = slug
     except Exception:
         pass
 
@@ -441,8 +457,8 @@ def _extract_pornhub_logged_in_username(html: str) -> str:
         if m:
             user = _clean(m.group(1))
             if user:
-                return user
-    return ""
+                return prefer_cased_username(user, fallback_slug)
+    return fallback_slug
 
 
 async def _finish_login(

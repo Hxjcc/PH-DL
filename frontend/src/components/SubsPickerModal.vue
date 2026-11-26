@@ -57,7 +57,7 @@ const defaultSource = computed(() =>
     : (store.accountUsername || store.subscriptionsLastSource || '')
 )
 const isOwnAccount = computed(() => {
-  if (activeSite.value === 'xhamster') return false
+  if (activeSite.value === 'xhamster') return true
   const cur = sourceUser.value.trim().toLowerCase()
   const own = defaultSource.value.trim().toLowerCase()
   return !cur || (own && cur === own) || !manualSource.value
@@ -331,7 +331,7 @@ function confirm() {
               type="button"
               class="group relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-muted-foreground cursor-pointer transition-colors hover:border-brand/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30"
               :disabled="uploadingAvatar"
-              title="点击更换本地账号头像（仅本地显示，不修改 PornHub 账号）"
+              title="点击更换本地账号头像（仅本地显示，不修改站点账号信息）"
               aria-label="更换本地账号头像"
               @click="avatarInput?.click()"
             >

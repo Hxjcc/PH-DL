@@ -267,8 +267,11 @@ async def test_pornhub_login_emits_uniform_site_prefixed_logs(monkeypatch):
 
 
 def test_pornhub_cookie_valid_message_extracts_username_and_formats_uniformly():
-    html = '<div id="topRightProfileMenu"><a href="/users/Hxiay">Hxiay</a></div>'
+    html = '<div id="topRightProfileMenu"><a href="/users/hxiay">Hxiay</a></div>'
     assert cookie_mod._extract_pornhub_logged_in_username(html) == "Hxiay"
+    assert cookie_mod.prefer_cased_username("hxiay", "Hxiay") == "Hxiay"
+    assert cookie_mod.prefer_cased_username("Hxiay", "hxiay") == "Hxiay"
+    assert cookie_mod.prefer_cased_username("OtherUser", "Hxiay") == "OtherUser"
     assert cookie_mod.format_cookie_valid_message("Hxiay") == "Cookie 有效（当前账号: Hxiay）"
     assert cookie_mod.format_cookie_valid_message("") == "Cookie 有效"
     assert (

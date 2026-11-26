@@ -19,6 +19,7 @@ from ..services.cookie import (
     format_cookie_valid_message,
     login_and_get_cookies,
     login_xhamster_and_get_cookies,
+    prefer_cased_username,
 )
 from ..services.notifier import send_serverchan
 from ..services.uploader import list_rclone_remotes, test_rclone_connection
@@ -113,9 +114,9 @@ async def test_cookie(container: AppContainer = Depends(require_auth)):
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
-    resolved_user = (res.logged_in_username or settings.ph_logged_in_username or "").strip() if res.valid else ""
-    if res.valid and res.logged_in_username and res.logged_in_username != settings.ph_logged_in_username:
-        await container.repo.update_settings_patch({"ph_logged_in_username": res.logged_in_username})
+    resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username) if res.valid else ""
+    if res.valid and resolved_user and resolved_user != settings.ph_logged_in_username:
+        await container.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
     status_msg = format_cookie_valid_message(resolved_user) if res.valid else res.message
     container.tasks.set_cookie_status(res.valid, status_msg)
     container.events.emit_log(
@@ -141,9 +142,9 @@ async def import_cookie(
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
-    resolved_user = (res.logged_in_username or settings.ph_logged_in_username or "").strip() if res.valid else ""
-    if res.valid and res.logged_in_username and res.logged_in_username != settings.ph_logged_in_username:
-        await container.repo.update_settings_patch({"ph_logged_in_username": res.logged_in_username})
+    resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username) if res.valid else ""
+    if res.valid and resolved_user and resolved_user != settings.ph_logged_in_username:
+        await container.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
     status_msg = format_cookie_valid_message(resolved_user) if res.valid else res.message
     container.tasks.set_cookie_status(res.valid, status_msg)
     container.events.emit_log(
@@ -178,11 +179,11 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
         container.events.broadcast("overview_changed", {})
         return {"success": False, "message": res.message}
 
+    resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username)
     patch: Dict[str, Any] = {"ph_cookie": res.cookie_str}
-    if res.logged_in_username:
-        patch["ph_logged_in_username"] = res.logged_in_username
-    updated = await container.repo.update_settings_patch(patch)
-    resolved_user = (res.logged_in_username or updated.ph_logged_in_username or "").strip()
+    if resolved_user:
+        patch["ph_logged_in_username"] = resolved_user
+    await container.repo.update_settings_patch(patch)
     container.tasks.set_cookie_status(True, format_cookie_valid_message(resolved_user))
     container.events.broadcast("overview_changed", {})
     return {
@@ -200,9 +201,9 @@ async def test_xh_cookie(container: AppContainer = Depends(require_auth)):
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
-    resolved_user = (username or settings.xh_logged_in_username or "").strip() if valid else ""
-    if valid and username and username != settings.xh_logged_in_username:
-        await container.repo.update_settings_patch({"xh_logged_in_username": username})
+    resolved_user = prefer_cased_username(username, settings.xh_logged_in_username) if valid else ""
+    if valid and resolved_user and resolved_user != settings.xh_logged_in_username:
+        await container.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
     status_msg = format_cookie_valid_message(resolved_user) if valid else message
     container.tasks.set_xh_cookie_status(valid, status_msg)
     container.events.emit_log(
@@ -228,9 +229,9 @@ async def import_xh_cookie(
         proxy_url=settings.normalized_proxy,
         timeout=settings.request_timeout,
     )
-    resolved_user = (username or settings.xh_logged_in_username or "").strip() if valid else ""
-    if valid and username and username != settings.xh_logged_in_username:
-        await container.repo.update_settings_patch({"xh_logged_in_username": username})
+    resolved_user = prefer_cased_username(username, settings.xh_logged_in_username) if valid else ""
+    if valid and resolved_user and resolved_user != settings.xh_logged_in_username:
+        await container.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
     status_msg = format_cookie_valid_message(resolved_user) if valid else message
     container.tasks.set_xh_cookie_status(valid, status_msg)
     container.events.emit_log(
@@ -265,11 +266,11 @@ async def refresh_xh_cookie(container: AppContainer = Depends(require_auth)):
         container.events.broadcast("overview_changed", {})
         return {"success": False, "message": res.message}
 
+    resolved_user = prefer_cased_username(res.logged_in_username, settings.xh_logged_in_username)
     patch: Dict[str, Any] = {"xh_cookie": res.cookie_str}
-    if res.logged_in_username:
-        patch["xh_logged_in_username"] = res.logged_in_username
-    updated = await container.repo.update_settings_patch(patch)
-    resolved_user = (res.logged_in_username or updated.xh_logged_in_username or "").strip()
+    if resolved_user:
+        patch["xh_logged_in_username"] = resolved_user
+    await container.repo.update_settings_patch(patch)
     container.tasks.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
     container.events.broadcast("overview_changed", {})
     return {

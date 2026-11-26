@@ -48,6 +48,7 @@ from ..services.cookie import (
     format_cookie_valid_message,
     login_and_get_cookies,
     login_xhamster_and_get_cookies,
+    prefer_cased_username,
 )
 from ..services.downloader import (
     DownloadDiskBudget,
@@ -302,9 +303,9 @@ class TaskManager:
                 timeout=settings.request_timeout,
             )
             if check.valid:
-                resolved_user = (check.logged_in_username or settings.ph_logged_in_username or "").strip()
-                if check.logged_in_username and check.logged_in_username != settings.ph_logged_in_username:
-                    settings = await self.repo.update_settings_patch({"ph_logged_in_username": check.logged_in_username})
+                resolved_user = prefer_cased_username(check.logged_in_username, settings.ph_logged_in_username)
+                if resolved_user and resolved_user != settings.ph_logged_in_username:
+                    settings = await self.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
                 status_msg = format_cookie_valid_message(resolved_user)
                 self.set_cookie_status(True, status_msg)
                 self.events.emit_log("INFO", f"[PornHub Cookie] {status_msg}。", job_id=job_id)
@@ -457,9 +458,9 @@ class TaskManager:
                 timeout=settings.request_timeout,
             )
             if valid:
-                resolved_user = (username or settings.xh_logged_in_username or "").strip()
-                if username and username != settings.xh_logged_in_username:
-                    settings = await self.repo.update_settings_patch({"xh_logged_in_username": username})
+                resolved_user = prefer_cased_username(username, settings.xh_logged_in_username)
+                if resolved_user and resolved_user != settings.xh_logged_in_username:
+                    settings = await self.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
                 status_msg = format_cookie_valid_message(resolved_user)
                 self.set_xh_cookie_status(True, status_msg)
                 self.events.emit_log("INFO", f"[xHamster Cookie] {status_msg}。", job_id=job_id)

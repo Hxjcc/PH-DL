@@ -573,17 +573,51 @@ def _extract_video_thumb_list_from_initials(
     return [], max_pages
 
 
-def extract_xhamster_video_cards(
+_XH_AVATAR_USER_ID_RE = re.compile(r"/(\d{1,4})/(\d{3})/(\d{3})/avatar", re.IGNORECASE)
+
+
+def _extract_user_id_from_avatar_url(url: str) -> Optional[int]:
+    m = _XH_AVATAR_USER_ID_RE.search(str(url or ""))
+    if not m:
+        return None
+    try:
+        uid = int("".join(m.groups()))
+        return uid if uid > 0 else None
+    except ValueError:
+        return None
+
+
+def _extract_bound_user_from_initials(initials: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Return ``(bound_slug, users_videos_url)`` when a creator page is linked to a ``/users/`` account."""
+    info = initials.get("infoComponent")
+    if not isinstance(info, dict):
+        return None
+    candidate_urls: List[str] = []
+    display_user = info.get("displayUserModel")
+    if isinstance(display_user, dict):
+        candidate_urls.append(str(display_user.get("pageURL") or display_user.get("url") or ""))
+    urls_map = info.get("urls")
+    if isinstance(urls_map, dict):
+        candidate_urls.append(str(urls_map.get("pornstarUrl") or ""))
+    for raw_url in candidate_urls:
+        parsed = parse_xhamster_target_from_url(raw_url.strip())
+        if parsed and parsed[0] == "users" and parsed[1]:
+            return parsed[1], build_xhamster_list_url(parsed[1], "users", page=1)
+    return None
+
+
+def _extract_xhamster_page_data(
     html: str,
     target_type: Optional[str] = None,
-) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[int]]:
-    """Parse list HTML into ``(items, avatar_url, display_name, max_pages)``."""
+) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[int], Optional[Tuple[str, str]]]:
+    """Parse list HTML into ``(items, avatar_url, display_name, max_pages, bound_user)``."""
     initials = extract_xhamster_initials(html)
     if not initials:
-        return [], "", "", None
+        return [], "", "", None, None
 
     avatar_url, display_name = _extract_profile_meta_from_initials(initials, target_type=target_type)
     raw_thumbs, max_pages = _extract_video_thumb_list_from_initials(initials, target_type=target_type)
+    bound_user = _extract_bound_user_from_initials(initials)
 
     results: List[Tuple[str, str, str, str, int]] = []
     seen_vkeys: Set[str] = set()
@@ -609,6 +643,15 @@ def extract_xhamster_video_cards(
         seen_vkeys.add(vkey)
         results.append((vkey, page_url, title, published_at, duration_seconds))
 
+    return results, avatar_url, display_name, max_pages, bound_user
+
+
+def extract_xhamster_video_cards(
+    html: str,
+    target_type: Optional[str] = None,
+) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[int]]:
+    """Parse list HTML into ``(items, avatar_url, display_name, max_pages)``."""
+    results, avatar_url, display_name, max_pages, _ = _extract_xhamster_page_data(html, target_type=target_type)
     return results, avatar_url, display_name, max_pages
 
 
@@ -647,6 +690,8 @@ async def scan_xhamster_list_pages(
     on_page: Optional[Callable[[List[Any]], Awaitable[None]]] = None,
     on_page_progress: Optional[Callable[[int, int, int], None]] = None,
     on_error: Optional[Callable[[str], None]] = None,
+    include_bound_user: bool = True,
+    already_seen_vkeys: Optional[Set[str]] = None,
 ) -> List[Any]:
     """Scan xHamster list pages, returning ``List[ListedVideo]``."""
     from .list_scanner import ListedVideo, parse_page_specs, parse_page_video_specs
@@ -666,6 +711,7 @@ async def scan_xhamster_list_pages(
 
     collected: List[ListedVideo] = []
     seen_all_vkeys: Set[str] = set()
+    external_seen = set(already_seen_vkeys or ())
     skip_set = set(skip_vkeys or ())
     pages_scanned = 0
     end_reached = False
@@ -675,6 +721,8 @@ async def scan_xhamster_list_pages(
     effective_target_type = target_type
     effective_profile_username = profile_username
     known_max_pages: Optional[int] = None
+    bound_user_info: Optional[Tuple[str, str]] = None
+    any_page_succeeded = False
 
     def report_error(page: int, reason: str) -> None:
         message = f"[xHamster 扫描] 列表第 {page} 页: {reason}"
@@ -777,13 +825,16 @@ async def scan_xhamster_list_pages(
                             await on_canonical_target(canon_type, canon_user)
 
             if len(res.text) >= _OFFLOAD_HTML_THRESHOLD:
-                raw_items, avatar_url, display_name, max_pages = await asyncio.to_thread(
-                    extract_xhamster_video_cards, res.text, effective_target_type
+                raw_items, avatar_url, display_name, max_pages, page_bound_user = await asyncio.to_thread(
+                    _extract_xhamster_page_data, res.text, effective_target_type
                 )
             else:
-                raw_items, avatar_url, display_name, max_pages = extract_xhamster_video_cards(
+                raw_items, avatar_url, display_name, max_pages, page_bound_user = _extract_xhamster_page_data(
                     res.text, effective_target_type
                 )
+            any_page_succeeded = True
+            if bound_user_info is None and page_bound_user is not None:
+                bound_user_info = page_bound_user
 
             if max_pages is not None and (known_max_pages is None or max_pages < known_max_pages):
                 known_max_pages = max_pages
@@ -819,7 +870,7 @@ async def scan_xhamster_list_pages(
                     continue
                 seen_all_vkeys.add(vkey)
                 new_unique_on_page += 1
-                if vkey in skip_set:
+                if vkey in skip_set or vkey in external_seen:
                     continue
                 page_videos.append(
                     ListedVideo(
@@ -862,6 +913,44 @@ async def scan_xhamster_list_pages(
 
         if is_natural and batch_failed:
             break
+
+    # Union-scan linked /users/{bound_slug}/videos for creator targets during natural full/catch-up scans
+    # so uploads missing the creator tag are never missed while staying under one target/folder.
+    if (
+        include_bound_user
+        and is_natural
+        and any_page_succeeded
+        and (effective_target_type or "").strip().lower() == "creator"
+        and bound_user_info is not None
+        and not ctx.cancel_event.is_set()
+    ):
+        bound_slug, bound_url = bound_user_info
+        ctx._emit(
+            "INFO",
+            f"[xHamster 扫描] 检测到创作者绑定上传号 {bound_slug}，补扫其用户视频页以合并遗漏视频: {bound_url}",
+        )
+        extra_videos = await scan_xhamster_list_pages(
+            ctx,
+            bound_url,
+            target_type="users",
+            catch_up=catch_up,
+            skip_vkeys=skip_set,
+            delay_min=delay_min,
+            delay_max=delay_max,
+            page_concurrency=page_concurrency,
+            timeout=timeout,
+            profile_username=bound_slug,
+            on_page=on_page,
+            on_page_progress=None,
+            on_error=None,
+            include_bound_user=False,
+            already_seen_vkeys=seen_all_vkeys | external_seen,
+        )
+        collected.extend(extra_videos)
+        ctx._emit(
+            "INFO",
+            f"[xHamster 扫描] 绑定上传号 {bound_slug} 补扫完成，补充 {len(extra_videos)} 个不重复视频。",
+        )
 
     return collected
 
@@ -1344,6 +1433,8 @@ async def fetch_xhamster_subscriptions(
     """Fetch logged-in xHamster subscriptions as ``(target_type, username, display_name, avatar_url)``."""
     results: List[Tuple[str, str, str, str]] = []
     seen: Set[Tuple[str, str]] = set()
+    bound_user_ids: Set[int] = set()
+    bound_user_slugs: Set[str] = set()
     req_timeout = max(5.0, float(timeout))
 
     def _add_item(utype: str, slug: str, display_name: str, avatar_url: str) -> None:
@@ -1371,7 +1462,10 @@ async def fetch_xhamster_subscriptions(
             timeout=req_timeout,
             log_label=f"xHamster 创作者订阅第 {page_num} 页",
         )
-        if res is None or res.status_code >= 400 or "/login" in (res.final_url or "").lower():
+        if res is None or res.status_code >= 400:
+            break
+        final_low = (res.final_url or "").lower()
+        if "/login" in final_low or "/my/subscriptions/pornstars" not in final_low:
             break
         initials = extract_xhamster_initials(res.text)
         if not initials:
@@ -1380,12 +1474,14 @@ async def fetch_xhamster_subscriptions(
         entries = layout.get("pornstars") if isinstance(layout.get("pornstars"), list) else []
         if not entries:
             break
+        found_subscribed = 0
         for item in entries:
             if not isinstance(item, dict):
                 continue
             sub_model = item.get("subscriptionModel")
-            if isinstance(sub_model, dict) and sub_model.get("subscribed") is False:
+            if not (isinstance(sub_model, dict) and sub_model.get("subscribed") is True):
                 continue
+            found_subscribed += 1
             page_url = str(item.get("pageURL") or "").strip()
             parsed = parse_xhamster_target_from_url(page_url)
             if parsed and parsed[0] in {"creator", "pornstar"}:
@@ -1394,8 +1490,20 @@ async def fetch_xhamster_subscriptions(
                 slug = str(item.get("inurl") or "").strip()
                 raw_t = str(item.get("type") or "creator").strip().lower()
                 utype = "pornstar" if raw_t == "pornstar" else "creator"
+            user_avatar = _normalize_thumb_url(item.get("imageUserAvatarUrl"))
+            bound_uid = _extract_user_id_from_avatar_url(user_avatar)
+            if bound_uid is not None:
+                bound_user_ids.add(bound_uid)
+            display_user = item.get("displayUserModel")
+            if isinstance(display_user, dict):
+                du_id = display_user.get("id")
+                if isinstance(du_id, int) and du_id > 0:
+                    bound_user_ids.add(du_id)
+                du_parsed = parse_xhamster_target_from_url(str(display_user.get("pageURL") or ""))
+                if du_parsed and du_parsed[0] == "users":
+                    bound_user_slugs.add(du_parsed[1].lower())
             avatar = (
-                _normalize_thumb_url(item.get("imageUserAvatarUrl"))
+                user_avatar
                 or _normalize_thumb_url(item.get("imageThumbUrl"))
                 or _normalize_thumb_url(item.get("logoThumbUrl"))
             )
@@ -1403,10 +1511,10 @@ async def fetch_xhamster_subscriptions(
 
         pag = initials.get("paginationProps") or initials.get("paginationComponent") or {}
         last_page = pag.get("lastPageNumber") if isinstance(pag, dict) else None
-        if not isinstance(last_page, int) or page_num >= last_page:
+        if found_subscribed == 0 or not isinstance(last_page, int) or page_num >= last_page:
             break
 
-    # 2. Channels (/my/subscriptions/channels) - strictly require subscribed == True!
+    # 2. Channels (/my/subscriptions/channels) - strictly require subscribed == True
     for page_num in range(1, 21):
         if ctx.cancel_event.is_set():
             break
@@ -1421,7 +1529,10 @@ async def fetch_xhamster_subscriptions(
             timeout=req_timeout,
             log_label=f"xHamster 频道订阅第 {page_num} 页",
         )
-        if res is None or res.status_code >= 400 or "/login" in (res.final_url or "").lower():
+        if res is None or res.status_code >= 400:
+            break
+        final_low = (res.final_url or "").lower()
+        if "/login" in final_low or "/my/subscriptions/channels" not in final_low:
             break
         initials = extract_xhamster_initials(res.text)
         if not initials:
@@ -1457,34 +1568,53 @@ async def fetch_xhamster_subscriptions(
         if found_subscribed == 0 or not isinstance(last_page, int) or page_num >= last_page:
             break
 
-    # 3. Subscribed independent /users/{slug} discovered via /my/subscriptions feed
-    if not ctx.cancel_event.is_set():
-        res_feed, _ = await ctx.fetch_with_pow(
-            f"{XH_ORIGIN}/my/subscriptions",
+    # 3. Official Users subscriptions (/my/subscriptions/users) - dedupe creator-bound uploader accounts
+    for page_num in range(1, 21):
+        if ctx.cancel_event.is_set():
+            break
+        url = (
+            f"{XH_ORIGIN}/my/subscriptions/users"
+            if page_num == 1
+            else f"{XH_ORIGIN}/my/subscriptions/users/{page_num}"
+        )
+        res, _ = await ctx.fetch_with_pow(
+            url,
             headers=_xh_headers(),
             timeout=req_timeout,
-            log_label="xHamster 订阅动态页",
+            log_label=f"xHamster 用户订阅第 {page_num} 页",
         )
-        if res_feed is not None and res_feed.status_code < 400 and "/login" not in (res_feed.final_url or "").lower():
-            initials = extract_xhamster_initials(res_feed.text) or {}
-            seen_comp = initials.get("seenVideoListComponent")
-            thumbs = seen_comp.get("videoThumbProps") if isinstance(seen_comp, dict) else None
-            if isinstance(thumbs, list):
-                for v in thumbs:
-                    if not isinstance(v, dict):
-                        continue
-                    landing = v.get("landing")
-                    if not isinstance(landing, dict):
-                        continue
-                    link = str(landing.get("link") or "").strip()
-                    parsed = parse_xhamster_target_from_url(link)
-                    if parsed and parsed[0] in {"users", "creator", "pornstar", "channel"}:
-                        utype, slug = parsed
-                        _add_item(
-                            utype,
-                            slug,
-                            str(landing.get("name") or slug),
-                            _normalize_thumb_url(landing.get("logo")),
-                        )
+        if res is None or res.status_code >= 400:
+            break
+        final_low = (res.final_url or "").lower()
+        if "/login" in final_low or "/my/subscriptions/users" not in final_low:
+            break
+        initials = extract_xhamster_initials(res.text)
+        if not initials:
+            break
+        entries = initials.get("subscriptionsUsersCollection")
+        if not isinstance(entries, list) or not entries:
+            break
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            uid = item.get("id")
+            if isinstance(uid, int) and uid in bound_user_ids:
+                continue
+            page_url = str(item.get("pageURL") or "").strip()
+            parsed = parse_xhamster_target_from_url(page_url)
+            slug = parsed[1] if parsed and parsed[0] == "users" else str(item.get("name") or "").strip()
+            if not slug or slug.lower() in bound_user_slugs:
+                continue
+            avatar = (
+                _normalize_thumb_url(item.get("thumbURL"))
+                or _normalize_thumb_url(item.get("avatarURL"))
+                or _normalize_thumb_url(item.get("imageUserAvatarUrl"))
+            )
+            _add_item("users", slug, str(item.get("name") or slug), avatar)
+
+        pag = initials.get("subscriptionsUsersPaging")
+        max_pages = pag.get("maxPages") if isinstance(pag, dict) else None
+        if not isinstance(max_pages, int) or page_num >= max_pages:
+            break
 
     return results

@@ -281,11 +281,16 @@ async def test_fetch_xhamster_subscriptions_filters_unsubscribed_recommendations
                 "layoutPage": {
                     "pornstars": [
                         {
-                            "name": "Fragile Tempt",
-                            "pageURL": "https://xhamster.com/creators/fragile-tempt",
-                            "imageUserAvatarUrl": "https://ic-nss.xhcdn.com/ft.jpg",
+                            "name": "SweetGirl69",
+                            "pageURL": "https://xhamster.com/creators/sweetgirl69",
+                            "imageUserAvatarUrl": "https://ic-ut-nss.xhcdn.com/a/xxx/webp/136/694/167/avatar_150.jpg",
                             "subscriptionModel": {"subscribed": True},
-                        }
+                        },
+                        {
+                            "name": "Recommended Creator",
+                            "pageURL": "https://xhamster.com/creators/rec-creator",
+                            "subscriptionModel": {"subscribed": False},
+                        },
                     ]
                 },
             }
@@ -316,22 +321,25 @@ async def test_fetch_xhamster_subscriptions_filters_unsubscribed_recommendations
         )
         + ";</script>"
     )
-    feed_html = (
+    users_html = (
         "<script>window.initials="
         + json.dumps(
             {
-                "seenVideoListComponent": {
-                    "videoThumbProps": [
-                        {
-                            "landing": {
-                                "type": "user",
-                                "name": "WebToLove",
-                                "link": "https://xhamster.com/users/webtolove",
-                                "logo": "https://ic-nss.xhcdn.com/wtl.jpg",
-                            }
-                        }
-                    ]
-                }
+                "subscriptionsUsersPaging": {"maxPages": 1},
+                "subscriptionsUsersCollection": [
+                    {
+                        "id": 136694167,
+                        "name": "SweetHot69",
+                        "pageURL": "https://xhamster.com/users/sweethot69",
+                        "thumbURL": "https://ic-ut-nss.xhcdn.com/a/yyy/webp/136/694/167/avatar_80.jpg",
+                    },
+                    {
+                        "id": 78837540,
+                        "name": "WebToLove",
+                        "pageURL": "https://xhamster.com/users/webtolove",
+                        "thumbURL": "https://ic-ut-nss.xhcdn.com/a/zzz/webp/078/837/540/avatar_80.jpg",
+                    },
+                ],
             }
         )
         + ";</script>"
@@ -342,17 +350,100 @@ async def test_fetch_xhamster_subscriptions_filters_unsubscribed_recommendations
             return PowFetchResult(pornstars_html, url, 200, 0, False), None
         if url.endswith("/my/subscriptions/channels"):
             return PowFetchResult(channels_html, url, 200, 0, False), None
-        if url.endswith("/my/subscriptions"):
-            return PowFetchResult(feed_html, url, 200, 0, False), None
-        return PowFetchResult("", url, 404, 0, False), None
+        if url.endswith("/my/subscriptions/users"):
+            return PowFetchResult(users_html, url, 200, 0, False), None
+        raise AssertionError(f"Unexpected subscription URL fetched: {url}")
 
     monkeypatch.setattr(ctx, "fetch_with_pow", fake_fetch)
     subs = await fetch_xhamster_subscriptions(ctx)
+    # SweetHot69 (id=136694167) is auto-deduplicated because SweetGirl69's avatar binds to user 136694167,
+    # while standalone subscribed user WebToLove is kept cleanly without scraping the video feed!
     assert subs == [
-        ("creator", "fragile-tempt", "Fragile Tempt", "https://ic-nss.xhcdn.com/ft.jpg"),
+        ("creator", "sweetgirl69", "SweetGirl69", "https://ic-ut-nss.xhcdn.com/a/xxx/webp/136/694/167/avatar_150.jpg"),
         ("channel", "sub-ch", "Subscribed Channel", "https://ic-nss.xhcdn.com/ch.jpg"),
-        ("users", "webtolove", "WebToLove", "https://ic-nss.xhcdn.com/wtl.jpg"),
+        ("users", "webtolove", "WebToLove", "https://ic-ut-nss.xhcdn.com/a/zzz/webp/078/837/540/avatar_80.jpg"),
     ]
+
+
+async def test_scan_xhamster_creator_unions_bound_user_videos_and_respects_explicit_pages(monkeypatch):
+    ctx = TaskHttpContext(concurrency=1)
+
+    creator_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "infoComponent": {
+                    "pageTitle": "SweetGirl69 Porn Videos",
+                    "displayUserModel": {
+                        "id": 136694167,
+                        "name": "SweetHot69",
+                        "pageURL": "https://xhamster.com/users/sweethot69",
+                    },
+                },
+                "paginationComponent": {"lastPageNumber": 1},
+                "trendingVideoSectionComponent": {
+                    "videoListProps": {
+                        "videoThumbProps": [
+                            {"id": 1, "title": "Shared Clip", "pageURL": "https://xhamster.com/videos/shared-xhAAA11", "duration": 100, "created": 1767225600},
+                            {"id": 2, "title": "Creator Collab", "pageURL": "https://xhamster.com/videos/collab-xhBBB22", "duration": 200, "created": 1767225600},
+                        ]
+                    }
+                },
+            }
+        )
+        + ";</script>"
+    )
+    bound_user_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "maxVideoPages": 1,
+                "videoListComponent": {
+                    "videoThumbProps": [
+                        {"id": 1, "title": "Shared Clip", "pageURL": "https://xhamster.com/videos/shared-xhAAA11", "duration": 100, "created": 1767225600},
+                        {"id": 3, "title": "Untagged User Upload", "pageURL": "https://xhamster.com/videos/untagged-xhCCC33", "duration": 300, "created": 1767225600},
+                    ]
+                },
+            }
+        )
+        + ";</script>"
+    )
+
+    fetched: List[str] = []
+
+    async def fake_fetch(url: str, **kwargs):
+        fetched.append(url)
+        if "/creators/sweetgirl69/newest" in url:
+            return PowFetchResult(creator_html, url, 200, 0, False), None
+        if "/users/sweethot69/videos" in url:
+            return PowFetchResult(bound_user_html, url, 200, 0, False), None
+        return PowFetchResult("", url, 404, 0, False), None
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fake_fetch)
+
+    # 1. Natural full scan unions creator + bound user videos with deduplication
+    full_videos = await scan_xhamster_list_pages(
+        ctx,
+        "https://xhamster.com/creators/sweetgirl69/newest",
+        target_type="creator",
+        delay_min=0,
+        delay_max=0,
+    )
+    assert [v.viewkey for v in full_videos] == ["xhAAA11", "xhBBB22", "xhCCC33"]
+    assert any("/users/sweethot69/videos" in u for u in fetched)
+
+    # 2. Explicit pages_spec stays strictly scoped to creator pages (no bound-user scan)
+    fetched.clear()
+    paged_videos = await scan_xhamster_list_pages(
+        ctx,
+        "https://xhamster.com/creators/sweetgirl69/newest",
+        target_type="creator",
+        pages_spec="1",
+        delay_min=0,
+        delay_max=0,
+    )
+    assert [v.viewkey for v in paged_videos] == ["xhAAA11", "xhBBB22"]
+    assert not any("/users/sweethot69/videos" in u for u in fetched)
 
 
 # ---------------------------------------------------------------------------
