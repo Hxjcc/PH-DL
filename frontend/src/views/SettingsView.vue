@@ -85,6 +85,8 @@ const YESCAPTCHA_SITE_OPTIONS = [
 const YESCAPTCHA_TASK_TYPES = {
   pornhub: [
     { label: 'reCAPTCHA v2 企业版（PornHub 使用 enterprise.js）', value: 'RecaptchaV2EnterpriseTaskProxyless' },
+    { label: '标准 v2 · 低价线路（15 点/次）', value: 'NoCaptchaTaskProxyless' },
+    { label: '标准 v2 · 标准线路（20 点/次）', value: 'RecaptchaV2TaskProxyless' },
   ],
   xhamster: [
     { label: '标准 v2 · 低价线路（15 点/次）', value: 'NoCaptchaTaskProxyless' },
@@ -117,6 +119,38 @@ const AUTH_MODES = [
   { value: 'account', label: '账号登录', icon: KeyRound },
   { value: 'cookie', label: '粘贴 Cookie', icon: Cookie },
 ]
+
+const LOGIN_POLL_INTERVAL_MS = 2500
+const LOGIN_POLL_TIMEOUT_MS = 15 * 60 * 1000
+const LOGIN_POLL_MAX_ERRORS = 5
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForLoginResult(fetchStatus) {
+  const deadline = Date.now() + LOGIN_POLL_TIMEOUT_MS
+  let consecutiveErrors = 0
+  while (Date.now() < deadline) {
+    await sleep(LOGIN_POLL_INTERVAL_MS)
+    let status = null
+    try {
+      status = await fetchStatus()
+      consecutiveErrors = 0
+    } catch (err) {
+      consecutiveErrors += 1
+      if (consecutiveErrors >= LOGIN_POLL_MAX_ERRORS) throw err
+      continue
+    }
+    if (!status?.running) {
+      if (!status?.has_result) {
+        throw new Error('登录任务状态已丢失，请重新点击登录')
+      }
+      return status
+    }
+  }
+  throw new Error('等待登录结果超时，请稍后点击「检测有效性」查看 Cookie 是否已更新')
+}
 
 const store = useAppStore()
 const activeTab = ref('cookie')
@@ -399,7 +433,8 @@ async function handleRefreshCookie() {
       form.value = cloneSettings(saved.settings)
       store.setSettingsCache(saved.settings)
     }
-    const res = await api.refreshCookie()
+    const started = await api.refreshCookie()
+    const res = started?.running ? await waitForLoginResult(api.cookieRefreshStatus) : started
     if (res.success) store.clearSubscriptionsCache()
     store.notify(res.message, res.success ? 'success' : 'error')
     await Promise.all([loadSettings(), store.refreshOverview()])
@@ -452,7 +487,8 @@ async function handleRefreshXhCookie() {
       form.value = cloneSettings(saved.settings)
       store.setSettingsCache(saved.settings)
     }
-    const res = await api.refreshXhCookie()
+    const started = await api.refreshXhCookie()
+    const res = started?.running ? await waitForLoginResult(api.xhCookieRefreshStatus) : started
     if (res.success) store.clearSubscriptionsCache()
     store.notify(res.message, res.success ? 'success' : 'error')
     await Promise.all([loadSettings(), store.refreshOverview()])
@@ -866,7 +902,7 @@ async function handleTestNotify() {
               <p class="text-[11px] text-muted-foreground">
                 {{
                   yescaptchaTaskSite === 'pornhub'
-                    ? 'PornHub 固定使用企业版 v2 线路。'
+                    ? 'PornHub 默认用企业版 v2；企业版排队慢时可切到标准 v2 线路尝试（PornHub 可能拒绝标准线路 token）。'
                     : '标准 v2 两个线路参数相同，可按需切换。'
                 }}
               </p>
@@ -874,12 +910,12 @@ async function handleTestNotify() {
             <div class="space-y-1.5">
               <label class="block text-xs font-medium text-foreground">解题超时（秒）</label>
               <Input v-model="form.yescaptcha_timeout_seconds" type="number" :min="30" :max="600" />
-              <p class="text-[11px] text-muted-foreground">两个站点共用此超时。</p>
+              <p class="text-[11px] text-muted-foreground">两个站点共用此超时。PornHub 企业版验证码较慢，建议不低于 300 秒。</p>
             </div>
           </div>
 
           <p class="text-xs text-muted-foreground">
-            默认使用国际节点 api.yescaptcha.com。PornHub 固定企业版 v2；xHamster 可选两个标准 v2 线路。
+            默认使用国际节点 api.yescaptcha.com。PornHub 可选企业版 v2 与两个标准 v2 线路；xHamster 可选两个标准 v2 线路。
             若 token 提交后仍要求验证码，可切换线路或粘贴浏览器 Cookie。
           </p>
         </div>

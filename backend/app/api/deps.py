@@ -14,6 +14,7 @@ from ..engine.events import EventBus
 from ..engine.loop_monitor import EventLoopMonitor
 from ..engine.scheduler import UpdateScheduler
 from ..engine.task_manager import TaskManager
+from ..services.login_ops import LoginOperationManager
 from ..services.playback import PlaybackService
 
 
@@ -28,6 +29,7 @@ class AppContainer:
     tasks: TaskManager
     scheduler: UpdateScheduler
     playback: PlaybackService
+    logins: LoginOperationManager
 
 
 def get_container(request: Request) -> AppContainer:

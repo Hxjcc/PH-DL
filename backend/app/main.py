@@ -26,6 +26,7 @@ from .engine.events import EventBus
 from .engine.loop_monitor import EventLoopMonitor
 from .engine.scheduler import UpdateScheduler
 from .engine.task_manager import TaskManager
+from .services.login_ops import LoginOperationManager
 from .services.playback import PlaybackService
 
 
@@ -104,6 +105,7 @@ def create_app(env_settings: Optional[EnvSettings] = None) -> FastAPI:
             tasks=tasks,
             scheduler=scheduler,
             playback=PlaybackService(),
+            logins=LoginOperationManager(),
         )
 
         queued = await tasks.restore_queued_jobs()
@@ -119,6 +121,7 @@ def create_app(env_settings: Optional[EnvSettings] = None) -> FastAPI:
         try:
             yield
         finally:
+            await app.state.container.logins.shutdown()
             await app.state.container.playback.aclose()
             await loop_monitor.stop()
             await scheduler.stop()

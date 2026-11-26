@@ -4,6 +4,25 @@ export function setUnauthorizedHandler(fn) {
   unauthorizedHandler = fn
 }
 
+const GATEWAY_HINTS = {
+  502: '网关错误（502）',
+  503: '服务暂不可用（503）',
+  504: '网关超时（504）',
+}
+
+function formatHttpError(status, text) {
+  const body = String(text || '').trim()
+  const looksLikeHtml = /^<!doctype html/i.test(body) || /^<html[\s>]/i.test(body) || /<center>/i.test(body)
+  if (looksLikeHtml) {
+    const hint = GATEWAY_HINTS[status]
+    if (hint) {
+      return `${hint}：反向代理等待后端响应超时。登录可能仍在后台继续，请稍后刷新状态；如频繁出现，请把反向代理的 proxy_read_timeout 调到 600s 以上。`
+    }
+    return `服务器返回了网页而不是接口数据（HTTP ${status}），请检查反向代理是否正确转发 /api 请求。`
+  }
+  return body || `请求失败 (${status})`
+}
+
 async function request(path, options = {}) {
   const opts = {
     credentials: 'include',
@@ -32,11 +51,11 @@ async function request(path, options = {}) {
     if (unauthorizedHandler && !path.startsWith('/api/auth/')) {
       unauthorizedHandler()
     }
-    throw new Error(data?.detail || '未登录或会话已过期')
+    throw new Error(formatHttpError(resp.status, data?.detail || text) || '未登录或会话已过期')
   }
 
   if (!resp.ok) {
-    throw new Error(data?.detail || data?.message || `请求失败 (${resp.status})`)
+    throw new Error(formatHttpError(resp.status, data?.detail || data?.message || text))
   }
   return data
 }
@@ -116,9 +135,11 @@ export const api = {
   testCookie: () => request('/api/settings/cookie/test', { method: 'POST' }),
   importCookie: (cookie) => request('/api/settings/cookie/import', { method: 'POST', body: { cookie } }),
   refreshCookie: () => request('/api/settings/cookie/refresh', { method: 'POST' }),
+  cookieRefreshStatus: () => request('/api/settings/cookie/refresh/status'),
   testXhCookie: () => request('/api/settings/xh-cookie/test', { method: 'POST' }),
   importXhCookie: (cookie) => request('/api/settings/xh-cookie/import', { method: 'POST', body: { cookie } }),
   refreshXhCookie: () => request('/api/settings/xh-cookie/refresh', { method: 'POST' }),
+  xhCookieRefreshStatus: () => request('/api/settings/xh-cookie/refresh/status'),
   testYescaptcha: () => request('/api/settings/yescaptcha/test', { method: 'POST' }),
   listRcloneRemotes: () => request('/api/settings/rclone/remotes'),
   testRclone: () => request('/api/settings/rclone/test', { method: 'POST' }),

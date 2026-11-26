@@ -179,7 +179,7 @@ class RuntimeSettings(BaseModel):
     yescaptcha_client_key: str = ""
     yescaptcha_ph_task_type: str = "RecaptchaV2EnterpriseTaskProxyless"
     yescaptcha_xh_task_type: str = "RecaptchaV2TaskProxyless"
-    yescaptcha_timeout_seconds: float = Field(default=180.0, ge=30.0, le=600.0)
+    yescaptcha_timeout_seconds: float = Field(default=300.0, ge=30.0, le=600.0)
 
     # Network & Retry
     proxy_url: str = ""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -1312,6 +1313,54 @@ async def test_login_xhamster_requires_yescaptcha_when_challenged(monkeypatch):
     assert solver_calls == []
 
 
+def test_xhamster_refresh_endpoint_background_polling(tmp_path: Path, monkeypatch):
+    from app.api import settings as settings_api
+    from app.services.cookie import CookieLoginResult
+
+    calls = {"count": 0}
+
+    async def fake_xh_login(username: str, password: str, **kwargs):
+        calls["count"] += 1
+        await asyncio.sleep(0.05)
+        return CookieLoginResult(
+            success=True,
+            cookie_str="x_csrf_token=1; _id=background_id_token",
+            logged_in_username="NativePea222",
+            message="xHamster 登录并更新 Cookie 成功（当前账号: NativePea222）",
+        )
+
+    monkeypatch.setattr(settings_api, "login_xhamster_and_get_cookies", fake_xh_login)
+
+    env = EnvSettings(data_dir=tmp_path, admin_password="secret", secret_key="k" * 40)
+    app = create_app(env)
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"password": "secret"}).status_code == 200
+        client.put(
+            "/api/settings",
+            json={"xh_username": "NativePea222", "xh_password": "secret-pass"},
+        )
+
+        first = client.post("/api/settings/xh-cookie/refresh").json()
+        assert first["started"] is True
+        assert first["running"] is True
+
+        second = client.post("/api/settings/xh-cookie/refresh").json()
+        assert second["started"] is False
+        assert second["running"] is True
+
+        status = {}
+        for _ in range(100):
+            status = client.get("/api/settings/xh-cookie/refresh/status").json()
+            if not status["running"]:
+                break
+            time.sleep(0.02)
+
+        assert status["running"] is False
+        assert status["success"] is True
+        assert status["logged_in_username"] == "NativePea222"
+        assert calls["count"] == 1
+
+
 def test_xhamster_refresh_endpoint_and_password_redaction(tmp_path: Path, monkeypatch):
     from app.api import settings as settings_api
     from app.services.cookie import CookieLoginResult
@@ -1342,11 +1391,16 @@ def test_xhamster_refresh_endpoint_and_password_redaction(tmp_path: Path, monkey
         assert saved["xh_username"] == "NativePea222"
         assert saved["xh_password"] == "********"
 
-        r_ref = client.post("/api/settings/xh-cookie/refresh")
+        r_ref = client.post("/api/settings/xh-cookie/refresh?wait=1")
         assert r_ref.status_code == 200
         body = r_ref.json()
         assert body["success"] is True
         assert body["logged_in_username"] == "NativePea222"
+
+        r_status = client.get("/api/settings/xh-cookie/refresh/status")
+        assert r_status.status_code == 200
+        assert r_status.json()["running"] is False
+        assert r_status.json()["success"] is True
 
         r_get = client.get("/api/settings")
         assert r_get.status_code == 200

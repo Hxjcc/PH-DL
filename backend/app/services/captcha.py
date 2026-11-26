@@ -112,7 +112,7 @@ async def solve_recaptcha(
     *,
     api_base: str = DEFAULT_API_BASE,
     task_type: str = DEFAULT_TASK_TYPE,
-    timeout: float = 180.0,
+    timeout: float = 300.0,
     poll_interval: float = MAX_POLL_SECONDS,
     proxy: Optional[str] = None,
     page_action: Optional[str] = None,
@@ -213,7 +213,12 @@ async def solve_recaptcha(
         elapsed = time.perf_counter() - started
         _emit(on_log, "INFO", f"YesCaptcha 识别中...（第 {polls} 次查询，已等待 {elapsed:.0f}s）")
 
-    raise CaptchaError("YesCaptcha 解题超时", "ERROR_TASK_TIMEOUT")
+    elapsed = time.perf_counter() - started
+    raise CaptchaError(
+        f"YesCaptcha 解题超时（已等待 {elapsed:.0f}s）。"
+        "PornHub 企业版验证码可能较慢，可在设置中把「解题超时」提高到 300 秒后重试。",
+        "ERROR_TASK_TIMEOUT",
+    )
 
 
 async def solve_recaptcha_v2(
@@ -223,7 +228,7 @@ async def solve_recaptcha_v2(
     *,
     api_base: str = DEFAULT_API_BASE,
     task_type: str = DEFAULT_TASK_TYPE,
-    timeout: float = 180.0,
+    timeout: float = 300.0,
     poll_interval: float = MAX_POLL_SECONDS,
     proxy: Optional[str] = None,
     cancel_event: Optional[asyncio.Event] = None,

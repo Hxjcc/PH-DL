@@ -619,6 +619,12 @@ async def _login_with_captcha(
     fresh_config = _extract_login_config(page_resp.text)
     page_url = str(page_resp.final_url or PORNHUB_LOGIN_URL)
     sitekey = fresh_config.sitekey or config.sitekey or PORNHUB_DEFAULT_SITEKEY
+    if yescaptcha_timeout_seconds < 240:
+        emit(
+            "WARNING",
+            f"YesCaptcha 解题超时为 {int(yescaptcha_timeout_seconds)} 秒；"
+            "PornHub 企业版验证码通常需要 2-3 分钟，建议在设置中提高到 300 秒。",
+        )
     emit("INFO", f"触发人机验证（reCAPTCHA），正在调用 YesCaptcha（{yescaptcha_task_type}）...")
 
     try:
@@ -695,7 +701,7 @@ async def login_and_get_cookies(
     yescaptcha_client_key: str = "",
     yescaptcha_api_base: str = "https://api.yescaptcha.com",
     yescaptcha_task_type: str = "RecaptchaV2EnterpriseTaskProxyless",
-    yescaptcha_timeout_seconds: float = 180.0,
+    yescaptcha_timeout_seconds: float = 300.0,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     emit = _make_site_logger("PornHub", on_log)
@@ -744,7 +750,7 @@ async def _login_and_get_cookies_once(
     yescaptcha_client_key: str = "",
     yescaptcha_api_base: str = "https://api.yescaptcha.com",
     yescaptcha_task_type: str = "RecaptchaV2EnterpriseTaskProxyless",
-    yescaptcha_timeout_seconds: float = 180.0,
+    yescaptcha_timeout_seconds: float = 300.0,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     emit = _make_site_logger("PornHub", on_log)
@@ -1025,7 +1031,7 @@ async def login_xhamster_and_get_cookies(
     yescaptcha_client_key: str = "",
     yescaptcha_task_type: str = XHAMSTER_DEFAULT_CAPTCHA_V2_TASK_TYPE,
     yescaptcha_api_base: str = "https://api.yescaptcha.com",
-    yescaptcha_timeout_seconds: float = 180.0,
+    yescaptcha_timeout_seconds: float = 300.0,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     """Authenticate against ``xhamster.com/api/front/user/login`` and return verified cookies."""
@@ -1075,7 +1081,7 @@ async def _login_xhamster_once(
     yescaptcha_client_key: str = "",
     yescaptcha_task_type: str = XHAMSTER_DEFAULT_CAPTCHA_V2_TASK_TYPE,
     yescaptcha_api_base: str = "https://api.yescaptcha.com",
-    yescaptcha_timeout_seconds: float = 180.0,
+    yescaptcha_timeout_seconds: float = 300.0,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     from ..parsers.xhamster import check_xhamster_cookie_valid

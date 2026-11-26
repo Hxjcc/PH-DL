@@ -160,20 +160,26 @@ async def import_cookie(
     }
 
 
-@router.post("/cookie/refresh")
-async def refresh_cookie(container: AppContainer = Depends(require_auth)):
+async def _perform_ph_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
     settings = await container.repo.get_settings()
-    res = await login_and_get_cookies(
-        settings.ph_username,
-        settings.ph_password,
-        proxy_url=settings.normalized_proxy,
-        timeout=settings.request_timeout,
-        yescaptcha_enabled=settings.yescaptcha_enabled,
-        yescaptcha_client_key=settings.yescaptcha_client_key,
-        yescaptcha_task_type=settings.yescaptcha_ph_task_type,
-        yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
-        on_log=lambda level, message: container.events.emit_log(level, message),
-    )
+    try:
+        res = await login_and_get_cookies(
+            settings.ph_username,
+            settings.ph_password,
+            proxy_url=settings.normalized_proxy,
+            timeout=settings.request_timeout,
+            yescaptcha_enabled=settings.yescaptcha_enabled,
+            yescaptcha_client_key=settings.yescaptcha_client_key,
+            yescaptcha_task_type=settings.yescaptcha_ph_task_type,
+            yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
+            on_log=lambda level, message: container.events.emit_log(level, message),
+        )
+    except Exception as err:  # pragma: no cover - defensive
+        message = f"自动登录异常: {err}"
+        container.tasks.set_cookie_status(False, message)
+        container.events.broadcast("overview_changed", {})
+        return {"success": False, "message": message}
+
     if not res.success:
         container.tasks.set_cookie_status(False, res.message)
         container.events.broadcast("overview_changed", {})
@@ -191,6 +197,30 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
         "logged_in_username": resolved_user,
         "message": res.message,
     }
+
+
+@router.post("/cookie/refresh")
+async def refresh_cookie(
+    wait: bool = False,
+    container: AppContainer = Depends(require_auth),
+):
+    """Start a PornHub login in the background.
+
+    A reCAPTCHA solve can take several minutes, so the request returns
+    immediately and the UI polls ``/cookie/refresh/status``.  Pass ``wait=1``
+    to keep the legacy synchronous behaviour.
+    """
+
+    return await container.logins.start(
+        "pornhub",
+        lambda: _perform_ph_cookie_refresh(container),
+        wait=wait,
+    )
+
+
+@router.get("/cookie/refresh/status")
+async def cookie_refresh_status(container: AppContainer = Depends(require_auth)):
+    return container.logins.snapshot("pornhub")
 
 
 @router.post("/xh-cookie/test")
@@ -247,20 +277,26 @@ async def import_xh_cookie(
     }
 
 
-@router.post("/xh-cookie/refresh")
-async def refresh_xh_cookie(container: AppContainer = Depends(require_auth)):
+async def _perform_xh_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
     settings = await container.repo.get_settings()
-    res = await login_xhamster_and_get_cookies(
-        settings.xh_username,
-        settings.xh_password,
-        proxy_url=settings.normalized_proxy,
-        timeout=settings.request_timeout,
-        yescaptcha_enabled=settings.yescaptcha_enabled,
-        yescaptcha_client_key=settings.yescaptcha_client_key,
-        yescaptcha_task_type=settings.yescaptcha_xh_task_type,
-        yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
-        on_log=lambda level, message: container.events.emit_log(level, message),
-    )
+    try:
+        res = await login_xhamster_and_get_cookies(
+            settings.xh_username,
+            settings.xh_password,
+            proxy_url=settings.normalized_proxy,
+            timeout=settings.request_timeout,
+            yescaptcha_enabled=settings.yescaptcha_enabled,
+            yescaptcha_client_key=settings.yescaptcha_client_key,
+            yescaptcha_task_type=settings.yescaptcha_xh_task_type,
+            yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
+            on_log=lambda level, message: container.events.emit_log(level, message),
+        )
+    except Exception as err:  # pragma: no cover - defensive
+        message = f"xHamster 自动登录异常: {err}"
+        container.tasks.set_xh_cookie_status(False, message)
+        container.events.broadcast("overview_changed", {})
+        return {"success": False, "message": message}
+
     if not res.success:
         container.tasks.set_xh_cookie_status(False, res.message)
         container.events.broadcast("overview_changed", {})
@@ -278,6 +314,25 @@ async def refresh_xh_cookie(container: AppContainer = Depends(require_auth)):
         "logged_in_username": resolved_user,
         "message": res.message,
     }
+
+
+@router.post("/xh-cookie/refresh")
+async def refresh_xh_cookie(
+    wait: bool = False,
+    container: AppContainer = Depends(require_auth),
+):
+    """Start an xHamster login in the background (see ``cookie/refresh``)."""
+
+    return await container.logins.start(
+        "xhamster",
+        lambda: _perform_xh_cookie_refresh(container),
+        wait=wait,
+    )
+
+
+@router.get("/xh-cookie/refresh/status")
+async def xh_cookie_refresh_status(container: AppContainer = Depends(require_auth)):
+    return container.logins.snapshot("xhamster")
 
 
 @router.post("/yescaptcha/test")
