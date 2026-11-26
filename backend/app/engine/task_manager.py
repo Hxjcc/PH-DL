@@ -140,6 +140,7 @@ class TaskManager:
         self._worker_task: Optional[asyncio.Task] = None
         self._current_job_id: Optional[int] = None
         self._current_cancel_event: Optional[asyncio.Event] = None
+        self._current_halt_reason: str = ""
         self._cancelled_queued_ids: Set[int] = set()
         self._last_cookie_valid: Optional[bool] = None
         self._last_cookie_message: str = "未检测"
@@ -242,6 +243,7 @@ class TaskManager:
             finally:
                 self._current_job_id = None
                 self._current_cancel_event = None
+                self._current_halt_reason = ""
                 self.events.clear_job_progress(job_id)
                 with contextlib.suppress(Exception):
                     await self.repo.prune_old_jobs(200)
@@ -313,6 +315,7 @@ class TaskManager:
         cancel_event = asyncio.Event()
         self._current_job_id = job_id
         self._current_cancel_event = cancel_event
+        self._current_halt_reason = ""
 
         started = await self.repo.claim_queued_job(job_id)
         if not started:
@@ -398,7 +401,12 @@ class TaskManager:
         if final_job is None:
             return
         if final_job["status"] in {"scanning", "running"}:
-            if cancel_event.is_set():
+            update_fields: Dict[str, Any] = {"finished_at": utc_now_iso()}
+            if self._current_halt_reason:
+                final_status = "partial_failed"
+                if not str(final_job.get("error_message") or "").strip():
+                    update_fields["error_message"] = self._current_halt_reason
+            elif cancel_event.is_set():
                 final_status = "cancelled"
             elif int(final_job.get("failed_items") or 0) > 0 or str(final_job.get("error_message") or "").strip():
                 final_status = "partial_failed"
@@ -407,7 +415,7 @@ class TaskManager:
             final_job = await self.repo.update_job(
                 job_id,
                 status=final_status,
-                finished_at=utc_now_iso(),
+                **update_fields,
             )
         if final_job:
             self.events.broadcast("job_updated", final_job)
@@ -483,18 +491,23 @@ class TaskManager:
         async def _mark_entries_cancelled(entries: List[UploadQueuedItem]) -> None:
             if not entries:
                 return
+            cancel_reason = (
+                "因触发网盘限额已暂停，保留本地文件"
+                if self._current_halt_reason
+                else "上传已取消，保留本地文件"
+            )
             for entry in entries:
                 self.events.clear_item_progress(entry.item_id)
                 it = await self.repo.update_job_item(
                     entry.item_id,
                     status="cancelled",
-                    error_message="上传已取消，保留本地文件",
+                    error_message=cancel_reason,
                 )
                 if it:
                     self.events.broadcast("item_updated", it)
                 self.events.emit_log(
                     "WARNING",
-                    f"[上传失败] {entry.local_path.name}: 上传已取消，保留本地文件",
+                    f"[上传失败] {entry.local_path.name}: {cancel_reason}",
                     job_id=job_id,
                 )
             await scheduler.on_upload_discarded(len(entries), sum(e.file_size for e in entries))
@@ -642,7 +655,11 @@ class TaskManager:
                         )
                     else:
                         cancelled = ctx.cancel_event.is_set()
-                        err_txt = "上传已取消，保留本地文件" if cancelled else up_res.error or "未能确认上传结果"
+                        err_txt = (
+                            ("因触发网盘限额已暂停，保留本地文件" if self._current_halt_reason else "上传已取消，保留本地文件")
+                            if cancelled
+                            else up_res.error or "未能确认上传结果"
+                        )
                         it = await self.repo.update_job_item(
                             entry.item_id,
                             status="cancelled" if cancelled else "failed",
@@ -653,6 +670,19 @@ class TaskManager:
                         if not cancelled:
                             _record_failed_url(uploader_folder, entry.page_url)
                         self.events.emit_log("WARNING", f"[上传失败] {entry.local_path.name}: {err_txt}", job_id=job_id)
+
+                fatal_limit = str(getattr(up_res, "fatal_limit_error", "") or "").strip()
+                if fatal_limit and not ctx.cancel_event.is_set():
+                    if not self._current_halt_reason:
+                        self._current_halt_reason = fatal_limit
+                        await self.repo.update_job(job_id, error_message=fatal_limit)
+                        self.events.emit_log(
+                            "ERROR",
+                            f"检测到网盘上传硬性限制（{fatal_limit}），已自动暂停当前任务剩余下载与上传，本地已下载文件均已保留。",
+                            job_id=job_id,
+                        )
+                    ctx.cancel_event.set()
+                    await upload_pool.notify_cancel()
             finally:
                 for entry in chunk:
                     self.events.clear_item_progress(entry.item_id)
@@ -1236,7 +1266,8 @@ class TaskManager:
                         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
                         raise
                 if ctx.cancel_event.is_set():
-                    await self.repo.bulk_cancel_pending_job_items(job_id, error_message="已取消")
+                    pending_cancel_msg = "因触发网盘限额已暂停" if self._current_halt_reason else "已取消"
+                    await self.repo.bulk_cancel_pending_job_items(job_id, error_message=pending_cancel_msg)
                     self.events.broadcast("job_items_changed", {"job_id": job_id})
                 await _refresh_job_progress(force=True)
 

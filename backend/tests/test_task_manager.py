@@ -1931,3 +1931,108 @@ async def test_auto_update_syncs_redirected_creator_username_and_migrates_histor
     finally:
         await tm.stop()
         await db.close()
+
+
+async def test_fatal_upload_limit_auto_halts_job_as_partial_failed_and_keeps_local_files(
+    tmp_path: Path, monkeypatch
+):
+    """When rclone reports fatal_limit_error (e.g. GD 750GB limit), remaining items halt cleanly and keep local files."""
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": True,
+                "max_concurrent_downloads": 1,
+                "rclone_transfers": 1,
+                "upload_workers": 1,
+                "upload_batch_size": 1,
+                "max_pending_upload_files": 20,
+                "min_free_disk_gb": 0.0,
+                "min_file_size_bytes": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        dl_dir = env.downloads_dir / "eve"
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        local_files = {}
+        for idx in range(1, 5):
+            vk = f"limvk{idx}"
+            fp = dl_dir / f"Clip {idx} [{vk}].mp4"
+            fp.write_bytes(mp4_payload())
+            local_files[vk] = fp
+            await repo.upsert_video(
+                vk,
+                title=f"Clip {idx}",
+                uploader="eve",
+                target_type="model",
+                quality="2160p",
+                video_page_url=f"https://www.pornhub.com/view_video.php?viewkey={vk}",
+                status="downloaded",
+                local_path=str(fp),
+                file_size=fp.stat().st_size,
+                upload_requested=True,
+                downloaded_at=f"2026-11-26T00:00:0{idx}+00:00",
+            )
+
+        from app.engine import task_manager as tm_mod
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        upload_calls = []
+        limit_msg = "已达到 Google Drive 每日 750GB 上传上限（请等待配额恢复或切换网盘后重试）"
+
+        async def fake_upload(download_dir, uploader_folder, files_by_viewkey, settings, cancel_event=None):
+            vkeys = list(files_by_viewkey.keys())
+            upload_calls.append(vkeys)
+            if len(upload_calls) == 1:
+                return UploadBatchResult(
+                    uploaded_viewkeys=vkeys,
+                    failed_viewkeys=[],
+                    verified_sources={vk: file_snapshot(p) for vk, p in files_by_viewkey.items()},
+                    remote_dir=f"gd:Pornhub/{uploader_folder}",
+                )
+            return UploadBatchResult(
+                uploaded_viewkeys=[],
+                failed_viewkeys=vkeys,
+                remote_dir=f"gd:Pornhub/{uploader_folder}",
+                error=limit_msg,
+                fatal_limit_error=limit_msg,
+            )
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "upload_file_batch", fake_upload)
+
+        tm.start()
+        job = await tm.enqueue_job("auto_update", "全量自动追更", {})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+
+        assert done is not None
+        assert done["status"] == "partial_failed"
+        assert "750GB" in done["error_message"]
+        assert upload_calls == [["limvk1"], ["limvk2"]]
+        assert done["uploaded_items"] == 1
+        assert done["failed_items"] == 1
+
+        items = await repo.list_job_items(job["id"])
+        statuses = {it["viewkey"]: it["status"] for it in items}
+        assert statuses == {
+            "limvk1": "done",
+            "limvk2": "failed",
+            "limvk3": "cancelled",
+            "limvk4": "cancelled",
+        }
+        assert not local_files["limvk1"].exists()
+        assert all(local_files[f"limvk{i}"].exists() for i in range(2, 5))
+    finally:
+        await tm.stop()
+        await db.close()

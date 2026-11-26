@@ -46,8 +46,86 @@ class UploadBatchResult:
     failed_viewkeys: List[str] = field(default_factory=list)
     remote_dir: str = ""
     error: str = ""
+    fatal_limit_error: str = ""
     verified_sources: Dict[str, FileSnapshot] = field(default_factory=dict)
     remote_paths: Dict[str, str] = field(default_factory=dict)
+
+
+_GENERIC_RCLONE_EXACT = frozenset(
+    {
+        "fatal error received - not attempting retries",
+        "not attempting retries",
+    }
+)
+_GENERIC_RCLONE_PREFIXES = (
+    "fatal error received",
+    "cancelling sync due to fatal error",
+)
+
+
+def summarize_rclone_error(
+    raw_lines: List[str],
+    *,
+    rc: int = 1,
+    remote_type: Optional[str] = None,
+    action: str = "copy",
+) -> Tuple[str, str]:
+    """Return ``(human_error, fatal_limit_error)`` from rclone stderr/JSON error lines.
+
+    Strips generic trailing lines such as ``Fatal error received - not attempting retries`` so
+    the underlying backend cause is surfaced, and flags remote-wide quota/upload-limit errors
+    that should pause the remaining items in the current job.
+    """
+    cleaned = [str(line or "").strip() for line in raw_lines if str(line or "").strip()]
+    joined_lower = "\n".join(cleaned).lower()
+    rtype = (remote_type or "").strip().lower()
+
+    if (
+        "userratelimitexceeded" in joined_lower
+        or "user rate limit exceeded" in joined_lower
+        or "upload limit" in joined_lower
+    ):
+        msg = "已达到 Google Drive 每日 750GB 上传上限（请等待配额恢复或切换网盘后重试）"
+        return msg, msg
+
+    if (
+        "storagequotaexceeded" in joined_lower
+        or "storage quota has been exceeded" in joined_lower
+        or "quota exceeded" in joined_lower
+        or "insufficient storage" in joined_lower
+        or "space is full" in joined_lower
+        or "file_space_not_enough" in joined_lower
+    ):
+        label = "Google Drive" if rtype == "drive" else "远端网盘"
+        msg = f"{label}存储空间已满，无法继续上传（本地文件已保留）"
+        return msg, msg
+
+    informative: List[str] = []
+    for line in cleaned:
+        low = line.lower()
+        if low in _GENERIC_RCLONE_EXACT or any(low.startswith(p) for p in _GENERIC_RCLONE_PREFIXES):
+            continue
+        informative.append(line)
+
+    if informative:
+        chosen = informative[-1]
+        if "last error was:" in chosen.lower():
+            idx = chosen.lower().rfind("last error was:")
+            tail = chosen[idx + len("last error was:") :].strip()
+            if tail:
+                chosen = tail
+        if rtype == "drive" and rc == 7 and "rate limit" in chosen.lower():
+            msg = "已达到 Google Drive 每日 750GB 上传上限（请等待配额恢复或切换网盘后重试）"
+            return msg, msg
+        return chosen, ""
+
+    if rtype == "drive" and rc == 7:
+        msg = "Google Drive 返回致命错误（通常为每日 750GB 上传上限或网盘空间已满），已保留本地文件"
+        return msg, msg
+
+    if cleaned:
+        return cleaned[-1], ""
+    return f"rclone {action} 返回 {rc}", ""
 
 
 def file_snapshot(path: Path) -> Optional[FileSnapshot]:
@@ -670,7 +748,15 @@ async def upload_file_batch(
                 )
                 if rc_mk != 0:
                     result.failed_viewkeys.extend(entries)
-                    result.error = err_mk.strip() or f"rclone mkdir 失败 (code={rc_mk})"
+                    err_msg, fatal_msg = summarize_rclone_error(
+                        err_mk.splitlines(),
+                        rc=rc_mk,
+                        remote_type=remote_type,
+                        action="mkdir",
+                    )
+                    result.error = err_msg or f"rclone mkdir 失败 (code={rc_mk})"
+                    if fatal_msg:
+                        result.fatal_limit_error = fatal_msg
                     return result
                 session_cache.created_remote_dirs.add(remote_dir)
                 need_mkdir = False
@@ -683,7 +769,15 @@ async def upload_file_batch(
         )
         if rc_mk != 0:
             result.failed_viewkeys.extend(entries)
-            result.error = err_mk.strip() or f"rclone mkdir 失败 (code={rc_mk})"
+            err_msg, fatal_msg = summarize_rclone_error(
+                err_mk.splitlines(),
+                rc=rc_mk,
+                remote_type=remote_type,
+                action="mkdir",
+            )
+            result.error = err_msg or f"rclone mkdir 失败 (code={rc_mk})"
+            if fatal_msg:
+                result.fatal_limit_error = fatal_msg
             return result
 
     def _make_stderr_handler(
@@ -706,12 +800,18 @@ async def upload_file_batch(
         def _on_stderr_line(line: str) -> None:
             parsed = parse_rclone_json_line(line)
             if parsed is None:
+                text = (line or "").strip()
+                if text:
+                    error_sink.append(text)
                 return
             lvl = str(parsed.get("level") or "").lower()
-            if lvl in {"error", "critical", "fatal"}:
+            if lvl in {"error", "critical", "fatal", "warning"}:
                 msg = str(parsed.get("msg") or "").strip()
+                err_field = str(parsed.get("error") or "").strip()
                 if msg:
                     error_sink.append(msg)
+                if err_field and err_field not in msg:
+                    error_sink.append(err_field)
             if on_progress is None:
                 return
             stats = parsed.get("stats")
@@ -780,11 +880,15 @@ async def upload_file_batch(
                 run_kwargs["on_stderr_line"] = _make_stderr_handler(same_name_entries, reported_error_lines)
             rc, _, stderr = await _run_cmd(cmd, **run_kwargs)
         if rc != 0:
-            if reported_error_lines:
-                result.error = result.error or reported_error_lines[-1]
-            else:
-                lines = [line for line in stderr.strip().splitlines() if line.strip()]
-                result.error = result.error or (lines[-1] if lines else f"rclone copy 返回 {rc}")
+            err_msg, fatal_msg = summarize_rclone_error(
+                reported_error_lines + stderr.splitlines(),
+                rc=rc,
+                remote_type=remote_type,
+                action="copy",
+            )
+            result.error = result.error or err_msg
+            if fatal_msg and not result.fatal_limit_error:
+                result.fatal_limit_error = fatal_msg
             result.failed_viewkeys.extend(same_name_entries)
         else:
             copied_entries.update(same_name_entries)
@@ -792,11 +896,11 @@ async def upload_file_batch(
     if renamed_entries:
         transfer_sem = asyncio.Semaphore(max(1, int(settings.rclone_transfers)))
 
-        async def _copyto_one(vk_item: str, entry_tuple: Tuple[Path, str, str, FileSnapshot]) -> Tuple[str, bool, str]:
+        async def _copyto_one(vk_item: str, entry_tuple: Tuple[Path, str, str, FileSnapshot]) -> Tuple[str, bool, str, str]:
             local_p, _, rem_rel, _ = entry_tuple
             async with transfer_sem:
                 if cancel_event is not None and cancel_event.is_set():
-                    return vk_item, False, "rclone 执行已取消"
+                    return vk_item, False, "rclone 执行已取消", ""
                 err_lines_one: List[str] = []
                 cmd = [
                     rclone,
@@ -813,22 +917,27 @@ async def upload_file_batch(
                     run_kwargs["on_stderr_line"] = _make_stderr_handler({vk_item: entry_tuple}, err_lines_one)
                 rc_one, _, stderr_one = await _run_cmd(cmd, **run_kwargs)
                 if rc_one == 0:
-                    return vk_item, True, ""
-                if err_lines_one:
-                    return vk_item, False, err_lines_one[-1]
-                lines = [line for line in stderr_one.strip().splitlines() if line.strip()]
-                return vk_item, False, lines[-1] if lines else f"rclone copyto 返回 {rc_one}"
+                    return vk_item, True, "", ""
+                err_msg, fatal_msg = summarize_rclone_error(
+                    err_lines_one + stderr_one.splitlines(),
+                    rc=rc_one,
+                    remote_type=remote_type,
+                    action="copyto",
+                )
+                return vk_item, False, err_msg, fatal_msg
 
         copyto_results = await asyncio.gather(
             *(_copyto_one(vk_item, entry_tuple) for vk_item, entry_tuple in renamed_entries.items())
         )
-        for vk_item, ok_one, err_one in copyto_results:
+        for vk_item, ok_one, err_one, fatal_one in copyto_results:
             if ok_one:
                 copied_entries[vk_item] = renamed_entries[vk_item]
             else:
                 result.failed_viewkeys.append(vk_item)
                 if err_one and not result.error:
                     result.error = err_one
+                if fatal_one and not result.fatal_limit_error:
+                    result.fatal_limit_error = fatal_one
 
     if not copied_entries:
         return result

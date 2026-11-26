@@ -565,3 +565,96 @@ async def test_uploader_streams_json_progress_and_caches_remote_session(tmp_path
     assert any(vk == "vk1" and phase == "uploading" and speed == 125_000_000 for vk, _, _, speed, phase in progress_events)
     assert any(vk == "vk1" and phase == "verifying" and sent == len(VALID_MP4) for vk, sent, _, _, phase in progress_events)
     assert any(vk == "vk2" and phase == "uploading" for vk, _, _, _, phase in progress_events)
+
+
+async def test_rclone_error_summary_strips_generic_fatal_tail_and_flags_drive_quota(tmp_path: Path, monkeypatch):
+    # 1. Google Drive daily 750GB upload limit hidden above generic Fatal error tail
+    err, fatal = uploader.summarize_rclone_error(
+        [
+            "Failed to copyto: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded",
+            "Cancelling sync due to fatal error: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded",
+            "Fatal error received - not attempting retries",
+        ],
+        rc=7,
+        remote_type="drive",
+        action="copyto",
+    )
+    assert "750GB" in err and fatal == err
+
+    # 2. Storage quota exceeded
+    err_q, fatal_q = uploader.summarize_rclone_error(
+        [
+            "googleapi: Error 403: The user's Drive storage quota has been exceeded., storageQuotaExceeded",
+            "Fatal error received - not attempting retries",
+        ],
+        rc=7,
+        remote_type="drive",
+        action="copyto",
+    )
+    assert "存储空间已满" in err_q and fatal_q == err_q
+
+    # 3. Google Drive rc=7 even when only generic fatal line was emitted
+    err_rc7, fatal_rc7 = uploader.summarize_rclone_error(
+        ["Fatal error received - not attempting retries"],
+        rc=7,
+        remote_type="drive",
+        action="copyto",
+    )
+    assert "750GB" in err_rc7 and fatal_rc7 == err_rc7
+
+    # 4. Non-quota error strips generic tail and does NOT flag fatal_limit_error
+    err_net, fatal_net = uploader.summarize_rclone_error(
+        [
+            "Failed to copyto: Post https://www.googleapis.com/upload/drive/v3/files: connection reset by peer",
+            "Fatal error received - not attempting retries",
+        ],
+        rc=1,
+        remote_type="drive",
+        action="copyto",
+    )
+    assert "connection reset by peer" in err_net
+    assert "Fatal error received" not in err_net
+    assert fatal_net == ""
+
+    # 5. End-to-end streaming JSON stderr in upload_file_batch captures both msg & error fields
+    dl_dir = tmp_path / "alice"
+    dl_dir.mkdir()
+    local_file = dl_dir / "Clip [vk1].mp4"
+    local_file.write_bytes(VALID_MP4)
+
+    async def fake_run_cmd(cmd: List[str], **kwargs):
+        action = cmd[1]
+        if action == "listremotes":
+            return 0, "gd: drive\n", ""
+        if action == "mkdir":
+            return 0, "", ""
+        if action == "copyto":
+            cb = kwargs.get("on_stderr_line")
+            assert cb is not None
+            cb(
+                json.dumps(
+                    {
+                        "level": "error",
+                        "msg": "Failed to copyto",
+                        "error": "googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded",
+                    }
+                )
+            )
+            cb(json.dumps({"level": "error", "msg": "Fatal error received - not attempting retries"}))
+            return 7, "", "Fatal error received - not attempting retries"
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(uploader, "_run_cmd", fake_run_cmd)
+    settings = RuntimeSettings(rclone_remote="gd", rclone_remote_base_dir="Pornhub", min_file_size_bytes=64)
+    res = await uploader.upload_file_batch(
+        download_dir=dl_dir,
+        uploader_folder="alice",
+        files_by_viewkey={"vk1": local_file},
+        settings=settings,
+        on_progress=lambda *_: None,
+        remote_names_by_viewkey={"vk1": "2026-11-26_Clip [vk1].mp4"},
+    )
+    assert res.failed_viewkeys == ["vk1"]
+    assert "750GB" in res.error
+    assert res.fatal_limit_error == res.error
+    assert local_file.exists()
