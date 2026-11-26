@@ -743,3 +743,166 @@ def test_xhamster_api_endpoints_e2e(tmp_path: Path, monkeypatch):
         assert r_t2.status_code == 200
         assert r_t2.json()["target"]["username"] == "_currentUser_"
         assert r_t2.json()["target"]["target_type"] == "favorites"
+
+
+# ---------------------------------------------------------------------------
+# 7. xHamster Auto-Login Service, Refresh Endpoint & Engine Auto-Renewal
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_login_xhamster_and_get_cookies_success_and_error(monkeypatch):
+    from types import SimpleNamespace
+    from app.services import cookie as cookie_svc
+    from app.parsers import xhamster as xh_parser
+
+    captured_calls = []
+
+    class FakeLoginCtx:
+        def __init__(self, cookie_str="", **kwargs):
+            self.cookie_str = cookie_str
+            self.cancel_event = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def cookie_string(self):
+            return self.cookie_str
+
+        async def fetch_with_pow(self, url, method="GET", data=None, headers=None, **kwargs):
+            captured_calls.append((method, url, data, headers or {}))
+            if method == "GET":
+                return SimpleNamespace(status_code=200, text="<html>login</html>", final_url=url), None
+            body = json.loads(data)
+            if body["password"] == "good-pass":
+                self.cookie_str = "x_csrf_token=1; _id=fake_session_token; _cfg=abc"
+                return SimpleNamespace(
+                    status_code=200,
+                    text=json.dumps({"extras": {"result": True, "userId": 411169334}, "requestData": []}),
+                    final_url=url,
+                ), None
+            return SimpleNamespace(
+                status_code=200,
+                text=json.dumps({"extras": {"result": False, "error": {"username": "Invalid login or password"}}, "requestData": []}),
+                final_url=url,
+            ), None
+
+    async def fake_verify(cookie_str: str, **kwargs):
+        assert "_id=fake_session_token" in cookie_str
+        return True, "Cookie 有效（当前账号: NativePea222）", "NativePea222"
+
+    monkeypatch.setattr(cookie_svc, "TaskHttpContext", FakeLoginCtx)
+    monkeypatch.setattr(xh_parser, "check_xhamster_cookie_valid", fake_verify)
+
+    # Empty creds
+    empty = await cookie_svc.login_xhamster_and_get_cookies("", "")
+    assert empty.success is False
+
+    # Successful login verifies double-submit CSRF header + JSON payload
+    ok = await cookie_svc.login_xhamster_and_get_cookies("NativePea222", "good-pass")
+    assert ok.success is True
+    assert ok.logged_in_username == "NativePea222"
+    assert "_id=fake_session_token" in ok.cookie_str
+    post_call = [c for c in captured_calls if c[0] == "POST"][0]
+    assert post_call[1] == "https://xhamster.com/api/front/user/login"
+    assert post_call[3].get("X-CSRF-Token") == "1"
+    assert json.loads(post_call[2])["remember"] == 1
+
+    # Wrong password returns friendly Chinese error
+    bad = await cookie_svc.login_xhamster_and_get_cookies("NativePea222", "bad-pass")
+    assert bad.success is False
+    assert "账号或密码错误" in bad.message
+
+
+def test_xhamster_refresh_endpoint_and_password_redaction(tmp_path: Path, monkeypatch):
+    from app.api import settings as settings_api
+    from app.services.cookie import CookieLoginResult
+
+    async def fake_xh_login(username: str, password: str, **kwargs):
+        if username == "NativePea222" and password == "secret-pass":
+            return CookieLoginResult(
+                success=True,
+                cookie_str="x_csrf_token=1; _id=refreshed_id_token",
+                logged_in_username="NativePea222",
+                message="xHamster 登录并更新 Cookie 成功（当前账号: NativePea222）",
+            )
+        return CookieLoginResult(success=False, message="xHamster 登录被拒绝: 账号或密码错误")
+
+    monkeypatch.setattr(settings_api, "login_xhamster_and_get_cookies", fake_xh_login)
+
+    env = EnvSettings(data_dir=tmp_path, admin_password="secret", secret_key="k" * 40)
+    app = create_app(env)
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"password": "secret"}).status_code == 200
+
+        r_save = client.put(
+            "/api/settings",
+            json={"xh_username": "NativePea222", "xh_password": "secret-pass"},
+        )
+        assert r_save.status_code == 200
+        saved = r_save.json()["settings"]
+        assert saved["xh_username"] == "NativePea222"
+        assert saved["xh_password"] == "********"
+
+        r_ref = client.post("/api/settings/xh-cookie/refresh")
+        assert r_ref.status_code == 200
+        body = r_ref.json()
+        assert body["success"] is True
+        assert body["logged_in_username"] == "NativePea222"
+
+        r_get = client.get("/api/settings")
+        assert r_get.status_code == 200
+        s = r_get.json()["settings"]
+        assert s["has_xh_cookie"] is True
+        assert s["xh_cookie"] == "********"
+        assert s["xh_logged_in_username"] == "NativePea222"
+        assert r_get.json()["xh_cookie_status"]["valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_task_manager_auto_renews_expired_xhamster_cookie(tmp_path: Path, monkeypatch):
+    from app.engine import task_manager as tm_mod
+    from app.services.cookie import CookieLoginResult
+
+    env = EnvSettings(data_dir=tmp_path, admin_password="secret", secret_key="k" * 40)
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    await repo.update_settings_patch(
+        {
+            "xh_username": "NativePea222",
+            "xh_password": "secret-pass",
+            "xh_cookie": "x_csrf_token=1; _id=expired",
+        }
+    )
+    events = EventBus()
+    tm = TaskManager(env, repo, events)
+
+    async def fake_check_xh(cookie_str: str, **kwargs):
+        if "_id=fresh" in cookie_str:
+            return True, "Cookie 有效（当前账号: NativePea222）", "NativePea222"
+        return False, "xHamster Cookie 已失效（重定向到登录页）", ""
+
+    async def fake_login_xh(username: str, password: str, **kwargs):
+        assert username == "NativePea222" and password == "secret-pass"
+        return CookieLoginResult(
+            success=True,
+            cookie_str="x_csrf_token=1; _id=fresh",
+            logged_in_username="NativePea222",
+            message="xHamster 登录并更新 Cookie 成功（当前账号: NativePea222）",
+        )
+
+    monkeypatch.setattr(tm_mod, "check_xhamster_cookie_valid", fake_check_xh)
+    monkeypatch.setattr(tm_mod, "login_xhamster_and_get_cookies", fake_login_xh)
+
+    try:
+        settings = await repo.get_settings()
+        refreshed = await tm._ensure_valid_xh_cookie(settings, job_id=1)
+        assert refreshed is not None
+        assert "_id=fresh" in refreshed.xh_cookie
+        assert refreshed.xh_logged_in_username == "NativePea222"
+        assert tm.xh_cookie_status["valid"] is True
+    finally:
+        await db.close()

@@ -15,6 +15,7 @@ SENSITIVE_RUNTIME_FIELDS = frozenset(
     {
         "ph_password",
         "ph_cookie",
+        "xh_password",
         "xh_cookie",
         "serverchan_send_key",
         "yescaptcha_client_key",
@@ -167,6 +168,8 @@ class RuntimeSettings(BaseModel):
     ph_password: str = ""
     ph_logged_in_username: str = ""
     ph_cookie: str = ""
+    xh_username: str = ""
+    xh_password: str = ""
     xh_cookie: str = ""
     xh_logged_in_username: str = ""
     account_avatar_version: str = ""

@@ -43,7 +43,7 @@ from ..parsers.xhamster import (
     is_xhamster_url,
     resolve_xhamster_target_type,
 )
-from ..services.cookie import check_cookie_valid, login_and_get_cookies
+from ..services.cookie import check_cookie_valid, login_and_get_cookies, login_xhamster_and_get_cookies
 from ..services.downloader import (
     DownloadDiskBudget,
     download_mp4_with_resume,
@@ -438,24 +438,46 @@ class TaskManager:
         job_id: int,
     ) -> Optional[RuntimeSettings]:
         self.events.emit_log("INFO", "正在验证 xHamster Cookie 有效性...", job_id=job_id)
-        if not settings.xh_cookie.strip():
-            msg = "xHamster 收藏夹需要配置有效的 xHamster Cookie，请在【系统设置 → Cookie 与账号】中导入"
-            self.set_xh_cookie_status(False, msg)
-            self.events.emit_log("ERROR", msg, job_id=job_id)
-            return None
-        valid, msg, username = await check_xhamster_cookie_valid(
-            settings.xh_cookie,
-            proxy_url=settings.normalized_proxy,
-            timeout=settings.request_timeout,
-        )
-        self.set_xh_cookie_status(valid, msg)
-        if not valid:
-            self.events.emit_log("ERROR", f"xHamster Cookie 校验失败: {msg}", job_id=job_id)
-            return None
-        if username and username != settings.xh_logged_in_username:
-            settings = await self.repo.update_settings_patch({"xh_logged_in_username": username})
-        self.events.emit_log("INFO", f"xHamster {msg}。", job_id=job_id)
-        return settings
+        if settings.xh_cookie.strip():
+            valid, msg, username = await check_xhamster_cookie_valid(
+                settings.xh_cookie,
+                proxy_url=settings.normalized_proxy,
+                timeout=settings.request_timeout,
+            )
+            if valid:
+                self.set_xh_cookie_status(True, msg)
+                if username and username != settings.xh_logged_in_username:
+                    settings = await self.repo.update_settings_patch({"xh_logged_in_username": username})
+                self.events.emit_log("INFO", f"xHamster {msg}。", job_id=job_id)
+                return settings
+            self.events.emit_log("WARNING", f"xHamster Cookie 校验未通过: {msg}", job_id=job_id)
+
+        if settings.xh_username.strip() and settings.xh_password.strip():
+            self.events.emit_log("INFO", "尝试使用 xHamster 账号自动登录刷新 Cookie...", job_id=job_id)
+            login_res = await login_xhamster_and_get_cookies(
+                settings.xh_username,
+                settings.xh_password,
+                proxy_url=settings.normalized_proxy,
+                timeout=settings.request_timeout,
+                on_log=lambda lvl, message: self.events.emit_log(lvl, message, job_id=job_id),
+            )
+            if login_res.success and login_res.cookie_str:
+                patch: Dict[str, Any] = {"xh_cookie": login_res.cookie_str}
+                if login_res.logged_in_username:
+                    patch["xh_logged_in_username"] = login_res.logged_in_username
+                settings = await self.repo.update_settings_patch(patch)
+                self.set_xh_cookie_status(True, login_res.message)
+                self.events.emit_log("INFO", f"{login_res.message}。", job_id=job_id)
+                return settings
+            err_msg = login_res.message or "xHamster 自动登录失败"
+        elif settings.xh_cookie.strip():
+            err_msg = "xHamster Cookie 已失效，且未配置 xHamster 账号密码"
+        else:
+            err_msg = "xHamster 收藏夹需要登录 xHamster 账号或粘贴有效 Cookie，请在【系统设置 → Cookie 与账号】中配置"
+
+        self.set_xh_cookie_status(False, err_msg)
+        self.events.emit_log("ERROR", f"xHamster 认证失败: {err_msg}", job_id=job_id)
+        return None
 
     async def _run_job(self, job_id: int) -> None:
         job = await self.repo.get_job(job_id)

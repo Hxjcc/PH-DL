@@ -47,6 +47,7 @@ import TagsInput from '../components/ui/TagsInput.vue'
 import ConfirmPopover from '../components/ui/ConfirmPopover.vue'
 import SubsPickerModal from '../components/SubsPickerModal.vue'
 import SiteBadge from '../components/SiteBadge.vue'
+import SegmentedControl from '../components/ui/SegmentedControl.vue'
 
 const store = useAppStore()
 
@@ -64,8 +65,8 @@ const sourceTabs = [
 ]
 
 const SITE_OPTIONS = [
-  { label: 'PornHub', value: 'pornhub' },
-  { label: 'xHamster', value: 'xhamster' },
+  { label: 'PornHub', value: 'pornhub', dot: 'bg-[#ff9000]' },
+  { label: 'xHamster', value: 'xhamster', dot: 'bg-red-500' },
 ]
 
 const PH_TARGET_TYPE_OPTIONS = [
@@ -895,29 +896,7 @@ async function handleClearTemp() {
               >
                 <div class="site-bar">
                   <span class="site-bar-label">来源站点</span>
-                  <div class="site-segmented" role="group" aria-label="目标站点">
-                    <button
-                      v-for="opt in SITE_OPTIONS"
-                      :key="opt.value"
-                      type="button"
-                      :aria-pressed="form.site === opt.value"
-                      :class="[
-                        'site-segmented-btn',
-                        form.site === opt.value ? 'site-segmented-btn-active' : '',
-                      ]"
-                      @click="form.site = opt.value"
-                    >
-                      <span
-                        :class="[
-                          'site-dot',
-                          opt.value === 'xhamster' ? 'bg-red-500' : 'bg-[#ff9000]',
-                          form.site === opt.value ? 'opacity-100' : 'opacity-40',
-                        ]"
-                        aria-hidden="true"
-                      />
-                      <span>{{ opt.label }}</span>
-                    </button>
-                  </div>
+                  <SegmentedControl v-model="form.site" :options="SITE_OPTIONS" aria-label="目标站点" />
                   <span v-if="form.site === 'xhamster'" class="site-bar-hint">
                     公开主页免 Cookie · 4K HLS 自动封装 MP4
                   </span>
@@ -1537,53 +1516,6 @@ async function handleClearTemp() {
   font-size: 12px;
   font-weight: 500;
   color: var(--foreground);
-}
-
-.site-segmented {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 10px;
-  background: var(--muted);
-}
-
-.site-segmented-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 11px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted-foreground);
-  cursor: pointer;
-  user-select: none;
-  transition:
-    background-color 150ms ease,
-    color 150ms ease,
-    box-shadow 150ms ease;
-}
-
-.site-segmented-btn:hover {
-  color: var(--foreground);
-}
-
-.site-segmented-btn-active {
-  background: var(--card);
-  color: var(--foreground);
-  box-shadow: 0 1px 2px rgba(9, 9, 11, 0.06);
-}
-
-.site-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 9999px;
-  flex-shrink: 0;
-  transition: opacity 150ms ease;
 }
 
 .site-bar-hint {

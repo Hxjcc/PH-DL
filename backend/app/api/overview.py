@@ -11,6 +11,7 @@ from ..db.repo import normalize_site
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.target import fetch_subscriptions
 from ..parsers.xhamster import fetch_xhamster_subscriptions
+from ..services.cookie import login_xhamster_and_get_cookies
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api", tags=["overview"])
@@ -88,13 +89,32 @@ async def get_subscriptions(
     norm_site = normalize_site(site)
 
     if norm_site == "xhamster":
-        if not settings.xh_cookie.strip():
+        xh_cookie = settings.xh_cookie.strip()
+        if not xh_cookie and settings.xh_username.strip() and settings.xh_password.strip():
+            login_res = await login_xhamster_and_get_cookies(
+                settings.xh_username,
+                settings.xh_password,
+                proxy_url=settings.normalized_proxy,
+                timeout=settings.request_timeout,
+                on_log=lambda level, message: container.events.emit_log(level, message),
+            )
+            if login_res.success and login_res.cookie_str:
+                patch = {"xh_cookie": login_res.cookie_str}
+                if login_res.logged_in_username:
+                    patch["xh_logged_in_username"] = login_res.logged_in_username
+                settings = await container.repo.update_settings_patch(patch)
+                container.tasks.set_xh_cookie_status(True, login_res.message)
+                xh_cookie = settings.xh_cookie.strip()
+            else:
+                container.tasks.set_xh_cookie_status(False, login_res.message)
+                raise HTTPException(status_code=400, detail=login_res.message)
+        if not xh_cookie:
             raise HTTPException(
                 status_code=400,
-                detail="请先在【系统设置 → Cookie 与账号】中配置有效 xHamster Cookie",
+                detail="请先在【系统设置 → Cookie 与账号】中登录 xHamster 账号或粘贴有效 Cookie",
             )
         async with TaskHttpContext(
-            cookie_str=settings.xh_cookie,
+            cookie_str=xh_cookie,
             proxy_url=settings.normalized_proxy,
             concurrency=2,
             timeout=settings.request_timeout,
@@ -103,7 +123,7 @@ async def get_subscriptions(
             subs = await fetch_xhamster_subscriptions(ctx, timeout=settings.request_timeout)
         return {
             "site": "xhamster",
-            "username": settings.xh_logged_in_username.strip(),
+            "username": (settings.xh_logged_in_username or settings.xh_username).strip(),
             "subscriptions": [
                 {
                     "site": "xhamster",

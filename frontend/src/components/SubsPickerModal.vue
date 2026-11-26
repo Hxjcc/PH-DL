@@ -11,6 +11,7 @@ import Button from './ui/Button.vue'
 import Badge from './ui/Badge.vue'
 import Switch from './ui/Switch.vue'
 import Spinner from './ui/Spinner.vue'
+import SegmentedControl from './ui/SegmentedControl.vue'
 import BaselineScopeFields from './BaselineScopeFields.vue'
 
 const props = defineProps({
@@ -46,8 +47,8 @@ const failedAvatarUrls = ref(new Set())
 let requestVersion = 0
 
 const SITE_OPTIONS = [
-  { value: 'pornhub', label: 'PornHub' },
-  { value: 'xhamster', label: 'xHamster' },
+  { value: 'pornhub', label: 'PornHub', dot: 'bg-[#ff9000]' },
+  { value: 'xhamster', label: 'xHamster', dot: 'bg-red-500' },
 ]
 
 const defaultSource = computed(() =>
@@ -306,31 +307,12 @@ function confirm() {
   >
     <div class="space-y-3.5">
       <div class="flex flex-wrap items-center justify-between gap-2">
-        <div class="inline-flex items-center rounded-lg bg-muted p-0.5 gap-0.5" role="group" aria-label="订阅站点">
-          <button
-            v-for="opt in SITE_OPTIONS"
-            :key="opt.value"
-            type="button"
-            :aria-pressed="activeSite === opt.value"
-            :class="[
-              'inline-flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium transition-all cursor-pointer select-none',
-              activeSite === opt.value
-                ? 'bg-card text-foreground shadow-xs'
-                : 'text-muted-foreground hover:text-foreground',
-            ]"
-            @click="switchSite(opt.value)"
-          >
-            <span
-              :class="[
-                'w-1.5 h-1.5 rounded-full shrink-0 transition-opacity',
-                opt.value === 'xhamster' ? 'bg-red-500' : 'bg-[#ff9000]',
-                activeSite === opt.value ? 'opacity-100' : 'opacity-40',
-              ]"
-              aria-hidden="true"
-            />
-            <span>{{ opt.label }}</span>
-          </button>
-        </div>
+        <SegmentedControl
+          :model-value="activeSite"
+          :options="SITE_OPTIONS"
+          aria-label="订阅站点"
+          @change="switchSite"
+        />
         <span v-if="activeSite === 'xhamster'" class="text-[11px] text-muted-foreground">
           支持导入创作者、明星、频道与已关注用户
         </span>

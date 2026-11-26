@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from ..engine.scheduler import parse_hhmm
 from ..parsers.xhamster import check_xhamster_cookie_valid
 from ..services.captcha import CaptchaError, get_yescaptcha_balance
-from ..services.cookie import check_cookie_valid, login_and_get_cookies
+from ..services.cookie import check_cookie_valid, login_and_get_cookies, login_xhamster_and_get_cookies
 from ..services.notifier import send_serverchan
 from ..services.uploader import list_rclone_remotes, test_rclone_connection
 from .deps import AppContainer, require_auth
@@ -203,6 +203,33 @@ async def import_xh_cookie(
         "valid": valid,
         "message": message,
         "logged_in_username": username,
+    }
+
+
+@router.post("/xh-cookie/refresh")
+async def refresh_xh_cookie(container: AppContainer = Depends(require_auth)):
+    settings = await container.repo.get_settings()
+    res = await login_xhamster_and_get_cookies(
+        settings.xh_username,
+        settings.xh_password,
+        proxy_url=settings.normalized_proxy,
+        timeout=settings.request_timeout,
+        on_log=lambda level, message: container.events.emit_log(level, message),
+    )
+    if not res.success:
+        container.tasks.set_xh_cookie_status(False, res.message)
+        return {"success": False, "message": res.message}
+
+    patch: Dict[str, Any] = {"xh_cookie": res.cookie_str}
+    if res.logged_in_username:
+        patch["xh_logged_in_username"] = res.logged_in_username
+    await container.repo.update_settings_patch(patch)
+    container.tasks.set_xh_cookie_status(True, res.message)
+    container.events.broadcast("overview_changed", {})
+    return {
+        "success": True,
+        "logged_in_username": res.logged_in_username,
+        "message": res.message,
     }
 
 

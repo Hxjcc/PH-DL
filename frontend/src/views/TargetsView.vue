@@ -46,6 +46,7 @@ import ConfirmPopover from '../components/ui/ConfirmPopover.vue'
 import SubsPickerModal from '../components/SubsPickerModal.vue'
 import BaselineScopeFields from '../components/BaselineScopeFields.vue'
 import SiteBadge from '../components/SiteBadge.vue'
+import SegmentedControl from '../components/ui/SegmentedControl.vue'
 
 const store = useAppStore()
 const router = useRouter()
@@ -111,13 +112,8 @@ const editForm = reactive({
   preferred_quality: '',
 })
 const SITE_CHOICES = [
-  { label: 'PornHub', value: 'pornhub' },
-  { label: 'xHamster', value: 'xhamster' },
-]
-const SITE_FILTER_OPTIONS = [
-  { label: '全部站点', value: 'all' },
-  { label: 'PornHub', value: 'pornhub' },
-  { label: 'xHamster', value: 'xhamster' },
+  { label: 'PornHub', value: 'pornhub', dot: 'bg-[#ff9000]' },
+  { label: 'xHamster', value: 'xhamster', dot: 'bg-red-500' },
 ]
 const PH_EDIT_TYPE_OPTIONS = [
   { label: 'Model', value: 'model' },
@@ -256,13 +252,27 @@ function targetNewBadgeTitle(t) {
   return parts.join(' · ')
 }
 
-const enabledCount = computed(() => targets.value.filter((t) => t.enabled).length)
-const disabledCount = computed(() => targets.value.filter((t) => !t.enabled).length)
-const updatedTodayCount = computed(() => targets.value.filter((t) => isUpdatedToday(t)).length)
-const errorCount = computed(() => targets.value.filter((t) => Boolean(t.last_error)).length)
+const siteScopedTargets = computed(() =>
+  siteFilter.value === 'all'
+    ? targets.value
+    : targets.value.filter((t) => (t.site || 'pornhub') === siteFilter.value)
+)
+const phTargetCount = computed(() => targets.value.filter((t) => (t.site || 'pornhub') === 'pornhub').length)
+const xhTargetCount = computed(() => targets.value.filter((t) => (t.site || 'pornhub') === 'xhamster').length)
+
+const siteFilterTabs = computed(() => [
+  { value: 'all', label: '全站', title: '显示全部站点目标' },
+  { value: 'pornhub', label: 'PH', dot: 'bg-[#ff9000]', count: phTargetCount.value, title: '仅显示 PornHub 目标' },
+  { value: 'xhamster', label: 'XH', dot: 'bg-red-500', count: xhTargetCount.value, title: '仅显示 xHamster 目标' },
+])
+
+const enabledCount = computed(() => siteScopedTargets.value.filter((t) => t.enabled).length)
+const disabledCount = computed(() => siteScopedTargets.value.filter((t) => !t.enabled).length)
+const updatedTodayCount = computed(() => siteScopedTargets.value.filter((t) => isUpdatedToday(t)).length)
+const errorCount = computed(() => siteScopedTargets.value.filter((t) => Boolean(t.last_error)).length)
 
 const statusPills = computed(() => [
-  { value: 'all', label: '全部', count: targets.value.length, icon: Users },
+  { value: 'all', label: '全部', count: siteScopedTargets.value.length, icon: Users },
   { value: 'updated_today', label: '今日更新', count: updatedTodayCount.value, icon: Sparkles },
   { value: 'enabled', label: '已启用', count: enabledCount.value, icon: CheckCircle2 },
   { value: 'disabled', label: '已暂停', count: disabledCount.value, icon: PauseCircle },
@@ -282,8 +292,6 @@ function targetVideoCountTitle(t) {
   if (total === 0) return '去重索引中暂无该目标的视频记录'
   return `共索引 ${total} 个视频（已入库 ${saved} · 仅基线 ${baseline}），点击前往历史记录查看`
 }
-
-const hasXhTargets = computed(() => targets.value.some((t) => (t.site || 'pornhub') === 'xhamster'))
 
 function openTargetHistory(t) {
   const site = t.site || 'pornhub'
@@ -791,28 +799,13 @@ async function handleDelete(t) {
           {{ schedule.enabled ? `每天 ${schedule.time} 自动运行` : '定时调度已暂停' }}
         </span>
         <span class="hidden sm:inline-block h-4 w-px bg-border" aria-hidden="true" />
-        <div
-          class="inline-flex items-center rounded-lg border border-border bg-surface-subtle/60 p-0.5"
-          role="group"
+        <SegmentedControl
+          :model-value="schedule.scan_mode"
+          :options="UPDATE_SCAN_MODES"
           aria-label="追更扫描模式"
-        >
-          <button
-            v-for="opt in UPDATE_SCAN_MODES"
-            :key="opt.value"
-            type="button"
-            :title="opt.title"
-            :aria-pressed="schedule.scan_mode === opt.value"
-            :class="[
-              'h-7 px-2.5 rounded-md text-xs font-medium transition-colors cursor-pointer select-none',
-              schedule.scan_mode === opt.value
-                ? 'bg-card text-foreground shadow-xs ring-1 ring-border/70'
-                : 'text-muted-foreground hover:text-foreground',
-            ]"
-            @click="setScanMode(opt.value)"
-          >
-            {{ opt.label }}
-          </button>
-        </div>
+          size="sm"
+          @change="setScanMode"
+        />
       </div>
 
       <div class="grid grid-cols-2 w-full sm:flex sm:w-auto items-center gap-2">
@@ -861,6 +854,14 @@ async function handleDelete(t) {
               {{ pill.count }}
             </span>
           </Button>
+          <span class="hidden sm:inline-block h-4 w-px bg-border mx-1 shrink-0" aria-hidden="true" />
+          <SegmentedControl
+            v-model="siteFilter"
+            :options="siteFilterTabs"
+            aria-label="按站点筛选"
+            size="sm"
+            class="h-8"
+          />
         </div>
 
         <!-- Search + Sort + Page Size + View Mode Switcher -->
@@ -906,13 +907,6 @@ async function handleDelete(t) {
           </div>
 
           <div class="grid grid-cols-2 gap-2 sm:flex sm:items-center">
-            <Select
-              v-if="hasXhTargets"
-              v-model="siteFilter"
-              :options="SITE_FILTER_OPTIONS"
-              aria-label="筛选站点"
-              class="h-9 w-full sm:w-28 text-xs"
-            />
             <Select
               :model-value="sortBy"
               :options="TARGET_SORT_OPTIONS"
@@ -1370,31 +1364,7 @@ async function handleDelete(t) {
         <div class="space-y-1.5">
           <label class="text-xs font-medium text-foreground">来源站点</label>
           <div>
-            <div class="inline-flex items-center rounded-lg bg-muted p-0.5 gap-0.5" role="group" aria-label="选择目标站点">
-              <button
-                v-for="opt in SITE_CHOICES"
-                :key="opt.value"
-                type="button"
-                :aria-pressed="newTarget.site === opt.value"
-                :class="[
-                  'inline-flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium transition-all cursor-pointer select-none',
-                  newTarget.site === opt.value
-                    ? 'bg-card text-foreground shadow-xs'
-                    : 'text-muted-foreground hover:text-foreground',
-                ]"
-                @click="newTarget.site = opt.value"
-              >
-                <span
-                  :class="[
-                    'w-1.5 h-1.5 rounded-full shrink-0 transition-opacity',
-                    opt.value === 'xhamster' ? 'bg-red-500' : 'bg-[#ff9000]',
-                    newTarget.site === opt.value ? 'opacity-100' : 'opacity-40',
-                  ]"
-                  aria-hidden="true"
-                />
-                <span>{{ opt.label }}</span>
-              </button>
-            </div>
+            <SegmentedControl v-model="newTarget.site" :options="SITE_CHOICES" aria-label="选择目标站点" />
           </div>
         </div>
 

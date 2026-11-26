@@ -19,6 +19,10 @@ PORNHUB_LOGIN_URL = "https://www.pornhub.com/login"
 # Stable reCAPTCHA sitekey of the PornHub login modal (fallback only).
 PORNHUB_DEFAULT_SITEKEY = "6LfyQRoUAAAAAApqS-inJxUwCOtvOHwKxJuZCsuv"
 
+XHAMSTER_LOGIN_URL = "https://xhamster.com/login"
+XHAMSTER_LOGIN_API_URL = "https://xhamster.com/api/front/user/login"
+XHAMSTER_DEFAULT_CSRF = "1"
+
 LogCallback = Callable[[str, str], None]
 
 # Coalesce concurrent auto-login calls per event loop + (account, proxy) to avoid
@@ -708,3 +712,218 @@ async def _login_and_get_cookies_once(
             )
     except Exception as err:
         return CookieLoginResult(success=False, message=f"自动登录异常: {err}")
+
+
+def _extract_xhamster_login_error(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    extras = data.get("extras")
+    containers = [extras, data] if isinstance(extras, dict) else [data]
+    for box in containers:
+        for key in ("error", "errors", "message", "errorMessage", "errorDescription"):
+            val = box.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+            if isinstance(val, dict):
+                parts = [str(v).strip() for v in val.values() if str(v or "").strip()]
+                if parts:
+                    return "; ".join(parts)
+            if isinstance(val, list):
+                parts = [str(v).strip() for v in val if str(v or "").strip()]
+                if parts:
+                    return "; ".join(parts)
+    return ""
+
+
+def _friendly_xhamster_auth_failure(message: str) -> str:
+    lower = (message or "").lower()
+    if "invalid login" in lower or "invalid password" in lower or "wrong password" in lower:
+        return f"xHamster 账号或密码错误 ({message})。请检查凭据，或切换到粘贴 Cookie。"
+    if "too many" in lower or "blocked" in lower or "locked" in lower or "limit" in lower:
+        return f"xHamster 登录尝试过于频繁或被暂时限制 ({message})，请稍后再试或粘贴浏览器 Cookie。"
+    if "captcha" in lower or "recaptcha" in lower or "robot" in lower:
+        return f"xHamster 要求人机验证 ({message})，请稍后重试或切换到粘贴浏览器 Cookie。"
+    return message or "xHamster 认证失败"
+
+
+async def login_xhamster_and_get_cookies(
+    username: str,
+    password: str,
+    proxy_url: Optional[str] = None,
+    timeout: float = 20.0,
+    *,
+    on_log: Optional[LogCallback] = None,
+) -> CookieLoginResult:
+    """Authenticate against ``xhamster.com/api/front/user/login`` and return verified cookies."""
+    if not (username or "").strip() or not (password or "").strip():
+        return CookieLoginResult(success=False, message="未配置 xHamster 账号或密码")
+
+    loop = asyncio.get_running_loop()
+    inflight = _INFLIGHT_LOGINS.setdefault(loop, {})
+    dedup_key = (f"xh:{username.strip().lower()}", (proxy_url or "").strip())
+    existing = inflight.get(dedup_key)
+    if existing is not None and not existing.done():
+        if on_log:
+            on_log("INFO", "检测到已有正在进行的 xHamster 自动登录任务，复用本次登录结果...")
+        return await asyncio.shield(existing)
+
+    task = asyncio.create_task(
+        _login_xhamster_once(
+            username,
+            password,
+            proxy_url=proxy_url,
+            timeout=timeout,
+            on_log=on_log,
+        )
+    )
+    inflight[dedup_key] = task
+
+    def _cleanup(finished: asyncio.Task[CookieLoginResult]) -> None:
+        if inflight.get(dedup_key) is finished:
+            inflight.pop(dedup_key, None)
+
+    task.add_done_callback(_cleanup)
+    return await asyncio.shield(task)
+
+
+async def _login_xhamster_once(
+    username: str,
+    password: str,
+    proxy_url: Optional[str] = None,
+    timeout: float = 20.0,
+    *,
+    on_log: Optional[LogCallback] = None,
+) -> CookieLoginResult:
+    from ..parsers.xhamster import check_xhamster_cookie_valid
+
+    def emit(level: str, message: str) -> None:
+        if on_log:
+            on_log(level, message)
+
+    try:
+        # xHamster uses a double-submit CSRF cookie (`x_csrf_token` cookie == `X-CSRF-Token` header).
+        ctx = TaskHttpContext(
+            cookie_str=f"x_csrf_token={XHAMSTER_DEFAULT_CSRF}",
+            proxy_url=proxy_url,
+            concurrency=1,
+            timeout=timeout,
+            max_retries=1,
+            retry_delay_base=1.0,
+            retry_delay_max=2.0,
+            on_log=on_log,
+        )
+        async with ctx:
+            page_resp, page_err = await ctx.fetch_with_pow(
+                XHAMSTER_LOGIN_URL,
+                timeout=timeout,
+                max_retries=1,
+                log_label="xHamster 登录页",
+            )
+            if page_resp is None:
+                return CookieLoginResult(
+                    success=False,
+                    message=f"访问 xHamster 登录页失败: {page_err or '请求失败'}",
+                )
+            if page_resp.status_code >= 400:
+                return CookieLoginResult(
+                    success=False,
+                    message=f"访问 xHamster 登录页失败 (HTTP {page_resp.status_code})",
+                )
+
+            current_cookies = parse_cookie_string(ctx.cookie_string())
+            csrf_token = (current_cookies.get("x_csrf_token") or XHAMSTER_DEFAULT_CSRF).strip() or XHAMSTER_DEFAULT_CSRF
+            page_url = str(page_resp.final_url or XHAMSTER_LOGIN_URL)
+            parsed_page = urlparse(page_url)
+            origin = f"{parsed_page.scheme or 'https'}://{parsed_page.netloc or 'xhamster.com'}"
+            api_url = urljoin(origin, "/api/front/user/login")
+
+            payload = json.dumps(
+                {
+                    "username": username.strip(),
+                    "password": password,
+                    "remember": 1,
+                    "redirectURL": page_url,
+                    "pageType": None,
+                    "source": None,
+                    "isSubscribedToUpdates": None,
+                },
+                separators=(",", ":"),
+            )
+
+            emit("INFO", "正在提交 xHamster 登录凭据...")
+            auth_resp, auth_err = await ctx.fetch_with_pow(
+                api_url,
+                method="POST",
+                data=payload,
+                headers={
+                    "X-CSRF-Token": csrf_token,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Origin": origin,
+                    "Referer": page_url,
+                    "Accept": "*/*",
+                },
+                timeout=timeout,
+                max_retries=1,
+                log_label="xHamster 登录提交",
+            )
+            if auth_resp is None:
+                return CookieLoginResult(
+                    success=False,
+                    message=f"xHamster 自动登录失败: {auth_err or '请求失败'}",
+                )
+            if auth_resp.status_code == 403:
+                return CookieLoginResult(
+                    success=False,
+                    message="xHamster 登录被拒 (HTTP 403，可能触发 CSRF 或风控校验)，请稍后重试或粘贴浏览器 Cookie。",
+                )
+            if auth_resp.status_code >= 400:
+                return CookieLoginResult(
+                    success=False,
+                    message=f"xHamster 登录请求返回 HTTP {auth_resp.status_code}",
+                )
+
+            data: Optional[dict] = None
+            try:
+                parsed = json.loads(auth_resp.text or "")
+                if isinstance(parsed, dict):
+                    data = parsed
+            except (ValueError, TypeError):
+                data = None
+
+            extras = data.get("extras") if isinstance(data, dict) and isinstance(data.get("extras"), dict) else {}
+            if extras.get("result") is True:
+                cookie_str = ctx.cookie_string()
+                if not cookie_str:
+                    return CookieLoginResult(success=False, message="xHamster 登录未返回任何 Cookie")
+                valid, verify_msg, logged_in_user = await check_xhamster_cookie_valid(
+                    cookie_str,
+                    proxy_url=proxy_url,
+                    timeout=timeout,
+                )
+                if not valid:
+                    return CookieLoginResult(
+                        success=False,
+                        message=f"xHamster 登录后校验失败: {verify_msg}",
+                    )
+                resolved_user = logged_in_user or username.strip()
+                return CookieLoginResult(
+                    success=True,
+                    cookie_str=cookie_str,
+                    logged_in_username=resolved_user,
+                    message=f"xHamster 登录并更新 Cookie 成功（当前账号: {resolved_user}）",
+                )
+
+            err_msg = _extract_xhamster_login_error(data)
+            if err_msg:
+                return CookieLoginResult(
+                    success=False,
+                    message=f"xHamster 登录被拒绝: {_friendly_xhamster_auth_failure(err_msg)}",
+                )
+
+            return CookieLoginResult(
+                success=False,
+                message=f"xHamster 自动登录失败，响应异常: {(auth_resp.text or '')[:200]}",
+            )
+    except Exception as err:
+        return CookieLoginResult(success=False, message=f"xHamster 自动登录异常: {err}")

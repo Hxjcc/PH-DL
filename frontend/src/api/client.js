@@ -118,6 +118,7 @@ export const api = {
   refreshCookie: () => request('/api/settings/cookie/refresh', { method: 'POST' }),
   testXhCookie: () => request('/api/settings/xh-cookie/test', { method: 'POST' }),
   importXhCookie: (cookie) => request('/api/settings/xh-cookie/import', { method: 'POST', body: { cookie } }),
+  refreshXhCookie: () => request('/api/settings/xh-cookie/refresh', { method: 'POST' }),
   testYescaptcha: () => request('/api/settings/yescaptcha/test', { method: 'POST' }),
   listRcloneRemotes: () => request('/api/settings/rclone/remotes'),
   testRclone: () => request('/api/settings/rclone/test', { method: 'POST' }),
