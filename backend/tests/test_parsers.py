@@ -468,6 +468,14 @@ def test_extract_target_avatar_prefers_profile_image_and_skips_default():
     )
     assert extract_target_avatar(only_default, "nobody") == ""
 
+    favorites_default_avatar = (
+        '<img id="getAvatar" class="jcrop-preview" alt="User avatar" '
+        'src="https://ei.phncdn.com/pics/users/default/pornhub/(m=x)(mh=y)male.jpg">'
+        '<div class="profileUserName">Hxiay</div>'
+    )
+    assert extract_target_avatar(favorites_default_avatar, "hxiay") == ""
+    assert extract_target_display_name(favorites_default_avatar, "hxiay") == "Hxiay"
+
 
 async def test_list_scanner_stops_on_404_page(monkeypatch):
     selectors = SelectorSettings()

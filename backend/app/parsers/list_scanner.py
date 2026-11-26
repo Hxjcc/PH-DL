@@ -427,6 +427,9 @@ def extract_video_links_from_list_page(
     ]
 
 
+_GENERIC_AVATAR_ALTS = frozenset({"avatar", "user avatar", "profile picture", "default avatar"})
+
+
 def _normalize_avatar_name(value: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
@@ -441,14 +444,19 @@ def extract_target_display_name(html: str, username: Optional[str] = None) -> st
     for img in tree.css("img#getAvatar, img.jcrop-preview"):
         attrs = getattr(img, "attributes", {}) or {}
         alt = (attrs.get("alt") or "").strip()
-        if alt:
+        if alt and alt.lower() not in _GENERIC_AVATAR_ALTS:
             return alt
+
+    for node in tree.css(".profileUserName"):
+        text = " ".join((node.text() or "").split()).strip()
+        if text and text.lower() not in _GENERIC_AVATAR_ALTS:
+            return text
 
     for img in tree.css("img.avatarTrigger, img.avatar, img.small-avatar"):
         attrs = getattr(img, "attributes", {}) or {}
         alt = (attrs.get("alt") or "").strip()
         alt_name = _normalize_avatar_name(alt)
-        if not alt:
+        if not alt or alt.lower() in _GENERIC_AVATAR_ALTS:
             continue
         if wanted_name and alt_name and wanted_name not in alt_name and alt_name not in wanted_name:
             continue
