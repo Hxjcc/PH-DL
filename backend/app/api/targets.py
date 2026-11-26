@@ -13,7 +13,7 @@ from ..db.repo import normalize_site
 from ..parsers.list_scanner import parse_page_specs
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.target import resolve_target_type
-from ..parsers.xhamster import resolve_xhamster_target_type
+from ..parsers.xhamster import resolve_xhamster_target
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api/targets", tags=["targets"])
@@ -117,8 +117,11 @@ async def create_target(
             max_retries=1,
         ) as ctx:
             if norm_site == "xhamster":
-                detected = await resolve_xhamster_target_type(ctx, uname, timeout=probe_timeout)
-                resolved_type = detected or "creator"
+                detected = await resolve_xhamster_target(ctx, uname, timeout=probe_timeout)
+                if detected:
+                    resolved_type, uname = detected
+                else:
+                    resolved_type = "creator"
             else:
                 detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
                 if detected == "channel":
@@ -178,7 +181,7 @@ async def batch_create_targets(
         and item.username.strip()
         for item in payload.items
     )
-    resolved_types: dict[tuple[str, str], str] = {}
+    resolved_types: dict[tuple[str, str], tuple[str, str]] = {}
     if needs_ph_auto or needs_xh_auto:
         settings = await container.repo.get_settings()
         probe_timeout = min(float(settings.request_timeout), 10.0)
@@ -200,7 +203,7 @@ async def batch_create_targets(
                         continue
                     seen_auto.add(key)
                     detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
-                    resolved_types[("pornhub", key)] = detected or "model"
+                    resolved_types[("pornhub", key)] = (detected or "model", uname)
         if needs_xh_auto:
             async with TaskHttpContext(
                 cookie_str=settings.xh_cookie,
@@ -218,15 +221,18 @@ async def batch_create_targets(
                     if not uname or key in seen_auto_xh:
                         continue
                     seen_auto_xh.add(key)
-                    detected = await resolve_xhamster_target_type(ctx, uname, timeout=probe_timeout)
-                    resolved_types[("xhamster", key)] = detected or "creator"
+                    detected = await resolve_xhamster_target(ctx, uname, timeout=probe_timeout)
+                    resolved_types[("xhamster", key)] = detected or ("creator", uname)
 
     for item in payload.items:
         item_site = normalize_site(item.site)
         raw_type = (item.target_type or ("creator" if item_site == "xhamster" else "model")).strip().lower()
         uname = item.username.strip()
         if raw_type == "auto":
-            utype = resolved_types.get((item_site, uname.lower()), "creator" if item_site == "xhamster" else "model")
+            utype, uname = resolved_types.get(
+                (item_site, uname.lower()),
+                ("creator" if item_site == "xhamster" else "model", uname),
+            )
         else:
             utype = raw_type
 

@@ -568,8 +568,12 @@ export const useAppStore = defineStore('app', {
       const entry = this.subscriptionsCache[cacheKey]
       const fresh = entry && Date.now() - entry.fetchedAt < SUBSCRIPTIONS_CACHE_TTL_MS
       if (!fresh || !Array.isArray(entry.subscriptions)) return null
-      // Older subscription entries predate avatar_url and need one fresh pull.
-      return entry.subscriptions.every((sub) => typeof sub?.avatar_url === 'string') ? entry : null
+      // Older subscription entries predate avatar_url or xHamster bound_username and need one fresh pull.
+      if (!entry.subscriptions.every((sub) => typeof sub?.avatar_url === 'string')) return null
+      if (normSite === 'xhamster' && !entry.subscriptions.every((sub) => typeof sub?.bound_username === 'string')) {
+        return null
+      }
+      return entry
     },
 
     clearSubscriptionsCache() {

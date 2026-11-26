@@ -938,15 +938,25 @@ async def test_xhamster_manual_job_skips_pornhub_cookie_and_uploads_to_xh_remote
 def test_xhamster_api_endpoints_e2e(tmp_path: Path, monkeypatch):
     from app.api import overview as overview_api
     from app.api import settings as settings_api
+    from app.parsers.xhamster import XHamsterSubscriptionItem
 
     async def fake_check_xh_cookie(cookie_str: str, **kwargs):
         return True, "Cookie 有效（当前账号: OrderlyPaw690）", "OrderlyPaw690"
 
     async def fake_xh_subs(ctx, timeout=20.0):
-        return [("creator", "fragile-tempt", "Fragile Tempt", "https://ic-nss.xhcdn.com/ft.jpg")]
+        return [
+            XHamsterSubscriptionItem(
+                "creator",
+                "fragile-tempt",
+                "Fragile Tempt",
+                "https://ic-nss.xhcdn.com/ft.jpg",
+                "webtolove",
+                "webtolove",
+            )
+        ]
 
     monkeypatch.setattr(settings_api, "check_xhamster_cookie_valid", fake_check_xh_cookie)
-    monkeypatch.setattr(overview_api, "fetch_xhamster_subscriptions", fake_xh_subs)
+    monkeypatch.setattr(overview_api, "fetch_xhamster_subscriptions_detailed", fake_xh_subs)
 
     env = EnvSettings(data_dir=tmp_path, admin_password="secret", secret_key="k" * 40)
     app = create_app(env)
@@ -976,6 +986,8 @@ def test_xhamster_api_endpoints_e2e(tmp_path: Path, monkeypatch):
         assert r_subs.status_code == 200
         assert r_subs.json()["site"] == "xhamster"
         assert r_subs.json()["subscriptions"][0]["username"] == "fragile-tempt"
+        assert r_subs.json()["subscriptions"][0]["bound_username"] == "webtolove"
+        assert r_subs.json()["subscriptions"][0]["bound_display_name"] == "webtolove"
 
         # Create xHamster creator & favorites targets
         r_t1 = client.post(
@@ -1650,3 +1662,171 @@ async def test_task_manager_xhamster_auto_subscribe_in_target_and_url_modes(tmp_
         )
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_xhamster_subscriptions_detailed_attaches_bound_user_alias(monkeypatch):
+    from app.parsers.xhamster import fetch_xhamster_subscriptions_detailed
+
+    ctx = TaskHttpContext(concurrency=1)
+    pornstars_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "paginationProps": {"lastPageNumber": 1},
+                "layoutPage": {
+                    "pornstars": [
+                        {
+                            "name": "Fragile Tempt",
+                            "pageURL": "https://xhamster.com/creators/fragile-tempt",
+                            "imageUserAvatarUrl": "https://ic-ut-nss.xhcdn.com/a/xxx/webp/078/837/540/avatar_150.jpg",
+                            "subscriptionModel": {"subscribed": True},
+                        }
+                    ]
+                },
+            }
+        )
+        + ";</script>"
+    )
+    channels_html = "<script>window.initials={\"layoutPage\":{\"channels\":[]}};</script>"
+    users_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "subscriptionsUsersPaging": {"maxPages": 1},
+                "subscriptionsUsersCollection": [
+                    {
+                        "id": 78837540,
+                        "name": "webtolove",
+                        "pageURL": "https://xhamster.com/users/webtolove",
+                        "thumbURL": "https://ic-ut-nss.xhcdn.com/a/zzz/webp/078/837/540/avatar_80.jpg",
+                    },
+                    {
+                        "id": 99900011,
+                        "name": "SoloUser",
+                        "pageURL": "https://xhamster.com/users/solouser",
+                        "thumbURL": "https://ic-ut-nss.xhcdn.com/a/aaa/webp/099/900/011/avatar_80.jpg",
+                    },
+                ],
+            }
+        )
+        + ";</script>"
+    )
+
+    async def fake_fetch(url: str, **kwargs):
+        if url.endswith("/my/subscriptions/pornstars"):
+            return PowFetchResult(pornstars_html, url, 200, 0, False), None
+        if url.endswith("/my/subscriptions/channels"):
+            return PowFetchResult(channels_html, url, 200, 0, False), None
+        if url.endswith("/my/subscriptions/users"):
+            return PowFetchResult(users_html, url, 200, 0, False), None
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fake_fetch)
+    items = await fetch_xhamster_subscriptions_detailed(ctx)
+    assert len(items) == 2
+    assert items[0].target_type == "creator"
+    assert items[0].username == "fragile-tempt"
+    assert items[0].display_name == "Fragile Tempt"
+    assert items[0].bound_username == "webtolove"
+    assert items[0].bound_display_name == "webtolove"
+    assert items[1].target_type == "users"
+    assert items[1].username == "solouser"
+    assert items[1].bound_username == ""
+
+
+@pytest.mark.asyncio
+async def test_xhamster_resolve_target_upgrades_bound_user_and_user_scan_unions_creator(monkeypatch):
+    from app.parsers.xhamster import resolve_xhamster_target
+
+    ctx = TaskHttpContext(concurrency=1)
+    user_profile_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "pornstarSectionComponent": {
+                    "pornstar": {
+                        "id": 405427,
+                        "name": "Fragile Tempt",
+                        "type": "creator",
+                        "pageURL": "https://xhamster.com/creators/fragile-tempt",
+                    }
+                }
+            }
+        )
+        + ";</script>"
+    )
+    user_videos_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "maxVideoPages": 1,
+                "videoListComponent": {
+                    "videoThumbProps": [
+                        {"id": 1, "title": "Own Clip", "pageURL": "https://xhamster.com/videos/own-xhAAA11", "duration": 100, "created": 1767225600},
+                    ]
+                },
+            }
+        )
+        + ";</script>"
+    )
+    creator_videos_html = (
+        "<script>window.initials="
+        + json.dumps(
+            {
+                "paginationComponent": {"lastPageNumber": 1},
+                "trendingVideoSectionComponent": {
+                    "videoListProps": {
+                        "videoThumbProps": [
+                            {"id": 1, "title": "Own Clip", "pageURL": "https://xhamster.com/videos/own-xhAAA11", "duration": 100, "created": 1767225600},
+                            {"id": 2, "title": "Collab Clip", "pageURL": "https://xhamster.com/videos/collab-xhBBB22", "duration": 200, "created": 1767225600},
+                        ]
+                    }
+                },
+            }
+        )
+        + ";</script>"
+    )
+    plain_user_html = "<script>window.initials={\"profile\":{\"modelName\":\"userModel\",\"id\":123}};</script>"
+
+    async def fake_fetch(url: str, **kwargs):
+        if url.endswith("/users/webtolove/videos"):
+            return PowFetchResult(user_videos_html, url, 200, 0, False), None
+        if url.endswith("/users/webtolove"):
+            return PowFetchResult(user_profile_html, url, 200, 0, False), None
+        if url.endswith("/creators/fragile-tempt/newest"):
+            return PowFetchResult(creator_videos_html, url, 200, 0, False), None
+        if url.endswith("/users/plainuser/videos"):
+            return PowFetchResult(user_videos_html, url, 200, 0, False), None
+        if url.endswith("/users/plainuser"):
+            return PowFetchResult(plain_user_html, url, 200, 0, False), None
+        return PowFetchResult("", url, 404, 0, False), None
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fake_fetch)
+
+    # 1. Auto-resolving a bound user upgrades to the linked creator target
+    assert await resolve_xhamster_target(ctx, "webtolove") == ("creator", "fragile-tempt")
+    assert await resolve_xhamster_target(ctx, "plainuser") == ("users", "plainuser")
+
+    # 2. Natural scan of an existing users target unions linked creator videos
+    full = await scan_xhamster_list_pages(
+        ctx,
+        "https://xhamster.com/users/webtolove/videos",
+        target_type="users",
+        profile_username="webtolove",
+        delay_min=0,
+        delay_max=0,
+    )
+    assert [v.viewkey for v in full] == ["xhAAA11", "xhBBB22"]
+
+    # 3. Explicit pages_spec stays strictly scoped to the user page
+    scoped = await scan_xhamster_list_pages(
+        ctx,
+        "https://xhamster.com/users/webtolove/videos",
+        target_type="users",
+        profile_username="webtolove",
+        pages_spec="1",
+        delay_min=0,
+        delay_max=0,
+    )
+    assert [v.viewkey for v in scoped] == ["xhAAA11"]

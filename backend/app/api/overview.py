@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ..db.repo import normalize_site
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.target import fetch_subscriptions
-from ..parsers.xhamster import fetch_xhamster_subscriptions
+from ..parsers.xhamster import fetch_xhamster_subscriptions_detailed
 from ..services.cookie import format_cookie_valid_message, login_xhamster_and_get_cookies
 from .deps import AppContainer, require_auth
 
@@ -126,19 +126,21 @@ async def get_subscriptions(
             timeout=settings.request_timeout,
             max_retries=settings.max_retries_page_fetch,
         ) as ctx:
-            subs = await fetch_xhamster_subscriptions(ctx, timeout=settings.request_timeout)
+            subs = await fetch_xhamster_subscriptions_detailed(ctx, timeout=settings.request_timeout)
         return {
             "site": "xhamster",
             "username": (settings.xh_logged_in_username or settings.xh_username).strip(),
             "subscriptions": [
                 {
                     "site": "xhamster",
-                    "type": t,
-                    "username": u,
-                    "display_name": display_name,
-                    "avatar_url": avatar_url,
+                    "type": item.target_type,
+                    "username": item.username,
+                    "display_name": item.display_name,
+                    "avatar_url": item.avatar_url,
+                    "bound_username": item.bound_username,
+                    "bound_display_name": item.bound_display_name,
                 }
-                for t, u, display_name, avatar_url in subs
+                for item in subs
             ],
         }
 

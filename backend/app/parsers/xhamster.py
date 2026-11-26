@@ -523,12 +523,53 @@ def _build_xhamster_paged_url(initial_url: str, target_type: Optional[str], page
     return urllib.parse.urlunparse(parsed._replace(path=f"{clean_path}/{p}"))
 
 
-async def resolve_xhamster_target_type(
+def _extract_linked_creator_from_user_initials(initials: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+    """Return ``(target_type, creator_slug, list_url)`` if a ``/users/<slug>`` page links to a creator/pornstar."""
+    sec = initials.get("pornstarSectionComponent")
+    if not isinstance(sec, dict):
+        return None
+    pornstar = sec.get("pornstar")
+    if not isinstance(pornstar, dict):
+        return None
+    page_url = str(pornstar.get("pageURL") or pornstar.get("url") or "").strip()
+    parsed = parse_xhamster_target_from_url(page_url)
+    if parsed and parsed[0] in {"creator", "pornstar"} and parsed[1]:
+        return parsed[0], parsed[1], build_xhamster_list_url(parsed[1], parsed[0], page=1)
+    return None
+
+
+async def resolve_xhamster_linked_creator(
+    ctx: TaskHttpContext,
+    username: str,
+    timeout: float = 15.0,
+) -> Optional[Tuple[str, str, str]]:
+    """Probe ``/users/<username>`` to discover a linked creator/pornstar page."""
+    norm_user = (username or "").strip()
+    if not norm_user or norm_user == "_currentUser_":
+        return None
+    profile_url = build_xhamster_profile_url(norm_user, "users")
+    res, _ = await ctx.fetch_with_pow(
+        profile_url,
+        headers=_xh_headers(),
+        timeout=max(5.0, float(timeout)),
+        max_retries=1,
+        log_label=f"查询 xHamster 关联创作者 {norm_user}",
+    )
+    if res is None or res.status_code >= 400:
+        return None
+    initials = extract_xhamster_initials(res.text)
+    if not initials:
+        return None
+    return _extract_linked_creator_from_user_initials(initials)
+
+
+async def resolve_xhamster_target(
     ctx: TaskHttpContext,
     username: str,
     hinted_type: Optional[str] = None,
     timeout: float = 15.0,
-) -> Optional[str]:
+) -> Optional[Tuple[str, str]]:
+    """Resolve ``(target_type, canonical_username)`` for an xHamster target, upgrading bound users to creators."""
     norm_user = (username or "").strip()
     if not norm_user or norm_user == "_currentUser_":
         return None
@@ -556,8 +597,23 @@ async def resolve_xhamster_target_type(
             continue
         detected = parse_xhamster_target_from_url(res.final_url)
         if detected and detected[0] in {"creator", "pornstar", "users", "channel"}:
-            return detected[0]
+            det_type, det_user = detected[0], detected[1] or norm_user
+            if det_type == "users":
+                linked = await resolve_xhamster_linked_creator(ctx, det_user, timeout=timeout)
+                if linked is not None:
+                    return linked[0], linked[1]
+            return det_type, det_user
     return None
+
+
+async def resolve_xhamster_target_type(
+    ctx: TaskHttpContext,
+    username: str,
+    hinted_type: Optional[str] = None,
+    timeout: float = 15.0,
+) -> Optional[str]:
+    resolved = await resolve_xhamster_target(ctx, username, hinted_type=hinted_type, timeout=timeout)
+    return resolved[0] if resolved else None
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1196,52 @@ async def scan_xhamster_list_pages(
             "INFO",
             f"[xHamster 扫描] 绑定上传号 {bound_slug} 补扫完成，补充 {len(extra_videos)} 个不重复视频。",
         )
+    elif (
+        include_bound_user
+        and is_natural
+        and any_page_succeeded
+        and (effective_target_type or "").strip().lower() in {"user", "users"}
+        and not ctx.cancel_event.is_set()
+    ):
+        parsed_active = parse_xhamster_target_from_url(active_list_url)
+        user_slug = (
+            effective_profile_username
+            if effective_profile_username and effective_profile_username != "_currentUser_"
+            else (parsed_active[1] if parsed_active and parsed_active[0] == "users" else "")
+        )
+        linked_creator = (
+            await resolve_xhamster_linked_creator(ctx, user_slug, timeout=timeout)
+            if user_slug
+            else None
+        )
+        if linked_creator is not None:
+            c_type, c_slug, c_url = linked_creator
+            ctx._emit(
+                "INFO",
+                f"[xHamster 扫描] 检测到用户 {user_slug} 绑定创作者主页 {c_slug} ({c_type})，补扫创作者视频页以合并合拍及关联视频: {c_url}",
+            )
+            extra_videos = await scan_xhamster_list_pages(
+                ctx,
+                c_url,
+                target_type=c_type,
+                catch_up=catch_up,
+                skip_vkeys=skip_set,
+                delay_min=delay_min,
+                delay_max=delay_max,
+                page_concurrency=page_concurrency,
+                timeout=timeout,
+                profile_username=c_slug,
+                on_page=on_page,
+                on_page_progress=None,
+                on_error=None,
+                include_bound_user=False,
+                already_seen_vkeys=seen_all_vkeys | external_seen,
+            )
+            collected.extend(extra_videos)
+            ctx._emit(
+                "INFO",
+                f"[xHamster 扫描] 关联创作者主页 {c_slug} 补扫完成，补充 {len(extra_videos)} 个不重复视频。",
+            )
 
     return collected
 
@@ -1634,26 +1736,54 @@ async def check_xhamster_cookie_valid(
         return False, f"Cookie 校验失败: {err}", ""
 
 
-async def fetch_xhamster_subscriptions(
+@dataclass
+class XHamsterSubscriptionItem:
+    target_type: str
+    username: str
+    display_name: str
+    avatar_url: str
+    bound_username: str = ""
+    bound_display_name: str = ""
+
+
+async def fetch_xhamster_subscriptions_detailed(
     ctx: TaskHttpContext,
     timeout: float = 20.0,
-) -> List[Tuple[str, str, str, str]]:
-    """Fetch logged-in xHamster subscriptions as ``(target_type, username, display_name, avatar_url)``."""
-    results: List[Tuple[str, str, str, str]] = []
+) -> List[XHamsterSubscriptionItem]:
+    """Fetch logged-in xHamster subscriptions with creator-bound uploader aliases attached."""
+    results: List[XHamsterSubscriptionItem] = []
     seen: Set[Tuple[str, str]] = set()
-    bound_user_ids: Set[int] = set()
-    bound_user_slugs: Set[str] = set()
+    uid_to_creator_idx: Dict[int, int] = {}
+    slug_to_creator_idx: Dict[str, int] = {}
     req_timeout = max(5.0, float(timeout))
 
-    def _add_item(utype: str, slug: str, display_name: str, avatar_url: str) -> None:
+    def _add_item(
+        utype: str,
+        slug: str,
+        display_name: str,
+        avatar_url: str,
+        *,
+        bound_username: str = "",
+        bound_display_name: str = "",
+    ) -> Optional[int]:
         clean_slug = (slug or "").strip()
         if not clean_slug:
-            return
+            return None
         key = (utype, clean_slug.lower())
         if key in seen:
-            return
+            return None
         seen.add(key)
-        results.append((utype, clean_slug, html_lib.unescape(display_name.strip()) or clean_slug, avatar_url))
+        results.append(
+            XHamsterSubscriptionItem(
+                target_type=utype,
+                username=clean_slug,
+                display_name=html_lib.unescape(display_name.strip()) or clean_slug,
+                avatar_url=avatar_url,
+                bound_username=bound_username.strip(),
+                bound_display_name=html_lib.unescape(bound_display_name.strip()) if bound_display_name.strip() else "",
+            )
+        )
+        return len(results) - 1
 
     # 1. Pornstars & Creators (/my/subscriptions/pornstars)
     for page_num in range(1, 21):
@@ -1700,22 +1830,35 @@ async def fetch_xhamster_subscriptions(
                 utype = "pornstar" if raw_t == "pornstar" else "creator"
             user_avatar = _normalize_thumb_url(item.get("imageUserAvatarUrl"))
             bound_uid = _extract_user_id_from_avatar_url(user_avatar)
-            if bound_uid is not None:
-                bound_user_ids.add(bound_uid)
+            bound_slug = ""
+            bound_name = ""
             display_user = item.get("displayUserModel")
             if isinstance(display_user, dict):
                 du_id = display_user.get("id")
                 if isinstance(du_id, int) and du_id > 0:
-                    bound_user_ids.add(du_id)
+                    bound_uid = du_id
                 du_parsed = parse_xhamster_target_from_url(str(display_user.get("pageURL") or ""))
                 if du_parsed and du_parsed[0] == "users":
-                    bound_user_slugs.add(du_parsed[1].lower())
+                    bound_slug = du_parsed[1]
+                bound_name = str(display_user.get("name") or "").strip()
             avatar = (
                 user_avatar
                 or _normalize_thumb_url(item.get("imageThumbUrl"))
                 or _normalize_thumb_url(item.get("logoThumbUrl"))
             )
-            _add_item(utype, slug, str(item.get("name") or slug), avatar)
+            idx = _add_item(
+                utype,
+                slug,
+                str(item.get("name") or slug),
+                avatar,
+                bound_username=bound_slug,
+                bound_display_name=bound_name or bound_slug,
+            )
+            if idx is not None:
+                if bound_uid is not None:
+                    uid_to_creator_idx[bound_uid] = idx
+                if bound_slug:
+                    slug_to_creator_idx[bound_slug.lower()] = idx
 
         pag = initials.get("paginationProps") or initials.get("paginationComponent") or {}
         last_page = pag.get("lastPageNumber") if isinstance(pag, dict) else None
@@ -1776,7 +1919,7 @@ async def fetch_xhamster_subscriptions(
         if found_subscribed == 0 or not isinstance(last_page, int) or page_num >= last_page:
             break
 
-    # 3. Official Users subscriptions (/my/subscriptions/users) - dedupe creator-bound uploader accounts
+    # 3. Official Users subscriptions (/my/subscriptions/users) - merge bound uploader alias onto creator row
     for page_num in range(1, 21):
         if ctx.cancel_event.is_set():
             break
@@ -1806,19 +1949,30 @@ async def fetch_xhamster_subscriptions(
             if not isinstance(item, dict):
                 continue
             uid = item.get("id")
-            if isinstance(uid, int) and uid in bound_user_ids:
-                continue
             page_url = str(item.get("pageURL") or "").strip()
             parsed = parse_xhamster_target_from_url(page_url)
             slug = parsed[1] if parsed and parsed[0] == "users" else str(item.get("name") or "").strip()
-            if not slug or slug.lower() in bound_user_slugs:
+            raw_name = html_lib.unescape(str(item.get("name") or slug).strip())
+            matched_idx: Optional[int] = None
+            if isinstance(uid, int) and uid in uid_to_creator_idx:
+                matched_idx = uid_to_creator_idx[uid]
+            elif slug and slug.lower() in slug_to_creator_idx:
+                matched_idx = slug_to_creator_idx[slug.lower()]
+            if matched_idx is not None:
+                target_item = results[matched_idx]
+                if slug and not target_item.bound_username:
+                    target_item.bound_username = slug
+                if raw_name and not target_item.bound_display_name:
+                    target_item.bound_display_name = raw_name
+                continue
+            if not slug:
                 continue
             avatar = (
                 _normalize_thumb_url(item.get("thumbURL"))
                 or _normalize_thumb_url(item.get("avatarURL"))
                 or _normalize_thumb_url(item.get("imageUserAvatarUrl"))
             )
-            _add_item("users", slug, str(item.get("name") or slug), avatar)
+            _add_item("users", slug, raw_name or slug, avatar)
 
         pag = initials.get("subscriptionsUsersPaging")
         max_pages = pag.get("maxPages") if isinstance(pag, dict) else None
@@ -1826,3 +1980,12 @@ async def fetch_xhamster_subscriptions(
             break
 
     return results
+
+
+async def fetch_xhamster_subscriptions(
+    ctx: TaskHttpContext,
+    timeout: float = 20.0,
+) -> List[Tuple[str, str, str, str]]:
+    """Fetch logged-in xHamster subscriptions as ``(target_type, username, display_name, avatar_url)``."""
+    detailed = await fetch_xhamster_subscriptions_detailed(ctx, timeout=timeout)
+    return [(it.target_type, it.username, it.display_name, it.avatar_url) for it in detailed]

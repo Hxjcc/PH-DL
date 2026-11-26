@@ -114,11 +114,32 @@ const trackedTargetsMap = computed(() => {
 function trackedTargetFor(sub) {
   const uLow = String(sub?.username || '').trim().toLowerCase()
   const tType = String(sub?.type || '').toLowerCase()
-  if (!uLow) return null
-  return trackedTargetsMap.value.byPair.get(`${tType}:${uLow}`) || trackedTargetsMap.value.byUser.get(uLow) || null
+  const boundLow = String(sub?.bound_username || '').trim().toLowerCase()
+  if (uLow) {
+    const direct = trackedTargetsMap.value.byPair.get(`${tType}:${uLow}`) || trackedTargetsMap.value.byUser.get(uLow)
+    if (direct) return direct
+  }
+  if (boundLow) {
+    return trackedTargetsMap.value.byPair.get(`users:${boundLow}`) || trackedTargetsMap.value.byUser.get(boundLow) || null
+  }
+  return null
 }
 function isSubTracked(sub) {
   return Boolean(trackedTargetFor(sub))
+}
+function boundUserLabel(sub) {
+  return String(sub?.bound_display_name || sub?.bound_username || '').trim()
+}
+function matchedBoundUserLabel(sub) {
+  const q = query.value.trim().toLowerCase()
+  const boundLabel = boundUserLabel(sub)
+  if (!q || !boundLabel) return ''
+  const matchedPrimary = [sub?.display_name, sub?.username].some((name) => String(name || '').toLowerCase().includes(q))
+  if (matchedPrimary) return ''
+  const matchedBound = [sub?.bound_username, sub?.bound_display_name].some((name) =>
+    String(name || '').toLowerCase().includes(q)
+  )
+  return matchedBound ? boundLabel : ''
 }
 const trackedSubCount = computed(() => availableItems.value.filter((sub) => isSubTracked(sub)).length)
 const untrackedSubCount = computed(() => availableItems.value.length - trackedSubCount.value)
@@ -133,7 +154,12 @@ const filtered = computed(() => {
     if (typeFilter.value !== 'all' && sub.type !== typeFilter.value) return false
     if (trackFilter.value === 'tracked' && !isSubTracked(sub)) return false
     if (trackFilter.value === 'untracked' && isSubTracked(sub)) return false
-    return !q || [sub.display_name, sub.username].some((name) => String(name || '').toLowerCase().includes(q))
+    return (
+      !q ||
+      [sub.display_name, sub.username, sub.bound_username, sub.bound_display_name].some((name) =>
+        String(name || '').toLowerCase().includes(q)
+      )
+    )
   })
 })
 const updatedTime = computed(() => fetchedAt.value
@@ -373,7 +399,13 @@ function confirm() {
       <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
         <div class="relative w-full sm:min-w-[180px] sm:flex-1">
           <Search class="absolute left-3 top-1/2 w-3.5 h-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input ref="searchInput" v-model="query" placeholder="搜索用户名或显示名..." aria-label="搜索订阅" class="pl-8" />
+          <Input
+            ref="searchInput"
+            v-model="query"
+            :placeholder="activeSite === 'xhamster' ? '搜索用户名、显示名或绑定上传号...' : '搜索用户名或显示名...'"
+            aria-label="搜索订阅"
+            class="pl-8"
+          />
         </div>
         <div class="flex items-center gap-2 sm:contents">
           <Select v-model="typeFilter" :options="typeOptions" class="flex-1 sm:flex-none sm:w-28" aria-label="订阅类型" />
@@ -441,7 +473,20 @@ function confirm() {
             </span>
             <span class="min-w-0 flex-1">
               <span class="block truncate text-sm font-medium" :title="sub.display_name || sub.username">{{ sub.display_name || sub.username }}</span>
-              <span v-if="sub.display_name && sub.display_name !== sub.username" class="mt-0.5 block truncate text-[11px] text-muted-foreground">{{ sub.username }}</span>
+              <span
+                v-if="matchedBoundUserLabel(sub)"
+                class="mt-0.5 block truncate text-[11px] font-medium text-foreground"
+                :title="`已自动合并绑定上传号 ${matchedBoundUserLabel(sub)}`"
+              >
+                匹配上传号 · {{ matchedBoundUserLabel(sub) }}
+              </span>
+              <span
+                v-else-if="sub.display_name && sub.display_name !== sub.username"
+                class="mt-0.5 block truncate text-[11px] text-muted-foreground"
+                :title="boundUserLabel(sub) ? `${sub.username}（已自动合并绑定上传号 ${boundUserLabel(sub)}）` : sub.username"
+              >
+                {{ sub.username }}
+              </span>
             </span>
             <span class="flex shrink-0 items-center gap-1 sm:gap-1.5">
               <span
@@ -461,7 +506,13 @@ function confirm() {
                 />
                 {{ trackedTargetFor(sub).enabled ? '已追更' : '已暂停' }}
               </span>
-              <Badge variant="outline" class="h-6 shrink-0 rounded-md px-1.5 sm:px-2 text-[11px] sm:text-xs">{{ targetTypeMeta(sub.type) }}</Badge>
+              <Badge
+                variant="outline"
+                class="h-6 shrink-0 rounded-md px-1.5 sm:px-2 text-[11px] sm:text-xs"
+                :title="boundUserLabel(sub) ? `已自动合并绑定上传号 ${boundUserLabel(sub)}，下载与追更自动同步两边视频` : undefined"
+              >
+                {{ targetTypeMeta(sub.type) }}<span v-if="boundUserLabel(sub)" class="ml-0.5 opacity-70">+1</span>
+              </Badge>
             </span>
           </button>
         </div>

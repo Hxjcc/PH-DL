@@ -43,7 +43,7 @@ from ..parsers.xhamster import (
     detect_site_from_url,
     extract_xhamster_subscribe_action_from_html,
     is_xhamster_url,
-    resolve_xhamster_target_type,
+    resolve_xhamster_target,
 )
 from ..services.cookie import (
     check_cookie_valid,
@@ -2023,18 +2023,31 @@ class TaskManager:
                 seen_users.add(uname.casefold())
                 if raw_type in explicit_types:
                     resolved = raw_type
+                    resolved_uname = uname
                 elif site == "xhamster":
-                    detected = await resolve_xhamster_target_type(site_ctx, uname, timeout=settings.request_timeout)
-                    resolved = detected or "creator"
-                    self.events.emit_log("INFO", f"自动识别 xHamster 目标 '{uname}' 类型为 '{resolved}'。", job_id=job_id)
+                    detected = await resolve_xhamster_target(site_ctx, uname, timeout=settings.request_timeout)
+                    if detected:
+                        resolved, resolved_uname = detected
+                    else:
+                        resolved, resolved_uname = "creator", uname
+                    if resolved_uname.casefold() != uname.casefold():
+                        self.events.emit_log(
+                            "INFO",
+                            f"自动识别 xHamster 目标 '{uname}' 关联创作者主页 '{resolved_uname}' ({resolved})。",
+                            job_id=job_id,
+                        )
+                    else:
+                        self.events.emit_log("INFO", f"自动识别 xHamster 目标 '{resolved_uname}' 类型为 '{resolved}'。", job_id=job_id)
                 else:
                     detected = await resolve_target_type(site_ctx, uname, timeout=settings.request_timeout)
                     if detected == "channel":
                         self.events.emit_log("WARNING", f"跳过 '{uname}'：识别为 Channel，当前不支持 Channel。", job_id=job_id)
                         continue
                     resolved = detected or "model"
+                    resolved_uname = uname
                     self.events.emit_log("INFO", f"自动识别目标 '{uname}' 类型为 '{resolved}'。", job_id=job_id)
-                targets.append((uname, resolved))
+                if not any(t_u.casefold() == resolved_uname.casefold() and t_t == resolved for t_u, t_t in targets):
+                    targets.append((resolved_uname, resolved))
 
         if not targets:
             await self.repo.update_job(job_id, error_message="没有有效的下载目标")
