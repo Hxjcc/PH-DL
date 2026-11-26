@@ -462,11 +462,16 @@ async def test_dynamic_download_worker_pool_avoids_head_of_line_blocking(job_eng
         return [detail(url.split("viewkey=")[1]) for url, _, _ in items]
 
     finished_order = []
+    release_slow = asyncio.Event()
 
     async def timed_download(**kwargs):
         vk = kwargs["viewkey"]
-        await asyncio.sleep(0.12 if vk == "slow0" else 0.01)
+        if vk == "slow0":
+            # Hold slow0 until worker 2 proves it stole and completed all 3 fast items.
+            await asyncio.wait_for(release_slow.wait(), timeout=5.0)
         finished_order.append(vk)
+        if vk != "slow0" and len(finished_order) == 3:
+            release_slow.set()
         return await fixture_download(**kwargs)
 
     monkeypatch.setattr(engine, "fetch_video_details_batch", details)
