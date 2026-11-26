@@ -815,6 +815,186 @@ async def test_login_xhamster_and_get_cookies_success_and_error(monkeypatch):
     assert "账号或密码错误" in bad.message
 
 
+def test_xhamster_login_url_encodes_captcha_token():
+    from app.services.cookie import _xhamster_login_url
+
+    url = _xhamster_login_url(
+        "https://xhamster.com/api/front/user/login",
+        captcha_token="a+b/c=",
+        captcha_version="v2",
+    )
+    assert "g-recaptcha-response=a%2Bb%2Fc%3D" in url
+    assert "g-recaptcha-version=v2" in url
+
+
+@pytest.mark.asyncio
+async def test_login_xhamster_solves_recaptcha_with_v2_fallback(monkeypatch):
+    from app.services import cookie as cookie_svc
+    from app.services.captcha import CaptchaSolution
+    from app.parsers import xhamster as xh_parser
+
+    login_html = (
+        '<script>window.initials={"recaptchaEnterpriseKeyV3":"page-ent-key",'
+        '"recaptchaKeyV2":"page-v2-key"};</script>'
+    )
+    post_payloads: List[Dict[str, Any]] = []
+    post_urls: List[str] = []
+    solver_calls: List[Dict[str, Any]] = []
+    post_count = 0
+
+    class FakeLoginCtx:
+        def __init__(self, cookie_str="", **kwargs):
+            self.cookie_str = cookie_str
+            self.cancel_event = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def cookie_string(self):
+            return self.cookie_str
+
+        async def fetch_with_pow(self, url, method="GET", data=None, headers=None, **kwargs):
+            nonlocal post_count
+            if method == "GET":
+                return SimpleNamespace(status_code=200, text=login_html, final_url=url), None
+
+            post_count += 1
+            body = json.loads(data)
+            post_payloads.append(body)
+            post_urls.append(url)
+            if post_count < 3:
+                # First attempt: no token. Second attempt: Enterprise v3 token,
+                # but the site still wants a captcha and asks for v2 fallback.
+                return SimpleNamespace(
+                    status_code=403,
+                    text=json.dumps(
+                        {
+                            "extras": {
+                                "result": False,
+                                "showCaptcha": True,
+                                "captchaActionName": "customLoginAction",
+                            },
+                            "requestData": [],
+                        }
+                    ),
+                    final_url=url,
+                ), None
+
+            self.cookie_str = "x_csrf_token=1; _id=fake_after_captcha"
+            return SimpleNamespace(
+                status_code=200,
+                text=json.dumps({"extras": {"result": True, "userId": 1}, "requestData": []}),
+                final_url=url,
+            ), None
+
+    async def fake_solver(client_key, website_url, website_key, **kwargs):
+        solver_calls.append(
+            {
+                "client_key": client_key,
+                "website_url": website_url,
+                "website_key": website_key,
+                **kwargs,
+            }
+        )
+        token = "v3-token" if len(solver_calls) == 1 else "v2-token"
+        return CaptchaSolution(token=token, task_id=f"task-{len(solver_calls)}", task_type="type")
+
+    async def fake_verify(cookie_str: str, **kwargs):
+        assert "_id=fake_after_captcha" in cookie_str
+        return True, "Cookie 有效（当前账号: NativePea222）", "NativePea222"
+
+    monkeypatch.setattr(cookie_svc, "TaskHttpContext", FakeLoginCtx)
+    monkeypatch.setattr(cookie_svc, "solve_recaptcha", fake_solver)
+    monkeypatch.setattr(xh_parser, "check_xhamster_cookie_valid", fake_verify)
+
+    result = await cookie_svc.login_xhamster_and_get_cookies(
+        "NativePea222",
+        "good-pass",
+        yescaptcha_enabled=True,
+        yescaptcha_client_key="client-key",
+        yescaptcha_timeout_seconds=60,
+    )
+
+    assert result.success is True
+    assert result.logged_in_username == "NativePea222"
+    assert "_id=fake_after_captcha" in result.cookie_str
+
+    assert all("g-recaptcha-response" not in payload for payload in post_payloads)
+    assert "g-recaptcha-response" not in post_urls[0]
+    assert "g-recaptcha-response=v3-token" in post_urls[1]
+    assert "g-recaptcha-version" not in post_urls[1]
+    assert "g-recaptcha-response=v2-token" in post_urls[2]
+    assert "g-recaptcha-version=v2" in post_urls[2]
+
+    assert len(solver_calls) == 2
+    assert solver_calls[0]["task_type"] == "RecaptchaV3EnterpriseTask"
+    assert solver_calls[0]["page_action"] == "customLoginAction"
+    assert solver_calls[0]["website_key"] == "page-ent-key"
+    assert solver_calls[1]["task_type"] == "RecaptchaV2TaskProxyless"
+    assert solver_calls[1]["website_key"] == "page-v2-key"
+
+
+@pytest.mark.asyncio
+async def test_login_xhamster_requires_yescaptcha_when_challenged(monkeypatch):
+    from app.services import cookie as cookie_svc
+    from app.parsers import xhamster as xh_parser
+
+    solver_calls = []
+
+    class FakeLoginCtx:
+        def __init__(self, cookie_str="", **kwargs):
+            self.cookie_str = cookie_str
+            self.cancel_event = asyncio.Event()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def cookie_string(self):
+            return self.cookie_str
+
+        async def fetch_with_pow(self, url, method="GET", data=None, headers=None, **kwargs):
+            if method == "GET":
+                return SimpleNamespace(
+                    status_code=200,
+                    text='<script>{"recaptchaEnterpriseKeyV3":"ent","recaptchaKeyV2":"v2"}</script>',
+                    final_url=url,
+                ), None
+            return SimpleNamespace(
+                status_code=403,
+                text=json.dumps(
+                    {
+                        "extras": {
+                            "result": False,
+                            "showCaptcha": True,
+                            "captchaActionName": "authorizedUserModel",
+                        },
+                        "requestData": [],
+                    }
+                ),
+                final_url=url,
+            ), None
+
+    async def fake_solver(*args, **kwargs):
+        solver_calls.append((args, kwargs))
+        raise AssertionError("solver must not be called when YesCaptcha is disabled")
+
+    monkeypatch.setattr(cookie_svc, "TaskHttpContext", FakeLoginCtx)
+    monkeypatch.setattr(cookie_svc, "solve_recaptcha", fake_solver)
+    monkeypatch.setattr(xh_parser, "check_xhamster_cookie_valid", lambda *a, **k: None)
+
+    result = await cookie_svc.login_xhamster_and_get_cookies("NativePea222", "good-pass")
+
+    assert result.success is False
+    assert "YesCaptcha" in result.message
+    assert solver_calls == []
+
+
 def test_xhamster_refresh_endpoint_and_password_redaction(tmp_path: Path, monkeypatch):
     from app.api import settings as settings_api
     from app.services.cookie import CookieLoginResult

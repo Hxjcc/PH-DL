@@ -1,4 +1,4 @@
-"""YesCaptcha client used by the PornHub auto-login flow.
+"""YesCaptcha client used by the PornHub and xHamster auto-login flows.
 
 YesCaptcha exposes a two-step JSON API: ``createTask`` returns a task id and
 ``getTaskResult`` is polled until the reCAPTCHA token is ready.  The module is
@@ -27,6 +27,11 @@ SUPPORTED_TASK_TYPES = (
     "RecaptchaV2TaskProxyless",
     "NoCaptchaTask",
     "RecaptchaV2EnterpriseTask",
+    # reCAPTCHA v3 / Enterprise v3 (used by xHamster login)
+    "RecaptchaV3TaskProxyless",
+    "RecaptchaV3TaskProxylessM1",
+    "RecaptchaV3EnterpriseTask",
+    "RecaptchaV3EnterpriseTaskM1",
 )
 MAX_POLL_SECONDS = 5.0
 
@@ -100,7 +105,7 @@ async def _post_json(
     return data
 
 
-async def solve_recaptcha_v2(
+async def solve_recaptcha(
     client_key: str,
     website_url: str,
     website_key: str,
@@ -110,13 +115,18 @@ async def solve_recaptcha_v2(
     timeout: float = 180.0,
     poll_interval: float = MAX_POLL_SECONDS,
     proxy: Optional[str] = None,
+    page_action: Optional[str] = None,
     cancel_event: Optional[asyncio.Event] = None,
     on_log: Optional[LogCallback] = None,
 ) -> CaptchaSolution:
-    """Create a reCAPTCHA v2 task and return the solved token.
+    """Create a reCAPTCHA task and return the solved token.
+
+    Supports both v2 task types and Enterprise v3 task types.  For v3, pass
+    ``page_action`` (the ``action`` used by ``grecaptcha.execute`` on the
+    target page) so the token is accepted by the site.
 
     The caller is responsible for submitting ``token`` to the target site as
-    the ``g-recaptcha-response`` form field (or the site's equivalent).
+    the ``g-recaptcha-response`` field (or the site's equivalent).
     """
 
     key = (client_key or "").strip()
@@ -135,6 +145,8 @@ async def solve_recaptcha_v2(
         "websiteURL": website_url.strip(),
         "websiteKey": website_key.strip(),
     }
+    if (page_action or "").strip():
+        task["pageAction"] = page_action.strip()
     proxy_fields = _proxy_fields(proxy)
     if task_type in {"NoCaptchaTask", "RecaptchaV2EnterpriseTask"}:
         if not proxy_fields:
@@ -202,6 +214,35 @@ async def solve_recaptcha_v2(
         _emit(on_log, "INFO", f"YesCaptcha 识别中...（第 {polls} 次查询）")
 
     raise CaptchaError("YesCaptcha 解题超时", "ERROR_TASK_TIMEOUT")
+
+
+async def solve_recaptcha_v2(
+    client_key: str,
+    website_url: str,
+    website_key: str,
+    *,
+    api_base: str = DEFAULT_API_BASE,
+    task_type: str = DEFAULT_TASK_TYPE,
+    timeout: float = 180.0,
+    poll_interval: float = MAX_POLL_SECONDS,
+    proxy: Optional[str] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    on_log: Optional[LogCallback] = None,
+) -> CaptchaSolution:
+    """Backward-compatible reCAPTCHA v2 wrapper around :func:`solve_recaptcha`."""
+
+    return await solve_recaptcha(
+        client_key,
+        website_url,
+        website_key,
+        api_base=api_base,
+        task_type=task_type,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        proxy=proxy,
+        cancel_event=cancel_event,
+        on_log=on_log,
+    )
 
 
 async def get_yescaptcha_balance(

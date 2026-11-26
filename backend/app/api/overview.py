@@ -96,6 +96,10 @@ async def get_subscriptions(
                 settings.xh_password,
                 proxy_url=settings.normalized_proxy,
                 timeout=settings.request_timeout,
+                yescaptcha_enabled=settings.yescaptcha_enabled,
+                yescaptcha_client_key=settings.yescaptcha_client_key,
+                yescaptcha_api_base=settings.yescaptcha_api_base,
+                yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
                 on_log=lambda level, message: container.events.emit_log(level, message),
             )
             if login_res.success and login_res.cookie_str:

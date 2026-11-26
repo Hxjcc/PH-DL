@@ -40,6 +40,40 @@ async def test_solve_recaptcha_v2_polls_until_ready(monkeypatch):
     assert calls[1][0].endswith("/getTaskResult")
 
 
+async def test_solve_recaptcha_v3_enterprise_sends_page_action(monkeypatch):
+    captured = {}
+
+    async def fake_post(url, payload, timeout=30.0, secret=""):
+        if url.endswith("/createTask"):
+            captured.update(payload)
+            return {"errorId": 0, "taskId": "task-v3"}
+        return {
+            "errorId": 0,
+            "status": "ready",
+            "solution": {"gRecaptchaResponse": "v3-token"},
+        }
+
+    monkeypatch.setattr(captcha, "_post_json", fake_post)
+
+    solution = await captcha.solve_recaptcha(
+        "key",
+        "https://xhamster.com/login",
+        "enterprise-key",
+        task_type="RecaptchaV3EnterpriseTask",
+        page_action="authorizedUserModel",
+        poll_interval=0.01,
+        timeout=30,
+    )
+
+    assert solution.token == "v3-token"
+    assert captured["task"] == {
+        "type": "RecaptchaV3EnterpriseTask",
+        "websiteURL": "https://xhamster.com/login",
+        "websiteKey": "enterprise-key",
+        "pageAction": "authorizedUserModel",
+    }
+
+
 async def test_solve_recaptcha_v2_handles_processing_then_ready(monkeypatch):
     results = [
         {"errorId": 0, "taskId": "task-2"},
