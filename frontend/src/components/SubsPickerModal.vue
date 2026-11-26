@@ -246,6 +246,13 @@ async function applySource() {
   await loadSubs()
 }
 
+function handleSourceKeydown(event) {
+  if (event.key !== 'Enter') return
+  event.preventDefault()
+  if (event.isComposing || event.keyCode === 229) return
+  applySource()
+}
+
 watch(() => props.open, (isOpen) => {
   if (isOpen) {
     activeSite.value = props.site === 'xhamster' ? 'xhamster' : 'pornhub'
@@ -346,7 +353,7 @@ function confirm() {
 
       <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-surface-subtle px-3 py-2.5">
         <div v-if="editingSource && activeSite === 'pornhub'" class="flex w-full items-center gap-2">
-          <Input ref="sourceInput" v-model="sourceDraft" class="min-w-0 flex-1" placeholder="源账号，留空使用已登录账号" aria-label="订阅源账号" @keydown.enter.prevent="applySource" />
+          <Input ref="sourceInput" v-model="sourceDraft" class="min-w-0 flex-1" placeholder="源账号，留空使用已登录账号" aria-label="订阅源账号" @keydown="handleSourceKeydown" />
           <Button size="sm" @click="applySource">获取</Button>
           <Button size="sm" variant="ghost" @click="editingSource = false; focusSearch()">取消</Button>
         </div>

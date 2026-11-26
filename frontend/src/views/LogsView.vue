@@ -180,9 +180,12 @@ async function handleClear() {
         </div>
 
         <div
-          v-for="entry in filtered"
+          v-for="(entry, idx) in filtered"
           :key="entry.boot_id ? `${entry.boot_id}:${entry.id}` : entry.id"
-          class="flex flex-col sm:flex-row sm:items-start gap-0.5 sm:gap-2.5 px-2 sm:px-2.5 py-1.5 sm:py-1 rounded-lg hover:bg-card transition-colors"
+          :class="[
+            'flex flex-col sm:flex-row sm:items-start gap-0.5 sm:gap-2.5 px-2 sm:px-2.5 py-1.5 sm:py-1 rounded-lg hover:bg-card transition-colors',
+            filtered.length > 60 && idx >= 25 && idx < filtered.length - 30 && 'cv-deferred-log-row',
+          ]"
         >
           <div class="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
             <span class="text-muted-foreground/75 shrink-0 tabular-nums">{{ formatLogTime(entry.ts) }}</span>

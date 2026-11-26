@@ -45,6 +45,13 @@ function removeTag(tag) {
 }
 
 function handleKeydown(event) {
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    if (event.isComposing || event.keyCode === 229) return
+    commit()
+    return
+  }
+  if (event.isComposing || event.keyCode === 229) return
   if (props.commitKeys.includes(event.key)) {
     event.preventDefault()
     commit()

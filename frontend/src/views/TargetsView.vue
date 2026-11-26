@@ -347,34 +347,34 @@ const filteredTargets = computed(() => {
   })
 
   if (sortBy.value === 'created_desc') {
-    return [...list].sort((a, b) => {
+    return list.toSorted((a, b) => {
       const diff = parseCreatedTs(b.created_at) - parseCreatedTs(a.created_at)
       if (diff !== 0) return diff
       return Number(b.id || 0) - Number(a.id || 0)
     })
   }
   if (sortBy.value === 'created_asc') {
-    return [...list].sort((a, b) => {
+    return list.toSorted((a, b) => {
       const diff = parseCreatedTs(a.created_at) - parseCreatedTs(b.created_at)
       if (diff !== 0) return diff
       return Number(a.id || 0) - Number(b.id || 0)
     })
   }
   if (sortBy.value === 'videos_desc') {
-    return [...list].sort((a, b) => {
+    return list.toSorted((a, b) => {
       const diff = targetVideoCount(b) - targetVideoCount(a)
       if (diff !== 0) return diff
       return targetDisplayName(a).toLowerCase().localeCompare(targetDisplayName(b).toLowerCase())
     })
   }
   if (statusFilter.value === 'updated_today') {
-    return [...list].sort((a, b) => {
+    return list.toSorted((a, b) => {
       const diff = targetTodayNewCount(b) - targetTodayNewCount(a)
       if (diff !== 0) return diff
       return String(b.last_checked_at || '').localeCompare(String(a.last_checked_at || ''))
     })
   }
-  return [...list].sort((a, b) => {
+  return list.toSorted((a, b) => {
     const diff = targetDisplayName(a).toLowerCase().localeCompare(targetDisplayName(b).toLowerCase())
     if (diff !== 0) return diff
     return Number(a.id || 0) - Number(b.id || 0)
@@ -1049,9 +1049,12 @@ async function handleDelete(t) {
         class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 sm:gap-4"
       >
         <Card
-          v-for="t in pagedTargets"
+          v-for="(t, idx) in pagedTargets"
           :key="t.id"
-          class="group p-4 sm:p-5 flex flex-col justify-between gap-3 sm:gap-4 transition-all duration-200 hover:border-brand/35"
+          :class="[
+            'group p-4 sm:p-5 flex flex-col justify-between gap-3 sm:gap-4 transition-all duration-200 hover:border-brand/35',
+            idx >= 12 && 'cv-deferred-target-card',
+          ]"
         >
           <!-- Card Top Row: Status Pill + Enable Switch -->
           <div class="space-y-4">

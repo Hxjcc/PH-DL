@@ -6,7 +6,7 @@ const props = defineProps({
   modelValue: { type: [String, Number], required: true },
   options: { type: Array, default: () => [] }, // [{ value, label, dot?, icon?, count?, title? }]
   ariaLabel: { type: String, default: '' },
-  size: { type: String, default: 'md' }, // 'sm' | 'md'
+  size: { type: String, default: 'md' }, // 'xs' | 'sm' | 'md'
   class: { type: String, default: '' },
 })
 
@@ -38,8 +38,12 @@ function select(value) {
       :title="opt.title"
       :aria-pressed="modelValue === opt.value"
       :class="[
-        'gap-1.5 rounded-md font-medium shadow-none transition-all duration-200 ease-[cubic-bezier(0.22,1,0.36,1)]',
-        size === 'sm' ? 'h-7 px-2.5 text-xs' : 'h-7 px-3 text-xs',
+        'rounded-md font-medium shadow-none transition-all duration-200 ease-[cubic-bezier(0.22,1,0.36,1)]',
+        size === 'xs'
+          ? 'gap-1 h-5 px-2 text-[11px] leading-none'
+          : size === 'sm'
+            ? 'gap-1.5 h-7 px-2.5 text-xs'
+            : 'gap-1.5 h-7 px-3 text-xs',
         modelValue === opt.value
           ? 'bg-card text-foreground shadow-xs hover:bg-card hover:text-foreground'
           : 'text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground',

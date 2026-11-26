@@ -82,6 +82,11 @@ const YESCAPTCHA_SITE_OPTIONS = [
   { label: 'xHamster', value: 'xhamster', dot: 'bg-red-500' },
 ]
 
+const RCLONE_DIR_SITE_OPTIONS = [
+  { label: 'PH', value: 'pornhub', dot: 'bg-[#ff9000]', title: 'PornHub 远端基础目录' },
+  { label: 'xH', value: 'xhamster', dot: 'bg-red-500', title: 'xHamster 远端基础目录' },
+]
+
 const YESCAPTCHA_TASK_TYPES = {
   pornhub: [
     { label: 'reCAPTCHA v2 企业版（PornHub 使用 enterprise.js）', value: 'RecaptchaV2EnterpriseTaskProxyless' },
@@ -215,6 +220,22 @@ watch(
   }
 )
 const providerTab = ref('pikpak')
+const manualPrimaryRemote = ref(false)
+const MANUAL_REMOTE_SENTINEL = '__PHDL_MANUAL_REMOTE__'
+const rcloneDirSite = ref('pornhub')
+const currentRcloneBaseDir = computed({
+  get: () => {
+    if (!form.value) return ''
+    return rcloneDirSite.value === 'xhamster'
+      ? form.value.rclone_xh_remote_base_dir
+      : form.value.rclone_remote_base_dir
+  },
+  set: (value) => {
+    if (!form.value) return
+    if (rcloneDirSite.value === 'xhamster') form.value.rclone_xh_remote_base_dir = value
+    else form.value.rclone_remote_base_dir = value
+  },
+})
 
 const REMOTE_TYPE_LABELS = {
   pikpak: 'PikPak',
@@ -226,10 +247,18 @@ const REMOTE_TYPE_LABELS = {
   sftp: 'SFTP',
 }
 
-const PROVIDER_TABS = [
-  { value: 'pikpak', label: 'PikPak' },
-  { value: 'drive', label: 'Google Drive' },
-  { value: 'custom', label: '其他网盘 / 自定义参数' },
+const PIKPAK_CHUNK_PRESETS = [
+  { label: '16Mi（高并发推荐）', value: '16Mi' },
+  { label: '32Mi（默认）', value: '32Mi' },
+  { label: '64Mi', value: '64Mi' },
+]
+
+const DRIVE_CHUNK_PRESETS = [
+  { label: '16Mi', value: '16Mi' },
+  { label: '32Mi', value: '32Mi' },
+  { label: '64Mi（推荐）', value: '64Mi' },
+  { label: '128Mi（大带宽）', value: '128Mi' },
+  { label: '256Mi', value: '256Mi' },
 ]
 
 function formatRemoteType(type) {
@@ -247,6 +276,73 @@ const activeRemoteType = computed(() => {
   if (['gd', 'gdrive', 'drive', 'google', 'googledrive'].includes(lower)) return 'drive'
   return ''
 })
+
+const providerTabOptions = computed(() => [
+  {
+    value: 'pikpak',
+    label: 'PikPak',
+    dot: activeRemoteType.value === 'pikpak' ? 'bg-emerald-500' : '',
+  },
+  {
+    value: 'drive',
+    label: 'Google Drive',
+    dot: activeRemoteType.value === 'drive' ? 'bg-emerald-500' : '',
+  },
+  {
+    value: 'custom',
+    label: '自定义参数',
+    dot:
+      activeRemoteType.value && !['pikpak', 'drive'].includes(activeRemoteType.value)
+        ? 'bg-emerald-500'
+        : '',
+  },
+])
+
+const primaryRemoteOptions = computed(() => {
+  const opts = rcloneRemotes.value.map((r) => ({
+    label: r.type ? `${r.name} · ${formatRemoteType(r.type)}` : r.name,
+    value: r.name,
+  }))
+  const cur = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '')
+  if (cur && !opts.some((o) => o.value.toLowerCase() === cur.toLowerCase())) {
+    opts.unshift({ label: `${cur}（自定义）`, value: cur })
+  }
+  if (opts.length > 0) {
+    opts.push({ label: '手动输入 Remote…', value: MANUAL_REMOTE_SENTINEL })
+  }
+  return opts
+})
+
+const primaryRemoteSelectValue = computed(() => {
+  const cur = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '')
+  if (!cur) return ''
+  const matched = rcloneRemotes.value.find((r) => r.name.toLowerCase() === cur.toLowerCase())
+  return matched ? matched.name : cur
+})
+
+const backupRemotePlaceholder = computed(() => {
+  const primaryLower = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '').toLowerCase()
+  const others = rcloneRemotes.value
+    .map((r) => r.name)
+    .filter((name) => name.toLowerCase() !== primaryLower)
+  if (others.length > 0) {
+    return `留空单盘；可用 ${others.slice(0, 3).join(', ')}`
+  }
+  return '留空单盘；如 gd2, gd3'
+})
+
+function buildChunkOptions(presets, currentValue) {
+  const cur = String(currentValue || '').trim()
+  if (!cur || presets.some((p) => p.value === cur)) return presets
+  return [{ label: `${cur}（当前）`, value: cur }, ...presets]
+}
+
+const pikpakChunkOptions = computed(() =>
+  buildChunkOptions(PIKPAK_CHUNK_PRESETS, form.value?.rclone_pikpak_chunk_size)
+)
+const driveChunkOptions = computed(() =>
+  buildChunkOptions(DRIVE_CHUNK_PRESETS, form.value?.rclone_drive_chunk_size)
+)
 
 function syncProviderTabFromType(rtype) {
   if (rtype === 'pikpak') providerTab.value = 'pikpak'
@@ -299,38 +395,20 @@ const activeRemoteChain = computed(() => {
   return primary ? [primary, ...backupRemoteList.value] : [...backupRemoteList.value]
 })
 
-function isPrimaryRemote(name) {
-  const primary = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '').toLowerCase()
-  return Boolean(primary) && primary === String(name || '').trim().toLowerCase()
-}
-
-function backupRemoteOrder(name) {
-  const key = String(name || '').trim().toLowerCase()
-  const idx = backupRemoteList.value.findIndex((item) => item.toLowerCase() === key)
-  return idx >= 0 ? idx + 1 : 0
-}
-
-function toggleBackupRemote(remote) {
-  if (!form.value || !remote?.name) return
-  const list = [...backupRemoteList.value]
-  const key = remote.name.toLowerCase()
-  const idx = list.findIndex((item) => item.toLowerCase() === key)
-  if (idx >= 0) {
-    list.splice(idx, 1)
-  } else {
-    list.push(remote.name)
+function handlePrimaryRemoteSelect(val) {
+  if (!form.value) return
+  if (val === MANUAL_REMOTE_SENTINEL) {
+    manualPrimaryRemote.value = true
+    return
   }
-  form.value.rclone_backup_remotes = list.join(', ')
-}
-
-function selectRcloneRemote(remote) {
-  if (!form.value || !remote?.name) return
-  form.value.rclone_remote = remote.name
-  const cleanedBackups = parseBackupRemoteList(form.value.rclone_backup_remotes, remote.name)
+  manualPrimaryRemote.value = false
+  form.value.rclone_remote = val
+  const cleanedBackups = parseBackupRemoteList(form.value.rclone_backup_remotes, val)
   if (form.value.rclone_backup_remotes) {
     form.value.rclone_backup_remotes = cleanedBackups.join(', ')
   }
-  syncProviderTabFromType(String(remote.type || '').toLowerCase() || activeRemoteType.value)
+  const matched = rcloneRemotes.value.find((r) => r.name.toLowerCase() === String(val || '').toLowerCase())
+  syncProviderTabFromType(String(matched?.type || '').toLowerCase() || activeRemoteType.value)
 }
 
 watch(activeTab, (tab) => {
@@ -1125,110 +1203,82 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <!-- Section 1: Remote Targets & Multi-Remote Failover (Aligned 3-Column Grid) -->
-        <div class="p-4 sm:p-5 space-y-3.5">
+        <!-- Section 1: Remote Targets & Multi-Remote Failover (Compact Single-Row 4-Col Grid) -->
+        <div class="px-4 sm:px-5 py-3.5 space-y-2.5">
           <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="flex flex-wrap items-center gap-2">
-              <h4 class="text-xs font-semibold text-foreground">远端目标与多盘接力</h4>
-              <span
-                v-if="activeRemoteChain.length > 1"
-                class="inline-flex items-center rounded-full bg-brand/10 dark:bg-brand/15 px-2 py-0.5 font-mono text-[11px] font-medium text-brand"
-              >
-                {{ activeRemoteChain.join(' → ') }}
-              </span>
-            </div>
-            <span v-if="rcloneRemotes.length > 0" class="text-[11px] text-muted-foreground">
-              点击名称切换主盘，点右侧「+ 备」加入备用顺位
+            <h4 class="text-xs font-semibold text-foreground">远端目标与多盘接力</h4>
+            <span
+              v-if="activeRemoteChain.length > 1"
+              class="text-[11px] text-muted-foreground"
+            >
+              接力链路：<span class="font-mono text-foreground">{{ activeRemoteChain.join(' → ') }}</span>
             </span>
           </div>
 
-          <div v-if="rcloneRemotes.length > 0" class="flex flex-wrap items-center gap-2">
-            <template v-for="r in rcloneRemotes" :key="r.name">
-              <div
-                v-if="isPrimaryRemote(r.name)"
-                class="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-full border border-brand/40 bg-brand/10 dark:bg-brand/15 text-xs font-medium text-brand select-none"
-              >
-                <span class="rounded-full bg-brand text-white dark:text-zinc-950 px-1.5 py-px text-[10px] font-semibold leading-tight">
-                  主
-                </span>
-                <span class="font-mono">{{ r.name }}</span>
-                <span class="text-[10px] opacity-80">{{ formatRemoteType(r.type) }}</span>
-              </div>
-              <div
-                v-else
-                :class="[
-                  'inline-flex items-center h-7 rounded-full border overflow-hidden text-xs font-medium transition-colors',
-                  backupRemoteOrder(r.name) > 0
-                    ? 'border-emerald-500/40 bg-emerald-500/8 dark:bg-emerald-500/12'
-                    : 'border-border bg-card',
-                ]"
-              >
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div class="space-y-1">
+              <div class="h-6 flex items-center justify-between gap-2">
+                <label class="text-xs font-medium text-foreground">主 Remote</label>
                 <button
+                  v-if="manualPrimaryRemote && rcloneRemotes.length > 0"
                   type="button"
-                  class="inline-flex items-center gap-1.5 h-full pl-2.5 pr-2 text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors cursor-pointer"
-                  :title="`设 ${r.name} 为主 Remote`"
-                  @click="selectRcloneRemote(r)"
+                  class="text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+                  @click="manualPrimaryRemote = false"
                 >
-                  <span class="font-mono text-foreground/90">{{ r.name }}</span>
-                  <span class="text-[10px] opacity-75">{{ formatRemoteType(r.type) }}</span>
-                </button>
-                <button
-                  type="button"
-                  :aria-pressed="backupRemoteOrder(r.name) > 0"
-                  :class="[
-                    'inline-flex items-center h-full px-2 border-l text-[10px] font-medium transition-colors cursor-pointer',
-                    backupRemoteOrder(r.name) > 0
-                      ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/25'
-                      : 'border-border/80 text-muted-foreground hover:text-brand hover:bg-brand/8',
-                  ]"
-                  :title="backupRemoteOrder(r.name) > 0 ? `从备用列表移除 ${r.name}` : `将 ${r.name} 加入备用列表`"
-                  @click="toggleBackupRemote(r)"
-                >
-                  {{ backupRemoteOrder(r.name) > 0 ? `备 #${backupRemoteOrder(r.name)}` : '+ 备' }}
+                  从列表选择
                 </button>
               </div>
-            </template>
-          </div>
+              <Select
+                v-if="!manualPrimaryRemote && primaryRemoteOptions.length > 0"
+                :model-value="primaryRemoteSelectValue"
+                :options="primaryRemoteOptions"
+                placeholder="选择远端"
+                @update:model-value="handlePrimaryRemoteSelect"
+              />
+              <Input v-else v-model="form.rclone_remote" placeholder="pikpak 或 gd" />
+            </div>
 
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
             <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">主 Remote 名称</label>
-              <Input v-model="form.rclone_remote" placeholder="pikpak 或 gd" />
-            </div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">PornHub 远端目录</label>
-              <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
-            </div>
-            <div class="space-y-1 sm:col-span-2 lg:col-span-1">
-              <label class="text-xs font-medium text-foreground">xHamster 远端目录</label>
-              <Input v-model="form.rclone_xh_remote_base_dir" placeholder="xHamster" />
-            </div>
-            <div class="space-y-1 sm:col-span-2">
-              <label class="text-xs font-medium text-foreground">备用 Remote（限额自动切换，逗号分隔）</label>
+              <div class="h-6 flex items-center">
+                <label class="text-xs font-medium text-foreground">备用 Remote（逗号分隔）</label>
+              </div>
               <Input
                 v-model="form.rclone_backup_remotes"
-                placeholder="留空表示单盘；例如 gd2, gd3"
+                :placeholder="backupRemotePlaceholder"
+                title="多个个人 Google Drive 可共享同一文件夹并在 rclone.conf 指向相同 root_folder_id，触发每日 750GB 上限或空间满时自动顺位切换"
               />
             </div>
-            <div class="space-y-1 sm:col-span-2 lg:col-span-1">
-              <label class="text-xs font-medium text-foreground">多盘调度策略</label>
+
+            <div class="space-y-1">
+              <div class="h-6 flex items-center">
+                <label class="text-xs font-medium text-foreground">多盘调度策略</label>
+              </div>
               <Select v-model="form.rclone_remote_strategy" :options="RCLONE_STRATEGY_OPTIONS" />
             </div>
-          </div>
 
-          <p v-if="activeRemoteChain.length > 1" class="text-[11px] text-muted-foreground">
-            单个远端触发每日 750GB 上限或空间已满时会自动切到下一顺位重试，不中断任务；「测试连接」会同时校验全部远端。
-          </p>
-          <p v-else class="text-[11px] text-muted-foreground">
-            多盘提示：多个个人 Google Drive 共享同一文件夹并在各远端指向相同 <span class="font-mono">root_folder_id</span>，填入备用列表即可自动接力突破单号 750GB/天 上限。
-          </p>
+            <div class="space-y-1">
+              <div class="h-6 flex items-center justify-between gap-2">
+                <label class="text-xs font-medium text-foreground">远端基础目录</label>
+                <SegmentedControl
+                  v-model="rcloneDirSite"
+                  :options="RCLONE_DIR_SITE_OPTIONS"
+                  size="xs"
+                  aria-label="远端目录站点"
+                />
+              </div>
+              <Input
+                v-model="currentRcloneBaseDir"
+                :placeholder="rcloneDirSite === 'xhamster' ? 'xHamster' : 'Pornhub'"
+              />
+            </div>
+          </div>
         </div>
 
         <!-- Section 2: Concurrency & Transfer Options (Balanced 3x2 Grid) -->
-        <div class="p-4 sm:p-5 space-y-3.5">
+        <div class="px-4 sm:px-5 py-3.5 space-y-3">
           <h4 class="text-xs font-semibold text-foreground">并发与传输策略</h4>
 
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             <div class="space-y-1">
               <label class="text-xs font-medium text-foreground">并行上传 Worker 数</label>
               <Input v-model="form.upload_workers" type="number" :min="1" :max="8" />
@@ -1277,102 +1327,44 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <!-- Section 3: Provider-Specific Tuning (Flat Integrated Section) -->
-        <div class="p-4 sm:p-5 space-y-3.5 bg-surface-subtle/30">
+        <!-- Section 3: Provider-Specific Tuning (Compact Single-Row Section) -->
+        <div class="px-4 sm:px-5 py-3.5 space-y-2.5 bg-surface-subtle/30">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="flex items-center gap-2">
-              <h4 class="text-xs font-semibold text-foreground">网盘专属调优参数</h4>
-              <span class="hidden sm:inline text-[11px] text-muted-foreground">按当前 Remote 类型自动匹配，独立保存</span>
+              <h4 class="text-xs font-semibold text-foreground">网盘专属调优</h4>
+              <span class="hidden sm:inline text-[11px] text-muted-foreground">按主 Remote 类型自动匹配，独立保存</span>
             </div>
-            <div class="flex flex-wrap items-center gap-1.5">
-              <Button
-                v-for="pt in PROVIDER_TABS"
-                :key="pt.value"
-                variant="outline"
-                size="xs"
-                :aria-pressed="providerTab === pt.value"
-                :class="[
-                  'h-6 gap-1.5 px-2.5 rounded-full text-[11px] font-medium shadow-none hover:shadow-none',
-                  providerTab === pt.value
-                    ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                    : 'border-border bg-card text-muted-foreground hover:text-foreground',
-                ]"
-                @click="providerTab = pt.value"
-              >
-                <span>{{ pt.label }}</span>
-                <span
-                  v-if="(pt.value === 'pikpak' && activeRemoteType === 'pikpak') || (pt.value === 'drive' && activeRemoteType === 'drive')"
-                  class="rounded-full bg-emerald-500/15 px-1.5 text-[10px] text-emerald-700 dark:text-emerald-300"
-                >
-                  当前生效
-                </span>
-              </Button>
-            </div>
+            <SegmentedControl
+              v-model="providerTab"
+              :options="providerTabOptions"
+              size="sm"
+              aria-label="网盘类型调优切换"
+            />
           </div>
 
           <!-- PikPak -->
-          <div v-if="providerTab === 'pikpak'" class="space-y-2.5">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5 items-end">
+          <div v-if="providerTab === 'pikpak'" class="space-y-2">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 items-end">
               <div class="space-y-1">
                 <label class="text-xs font-medium text-foreground">PikPak 分块并发（--pikpak-upload-concurrency）</label>
                 <Input v-model="form.rclone_pikpak_upload_concurrency" type="number" :min="1" :max="32" />
               </div>
-              <div class="flex flex-col sm:flex-row sm:items-end gap-2">
-                <div class="space-y-1 flex-1 min-w-0">
-                  <label class="text-xs font-medium text-foreground">PikPak 分块大小（--pikpak-chunk-size）</label>
-                  <Input v-model="form.rclone_pikpak_chunk_size" placeholder="16Mi" />
-                </div>
-                <div class="flex items-center gap-1 pb-0.5 shrink-0">
-                  <Button
-                    v-for="sz in ['16Mi', '32Mi', '64Mi']"
-                    :key="sz"
-                    variant="outline"
-                    size="xs"
-                    :aria-pressed="form.rclone_pikpak_chunk_size === sz"
-                    :class="[
-                      'h-9 px-2.5 rounded-lg font-mono text-[11px] shadow-none hover:shadow-none',
-                      form.rclone_pikpak_chunk_size === sz
-                        ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                        : 'border-border bg-card text-muted-foreground hover:text-foreground',
-                    ]"
-                    @click="form.rclone_pikpak_chunk_size = sz"
-                  >
-                    {{ sz }}
-                  </Button>
-                </div>
+              <div class="space-y-1">
+                <label class="text-xs font-medium text-foreground">PikPak 分块大小（--pikpak-chunk-size）</label>
+                <Select v-model="form.rclone_pikpak_chunk_size" :options="pikpakChunkOptions" />
               </div>
             </div>
             <p class="text-[11px] text-muted-foreground">
-              建议策略：多 Worker + 小分块（千兆 / 4G 内存推荐 <span class="font-mono text-foreground">Worker = 6</span>、<span class="font-mono text-foreground">分块并发 = 3</span>、<span class="font-mono text-foreground">16Mi</span>）。
+              建议：多 Worker + 小分块（千兆 / 4G 内存推荐 <span class="font-mono text-foreground">Worker = 6</span>、<span class="font-mono text-foreground">分块并发 = 3</span>、<span class="font-mono text-foreground">16Mi</span>）。
             </p>
           </div>
 
           <!-- Google Drive -->
-          <div v-else-if="providerTab === 'drive'" class="space-y-2.5">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5 items-end">
-              <div class="flex flex-col sm:flex-row sm:items-end gap-2">
-                <div class="space-y-1 flex-1 min-w-0">
-                  <label class="text-xs font-medium text-foreground">GD 分块大小（--drive-chunk-size，2 的幂）</label>
-                  <Input v-model="form.rclone_drive_chunk_size" placeholder="64Mi" />
-                </div>
-                <div class="flex items-center gap-1 pb-0.5 shrink-0">
-                  <Button
-                    v-for="sz in ['32Mi', '64Mi', '128Mi']"
-                    :key="sz"
-                    variant="outline"
-                    size="xs"
-                    :aria-pressed="form.rclone_drive_chunk_size === sz"
-                    :class="[
-                      'h-9 px-2.5 rounded-lg font-mono text-[11px] shadow-none hover:shadow-none',
-                      form.rclone_drive_chunk_size === sz
-                        ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                        : 'border-border bg-card text-muted-foreground hover:text-foreground',
-                    ]"
-                    @click="form.rclone_drive_chunk_size = sz"
-                  >
-                    {{ sz }}
-                  </Button>
-                </div>
+          <div v-else-if="providerTab === 'drive'" class="space-y-2">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 items-end">
+              <div class="space-y-1">
+                <label class="text-xs font-medium text-foreground">GD 分块大小（--drive-chunk-size）</label>
+                <Select v-model="form.rclone_drive_chunk_size" :options="driveChunkOptions" />
               </div>
               <label
                 class="inline-flex items-center gap-2 h-9 text-xs text-foreground/85 cursor-pointer"
@@ -1383,7 +1375,7 @@ async function handleTestNotify() {
               </label>
             </div>
             <p class="text-[11px] text-muted-foreground">
-              建议策略：少 Worker + 大分块（切到 GD 时建议上方 <span class="font-mono text-foreground">Worker = 2~3</span>、分块 <span class="font-mono text-foreground">64Mi / 128Mi</span>，建议自建 OAuth Client ID）。
+              建议：少 Worker + 大分块（<span class="font-mono text-foreground">Worker = 2~3</span>、分块 <span class="font-mono text-foreground">64Mi / 128Mi</span>，建议自建 OAuth Client ID）。
             </p>
           </div>
 
@@ -1398,7 +1390,7 @@ async function handleTestNotify() {
               />
             </div>
             <p class="text-[11px] text-muted-foreground">
-              接入 OneDrive / S3 / R2 / WebDAV / Alist 等网盘时可直接填写官方调优参数（仅允许安全 <span class="font-mono">--*</span> 选项，自动过滤危险参数）。
+              接入 OneDrive / S3 / R2 / WebDAV / Alist 等网盘时可直接填写官方调优参数（仅允许安全 <span class="font-mono">--*</span> 选项）。
             </p>
           </div>
         </div>

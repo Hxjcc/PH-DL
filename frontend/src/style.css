@@ -4,6 +4,7 @@
 
 /* Pure Monochrome Minimalist Light & Dark Theme (Vercel / Apple / shadcn New York) */
 :root {
+  color-scheme: light dark;
   --background: #f8f8fa;
   --foreground: #09090b;
   --sidebar: #ffffff;
@@ -31,6 +32,14 @@
   --radius: 0.75rem;
   --dot-grid-color: #e4e4e7;
   --card-shadow: 0 1px 2px rgba(9, 9, 11, 0.03), 0 4px 14px -4px rgba(9, 9, 11, 0.04);
+}
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]) {
+  color-scheme: dark;
+}
+
+:root:has(> head > meta[name="color-scheme"][content="light"]) {
+  color-scheme: light;
 }
 
 .dark {
@@ -163,8 +172,13 @@
 }
 
 .ph-textarea {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(113, 113, 122, 0.24) transparent;
+  field-sizing: content;
+  height: auto;
+  min-block-size: 4.5rem;
+  max-block-size: 16rem;
+  resize: vertical;
+  scrollbar-width: auto;
+  scrollbar-color: rgba(113, 113, 122, 0.36) transparent;
 }
 
 .ph-textarea::-webkit-scrollbar {
@@ -208,6 +222,27 @@
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+/* Defer layout/paint for strictly off-screen list items (paired with contain-intrinsic-size to prevent jump) */
+.cv-deferred-job-item {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 74px;
+}
+
+.cv-deferred-history-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 112px;
+}
+
+.cv-deferred-target-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 176px;
+}
+
+.cv-deferred-log-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 28px;
 }
 
 .no-scrollbar {

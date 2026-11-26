@@ -897,7 +897,10 @@ function downloadExportTxt() {
             <div
               v-for="(item, idx) in visibleItems"
               :key="item.id"
-              class="job-item-row rounded-lg border border-border/80 bg-card px-3 sm:px-3.5 py-2 sm:py-2.5 space-y-1.5 sm:space-y-2 transition-colors hover:border-foreground/20"
+              :class="[
+                'job-item-row rounded-lg border border-border/80 bg-card px-3 sm:px-3.5 py-2 sm:py-2.5 space-y-1.5 sm:space-y-2 transition-colors hover:border-foreground/20',
+                idx >= 8 && 'cv-deferred-job-item',
+              ]"
             >
               <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5 sm:gap-2.5">
                 <!-- Left: Index + Status Badge + Title -->

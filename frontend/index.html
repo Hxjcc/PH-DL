@@ -3,8 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f8f8fa" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=6" />
+    <link rel="manifest" href="/manifest.webmanifest" />
     <title>PH-DL</title>
+    <script>
+      ;(function () {
+        try {
+          var t = localStorage.getItem('phdl-theme')
+          var override = t === 'dark' || t === 'light' ? t : ''
+          var schemeMeta = document.querySelector('meta[name="color-scheme"]')
+          if (schemeMeta) schemeMeta.content = override || 'light dark'
+          var isDark =
+            override === 'dark' ||
+            (!override && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (isDark) document.documentElement.classList.add('dark')
+          var themeMeta = document.querySelector('meta[name="theme-color"]')
+          if (themeMeta) themeMeta.content = isDark ? '#09090b' : '#f8f8fa'
+        } catch (e) {}
+      })()
+    </script>
     <style>
       html {
         background-color: #f8f8fa;
@@ -15,22 +34,6 @@
         color: #fafafa;
       }
     </style>
-    <script>
-      ;(function () {
-        try {
-          var t = localStorage.getItem('phdl-theme')
-          var isDark =
-            t === 'dark' ||
-            (!t && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
-          if (isDark) {
-            document.documentElement.classList.add('dark')
-            document.documentElement.style.colorScheme = 'dark'
-          } else {
-            document.documentElement.style.colorScheme = 'light'
-          }
-        } catch (e) {}
-      })()
-    </script>
   </head>
   <body class="bg-background text-foreground antialiased selection:bg-brand/20 selection:text-foreground">
     <div id="app"></div>

@@ -1045,9 +1045,9 @@ onDeactivated(() => {
             :class="['divide-y divide-border transition-opacity duration-150', fetching ? 'opacity-65' : '']"
           >
             <div
-              v-for="v in items"
+              v-for="(v, idx) in items"
               :key="`m-${v.viewkey}`"
-              class="px-3.5 py-3 space-y-2"
+              :class="['px-3.5 py-3 space-y-2', idx >= 8 && 'cv-deferred-history-card']"
             >
               <div class="flex items-start gap-2.5">
                 <button

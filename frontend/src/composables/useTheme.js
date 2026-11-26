@@ -1,34 +1,93 @@
 import { computed, nextTick, ref } from 'vue'
 
 const STORAGE_KEY = 'phdl-theme'
+const THEME_COLORS = {
+  light: '#f8f8fa',
+  dark: '#09090b',
+}
 
-function detectInitialTheme() {
-  if (typeof document !== 'undefined' && document.documentElement.classList.contains('dark')) {
+function getSystemTheme() {
+  if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches) {
     return 'dark'
   }
+  return 'light'
+}
+
+function readStoredOverride() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
     if (saved === 'dark' || saved === 'light') return saved
-    if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-      return 'dark'
-    }
   } catch {}
-  return 'light'
+  return ''
+}
+
+function detectInitialTheme() {
+  const override = readStoredOverride()
+  if (override) return override
+  if (typeof document !== 'undefined' && document.documentElement.classList.contains('dark')) {
+    return 'dark'
+  }
+  return getSystemTheme()
 }
 
 const theme = ref(detectInitialTheme())
 let activeTransition = null
 let fallbackTimer = null
 
-function applyTheme(next) {
-  theme.value = next
-  if (typeof document !== 'undefined') {
-    document.documentElement.classList.toggle('dark', next === 'dark')
-    document.documentElement.style.colorScheme = next
+function syncThemeDocumentMeta(rendered, metaScheme) {
+  if (typeof document === 'undefined') return
+  document.documentElement.classList.toggle('dark', rendered === 'dark')
+  const schemeMeta = document.querySelector('meta[name="color-scheme"]')
+  if (schemeMeta) {
+    schemeMeta.content = metaScheme
   }
-  try {
-    localStorage.setItem(STORAGE_KEY, next)
-  } catch {}
+  const themeMeta = document.querySelector('meta[name="theme-color"]')
+  if (themeMeta) {
+    themeMeta.content = THEME_COLORS[rendered] || THEME_COLORS.light
+  }
+}
+
+function applyTheme(next, { persist = true } = {}) {
+  const normalized = next === 'dark' ? 'dark' : 'light'
+  theme.value = normalized
+
+  let metaScheme = normalized
+  if (persist) {
+    const systemPref = getSystemTheme()
+    if (normalized === systemPref) {
+      metaScheme = 'light dark'
+      try {
+        localStorage.removeItem(STORAGE_KEY)
+      } catch {}
+    } else {
+      try {
+        localStorage.setItem(STORAGE_KEY, normalized)
+      } catch {}
+    }
+  } else {
+    metaScheme = readStoredOverride() || 'light dark'
+  }
+
+  syncThemeDocumentMeta(normalized, metaScheme)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== STORAGE_KEY) return
+    const override = event.newValue === 'dark' || event.newValue === 'light' ? event.newValue : ''
+    const nextRendered = override || getSystemTheme()
+    theme.value = nextRendered
+    syncThemeDocumentMeta(nextRendered, override || 'light dark')
+  })
+
+  const darkMq = window.matchMedia?.('(prefers-color-scheme: dark)')
+  darkMq?.addEventListener?.('change', (event) => {
+    // Only follow OS changes when no manual override is stored (never retroactively clear a pinned override).
+    if (readStoredOverride()) return
+    const nextRendered = event.matches ? 'dark' : 'light'
+    theme.value = nextRendered
+    syncThemeDocumentMeta(nextRendered, 'light dark')
+  })
 }
 
 function resolveOrigin(event) {
