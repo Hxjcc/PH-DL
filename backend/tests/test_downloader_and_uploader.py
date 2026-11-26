@@ -658,3 +658,90 @@ async def test_rclone_error_summary_strips_generic_fatal_tail_and_flags_drive_qu
     assert "750GB" in res.error
     assert res.fatal_limit_error == res.error
     assert local_file.exists()
+
+
+async def test_multi_remote_chain_session_cache_and_connection_test(tmp_path: Path, monkeypatch):
+    # 1. RuntimeSettings.rclone_remote_chain deduplicates and normalizes delimiters/colons
+    settings = RuntimeSettings(
+        rclone_remote="gd1:",
+        rclone_backup_remotes=" gd2:, GD1，gd3;\ngd2 ",
+        rclone_remote_base_dir="Pornhub",
+        min_file_size_bytes=64,
+    )
+    assert settings.rclone_remote_chain() == ["gd1", "gd2", "gd3"]
+
+    # 2. UploadSessionCache caches remote_types per remote name independently
+    dl_dir = tmp_path / "alice"
+    dl_dir.mkdir()
+    f1 = dl_dir / "Clip 1 [vk1].mp4"
+    f2 = dl_dir / "Clip 2 [vk2].mp4"
+    f3 = dl_dir / "Clip 3 [vk3].mp4"
+    for fp in (f1, f2, f3):
+        fp.write_bytes(VALID_MP4)
+
+    seen_cmds: List[List[str]] = []
+
+    async def fake_run_cmd(cmd: List[str], **kwargs):
+        seen_cmds.append(list(cmd))
+        action = cmd[1]
+        if action == "listremotes":
+            return 0, "pikpak: pikpak\ngd2: drive\n", ""
+        if action == "mkdir":
+            return 0, "", ""
+        if action == "copy":
+            return 0, "", ""
+        if action == "lsjson":
+            return 0, json.dumps({"Size": len(VALID_MP4), "IsDir": False}), ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(uploader, "_run_cmd", fake_run_cmd)
+    cache = uploader.UploadSessionCache()
+    s_pikpak = RuntimeSettings(rclone_remote="pikpak", rclone_remote_base_dir="Pornhub", min_file_size_bytes=64)
+    s_gd2 = s_pikpak.model_copy(update={"rclone_remote": "gd2"})
+
+    r1 = await uploader.upload_file_batch(dl_dir, "alice", {"vk1": f1}, s_pikpak, session_cache=cache)
+    r2 = await uploader.upload_file_batch(dl_dir, "alice", {"vk2": f2}, s_gd2, session_cache=cache)
+    r3 = await uploader.upload_file_batch(dl_dir, "alice", {"vk3": f3}, s_gd2, session_cache=cache)
+
+    assert r1.uploaded_viewkeys == ["vk1"]
+    assert r2.uploaded_viewkeys == ["vk2"]
+    assert r3.uploaded_viewkeys == ["vk3"]
+    assert cache.remote_types == {"pikpak": "pikpak", "gd2": "drive"}
+    assert sum(1 for c in seen_cmds if c[1] == "listremotes") == 2
+    copy_cmds = [c for c in seen_cmds if c[1] == "copy"]
+    assert any("--pikpak-chunk-size=32Mi" in c for c in copy_cmds[:1])
+    assert any("--drive-stop-on-upload-limit" in c for c in copy_cmds[1:2])
+
+    # 3. test_rclone_remotes tests all configured remotes and allows root fallback for fresh backup
+    async def fake_probe_cmd(cmd: List[str], **kwargs):
+        action = cmd[1]
+        if action == "version":
+            return 0, "rclone v1.69.0\n", ""
+        if action == "listremotes":
+            return 0, "gd1: drive\ngd2: drive\ngd3: drive\n", ""
+        if action == "lsd":
+            target = cmd[2]
+            if target == "gd1:Pornhub":
+                return 0, "0 2026-11-26 alice\n", ""
+            if target == "gd2:Pornhub":
+                return 3, "", "directory not found"
+            if target == "gd2:":
+                return 0, "", ""
+            if target == "gd3:Pornhub":
+                return 1, "", "invalid_grant: token expired"
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(uploader, "_run_cmd", fake_probe_cmd)
+    ok_all, msg_all, res_all = await uploader.test_rclone_remotes(
+        RuntimeSettings(rclone_remote="gd1", rclone_backup_remotes="gd2", rclone_remote_base_dir="Pornhub")
+    )
+    assert ok_all is True
+    assert "全部 2 个远端可用" in msg_all
+    assert [r["ok"] for r in res_all] == [True, True]
+
+    ok_part, msg_part, res_part = await uploader.test_rclone_remotes(
+        RuntimeSettings(rclone_remote="gd1", rclone_backup_remotes="gd2, gd3", rclone_remote_base_dir="Pornhub")
+    )
+    assert ok_part is False
+    assert "可用 2/3" in msg_part
+    assert [r["ok"] for r in res_part] == [True, True, False]

@@ -2114,3 +2114,359 @@ async def test_fatal_upload_limit_auto_halts_job_as_partial_failed_and_keeps_loc
     finally:
         await tm.stop()
         await db.close()
+
+
+async def test_multi_remote_auto_failover_and_cooldown_reuse(tmp_path: Path, monkeypatch):
+    """When primary gd1 hits 750GB limit and gd2 hits storage full, uploads seamlessly fail over to gd3."""
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": True,
+                "rclone_remote": "gd1",
+                "rclone_backup_remotes": "gd2, gd3",
+                "rclone_remote_strategy": "failover",
+                "max_concurrent_downloads": 1,
+                "rclone_transfers": 1,
+                "upload_workers": 1,
+                "upload_batch_size": 1,
+                "max_pending_upload_files": 20,
+                "min_free_disk_gb": 0.0,
+                "min_file_size_bytes": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        dl_dir = env.downloads_dir / "eve"
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        local_files = {}
+        for idx in range(1, 5):
+            vk = f"fovk{idx}"
+            fp = dl_dir / f"Clip {idx} [{vk}].mp4"
+            fp.write_bytes(mp4_payload())
+            local_files[vk] = fp
+            await repo.upsert_video(
+                vk,
+                title=f"Clip {idx}",
+                uploader="eve",
+                target_type="model",
+                quality="2160p",
+                video_page_url=f"https://www.pornhub.com/view_video.php?viewkey={vk}",
+                status="downloaded",
+                local_path=str(fp),
+                file_size=fp.stat().st_size,
+                upload_requested=True,
+                downloaded_at=f"2026-11-26T00:00:0{idx}+00:00",
+            )
+
+        from app.engine import task_manager as tm_mod
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        upload_attempts = []
+        gd1_calls = 0
+        gd2_calls = 0
+
+        async def fake_upload(download_dir, uploader_folder, files_by_viewkey, settings, cancel_event=None):
+            nonlocal gd1_calls, gd2_calls
+            remote = settings.rclone_remote
+            vkeys = list(files_by_viewkey.keys())
+            upload_attempts.append((remote, vkeys))
+            if remote == "gd1":
+                gd1_calls += 1
+                if gd1_calls >= 2:
+                    msg = "已达到 Google Drive 每日 750GB 上传上限（请等待配额恢复或切换网盘后重试）"
+                    return UploadBatchResult(
+                        uploaded_viewkeys=[],
+                        failed_viewkeys=vkeys,
+                        remote_dir=f"{remote}:Pornhub/{uploader_folder}",
+                        error=msg,
+                        fatal_limit_error=msg,
+                    )
+            elif remote == "gd2":
+                gd2_calls += 1
+                if gd2_calls >= 2:
+                    msg = "Google Drive存储空间已满，无法继续上传（本地文件已保留）"
+                    return UploadBatchResult(
+                        uploaded_viewkeys=[],
+                        failed_viewkeys=vkeys,
+                        remote_dir=f"{remote}:Pornhub/{uploader_folder}",
+                        error=msg,
+                        fatal_limit_error=msg,
+                    )
+            return UploadBatchResult(
+                uploaded_viewkeys=vkeys,
+                failed_viewkeys=[],
+                verified_sources={vk: file_snapshot(p) for vk, p in files_by_viewkey.items()},
+                remote_dir=f"{remote}:Pornhub/{uploader_folder}",
+            )
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "upload_file_batch", fake_upload)
+
+        tm.start()
+        job = await tm.enqueue_job("auto_update", "全量自动追更", {})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+
+        assert done is not None
+        assert done["status"] == "completed"
+        assert done["uploaded_items"] == 4
+        assert done["failed_items"] == 0
+        assert upload_attempts == [
+            ("gd1", ["fovk1"]),
+            ("gd1", ["fovk2"]),  # hits 750GB limit -> fails over to gd2
+            ("gd2", ["fovk2"]),  # succeeds on gd2
+            ("gd2", ["fovk3"]),  # gd1 skipped; hits storage full -> fails over to gd3
+            ("gd3", ["fovk3"]),  # succeeds on gd3
+            ("gd3", ["fovk4"]),  # gd1 & gd2 skipped; directly uploaded to gd3
+        ]
+        assert all(not fp.exists() for fp in local_files.values())
+
+        v1 = await repo.get_video("fovk1")
+        v2 = await repo.get_video("fovk2")
+        v3 = await repo.get_video("fovk3")
+        v4 = await repo.get_video("fovk4")
+        assert v1["remote_path"].startswith("gd1:Pornhub/eve/")
+        assert v2["remote_path"].startswith("gd2:Pornhub/eve/")
+        assert v3["remote_path"].startswith("gd3:Pornhub/eve/")
+        assert v4["remote_path"].startswith("gd3:Pornhub/eve/")
+
+        # Cooldown persists across jobs while gd3 is still healthy
+        cooldowns = tm.get_remote_cooldowns_snapshot()
+        assert "gd1" in cooldowns and "gd2" in cooldowns and "gd3" not in cooldowns
+
+        fp5 = dl_dir / "Clip 5 [fovk5].mp4"
+        fp5.write_bytes(mp4_payload())
+        await repo.upsert_video(
+            "fovk5",
+            title="Clip 5",
+            uploader="eve",
+            target_type="model",
+            quality="2160p",
+            video_page_url="https://www.pornhub.com/view_video.php?viewkey=fovk5",
+            status="downloaded",
+            local_path=str(fp5),
+            file_size=fp5.stat().st_size,
+            upload_requested=True,
+            downloaded_at="2026-11-26T00:00:05+00:00",
+        )
+        job2 = await tm.enqueue_job("auto_update", "全量自动追更", {})
+        done2 = await _wait_job_done(repo, job2["id"], timeout=5.0)
+        assert done2 is not None and done2["status"] == "completed"
+        assert upload_attempts[-1] == ("gd3", ["fovk5"])
+    finally:
+        await tm.stop()
+        await db.close()
+
+
+async def test_multi_remote_halts_only_when_all_remotes_exhausted(tmp_path: Path, monkeypatch):
+    """Job pauses and keeps local files only once every configured remote hits quota limits."""
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": True,
+                "rclone_remote": "gd1",
+                "rclone_backup_remotes": "gd2",
+                "rclone_remote_strategy": "failover",
+                "max_concurrent_downloads": 1,
+                "rclone_transfers": 1,
+                "upload_workers": 1,
+                "upload_batch_size": 1,
+                "max_pending_upload_files": 20,
+                "min_free_disk_gb": 0.0,
+                "min_file_size_bytes": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        dl_dir = env.downloads_dir / "eve"
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        local_files = {}
+        for idx in range(1, 4):
+            vk = f"alllim{idx}"
+            fp = dl_dir / f"Clip {idx} [{vk}].mp4"
+            fp.write_bytes(mp4_payload())
+            local_files[vk] = fp
+            await repo.upsert_video(
+                vk,
+                title=f"Clip {idx}",
+                uploader="eve",
+                target_type="model",
+                quality="2160p",
+                video_page_url=f"https://www.pornhub.com/view_video.php?viewkey={vk}",
+                status="downloaded",
+                local_path=str(fp),
+                file_size=fp.stat().st_size,
+                upload_requested=True,
+                downloaded_at=f"2026-11-26T00:00:0{idx}+00:00",
+            )
+
+        from app.engine import task_manager as tm_mod
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        attempts = []
+
+        async def fake_upload(download_dir, uploader_folder, files_by_viewkey, settings, cancel_event=None):
+            remote = settings.rclone_remote
+            vkeys = list(files_by_viewkey.keys())
+            attempts.append((remote, vkeys))
+            if vkeys == ["alllim1"] and remote == "gd1":
+                return UploadBatchResult(
+                    uploaded_viewkeys=vkeys,
+                    failed_viewkeys=[],
+                    verified_sources={vk: file_snapshot(p) for vk, p in files_by_viewkey.items()},
+                    remote_dir=f"{remote}:Pornhub/{uploader_folder}",
+                )
+            msg = "已达到 Google Drive 每日 750GB 上传上限（请等待配额恢复或切换网盘后重试）"
+            return UploadBatchResult(
+                uploaded_viewkeys=[],
+                failed_viewkeys=vkeys,
+                remote_dir=f"{remote}:Pornhub/{uploader_folder}",
+                error=msg,
+                fatal_limit_error=msg,
+            )
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "upload_file_batch", fake_upload)
+
+        tm.start()
+        job = await tm.enqueue_job("auto_update", "全量自动追更", {})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+
+        assert done is not None
+        assert done["status"] == "partial_failed"
+        assert "gd1" in done["error_message"] and "gd2" in done["error_message"]
+        assert attempts == [("gd1", ["alllim1"]), ("gd1", ["alllim2"]), ("gd2", ["alllim2"])]
+        items = await repo.list_job_items(job["id"])
+        assert {it["viewkey"]: it["status"] for it in items} == {
+            "alllim1": "done",
+            "alllim2": "failed",
+            "alllim3": "cancelled",
+        }
+        assert not local_files["alllim1"].exists()
+        assert local_files["alllim2"].exists() and local_files["alllim3"].exists()
+    finally:
+        await tm.stop()
+        await db.close()
+
+
+async def test_multi_remote_round_robin_spreads_and_fails_over(tmp_path: Path, monkeypatch):
+    """Round-robin strategy alternates across configured remotes and fails over smoothly on quota error."""
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+
+    try:
+        await repo.update_settings_patch(
+            {
+                "ph_cookie": "sess=valid",
+                "uploader_enabled": True,
+                "rclone_remote": "gd1",
+                "rclone_backup_remotes": "gd2",
+                "rclone_remote_strategy": "round_robin",
+                "max_concurrent_downloads": 1,
+                "rclone_transfers": 1,
+                "upload_workers": 1,
+                "upload_batch_size": 1,
+                "max_pending_upload_files": 20,
+                "min_free_disk_gb": 0.0,
+                "min_file_size_bytes": 1,
+                "page_delay_min": 0.0,
+                "page_delay_max": 0.0,
+            }
+        )
+        dl_dir = env.downloads_dir / "eve"
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        for idx in range(1, 5):
+            vk = f"rrvk{idx}"
+            fp = dl_dir / f"Clip {idx} [{vk}].mp4"
+            fp.write_bytes(mp4_payload())
+            await repo.upsert_video(
+                vk,
+                title=f"Clip {idx}",
+                uploader="eve",
+                target_type="model",
+                quality="2160p",
+                video_page_url=f"https://www.pornhub.com/view_video.php?viewkey={vk}",
+                status="downloaded",
+                local_path=str(fp),
+                file_size=fp.stat().st_size,
+                upload_requested=True,
+                downloaded_at=f"2026-11-26T00:00:0{idx}+00:00",
+            )
+
+        from app.engine import task_manager as tm_mod
+
+        async def fake_check_cookie(*args, **kwargs):
+            return CookieCheckResult(valid=True, message="ok")
+
+        attempts = []
+        gd1_hits = 0
+
+        async def fake_upload(download_dir, uploader_folder, files_by_viewkey, settings, cancel_event=None):
+            nonlocal gd1_hits
+            remote = settings.rclone_remote
+            vkeys = list(files_by_viewkey.keys())
+            attempts.append((remote, vkeys))
+            if remote == "gd1":
+                gd1_hits += 1
+                if gd1_hits >= 2:
+                    msg = "已达到 Google Drive 每日 750GB 上传上限（请等待配额恢复或切换网盘后重试）"
+                    return UploadBatchResult(
+                        uploaded_viewkeys=[],
+                        failed_viewkeys=vkeys,
+                        remote_dir=f"{remote}:Pornhub/{uploader_folder}",
+                        error=msg,
+                        fatal_limit_error=msg,
+                    )
+            return UploadBatchResult(
+                uploaded_viewkeys=vkeys,
+                failed_viewkeys=[],
+                verified_sources={vk: file_snapshot(p) for vk, p in files_by_viewkey.items()},
+                remote_dir=f"{remote}:Pornhub/{uploader_folder}",
+            )
+
+        monkeypatch.setattr(tm_mod, "check_cookie_valid", fake_check_cookie)
+        monkeypatch.setattr(tm_mod, "upload_file_batch", fake_upload)
+
+        tm.start()
+        job = await tm.enqueue_job("auto_update", "全量自动追更", {})
+        done = await _wait_job_done(repo, job["id"], timeout=5.0)
+
+        assert done is not None
+        assert done["status"] == "completed"
+        assert done["uploaded_items"] == 4
+        assert attempts == [
+            ("gd1", ["rrvk1"]),
+            ("gd2", ["rrvk2"]),
+            ("gd1", ["rrvk3"]),  # gd1 hits 750GB -> immediate failover to gd2
+            ("gd2", ["rrvk3"]),
+            ("gd2", ["rrvk4"]),  # gd1 cooled down -> gd2 only
+        ]
+    finally:
+        await tm.stop()
+        await db.close()

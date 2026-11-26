@@ -25,6 +25,7 @@ class UploadSessionCache:
 
     remote_type: Optional[str] = None
     remote_type_checked: bool = False
+    remote_types: Dict[str, Optional[str]] = field(default_factory=dict)
     created_remote_dirs: Set[str] = field(default_factory=set)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
@@ -126,6 +127,23 @@ def summarize_rclone_error(
     if cleaned:
         return cleaned[-1], ""
     return f"rclone {action} 返回 {rc}", ""
+
+
+def classify_rclone_limit_kind(fatal_limit_error: str) -> str:
+    """Classify a fatal limit message into ``'storage_full'``, ``'upload_limit'``, or ``''``."""
+    text = (fatal_limit_error or "").strip().lower()
+    if not text:
+        return ""
+    if (
+        "存储空间已满" in text
+        or "storagequotaexceeded" in text
+        or "storage quota" in text
+        or "insufficient storage" in text
+        or "space is full" in text
+        or "file_space_not_enough" in text
+    ):
+        return "storage_full"
+    return "upload_limit"
 
 
 def file_snapshot(path: Path) -> Optional[FileSnapshot]:
@@ -645,16 +663,56 @@ def _upload_file_list(files: List[str]):
                 path.unlink(missing_ok=True)
 
 
-async def test_rclone_connection(settings: RuntimeSettings) -> Tuple[bool, str]:
+async def _probe_single_remote(
+    rclone: str,
+    remote: str,
+    base: str,
+    remotes_map: Dict[str, str],
+    timeout: float,
+) -> Tuple[bool, str, str]:
+    """Check one remote's existence and directory accessibility.
+
+    Returns ``(ok, detail, detected_type)``.
+    """
+    if remote not in remotes_map:
+        available = ", ".join(remotes_map.keys()) or "无"
+        return False, f"未在 rclone.conf 找到远端 '{remote}'（当前可用: {available}）", ""
+
+    rtype = remotes_map.get(remote) or ""
+    target = f"{remote}:{base}" if base else f"{remote}:"
+    rc3, _, err3 = await _run_cmd(
+        [rclone, "lsd", target, "--max-depth", "1"],
+        timeout=timeout,
+    )
+    if rc3 == 0:
+        return True, target, rtype
+
+    err3_text = (err3 or "").strip()
+    if base and ("directory not found" in err3_text.lower() or "not found" in err3_text.lower()):
+        rc_root, _, err_root = await _run_cmd(
+            [rclone, "lsd", f"{remote}:", "--max-depth", "1"],
+            timeout=timeout,
+        )
+        if rc_root == 0:
+            return True, f"{remote}:（{base} 目录将在首次上传时自动创建）", rtype
+        err3_text = (err_root or err3_text).strip()
+
+    return False, f"远端目录 '{target}' 访问失败: {err3_text or f'exit={rc3}'}", rtype
+
+
+async def test_rclone_remotes(
+    settings: RuntimeSettings,
+) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    """Test primary remote and any configured backup remotes, returning per-remote statuses."""
     rclone = (settings.rclone_bin or "rclone").strip()
     short_timeout = min(settings.rclone_timeout_seconds, 60)
     rc, out, err = await _run_cmd([rclone, "version"], timeout=short_timeout)
     if rc != 0:
-        return False, f"rclone 不可用: {err.strip() or f'exit={rc}'}"
+        return False, f"rclone 不可用: {err.strip() or f'exit={rc}'}", []
 
-    remote = (settings.rclone_remote or "").strip().rstrip(":")
-    if not remote:
-        return False, "未配置 rclone remote 名称"
+    chain = settings.rclone_remote_chain()
+    if not chain:
+        return False, "未配置 rclone remote 名称", []
 
     rc2, out2, err2 = await _run_cmd([rclone, "listremotes", "--long"], timeout=short_timeout)
     remotes_map: Dict[str, str] = {}
@@ -663,26 +721,53 @@ async def test_rclone_connection(settings: RuntimeSettings) -> Tuple[bool, str]:
     else:
         rc2_fb, out2_fb, err2_fb = await _run_cmd([rclone, "listremotes"], timeout=short_timeout)
         if rc2_fb != 0:
-            return False, f"读取 rclone remotes 失败: {(err2_fb or err2).strip()}"
+            return False, f"读取 rclone remotes 失败: {(err2_fb or err2).strip()}", []
         remotes_map = {line.strip().rstrip(":"): "" for line in out2_fb.splitlines() if line.strip()}
 
-    if remote not in remotes_map:
-        available = ", ".join(remotes_map.keys()) or "无"
-        return False, f"未在 rclone.conf 找到远端 '{remote}'（当前可用: {available}）"
-
     base = (settings.rclone_remote_base_dir or "").strip().strip("/")
-    target = f"{remote}:{base}" if base else f"{remote}:"
-    rc3, _, err3 = await _run_cmd(
-        [rclone, "lsd", target, "--max-depth", "1"],
-        timeout=short_timeout,
-    )
-    if rc3 != 0:
-        return False, f"远端目录 '{target}' 访问失败: {err3.strip() or f'exit={rc3}'}"
-
     ver_line = out.splitlines()[0].strip() if out.strip() else "rclone ok"
-    rtype = remotes_map.get(remote)
-    type_tag = f", type={rtype}" if rtype else ""
-    return True, f"连接成功 ({ver_line}{type_tag} -> {target})"
+
+    probes = await asyncio.gather(
+        *[_probe_single_remote(rclone, r, base, remotes_map, short_timeout) for r in chain]
+    )
+    results: List[Dict[str, Any]] = []
+    for remote_name, (ok_i, detail_i, rtype_i) in zip(chain, probes):
+        results.append(
+            {
+                "remote": remote_name,
+                "type": rtype_i,
+                "ok": ok_i,
+                "message": detail_i,
+            }
+        )
+
+    if len(chain) == 1:
+        r0 = results[0]
+        if not r0["ok"]:
+            return False, str(r0["message"]), results
+        type_tag = f", type={r0['type']}" if r0["type"] else ""
+        return True, f"连接成功 ({ver_line}{type_tag} -> {r0['message']})", results
+
+    ok_items = [r for r in results if r["ok"]]
+    fail_items = [r for r in results if not r["ok"]]
+    if not fail_items:
+        labels = [
+            f"{r['remote']}({r['type']})" if r["type"] else r["remote"]
+            for r in ok_items
+        ]
+        return True, f"连接成功 ({ver_line}) · 全部 {len(chain)} 个远端可用: {' → '.join(labels)}", results
+
+    fail_desc = "；".join(f"{r['remote']}: {r['message']}" for r in fail_items)
+    return (
+        False,
+        f"部分远端连接失败（可用 {len(ok_items)}/{len(chain)}）：{fail_desc}",
+        results,
+    )
+
+
+async def test_rclone_connection(settings: RuntimeSettings) -> Tuple[bool, str]:
+    ok, msg, _ = await test_rclone_remotes(settings)
+    return ok, msg
 
 
 async def upload_file_batch(
@@ -730,13 +815,17 @@ async def upload_file_batch(
         return result
 
     rclone = (settings.rclone_bin or "rclone").strip()
+    remote_key = (settings.rclone_remote or "").strip().rstrip(":").lower()
     if session_cache is not None:
         async with session_cache._lock:
-            if not session_cache.remote_type_checked:
-                session_cache.remote_type = await detect_remote_type(settings, cancel_event=cancel_event)
+            if remote_key in session_cache.remote_types:
+                remote_type = session_cache.remote_types[remote_key]
+            else:
+                remote_type = await detect_remote_type(settings, cancel_event=cancel_event)
                 if cancel_event is None or not cancel_event.is_set():
+                    session_cache.remote_types[remote_key] = remote_type
+                    session_cache.remote_type = remote_type
                     session_cache.remote_type_checked = True
-            remote_type = session_cache.remote_type
     else:
         remote_type = await detect_remote_type(settings, cancel_event=cancel_event)
 

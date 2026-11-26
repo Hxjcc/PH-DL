@@ -727,6 +727,250 @@ async def test_download_hls_to_mp4_ytdlp_cancel_resume_remux_and_403_refresh(tmp
         httpd.shutdown()
 
 
+async def test_download_hls_to_mp4_aiohttp_fast_path_resume_403_and_ytdlp_fallback(tmp_path: Path, monkeypatch):
+    """Verify the async aiohttp HLS engine: concurrent ordered assembly, cancel+resume, 403 refresh, fMP4 init, and encrypted yt-dlp fallback."""
+    import http.server
+    import socketserver
+    import threading
+    import aiohttp
+
+    from app.parsers.video import VideoDetail
+
+    # Distinct valid 188-byte MPEG-TS packets (0x47 sync byte every 188 bytes) so we prove exact in-order assembly!
+    ts_segs = [
+        (bytes([0x47, idx]) + bytes([idx + 1] * 186)) * 8
+        for idx in range(6)
+    ]
+    fmp4_init = mp4_payload(b"init")[:64]
+    fmp4_segs = [b"moof" + bytes([10 + idx] * 2044) for idx in range(3)]
+
+    srv_dir = tmp_path / "hls_aio_srv"
+    srv_dir.mkdir()
+    for idx, payload in enumerate(ts_segs):
+        (srv_dir / f"seg{idx}.ts").write_bytes(payload)
+    ts_playlist = (
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n"
+        + "".join(f"#EXTINF:4.000,\nseg{idx}.ts\n" for idx in range(len(ts_segs)))
+        + "#EXT-X-ENDLIST\n"
+    )
+    (srv_dir / "ts_v1.m3u8").write_text(ts_playlist, encoding="utf-8")
+    (srv_dir / "ts_v2.m3u8").write_text(ts_playlist, encoding="utf-8")
+
+    (srv_dir / "init.mp4").write_bytes(fmp4_init)
+    for idx, payload in enumerate(fmp4_segs):
+        (srv_dir / f"seg{idx}.m4s").write_bytes(payload)
+    (srv_dir / "fmp4.m3u8").write_text(
+        '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI="init.mp4"\n'
+        + "".join(f"#EXTINF:4.000,\nseg{idx}.m4s\n" for idx in range(len(fmp4_segs)))
+        + "#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+    (srv_dir / "enc.m3u8").write_text(
+        '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        "#EXTINF:4.000,\nseg0.ts\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+
+    hits: List[str] = []
+    loop = asyncio.get_running_loop()
+    state: Dict[str, Any] = {"fail_403_seg3": False, "cancel_on_seg2": None}
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(srv_dir), **kw)
+
+        def do_GET(self):
+            hits.append(self.path)
+            if state["fail_403_seg3"] and self.path == "/seg3.ts":
+                self.send_error(403, "Expired signed CDN segment")
+                return
+            if state["cancel_on_seg2"] is not None and self.path == "/seg2.ts":
+                ev = state["cancel_on_seg2"]
+                loop.call_soon_threadsafe(ev.set)
+                import time
+                time.sleep(0.08)
+            return super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+
+    httpd = ThreadedServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    srv_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    srv_thread.start()
+
+    monkeypatch.setattr(hls_mod.shutil, "which", lambda name: "/usr/local/bin/ffmpeg")
+    captured_inputs: List[bytes] = []
+    remux_cmds: List[List[str]] = []
+
+    async def fake_run_ffmpeg(cmd: List[str], *, cancel_event: asyncio.Event, timeout: float = 600.0):
+        remux_cmds.append(cmd)
+        in_path = Path(cmd[cmd.index("-i") + 1])
+        captured_inputs.append(in_path.read_bytes())
+        out_path = Path(cmd[-1])
+        out_path.write_bytes(mp4_payload())
+        return 0, ""
+
+    monkeypatch.setattr(hls_mod, "_run_ffmpeg", fake_run_ffmpeg)
+
+    try:
+        dl_dir = tmp_path / "downloads" / "xHamster" / "creator_fast"
+        tmp_dir = tmp_path / "temp" / "xHamster" / "creator_fast"
+        ctx = TaskHttpContext(concurrency=2)
+
+        async with aiohttp.ClientSession() as session:
+            # 1. Cancel on seg2 (sequential concurrency=1) -> seg0 & seg1 persisted in single stream.part + manifest.json
+            hls_dir = tmp_dir / "Fast TS [xhFast1].hls"
+            cancel_ev = asyncio.Event()
+            state["cancel_on_seg2"] = cancel_ev
+            cancelled = await hls_mod.download_hls_to_mp4(
+                session=session,
+                parse_ctx=ctx,
+                selectors=SelectorSettings(),
+                viewkey="xhFast1",
+                title="Fast TS",
+                playlist_url=f"http://127.0.0.1:{port}/ts_v1.m3u8",
+                page_url="https://xhamster.com/videos/fast-ts-xhFast1",
+                referer_url="https://xhamster.com/videos/fast-ts-xhFast1",
+                quality="1080p",
+                download_dir=dl_dir,
+                temp_dir=tmp_dir,
+                segment_concurrency=1,
+                min_file_size_bytes=16,
+                cancel_event=cancel_ev,
+            )
+            assert cancelled.cancelled is True
+            assert cancelled.temp_path == hls_dir
+            manifest = json.loads((hls_dir / "manifest.json").read_text(encoding="utf-8"))
+            assert manifest["engine"] == "aiohttp"
+            assert manifest["completed_segments"] == 2
+            assert (hls_dir / "stream.part").stat().st_size == len(ts_segs[0]) + len(ts_segs[1])
+            assert not any("-Frag" in p.name for p in hls_dir.iterdir())
+
+            # 2. Resume concurrently (segment_concurrency=4) -> skips seg0 & seg1, writes exact byte-ordered stream!
+            hits.clear()
+            state["cancel_on_seg2"] = None
+            phases: List[str] = []
+            resumed = await hls_mod.download_hls_to_mp4(
+                session=session,
+                parse_ctx=ctx,
+                selectors=SelectorSettings(),
+                viewkey="xhFast1",
+                title="Fast TS",
+                playlist_url=f"http://127.0.0.1:{port}/ts_v2.m3u8",
+                page_url="https://xhamster.com/videos/fast-ts-xhFast1",
+                referer_url="https://xhamster.com/videos/fast-ts-xhFast1",
+                quality="1080p",
+                download_dir=dl_dir,
+                temp_dir=tmp_dir,
+                partial_path=hls_dir,
+                segment_concurrency=4,
+                min_file_size_bytes=16,
+                on_progress=lambda dl, tot, spd, phase="downloading": phases.append(phase),
+            )
+            assert resumed.success is True
+            assert not hls_dir.exists()
+            assert "/seg0.ts" not in hits and "/seg1.ts" not in hits
+            assert captured_inputs[-1] == b"".join(ts_segs)
+            assert "downloading" in phases and "remuxing" in phases
+            assert "-bsf:a" in remux_cmds[-1]
+
+            # 3. fMP4 with #EXT-X-MAP init segment assembles init + seg0..seg2 in exact order
+            hits.clear()
+            fmp4_res = await hls_mod.download_hls_to_mp4(
+                session=session,
+                parse_ctx=ctx,
+                selectors=SelectorSettings(),
+                viewkey="xhFmp4Fast",
+                title="Fast fMP4",
+                playlist_url=f"http://127.0.0.1:{port}/fmp4.m3u8",
+                page_url="https://xhamster.com/videos/fast-fmp4-xhFmp4Fast",
+                referer_url="https://xhamster.com/videos/fast-fmp4-xhFmp4Fast",
+                quality="2160p",
+                download_dir=dl_dir,
+                temp_dir=tmp_dir,
+                segment_concurrency=3,
+                min_file_size_bytes=16,
+            )
+            assert fmp4_res.success is True
+            assert captured_inputs[-1] == fmp4_init + b"".join(fmp4_segs)
+            assert "-bsf:a" not in remux_cmds[-1]
+
+            # 4. HTTP 403 on seg3 refreshes URL and resumes seamlessly without re-downloading seg0..seg2
+            hits.clear()
+            state["fail_403_seg3"] = True
+            refresh_count = 0
+
+            async def fake_fetch_single(*args, **kwargs):
+                nonlocal refresh_count
+                refresh_count += 1
+                state["fail_403_seg3"] = False
+                return VideoDetail(
+                    viewkey="xhAio403",
+                    title="Aio 403",
+                    page_url="https://xhamster.com/videos/aio-403-xhAio403",
+                    referer_url="https://xhamster.com/videos/aio-403-xhAio403",
+                    download_url=f"http://127.0.0.1:{port}/ts_v2.m3u8",
+                    quality="1080p",
+                    video_format="hls",
+                )
+
+            monkeypatch.setattr(hls_mod, "fetch_single_video_detail", fake_fetch_single)
+            res_403 = await hls_mod.download_hls_to_mp4(
+                session=session,
+                parse_ctx=ctx,
+                selectors=SelectorSettings(),
+                viewkey="xhAio403",
+                title="Aio 403",
+                playlist_url=f"http://127.0.0.1:{port}/ts_v1.m3u8",
+                page_url="https://xhamster.com/videos/aio-403-xhAio403",
+                referer_url="https://xhamster.com/videos/aio-403-xhAio403",
+                quality="1080p",
+                download_dir=dl_dir,
+                temp_dir=tmp_dir,
+                max_attempts=2,
+                segment_concurrency=1,
+                retry_delay_base=0.0,
+                retry_delay_max=0.0,
+                min_file_size_bytes=16,
+            )
+            assert res_403.success is True
+            assert refresh_count == 1
+            assert hits.count("/seg0.ts") == 1 and hits.count("/seg1.ts") == 1 and hits.count("/seg2.ts") == 1
+            assert captured_inputs[-1] == b"".join(ts_segs)
+
+            # 5. Encrypted HLS playlist seamlessly falls back to yt-dlp engine
+            fallback_called: List[str] = []
+
+            def fake_ytdlp_sync(**kwargs):
+                fallback_called.append(kwargs["playlist_url"])
+                (kwargs["hls_dir"] / "stream.mp4").write_bytes(b"".join(ts_segs))
+                return True, [], None
+
+            monkeypatch.setattr(hls_mod, "_run_ytdlp_hls_sync", fake_ytdlp_sync)
+            enc_res = await hls_mod.download_hls_to_mp4(
+                session=session,
+                parse_ctx=ctx,
+                selectors=SelectorSettings(),
+                viewkey="xhEncFb",
+                title="Encrypted Clip",
+                playlist_url=f"http://127.0.0.1:{port}/enc.m3u8",
+                page_url="https://xhamster.com/videos/enc-xhEncFb",
+                referer_url="https://xhamster.com/videos/enc-xhEncFb",
+                quality="1080p",
+                download_dir=dl_dir,
+                temp_dir=tmp_dir,
+                min_file_size_bytes=16,
+            )
+            assert enc_res.success is True
+            assert fallback_called == [f"http://127.0.0.1:{port}/enc.m3u8"]
+    finally:
+        httpd.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # 4. Schema v9 Migration, Multi-Site Repo Isolation & Uploader Routing
 # ---------------------------------------------------------------------------

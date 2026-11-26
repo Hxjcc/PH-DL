@@ -22,7 +22,7 @@ from ..services.cookie import (
     prefer_cased_username,
 )
 from ..services.notifier import send_serverchan
-from ..services.uploader import list_rclone_remotes, test_rclone_connection
+from ..services.uploader import list_rclone_remotes, test_rclone_remotes
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -101,6 +101,9 @@ async def update_settings(
         updated = await container.repo.update_settings_patch(patch)
     except Exception as err:
         raise HTTPException(status_code=400, detail=f"配置校验失败: {err}") from err
+
+    if any(k in patch for k in ("rclone_remote", "rclone_backup_remotes", "rclone_remote_strategy")):
+        container.tasks.clear_remote_cooldowns()
 
     container.events.broadcast("overview_changed", {})
     return {"settings": updated.to_redacted_dict()}
@@ -363,8 +366,11 @@ async def get_rclone_remotes(container: AppContainer = Depends(require_auth)):
 @router.post("/rclone/test")
 async def test_rclone(container: AppContainer = Depends(require_auth)):
     settings = await container.repo.get_settings()
-    ok, msg = await test_rclone_connection(settings)
-    return {"ok": ok, "message": msg}
+    ok, msg, results = await test_rclone_remotes(settings)
+    healthy = [str(r["remote"]) for r in results if r.get("ok") and r.get("remote")]
+    if healthy:
+        container.tasks.clear_remote_cooldowns(healthy)
+    return {"ok": ok, "message": msg, "results": results}
 
 
 @router.post("/notify/test")

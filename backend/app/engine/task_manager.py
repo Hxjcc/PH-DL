@@ -14,7 +14,7 @@ import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import aiohttp
 
@@ -71,6 +71,7 @@ from ..services.notifier import build_auto_update_report, send_serverchan
 from ..services.uploader import (
     UploadSessionCache,
     build_remote_dir,
+    classify_rclone_limit_kind,
     delete_verified_source,
     file_snapshot,
     upload_file_batch,
@@ -151,6 +152,10 @@ async def _invoke_upload_file_batch(
     return await upload_file_batch(**kwargs)
 
 
+REMOTE_UPLOAD_LIMIT_COOLDOWN_SECONDS = 6 * 3600.0
+REMOTE_STORAGE_FULL_COOLDOWN_SECONDS = 24 * 3600.0
+
+
 class TaskManager:
     """In-process async job orchestrator replacing CLI subprocess execution."""
 
@@ -170,6 +175,115 @@ class TaskManager:
         self._last_xh_cookie_valid: Optional[bool] = None
         self._last_xh_cookie_message: str = "未检测"
         self._current_xh_ctx: Optional[TaskHttpContext] = None
+        self._remote_cooldowns: Dict[str, Tuple[float, str]] = {}
+        self._rr_remote_cursor: int = 0
+
+    def clear_remote_cooldowns(self, remotes: Optional[Iterable[str]] = None) -> None:
+        """Reset in-memory quota cooldowns for specified remotes (or all when ``remotes`` is None)."""
+        if remotes is None:
+            self._remote_cooldowns.clear()
+            self._rr_remote_cursor = 0
+            return
+        for remote in remotes:
+            key = str(remote or "").strip().rstrip(":").lower()
+            if key:
+                self._remote_cooldowns.pop(key, None)
+
+    def get_remote_cooldowns_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Return currently active (non-expired) remote cooldowns."""
+        now = time.monotonic()
+        expired = [k for k, (until, _) in self._remote_cooldowns.items() if until <= now]
+        for k in expired:
+            self._remote_cooldowns.pop(k, None)
+        return {
+            k: {
+                "remaining_seconds": max(0, int(until - now)),
+                "reason": reason,
+            }
+            for k, (until, reason) in self._remote_cooldowns.items()
+        }
+
+    def _effective_rclone_chain(self, settings: RuntimeSettings) -> List[str]:
+        chain = settings.rclone_remote_chain()
+        if chain:
+            return chain
+        fallback = (settings.rclone_remote or "pikpak").strip().rstrip(":")
+        return [fallback] if fallback else ["pikpak"]
+
+    def _is_remote_on_cooldown(self, remote: str, *, now: Optional[float] = None) -> bool:
+        key = str(remote or "").strip().rstrip(":").lower()
+        if not key:
+            return False
+        entry = self._remote_cooldowns.get(key)
+        if entry is None:
+            return False
+        cur = time.monotonic() if now is None else now
+        if entry[0] <= cur:
+            self._remote_cooldowns.pop(key, None)
+            return False
+        return True
+
+    def _mark_remote_exhausted(self, remote: str, reason: str) -> bool:
+        """Put ``remote`` on cooldown after hitting a hard upload/storage limit.
+
+        Returns ``True`` when the remote newly transitions into cooldown so concurrent
+        upload workers emit the switch warning only once.
+        """
+        key = str(remote or "").strip().rstrip(":").lower()
+        if not key:
+            return False
+        now = time.monotonic()
+        existing = self._remote_cooldowns.get(key)
+        was_active = existing is not None and existing[0] > now
+        kind = classify_rclone_limit_kind(reason)
+        duration = (
+            REMOTE_STORAGE_FULL_COOLDOWN_SECONDS
+            if kind == "storage_full"
+            else REMOTE_UPLOAD_LIMIT_COOLDOWN_SECONDS
+        )
+        self._remote_cooldowns[key] = (now + duration, reason)
+        return not was_active
+
+    def _prepare_rclone_chain_for_job(self, settings: RuntimeSettings) -> Tuple[List[str], List[str]]:
+        """Return ``(full_chain, skipped_cooldown_remotes)`` for a newly started job.
+
+        If every configured remote is currently cooled down (e.g. single-remote user
+        retrying manually later, or all drives were previously exhausted), clear their
+        cooldowns so the new job probes fresh rather than failing immediately.
+        """
+        chain = self._effective_rclone_chain(settings)
+        now = time.monotonic()
+        skipped = [r for r in chain if self._is_remote_on_cooldown(r, now=now)]
+        if len(skipped) >= len(chain):
+            self.clear_remote_cooldowns(chain)
+            return chain, []
+        return chain, skipped
+
+    def _pick_upload_remote(
+        self,
+        settings: RuntimeSettings,
+        *,
+        exclude: Optional[Set[str]] = None,
+        advance_cursor: bool = True,
+    ) -> Optional[str]:
+        """Select the next non-exhausted remote according to ``rclone_remote_strategy``."""
+        chain = self._effective_rclone_chain(settings)
+        excluded = {r.lower() for r in (exclude or set())}
+        now = time.monotonic()
+        available = [
+            r
+            for r in chain
+            if r.lower() not in excluded and not self._is_remote_on_cooldown(r, now=now)
+        ]
+        if not available:
+            return None
+        strategy = getattr(settings, "rclone_remote_strategy", "failover")
+        if strategy == "round_robin" and len(available) > 1:
+            idx = self._rr_remote_cursor % len(available)
+            if advance_cursor:
+                self._rr_remote_cursor += 1
+            return available[idx]
+        return available[0]
 
     def start(self) -> None:
         if self._worker_task is None or self._worker_task.done():
@@ -743,6 +857,17 @@ class TaskManager:
             allow_small_micro_batch=True,
         )
         upload_session_cache = UploadSessionCache()
+        configured_remote_chain: List[str] = []
+        if auto_upload:
+            configured_remote_chain, skipped_remotes = self._prepare_rclone_chain_for_job(settings)
+            if skipped_remotes:
+                remaining_remotes = [r for r in configured_remote_chain if r not in skipped_remotes]
+                self.events.emit_log(
+                    "INFO",
+                    f"[上传策略] 已跳过冷却中的限额网盘 ({', '.join(skipped_remotes)})，"
+                    f"本次优先使用: {', '.join(remaining_remotes)}",
+                    job_id=job_id,
+                )
         scheduler.emit_status(force=True)
 
         async def _mark_entries_cancelled(entries: List[UploadQueuedItem]) -> None:
@@ -782,9 +907,10 @@ class TaskManager:
             uploader_folder = chunk[0].uploader_folder
             download_dir = chunk[0].download_dir
             chunk_site = normalize_site(chunk[0].site)
-            remote_target = build_remote_dir(settings, uploader_folder, site=chunk_site)
             vk_to_entry = {e.viewkey: e for e in chunk}
             chunk_bytes = sum(e.file_size for e in chunk)
+            primary_remote = (settings.rclone_remote or "pikpak").strip().rstrip(":")
+            remote_chain = configured_remote_chain or self._effective_rclone_chain(settings)
 
             for entry in chunk:
                 it = await self.repo.update_job_item(entry.item_id, status="uploading")
@@ -799,28 +925,11 @@ class TaskManager:
                     phase="uploading",
                 )
 
-            files_map = {e.viewkey: e.local_path for e in chunk}
             remote_names_map: Dict[str, str] = {}
             for entry in chunk:
                 dated_name = format_remote_video_filename(entry.local_path.name, entry.published_at)
                 if dated_name and dated_name != entry.local_path.name:
                     remote_names_map[entry.viewkey] = dated_name
-
-            if len(chunk) == 1:
-                size_mb = chunk[0].file_size / (1024 * 1024)
-                size_tag = f" ({size_mb:.1f} MB)" if chunk[0].file_size > 0 else ""
-                remote_label = remote_names_map.get(chunk[0].viewkey) or chunk[0].local_path.name
-                self.events.emit_log(
-                    "INFO",
-                    f"[上传] 开始上传至 {remote_target}: {remote_label}{size_tag}",
-                    job_id=job_id,
-                )
-            else:
-                self.events.emit_log(
-                    "INFO",
-                    f"[上传] 开始向 {remote_target} 并行上传 {len(chunk)} 个视频...",
-                    job_id=job_id,
-                )
 
             def _on_upload_progress(vk: str, sent: int, total: int, speed: float, phase: str) -> None:
                 entry = vk_to_entry.get(vk)
@@ -834,87 +943,209 @@ class TaskManager:
                         phase=phase,
                     )
 
-            await scheduler.on_upload_started()
-            upload_started = time.monotonic()
-            try:
-                up_res = await _invoke_upload_file_batch(
-                    download_dir=download_dir,
-                    uploader_folder=uploader_folder,
-                    files_by_viewkey=files_map,
-                    settings=settings,
-                    cancel_event=ctx.cancel_event,
-                    session_cache=upload_session_cache,
-                    on_progress=_on_upload_progress,
-                    remote_names_by_viewkey=remote_names_map or None,
-                    site=chunk_site,
-                )
-                elapsed = max(0.0, time.monotonic() - upload_started)
-                uploaded_set = set(up_res.uploaded_viewkeys)
-
-                for entry in chunk:
-                    self.events.clear_item_progress(entry.item_id)
-                    snapshot = up_res.verified_sources.get(entry.viewkey)
-                    local_rel = entry.local_path.relative_to(download_dir).as_posix()
-                    custom_remote_name = remote_names_map.get(entry.viewkey)
-                    if custom_remote_name:
-                        parent_rel = Path(local_rel).parent.as_posix()
-                        fallback_remote_rel = f"{parent_rel}/{custom_remote_name}" if parent_rel not in {"", "."} else custom_remote_name
-                    else:
-                        fallback_remote_rel = local_rel
-                    verified_remote_path = (
-                        (getattr(up_res, "remote_paths", None) or {}).get(entry.viewkey)
-                        or f"{up_res.remote_dir}/{fallback_remote_rel}"
+            async def _halt_for_all_remotes_exhausted(fatal_limit: str) -> None:
+                if ctx.cancel_event.is_set():
+                    return
+                if not self._current_halt_reason:
+                    halt_msg = (
+                        f"所有配置的网盘（{', '.join(remote_chain)}）均已达到上传/空间限额（{fatal_limit}）"
+                        if len(remote_chain) > 1
+                        else fatal_limit
                     )
-                    if (
-                        entry.viewkey in uploaded_set and snapshot is not None
-                        and not ctx.cancel_event.is_set() and file_snapshot(entry.local_path) == snapshot
-                        and await self.repo.record_verified_upload(
-                            entry.viewkey,
-                            str(entry.local_path),
-                            verified_remote_path,
+                    self._current_halt_reason = halt_msg
+                    await self.repo.update_job(job_id, error_message=halt_msg)
+                    self.events.emit_log(
+                        "ERROR",
+                        f"检测到网盘上传硬性限制（{halt_msg}），已自动暂停当前任务剩余下载与上传，本地已下载文件均已保留。",
+                        job_id=job_id,
+                    )
+                ctx.cancel_event.set()
+                await upload_pool.notify_cancel()
+
+            await scheduler.on_upload_started()
+            try:
+                remaining_entries: List[UploadQueuedItem] = list(chunk)
+                tried_remotes: Set[str] = set()
+
+                while remaining_entries and not ctx.cancel_event.is_set():
+                    active_remote = self._pick_upload_remote(settings, exclude=tried_remotes)
+                    if active_remote is None:
+                        fallback_reason = next(
+                            (
+                                reason
+                                for r in remote_chain
+                                for (_, reason) in [self._remote_cooldowns.get(r.lower(), (0.0, ""))]
+                                if reason
+                            ),
+                            "已达到网盘上传或空间限额",
                         )
-                    ):
-                        local_path = str(entry.local_path)
-                        removed_local = False
-                        if not ctx.cancel_event.is_set() and delete_verified_source(entry.local_path, snapshot):
-                            await self.repo.clear_uploaded_local_path(entry.viewkey, local_path)
-                            local_path = ""
-                            removed_local = True
-                        elif not ctx.cancel_event.is_set():
-                            self.events.emit_log(
-                                "WARNING",
-                                f"[上传] 本地副本未移除: {entry.local_path.name}",
-                                job_id=job_id,
-                            )
-                        it = await self.repo.update_job_item(
-                            entry.item_id,
-                            status="done",
-                            local_path=local_path,
-                            upload_requested=0,
-                            error_message="",
-                        )
-                        if it:
-                            self.events.broadcast("item_updated", it)
-                        uploaded_by_uploader[uploader_folder] += 1
-                        cleanup_note = "，已删除本地文件" if removed_local else "，保留本地副本"
-                        speed_note = ""
-                        if elapsed > 0.1 and entry.file_size > 0 and len(chunk) == 1:
-                            speed_mb_s = (entry.file_size / (1024 * 1024)) / elapsed
-                            speed_note = f", {speed_mb_s:.1f} MB/s"
-                        remote_display_name = custom_remote_name or entry.local_path.name
+                        await _halt_for_all_remotes_exhausted(fallback_reason)
+                        break
+
+                    tried_remotes.add(active_remote.lower())
+                    effective_settings = (
+                        settings
+                        if active_remote.lower() == primary_remote.lower()
+                        else settings.model_copy(update={"rclone_remote": active_remote})
+                    )
+                    remote_target = build_remote_dir(effective_settings, uploader_folder, site=chunk_site)
+                    files_map = {e.viewkey: e.local_path for e in remaining_entries}
+                    batch_remote_names = {
+                        e.viewkey: remote_names_map[e.viewkey]
+                        for e in remaining_entries
+                        if e.viewkey in remote_names_map
+                    }
+
+                    if len(remaining_entries) == 1:
+                        one = remaining_entries[0]
+                        size_mb = one.file_size / (1024 * 1024)
+                        size_tag = f" ({size_mb:.1f} MB)" if one.file_size > 0 else ""
+                        remote_label = batch_remote_names.get(one.viewkey) or one.local_path.name
                         self.events.emit_log(
                             "INFO",
-                            f"[上传成功] {remote_display_name} -> {up_res.remote_dir} "
-                            f"(耗时 {elapsed:.1f}s{speed_note}{cleanup_note})",
+                            f"[上传] 开始上传至 {remote_target}: {remote_label}{size_tag}",
                             job_id=job_id,
                         )
                     else:
-                        cancelled = ctx.cancel_event.is_set()
-                        err_txt = (
-                            ("因触发网盘限额已暂停，保留本地文件" if self._current_halt_reason else "上传已取消，保留本地文件")
-                            if cancelled
-                            else up_res.error or "未能确认上传结果"
+                        self.events.emit_log(
+                            "INFO",
+                            f"[上传] 开始向 {remote_target} 并行上传 {len(remaining_entries)} 个视频...",
+                            job_id=job_id,
                         )
+
+                    upload_started = time.monotonic()
+                    up_res = await _invoke_upload_file_batch(
+                        download_dir=download_dir,
+                        uploader_folder=uploader_folder,
+                        files_by_viewkey=files_map,
+                        settings=effective_settings,
+                        cancel_event=ctx.cancel_event,
+                        session_cache=upload_session_cache,
+                        on_progress=_on_upload_progress,
+                        remote_names_by_viewkey=batch_remote_names or None,
+                        site=chunk_site,
+                    )
+                    elapsed = max(0.0, time.monotonic() - upload_started)
+                    uploaded_set = set(up_res.uploaded_viewkeys)
+                    next_remaining: List[UploadQueuedItem] = []
+
+                    for entry in remaining_entries:
+                        self.events.clear_item_progress(entry.item_id)
+                        snapshot = up_res.verified_sources.get(entry.viewkey)
+                        local_rel = entry.local_path.relative_to(download_dir).as_posix()
+                        custom_remote_name = batch_remote_names.get(entry.viewkey)
+                        if custom_remote_name:
+                            parent_rel = Path(local_rel).parent.as_posix()
+                            fallback_remote_rel = (
+                                f"{parent_rel}/{custom_remote_name}"
+                                if parent_rel not in {"", "."}
+                                else custom_remote_name
+                            )
+                        else:
+                            fallback_remote_rel = local_rel
+                        verified_remote_path = (
+                            (getattr(up_res, "remote_paths", None) or {}).get(entry.viewkey)
+                            or f"{up_res.remote_dir}/{fallback_remote_rel}"
+                        )
+                        if (
+                            entry.viewkey in uploaded_set
+                            and snapshot is not None
+                            and not ctx.cancel_event.is_set()
+                            and file_snapshot(entry.local_path) == snapshot
+                            and await self.repo.record_verified_upload(
+                                entry.viewkey,
+                                str(entry.local_path),
+                                verified_remote_path,
+                            )
+                        ):
+                            local_path = str(entry.local_path)
+                            removed_local = False
+                            if not ctx.cancel_event.is_set() and delete_verified_source(entry.local_path, snapshot):
+                                await self.repo.clear_uploaded_local_path(entry.viewkey, local_path)
+                                local_path = ""
+                                removed_local = True
+                            elif not ctx.cancel_event.is_set():
+                                self.events.emit_log(
+                                    "WARNING",
+                                    f"[上传] 本地副本未移除: {entry.local_path.name}",
+                                    job_id=job_id,
+                                )
+                            it = await self.repo.update_job_item(
+                                entry.item_id,
+                                status="done",
+                                local_path=local_path,
+                                upload_requested=0,
+                                error_message="",
+                            )
+                            if it:
+                                self.events.broadcast("item_updated", it)
+                            uploaded_by_uploader[uploader_folder] += 1
+                            cleanup_note = "，已删除本地文件" if removed_local else "，保留本地副本"
+                            speed_note = ""
+                            if elapsed > 0.1 and entry.file_size > 0 and len(remaining_entries) == 1:
+                                speed_mb_s = (entry.file_size / (1024 * 1024)) / elapsed
+                                speed_note = f", {speed_mb_s:.1f} MB/s"
+                            remote_display_name = custom_remote_name or entry.local_path.name
+                            self.events.emit_log(
+                                "INFO",
+                                f"[上传成功] {remote_display_name} -> {up_res.remote_dir} "
+                                f"(耗时 {elapsed:.1f}s{speed_note}{cleanup_note})",
+                                job_id=job_id,
+                            )
+                        else:
+                            next_remaining.append(entry)
+
+                    if not next_remaining:
+                        remaining_entries = []
+                        break
+
+                    fatal_limit = str(getattr(up_res, "fatal_limit_error", "") or "").strip()
+                    if fatal_limit and not ctx.cancel_event.is_set():
+                        newly_exhausted = self._mark_remote_exhausted(active_remote, fatal_limit)
+                        next_remote = self._pick_upload_remote(
+                            settings,
+                            exclude=tried_remotes,
+                            advance_cursor=False,
+                        )
+                        if next_remote is not None:
+                            if newly_exhausted:
+                                self.events.emit_log(
+                                    "WARNING",
+                                    f"[上传切换] 网盘 {active_remote} 触发限额（{fatal_limit}），"
+                                    f"已自动切换至备用网盘 {next_remote} 继续上传",
+                                    job_id=job_id,
+                                )
+                            else:
+                                label = (
+                                    next_remaining[0].local_path.name
+                                    if len(next_remaining) == 1
+                                    else f"{len(next_remaining)} 个视频"
+                                )
+                                self.events.emit_log(
+                                    "INFO",
+                                    f"[上传切换] {label} 将改用备用网盘 {next_remote} 重试上传",
+                                    job_id=job_id,
+                                )
+                            for entry in next_remaining:
+                                self.events.emit_item_progress(
+                                    job_id,
+                                    entry.item_id,
+                                    0,
+                                    entry.file_size,
+                                    0.0,
+                                    phase="uploading",
+                                )
+                            remaining_entries = next_remaining
+                            continue
+
+                    # No failover target left (or non-quota failure / user cancellation)
+                    cancelled = ctx.cancel_event.is_set()
+                    err_txt = (
+                        ("因触发网盘限额已暂停，保留本地文件" if self._current_halt_reason else "上传已取消，保留本地文件")
+                        if cancelled
+                        else up_res.error or "未能确认上传结果"
+                    )
+                    for entry in next_remaining:
                         it = await self.repo.update_job_item(
                             entry.item_id,
                             status="cancelled" if cancelled else "failed",
@@ -924,20 +1155,35 @@ class TaskManager:
                             self.events.broadcast("item_updated", it)
                         if not cancelled:
                             _record_failed_url(uploader_folder, entry.page_url)
-                        self.events.emit_log("WARNING", f"[上传失败] {entry.local_path.name}: {err_txt}", job_id=job_id)
-
-                fatal_limit = str(getattr(up_res, "fatal_limit_error", "") or "").strip()
-                if fatal_limit and not ctx.cancel_event.is_set():
-                    if not self._current_halt_reason:
-                        self._current_halt_reason = fatal_limit
-                        await self.repo.update_job(job_id, error_message=fatal_limit)
                         self.events.emit_log(
-                            "ERROR",
-                            f"检测到网盘上传硬性限制（{fatal_limit}），已自动暂停当前任务剩余下载与上传，本地已下载文件均已保留。",
+                            "WARNING",
+                            f"[上传失败] {entry.local_path.name}: {err_txt}",
                             job_id=job_id,
                         )
-                    ctx.cancel_event.set()
-                    await upload_pool.notify_cancel()
+                    remaining_entries = []
+                    if fatal_limit and not ctx.cancel_event.is_set():
+                        await _halt_for_all_remotes_exhausted(fatal_limit)
+                    break
+
+                if remaining_entries:
+                    cancel_reason = (
+                        "因触发网盘限额已暂停，保留本地文件"
+                        if self._current_halt_reason
+                        else "上传已取消，保留本地文件"
+                    )
+                    for entry in remaining_entries:
+                        it = await self.repo.update_job_item(
+                            entry.item_id,
+                            status="cancelled",
+                            error_message=cancel_reason,
+                        )
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        self.events.emit_log(
+                            "WARNING",
+                            f"[上传失败] {entry.local_path.name}: {cancel_reason}",
+                            job_id=job_id,
+                        )
             finally:
                 for entry in chunk:
                     self.events.clear_item_progress(entry.item_id)
@@ -1018,7 +1264,15 @@ class TaskManager:
                         self.events.broadcast("job_updated", refreshed)
 
             timeout = aiohttp.ClientTimeout(total=None, connect=20.0, sock_connect=20.0, sock_read=45.0)
-            connector = aiohttp.TCPConnector(limit=64, limit_per_host=16)
+            dl_slots = max(1, int(settings.max_concurrent_downloads))
+            conn_per_host = max(32, min(96, dl_slots * 12))
+            conn_total = max(128, conn_per_host * 2)
+            connector = aiohttp.TCPConnector(
+                limit=conn_total,
+                limit_per_host=conn_per_host,
+                keepalive_timeout=60.0,
+                ttl_dns_cache=300,
+            )
 
             async with aiohttp.ClientSession(
                 timeout=timeout,

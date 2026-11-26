@@ -207,6 +207,8 @@ class RuntimeSettings(BaseModel):
     uploader_enabled: bool = True
     rclone_bin: str = "rclone"
     rclone_remote: str = "pikpak"
+    rclone_backup_remotes: str = ""  # comma-separated fallback remotes, e.g. "gd2,gd3"
+    rclone_remote_strategy: Literal["failover", "round_robin"] = "failover"
     rclone_remote_base_dir: str = "Pornhub"
     rclone_xh_remote_base_dir: str = "xHamster"
     rclone_transfers: int = Field(default=1, ge=1, le=16)
@@ -243,6 +245,31 @@ class RuntimeSettings(BaseModel):
     def normalized_proxy(self) -> Optional[str]:
         p = (self.proxy_url or "").strip()
         return p or None
+
+    def rclone_remote_chain(self) -> list[str]:
+        """Return deduplicated ordered remote names: ``[primary, *backups]``."""
+        raw_items: list[str] = []
+        primary = (self.rclone_remote or "").strip().rstrip(":")
+        if primary:
+            raw_items.append(primary)
+        raw_backups = (
+            (self.rclone_backup_remotes or "")
+            .replace("，", ",")
+            .replace("\n", ",")
+            .replace(";", ",")
+        )
+        for part in raw_backups.split(","):
+            name = part.strip().rstrip(":")
+            if name:
+                raw_items.append(name)
+        seen: set[str] = set()
+        chain: list[str] = []
+        for item in raw_items:
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                chain.append(item)
+        return chain
 
     def to_redacted_dict(self) -> dict[str, Any]:
         data = self.model_dump()

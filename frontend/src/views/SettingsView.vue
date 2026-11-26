@@ -104,10 +104,17 @@ const XH_CODEC_OPTIONS = [
   { label: 'AV1（同画质体积更小，需播放器支持）', value: 'av1' },
 ]
 
+const RCLONE_STRATEGY_OPTIONS = [
+  { label: '顺序主备（用满自动切换下一个）', value: 'failover' },
+  { label: '多盘轮询（均摊每日额度 + 限额切换）', value: 'round_robin' },
+]
+
 function cloneSettings(src) {
   if (!src) return null
   return {
     ...src,
+    rclone_backup_remotes: src.rclone_backup_remotes ?? '',
+    rclone_remote_strategy: src.rclone_remote_strategy || 'failover',
     yescaptcha_ph_task_type:
       src.yescaptcha_ph_task_type || 'RecaptchaV2EnterpriseTaskProxyless',
     yescaptcha_xh_task_type: src.yescaptcha_xh_task_type || 'RecaptchaV2TaskProxyless',
@@ -256,9 +263,65 @@ async function loadRcloneRemotes({ force = false } = {}) {
   }
 }
 
+function parseBackupRemoteList(raw, primaryName = '') {
+  const primaryLower = String(primaryName || '').trim().replace(/:+$/, '').toLowerCase()
+  const parts = String(raw || '')
+    .replace(/[，;\n]+/g, ',')
+    .split(',')
+    .map((s) => s.trim().replace(/:+$/, ''))
+    .filter(Boolean)
+  const seen = new Set(primaryLower ? [primaryLower] : [])
+  const out = []
+  for (const name of parts) {
+    const key = name.toLowerCase()
+    if (!seen.has(key)) {
+      seen.add(key)
+      out.push(name)
+    }
+  }
+  return out
+}
+
+const backupRemoteList = computed(() =>
+  parseBackupRemoteList(form.value?.rclone_backup_remotes, form.value?.rclone_remote)
+)
+
+const backupCandidateRemotes = computed(() => {
+  const primaryLower = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '').toLowerCase()
+  return rcloneRemotes.value.filter((r) => r.name.toLowerCase() !== primaryLower)
+})
+
+const activeRemoteChain = computed(() => {
+  const primary = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '')
+  return primary ? [primary, ...backupRemoteList.value] : [...backupRemoteList.value]
+})
+
+function backupRemoteOrder(name) {
+  const key = String(name || '').trim().toLowerCase()
+  const idx = backupRemoteList.value.findIndex((item) => item.toLowerCase() === key)
+  return idx >= 0 ? idx + 1 : 0
+}
+
+function toggleBackupRemote(remote) {
+  if (!form.value || !remote?.name) return
+  const list = [...backupRemoteList.value]
+  const key = remote.name.toLowerCase()
+  const idx = list.findIndex((item) => item.toLowerCase() === key)
+  if (idx >= 0) {
+    list.splice(idx, 1)
+  } else {
+    list.push(remote.name)
+  }
+  form.value.rclone_backup_remotes = list.join(', ')
+}
+
 function selectRcloneRemote(remote) {
   if (!form.value || !remote?.name) return
   form.value.rclone_remote = remote.name
+  const cleanedBackups = parseBackupRemoteList(form.value.rclone_backup_remotes, remote.name)
+  if (form.value.rclone_backup_remotes) {
+    form.value.rclone_backup_remotes = cleanedBackups.join(', ')
+  }
   syncProviderTabFromType(String(remote.type || '').toLowerCase() || activeRemoteType.value)
 }
 
@@ -1091,6 +1154,55 @@ async function handleTestNotify() {
             </div>
           </div>
 
+          <!-- Multi-Remote Auto-Failover -->
+          <div class="rounded-xl border border-border/80 bg-surface-subtle/40 p-3.5 space-y-2.5">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div class="space-y-1 md:col-span-2">
+                <label class="text-xs font-medium text-foreground">备用 Remote 列表（限额自动切换，逗号分隔）</label>
+                <Input
+                  v-model="form.rclone_backup_remotes"
+                  placeholder="留空表示单盘；例如 gd2, gd3（填好后触发每日 750GB 或空间满自动接力）"
+                />
+              </div>
+              <div class="space-y-1">
+                <label class="text-xs font-medium text-foreground">多盘调度策略</label>
+                <Select v-model="form.rclone_remote_strategy" :options="RCLONE_STRATEGY_OPTIONS" />
+              </div>
+            </div>
+
+            <div v-if="backupCandidateRemotes.length > 0" class="flex flex-wrap items-center gap-1.5">
+              <span class="text-[11px] text-muted-foreground mr-0.5">快捷加入备用：</span>
+              <Button
+                v-for="r in backupCandidateRemotes"
+                :key="r.name"
+                variant="outline"
+                size="xs"
+                :aria-pressed="backupRemoteOrder(r.name) > 0"
+                :class="[
+                  'h-6 gap-1.5 px-2.5 rounded-full text-[11px] font-medium shadow-none hover:shadow-none',
+                  backupRemoteOrder(r.name) > 0
+                    ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
+                    : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-foreground/20',
+                ]"
+                @click="toggleBackupRemote(r)"
+              >
+                <span v-if="backupRemoteOrder(r.name) > 0" class="font-mono text-[10px]">
+                  #{{ backupRemoteOrder(r.name) }}
+                </span>
+                <span class="font-mono">{{ r.name }}</span>
+                <span class="text-[10px] opacity-75">{{ formatRemoteType(r.type) }}</span>
+              </Button>
+            </div>
+
+            <p v-if="activeRemoteChain.length > 1" class="text-[11px] text-muted-foreground">
+              当前上传链路：<span class="font-mono text-foreground">{{ activeRemoteChain.join(' → ') }}</span>
+              （单个账号触发每日 750GB 上限或空间已满时自动无缝切换重试，不中断任务；「测试连接」会同时校验所有远端）
+            </p>
+            <p v-else class="text-[11px] text-muted-foreground">
+              多个人盘接力技巧：在各 Google Drive 账号中共享同一文件夹并在 <span class="font-mono">rclone.conf</span> 指向相同 <span class="font-mono">root_folder_id</span>，再把新远端名填入上方备用列表即可自动接力突破单号 750GB/天 上限。
+            </p>
+          </div>
+
           <!-- Switches + Collapsible Advanced (bin / log level) -->
           <div class="flex flex-wrap items-center justify-between gap-3 pt-0.5">
             <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
@@ -1234,10 +1346,10 @@ async function handleTestNotify() {
                 </div>
                 <label
                   class="inline-flex items-center gap-2 h-9 text-xs text-foreground/85 cursor-pointer"
-                  title="Google Drive 单号每日 750GB 上传上限触发时立即终止本次上传并保留本地文件，避免干等超时"
+                  title="Google Drive 单号每日 750GB 上传上限触发时立即终止当前远端上传；若已配置备用 Remote 将自动切换重试，否则暂停任务并保留本地文件"
                 >
                   <Switch v-model="form.rclone_drive_stop_on_upload_limit" />
-                  <span>达每日 750GB 上限时立即停止重试</span>
+                  <span>达每日 750GB 上限时立即停止重试（配合备用盘自动切换）</span>
                 </label>
               </div>
               <p class="text-[11px] text-muted-foreground">

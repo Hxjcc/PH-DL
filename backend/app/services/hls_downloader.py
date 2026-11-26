@@ -1,8 +1,9 @@
-"""yt-dlp library-mode HLS downloader with fragment resume, disk backpressure, and lossless MP4 remuxing."""
+"""High-speed async aiohttp HLS downloader with yt-dlp fallback, fragment resume, and lossless MP4 remuxing."""
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import gc
 import inspect
@@ -15,7 +16,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import yt_dlp
@@ -43,7 +44,13 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 _HLS_ENGINE_NAME = "yt-dlp"
 _HLS_MANIFEST_VERSION = 2
-_META_FILENAMES = frozenset({"manifest.json"})
+_AIOHTTP_ENGINE_NAME = "aiohttp"
+_AIOHTTP_MANIFEST_VERSION = 3
+_AIOHTTP_CHUNK_BYTES = 256 * 1024
+_AIOHTTP_STREAM_BUFFER_BYTES = 2 * 1024 * 1024
+_AIOHTTP_MANIFEST_FLUSH_SEGMENTS = 16
+_AIOHTTP_MANIFEST_FLUSH_SECONDS = 4.0
+_META_FILENAMES = frozenset({"manifest.json", "manifest.json.tmp"})
 
 
 def is_hls_url(url: Optional[str]) -> bool:
@@ -64,6 +71,9 @@ class HlsMediaPlaylist:
     total_duration: float
     is_fmp4: bool
     encrypted_method: str = ""
+    is_master: bool = False
+    has_byterange: bool = False
+    has_separate_media: bool = False
 
 
 def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
@@ -72,10 +82,22 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
     segments: List[str] = []
     total_duration = 0.0
     encrypted_method = ""
+    is_master = False
+    has_byterange = False
+    has_separate_media = False
 
     for raw_line in (m3u8_text or "").splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            is_master = True
+            continue
+        if line.startswith("#EXT-X-BYTERANGE:"):
+            has_byterange = True
+            continue
+        if line.startswith("#EXT-X-MEDIA:"):
+            has_separate_media = True
             continue
         if line.startswith("#EXT-X-MAP:"):
             m_uri = _EXT_X_MAP_URI_RE.search(line)
@@ -109,6 +131,9 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
         total_duration=total_duration,
         is_fmp4=is_fmp4,
         encrypted_method=encrypted_method,
+        is_master=is_master,
+        has_byterange=has_byterange,
+        has_separate_media=has_separate_media,
     )
 
 
@@ -472,6 +497,8 @@ def _run_ytdlp_hls_sync(
         "outtmpl": str(hls_dir / "stream.%(ext)s"),
         "format": "best",
         "concurrent_fragment_downloads": max(1, min(16, int(segment_concurrency))),
+        "buffersize": 256 * 1024,
+        "http_chunk_size": 0,
         "retries": 4,
         "fragment_retries": 6,
         "file_access_retries": 5,
@@ -524,6 +551,473 @@ def _run_ytdlp_hls_sync(
     return False, capture.errors, caught
 
 
+@dataclass(frozen=True)
+class _AiohttpHlsOutcome:
+    ok: bool = False
+    fallback_to_ytdlp: bool = False
+    cancelled: bool = False
+    expired_code: Optional[int] = None
+    error: str = ""
+    disk_error: Optional[_DiskSpaceError] = None
+
+
+def _read_hls_manifest(hls_dir: Path) -> Optional[Dict[str, Any]]:
+    manifest_path = hls_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_hls_manifest_atomic(hls_dir: Path, meta: Dict[str, Any]) -> None:
+    manifest_path = hls_dir / "manifest.json"
+    tmp_path = hls_dir / "manifest.json.tmp"
+    payload = json.dumps(meta)
+    try:
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, manifest_path)
+    except PermissionError:
+        with contextlib.suppress(OSError):
+            manifest_path.write_text(payload, encoding="utf-8")
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+
+
+def _write_stream_blocks(fh: Any, blocks: List[bytes], *, flush: bool = False) -> None:
+    for block in blocks:
+        fh.write(block)
+    if flush:
+        fh.flush()
+
+
+async def _download_hls_aiohttp(
+    *,
+    session: aiohttp.ClientSession,
+    playlist_url: str,
+    hls_dir: Path,
+    viewkey: str,
+    quality: str,
+    referer: str,
+    cookie_str: str,
+    proxy_url: Optional[str],
+    segment_concurrency: int,
+    request_timeout: float,
+    stop: asyncio.Event,
+    prepare_write: Callable[[int], None],
+    on_tick: Callable[[int, int, float], None],
+) -> _AiohttpHlsOutcome:
+    """Download an unencrypted HLS media playlist asynchronously over a pooled aiohttp session.
+
+    Uses a bounded sliding window to fetch segments concurrently over Keep-Alive connections and
+    appends them strictly in order to a single ``stream.part`` file (zero per-fragment temp files).
+    Falls back cleanly to yt-dlp for encrypted, master, byte-range, or separate-audio playlists.
+    """
+    headers: Dict[str, str] = {**DOWNLOAD_HEADERS, "Referer": referer}
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+    proxy = proxy_url or None
+    req_timeout = max(10.0, float(request_timeout))
+    playlist_timeout = aiohttp.ClientTimeout(
+        total=req_timeout,
+        connect=min(req_timeout, 20.0),
+        sock_connect=min(req_timeout, 20.0),
+        sock_read=req_timeout,
+    )
+    seg_timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=min(req_timeout, 20.0),
+        sock_connect=min(req_timeout, 20.0),
+        sock_read=req_timeout,
+    )
+
+    # 1. Fetch & parse media playlist
+    try:
+        async with await until_stopped(
+            session.get(
+                playlist_url,
+                headers=headers,
+                allow_redirects=True,
+                proxy=proxy,
+                timeout=playlist_timeout,
+            ),
+            stop,
+        ) as resp:
+            if resp.status in (403, 410, 472):
+                return _AiohttpHlsOutcome(expired_code=resp.status, error=f"HTTP {resp.status}")
+            if resp.status != 200:
+                return _AiohttpHlsOutcome(error=f"HLS 清单拉取失败 (HTTP {resp.status})")
+            m3u8_text = await until_stopped(resp.text(errors="replace"), stop)
+            effective_url = str(resp.url)
+    except StopRequested:
+        return _AiohttpHlsOutcome(cancelled=True)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+        return _AiohttpHlsOutcome(error=f"HLS 清单请求失败: {err}")
+
+    upper_m3u8 = (m3u8_text or "").upper()
+    if "#EXTM3U" not in upper_m3u8 and "#EXTINF" not in upper_m3u8:
+        return _AiohttpHlsOutcome(fallback_to_ytdlp=True, error="非标准 HLS 媒体清单")
+
+    playlist = parse_hls_media_playlist(m3u8_text, effective_url)
+    if (
+        not playlist.segment_urls
+        or playlist.encrypted_method
+        or playlist.is_master
+        or playlist.has_byterange
+        or playlist.has_separate_media
+    ):
+        return _AiohttpHlsOutcome(fallback_to_ytdlp=True)
+
+    # 2. Initialize or resume single sequential stream.part
+    total_segments = len(playlist.segment_urls)
+    norm_q = normalized_quality(quality)
+    stream_part = hls_dir / "stream.part"
+    completed_segments = 0
+    stream_bytes = 0
+    init_written = False
+    reused = False
+
+    old_meta = _read_hls_manifest(hls_dir)
+    if (
+        old_meta is not None
+        and old_meta.get("engine") == _AIOHTTP_ENGINE_NAME
+        and old_meta.get("version") == _AIOHTTP_MANIFEST_VERSION
+        and old_meta.get("viewkey") == viewkey
+        and old_meta.get("quality") == norm_q
+        and old_meta.get("segment_count") == total_segments
+        and bool(old_meta.get("is_fmp4")) == playlist.is_fmp4
+        and stream_part.is_file()
+    ):
+        try:
+            saved_completed = int(old_meta.get("completed_segments") or 0)
+            saved_bytes = int(old_meta.get("stream_bytes") or 0)
+            saved_init = bool(old_meta.get("init_written"))
+            actual_size = stream_part.stat().st_size
+            if (
+                0 <= saved_completed <= total_segments
+                and 0 <= saved_bytes <= actual_size
+                and (not playlist.init_url or saved_init or saved_completed == 0)
+            ):
+                completed_segments = saved_completed
+                stream_bytes = saved_bytes
+                init_written = saved_init
+                reused = True
+        except (OSError, ValueError, TypeError):
+            reused = False
+
+    if not reused:
+        if hls_dir.is_dir():
+            shutil.rmtree(hls_dir, ignore_errors=True)
+        hls_dir.mkdir(parents=True, exist_ok=True)
+        completed_segments = 0
+        stream_bytes = 0
+        init_written = False
+
+    def _build_meta() -> Dict[str, Any]:
+        return {
+            "engine": _AIOHTTP_ENGINE_NAME,
+            "version": _AIOHTTP_MANIFEST_VERSION,
+            "viewkey": viewkey,
+            "quality": norm_q,
+            "segment_count": total_segments,
+            "is_fmp4": playlist.is_fmp4,
+            "init_written": init_written,
+            "completed_segments": completed_segments,
+            "stream_bytes": stream_bytes,
+        }
+
+    _write_hls_manifest_atomic(hls_dir, _build_meta())
+
+    # 3. Real-time progress & rolling 2s speed tracker
+    in_flight_bytes = 0
+    best_reported_bytes = stream_bytes
+    speed_window: Deque[Tuple[float, int]] = collections.deque()
+    speed_window_bytes = 0
+    last_tick_at = 0.0
+    ready_buffers: Dict[int, bytes] = {}
+    ready_buffered_bytes = 0
+
+    def _record_speed_delta(delta: int, *, force_tick: bool = False) -> None:
+        nonlocal speed_window_bytes, best_reported_bytes, last_tick_at
+        now = time.monotonic()
+        if delta > 0:
+            speed_window.append((now, delta))
+            speed_window_bytes += delta
+        cutoff = now - 2.0
+        while speed_window and speed_window[0][0] < cutoff:
+            _, old_b = speed_window.popleft()
+            speed_window_bytes -= old_b
+
+        if not force_tick and last_tick_at > 0.0 and (now - last_tick_at) < 0.25:
+            return
+
+        reported_dl = max(best_reported_bytes, stream_bytes + max(0, in_flight_bytes))
+        best_reported_bytes = reported_dl
+        done_count = completed_segments + len(ready_buffers)
+        if done_count > 0 and done_count < total_segments:
+            known_done_bytes = stream_bytes + ready_buffered_bytes
+            avg_seg = max(known_done_bytes, reported_dl) / done_count
+            est_total = max(reported_dl + 1, int(avg_seg * total_segments))
+        elif completed_segments >= total_segments:
+            est_total = max(reported_dl, stream_bytes)
+        else:
+            est_total = max(reported_dl + 1, 1)
+
+        if speed_window:
+            span = max(0.25, now - speed_window[0][0])
+            speed_bps = max(0.0, speed_window_bytes / span)
+        else:
+            speed_bps = 0.0
+
+        last_tick_at = now
+        on_tick(reported_dl, est_total, speed_bps)
+
+    abort_event = asyncio.Event()
+    if stop.is_set():
+        abort_event.set()
+
+    async def _fetch_segment_bytes(seg_url: str, *, max_seg_retries: int = 4) -> Tuple[Optional[bytes], Optional[int], str]:
+        nonlocal in_flight_bytes
+        last_err = ""
+        for retry_idx in range(max_seg_retries + 1):
+            if stop.is_set() or abort_event.is_set():
+                return None, None, ""
+            received = 0
+            try:
+                async with session.get(
+                    seg_url,
+                    headers=headers,
+                    allow_redirects=True,
+                    proxy=proxy,
+                    timeout=seg_timeout,
+                ) as resp:
+                    if resp.status in (403, 410, 472):
+                        return None, resp.status, f"HTTP {resp.status}"
+                    if resp.status != 200:
+                        last_err = f"HTTP {resp.status}"
+                    else:
+                        expected_len = resp.content_length
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(_AIOHTTP_CHUNK_BYTES):
+                            if stop.is_set() or abort_event.is_set():
+                                in_flight_bytes -= received
+                                return None, None, ""
+                            if not chunk:
+                                continue
+                            buf.extend(chunk)
+                            n = len(chunk)
+                            received += n
+                            in_flight_bytes += n
+                            _record_speed_delta(n)
+                        if expected_len is not None and len(buf) != expected_len:
+                            in_flight_bytes -= received
+                            last_err = f"分片大小不完整 ({len(buf)}/{expected_len})"
+                        elif len(buf) == 0:
+                            in_flight_bytes -= received
+                            last_err = "分片内容为空"
+                        else:
+                            return bytes(buf), None, ""
+            except asyncio.CancelledError:
+                in_flight_bytes -= received
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+                in_flight_bytes -= received
+                last_err = str(err) or type(err).__name__
+
+            if retry_idx < max_seg_retries and not stop.is_set() and not abort_event.is_set():
+                delay = min(0.5 * (2 ** retry_idx), 4.0)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(abort_event.wait(), timeout=delay)
+        return None, None, last_err or "分片下载失败"
+
+    if stream_bytes > 0:
+        _record_speed_delta(0, force_tick=True)
+
+    # 4. Open stream.part once with a large sequential write buffer
+    fh = open(stream_part, "r+b" if reused else "wb", buffering=_AIOHTTP_STREAM_BUFFER_BYTES)
+    try:
+        if reused:
+            fh.seek(stream_bytes)
+            fh.truncate(stream_bytes)
+
+        # Download fMP4 init segment if required
+        if playlist.init_url and not init_written:
+            init_data, init_code, init_err = await _fetch_segment_bytes(playlist.init_url)
+            if stop.is_set():
+                return _AiohttpHlsOutcome(cancelled=True)
+            if init_data is None:
+                return _AiohttpHlsOutcome(
+                    expired_code=init_code,
+                    error=init_err or "HLS 初始化分片下载失败",
+                )
+            try:
+                prepare_write(len(init_data))
+            except _DiskSpaceError as derr:
+                return _AiohttpHlsOutcome(disk_error=derr, error=str(derr))
+            await asyncio.to_thread(_write_stream_blocks, fh, [init_data], flush=True)
+            in_flight_bytes = max(0, in_flight_bytes - len(init_data))
+            stream_bytes += len(init_data)
+            init_written = True
+            _write_hls_manifest_atomic(hls_dir, _build_meta())
+
+        remaining_segments = total_segments - completed_segments
+        if remaining_segments > 0:
+            workers = max(1, min(16, int(segment_concurrency), remaining_segments))
+            window_size = 1 if workers == 1 else max(workers * 2, 16)
+            next_fetch_idx = completed_segments
+            next_write_idx = completed_segments
+            window_cv = asyncio.Condition()
+            fatal_outcome: Optional[_AiohttpHlsOutcome] = None
+            fetcher_tasks: List[asyncio.Task[None]] = []
+            last_manifest_seg = completed_segments
+            last_manifest_at = time.monotonic()
+
+            async def _watch_stop() -> None:
+                await stop.wait()
+                abort_event.set()
+                async with window_cv:
+                    window_cv.notify_all()
+                for ft in fetcher_tasks:
+                    if not ft.done():
+                        ft.cancel()
+
+            async def _fetcher() -> None:
+                nonlocal next_fetch_idx, fatal_outcome, ready_buffered_bytes
+                while not abort_event.is_set() and not stop.is_set():
+                    async with window_cv:
+                        while (
+                            not abort_event.is_set()
+                            and not stop.is_set()
+                            and next_fetch_idx < total_segments
+                            and (next_fetch_idx - next_write_idx) >= window_size
+                        ):
+                            await window_cv.wait()
+                        if abort_event.is_set() or stop.is_set() or next_fetch_idx >= total_segments:
+                            return
+                        seg_idx = next_fetch_idx
+                        next_fetch_idx += 1
+
+                    seg_url = playlist.segment_urls[seg_idx]
+                    data, err_code, err_msg = await _fetch_segment_bytes(seg_url)
+                    if data is None:
+                        if not stop.is_set() and fatal_outcome is None:
+                            fatal_outcome = _AiohttpHlsOutcome(
+                                expired_code=err_code,
+                                error=err_msg or f"分片 {seg_idx + 1} 下载失败",
+                            )
+                        abort_event.set()
+                        async with window_cv:
+                            window_cv.notify_all()
+                        return
+
+                    async with window_cv:
+                        ready_buffers[seg_idx] = data
+                        ready_buffered_bytes += len(data)
+                        if seg_idx == next_write_idx:
+                            window_cv.notify_all()
+
+            async def _writer() -> None:
+                nonlocal next_write_idx, completed_segments, stream_bytes
+                nonlocal in_flight_bytes, ready_buffered_bytes, fatal_outcome
+                nonlocal last_manifest_seg, last_manifest_at
+                while next_write_idx < total_segments:
+                    async with window_cv:
+                        while (
+                            next_write_idx not in ready_buffers
+                            and not abort_event.is_set()
+                            and not stop.is_set()
+                        ):
+                            await window_cv.wait()
+
+                        blocks: List[bytes] = []
+                        while next_write_idx in ready_buffers:
+                            blk = ready_buffers.pop(next_write_idx)
+                            ready_buffered_bytes -= len(blk)
+                            blocks.append(blk)
+                            next_write_idx += 1
+
+                        should_stop = (not blocks) and (abort_event.is_set() or stop.is_set())
+
+                    if should_stop:
+                        break
+                    if not blocks:
+                        continue
+
+                    batch_len = sum(len(b) for b in blocks)
+                    try:
+                        prepare_write(batch_len)
+                    except _DiskSpaceError as derr:
+                        fatal_outcome = _AiohttpHlsOutcome(disk_error=derr, error=str(derr))
+                        abort_event.set()
+                        async with window_cv:
+                            window_cv.notify_all()
+                        break
+
+                    now = time.monotonic()
+                    need_manifest = (
+                        (next_write_idx - last_manifest_seg) >= _AIOHTTP_MANIFEST_FLUSH_SEGMENTS
+                        or (now - last_manifest_at) >= _AIOHTTP_MANIFEST_FLUSH_SECONDS
+                        or next_write_idx >= total_segments
+                    )
+                    await asyncio.to_thread(_write_stream_blocks, fh, blocks, flush=need_manifest)
+                    in_flight_bytes = max(0, in_flight_bytes - batch_len)
+                    stream_bytes += batch_len
+                    completed_segments = next_write_idx
+
+                    if need_manifest:
+                        _write_hls_manifest_atomic(hls_dir, _build_meta())
+                        last_manifest_seg = completed_segments
+                        last_manifest_at = now
+
+                    async with window_cv:
+                        window_cv.notify_all()
+
+            stop_watcher = asyncio.create_task(_watch_stop())
+            writer_task = asyncio.create_task(_writer())
+            fetcher_tasks = [asyncio.create_task(_fetcher()) for _ in range(workers)]
+            try:
+                await writer_task
+                if abort_event.is_set() or stop.is_set():
+                    for ft in fetcher_tasks:
+                        if not ft.done():
+                            ft.cancel()
+                await asyncio.gather(*fetcher_tasks, return_exceptions=True)
+            finally:
+                stop_watcher.cancel()
+                with contextlib.suppress(BaseException):
+                    await stop_watcher
+                for ft in fetcher_tasks:
+                    if not ft.done():
+                        ft.cancel()
+                await asyncio.gather(*fetcher_tasks, return_exceptions=True)
+
+            await asyncio.to_thread(fh.flush)
+            _write_hls_manifest_atomic(hls_dir, _build_meta())
+
+            if stop.is_set():
+                return _AiohttpHlsOutcome(cancelled=True)
+            if fatal_outcome is not None:
+                return fatal_outcome
+            if completed_segments < total_segments:
+                return _AiohttpHlsOutcome(error="HLS 分片未能全部完成")
+
+        await asyncio.to_thread(fh.flush)
+        _write_hls_manifest_atomic(hls_dir, _build_meta())
+    finally:
+        with contextlib.suppress(OSError):
+            fh.close()
+
+    if stop.is_set():
+        return _AiohttpHlsOutcome(cancelled=True)
+
+    final_stream = hls_dir / "stream.mp4"
+    os.replace(stream_part, final_stream)
+    _record_speed_delta(0, force_tick=True)
+    return _AiohttpHlsOutcome(ok=True)
+
+
 async def download_hls_to_mp4(
     *,
     session: aiohttp.ClientSession,
@@ -545,7 +1039,7 @@ async def download_hls_to_mp4(
     preferred_qualities: Optional[Set[str]] = None,
     xh_preferred_codec: str = "h264",
     max_attempts: int = 3,
-    segment_concurrency: int = 8,
+    segment_concurrency: int = 10,
     retry_delay_base: float = 2.0,
     retry_delay_max: float = 10.0,
     request_timeout: Optional[float] = None,
@@ -554,8 +1048,7 @@ async def download_hls_to_mp4(
     on_progress: Optional[ProgressCallback] = None,
     on_log: Optional[LogCallback] = None,
 ) -> DownloadOutcome:
-    """Download an HLS stream via yt-dlp with fragment resume and lossless ffmpeg MP4 remuxing."""
-    _ = session  # Retained in signature for caller compatibility; yt-dlp manages its own HTTP pool.
+    """Download an HLS stream via async aiohttp (with yt-dlp fallback), fragment resume, and lossless MP4 remuxing."""
     stop = cancel_event if cancel_event is not None else parse_ctx.cancel_event
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", viewkey or ""):
         return DownloadOutcome(success=False, error="缺少或无效的 viewkey")
@@ -648,7 +1141,30 @@ async def download_hls_to_mp4(
         current_quality = detail.quality or current_quality
         return True
 
-    def _prepare_hls_dir() -> None:
+    def _find_reusable_completed_stream() -> Optional[Path]:
+        """Reuse an already-downloaded ``stream.mp4`` when resuming right before remux."""
+        old_meta = _read_hls_manifest(hls_dir)
+        if old_meta is None:
+            return None
+        if (
+            old_meta.get("engine") in {_HLS_ENGINE_NAME, _AIOHTTP_ENGINE_NAME}
+            and old_meta.get("viewkey") == viewkey
+            and old_meta.get("quality") == normalized_quality(current_quality)
+        ):
+            return _find_downloaded_stream(hls_dir)
+        return None
+
+    def _has_active_ytdlp_checkpoint() -> bool:
+        old_meta = _read_hls_manifest(hls_dir)
+        return (
+            old_meta is not None
+            and old_meta.get("engine") == _HLS_ENGINE_NAME
+            and old_meta.get("viewkey") == viewkey
+            and old_meta.get("quality") == normalized_quality(current_quality)
+            and (hls_dir / "stream.mp4.ytdl").is_file()
+        )
+
+    def _prepare_ytdlp_hls_dir() -> None:
         manifest_path = hls_dir / "manifest.json"
         expected_meta = {
             "engine": _HLS_ENGINE_NAME,
@@ -657,17 +1173,13 @@ async def download_hls_to_mp4(
             "quality": normalized_quality(current_quality),
         }
         if hls_dir.is_dir():
-            reuse = False
-            try:
-                old_meta = json.loads(manifest_path.read_text(encoding="utf-8"))
-                reuse = (
-                    isinstance(old_meta, dict)
-                    and old_meta.get("engine") == _HLS_ENGINE_NAME
-                    and old_meta.get("viewkey") == expected_meta["viewkey"]
-                    and old_meta.get("quality") == expected_meta["quality"]
-                )
-            except (OSError, ValueError, TypeError):
-                reuse = False
+            old_meta = _read_hls_manifest(hls_dir)
+            reuse = (
+                old_meta is not None
+                and old_meta.get("engine") == _HLS_ENGINE_NAME
+                and old_meta.get("viewkey") == expected_meta["viewkey"]
+                and old_meta.get("quality") == expected_meta["quality"]
+            )
             if not reuse:
                 shutil.rmtree(hls_dir, ignore_errors=True)
         hls_dir.mkdir(parents=True, exist_ok=True)
@@ -691,62 +1203,116 @@ async def download_hls_to_mp4(
                     last_error = "无法解析 HLS 播放清单"
                     should_retry = True
                 else:
-                    _prepare_hls_dir()
-                    raw_stream = _find_downloaded_stream(hls_dir)
+                    raw_stream = _find_reusable_completed_stream()
 
                     if raw_stream is None:
-                        initial_bytes = _media_dir_size(hls_dir)
-                        if initial_bytes > 0:
-                            emit_progress(initial_bytes, initial_bytes + 1, 0.0, "downloading")
+                        use_ytdlp = session is None or _has_active_ytdlp_checkpoint()
 
-                        thread_stop = threading.Event()
-                        if stop.is_set():
-                            thread_stop.set()
-
-                        async def _bridge_cancel() -> None:
-                            await stop.wait()
-                            thread_stop.set()
-
-                        cancel_bridge = asyncio.create_task(_bridge_cancel())
-                        try:
+                        if not use_ytdlp and session is not None:
                             with disk.reserve(0) as prepare_write:
-                                ok_dl, ydl_errors, ydl_exc = await asyncio.to_thread(
-                                    _run_ytdlp_hls_sync,
+                                aio_res = await _download_hls_aiohttp(
+                                    session=session,
                                     playlist_url=url,
                                     hls_dir=hls_dir,
+                                    viewkey=viewkey,
+                                    quality=current_quality,
                                     referer=referer,
                                     cookie_str=cookie_str,
                                     proxy_url=proxy_url,
                                     segment_concurrency=segment_concurrency,
                                     request_timeout=req_timeout,
-                                    ffmpeg_bin=ffmpeg_bin,
-                                    thread_stop=thread_stop,
+                                    stop=stop,
                                     prepare_write=prepare_write,
-                                    on_tick=lambda d, t, s: emit_progress_threadsafe(d, t, s, "downloading"),
+                                    on_tick=lambda d, t, s: emit_progress(d, t, s, "downloading"),
                                 )
-                        finally:
-                            cancel_bridge.cancel()
-                            with contextlib.suppress(BaseException):
-                                await cancel_bridge
-
-                        if stop.is_set() or (isinstance(ydl_exc, DownloadCancelled) and not isinstance(ydl_exc, _DiskSpaceError)):
-                            raise StopRequested
-                        if isinstance(ydl_exc, _DiskSpaceError):
-                            raise ydl_exc
-                        if not ok_dl:
-                            err_summary, expired_code, non_retryable = _classify_ytdlp_error(ydl_exc, ydl_errors)
-                            last_error = err_summary
-                            if non_retryable:
-                                return incomplete(last_error)
-                            if expired_code is not None and attempt < attempts - 1:
-                                emit("INFO", f"{title}: HLS 签名链接疑似过期（HTTP {expired_code}），重新解析链接并续传剩余分片")
-                                await until_stopped(refresh_playlist_url(), stop)
-                            should_retry = True
-                        else:
-                            raw_stream = _find_downloaded_stream(hls_dir)
-                            if raw_stream is None:
-                                last_error = "yt-dlp 下载完成后未找到视频流文件"
+                            if aio_res.cancelled or stop.is_set():
+                                raise StopRequested
+                            if aio_res.disk_error is not None:
+                                raise aio_res.disk_error
+                            if aio_res.fallback_to_ytdlp:
+                                use_ytdlp = True
+                            elif aio_res.ok:
+                                raw_stream = _find_downloaded_stream(hls_dir)
+                                if raw_stream is None:
+                                    last_error = "HLS 下载完成后未找到视频流文件"
+                                    should_retry = True
+                            else:
+                                last_error = aio_res.error or "HLS 分片下载失败"
+                                if aio_res.expired_code is not None and attempt < attempts - 1:
+                                    emit(
+                                        "INFO",
+                                        f"{title}: HLS 签名链接疑似过期（HTTP {aio_res.expired_code}），"
+                                        "重新解析链接并续传剩余分片",
+                                    )
+                                    await until_stopped(refresh_playlist_url(), stop)
                                 should_retry = True
+
+                        if use_ytdlp and not should_retry and raw_stream is None:
+                            _prepare_ytdlp_hls_dir()
+                            raw_stream = _find_downloaded_stream(hls_dir)
+
+                            if raw_stream is None:
+                                initial_bytes = _media_dir_size(hls_dir)
+                                if initial_bytes > 0:
+                                    emit_progress(initial_bytes, initial_bytes + 1, 0.0, "downloading")
+
+                                thread_stop = threading.Event()
+                                if stop.is_set():
+                                    thread_stop.set()
+
+                                async def _bridge_cancel() -> None:
+                                    await stop.wait()
+                                    thread_stop.set()
+
+                                cancel_bridge = asyncio.create_task(_bridge_cancel())
+                                try:
+                                    with disk.reserve(0) as prepare_write:
+                                        ok_dl, ydl_errors, ydl_exc = await asyncio.to_thread(
+                                            _run_ytdlp_hls_sync,
+                                            playlist_url=url,
+                                            hls_dir=hls_dir,
+                                            referer=referer,
+                                            cookie_str=cookie_str,
+                                            proxy_url=proxy_url,
+                                            segment_concurrency=segment_concurrency,
+                                            request_timeout=req_timeout,
+                                            ffmpeg_bin=ffmpeg_bin,
+                                            thread_stop=thread_stop,
+                                            prepare_write=prepare_write,
+                                            on_tick=lambda d, t, s: emit_progress_threadsafe(d, t, s, "downloading"),
+                                        )
+                                finally:
+                                    cancel_bridge.cancel()
+                                    with contextlib.suppress(BaseException):
+                                        await cancel_bridge
+
+                                if stop.is_set() or (
+                                    isinstance(ydl_exc, DownloadCancelled)
+                                    and not isinstance(ydl_exc, _DiskSpaceError)
+                                ):
+                                    raise StopRequested
+                                if isinstance(ydl_exc, _DiskSpaceError):
+                                    raise ydl_exc
+                                if not ok_dl:
+                                    err_summary, expired_code, non_retryable = _classify_ytdlp_error(
+                                        ydl_exc, ydl_errors
+                                    )
+                                    last_error = err_summary
+                                    if non_retryable:
+                                        return incomplete(last_error)
+                                    if expired_code is not None and attempt < attempts - 1:
+                                        emit(
+                                            "INFO",
+                                            f"{title}: HLS 签名链接疑似过期（HTTP {expired_code}），"
+                                            "重新解析链接并续传剩余分片",
+                                        )
+                                        await until_stopped(refresh_playlist_url(), stop)
+                                    should_retry = True
+                                else:
+                                    raw_stream = _find_downloaded_stream(hls_dir)
+                                    if raw_stream is None:
+                                        last_error = "yt-dlp 下载完成后未找到视频流文件"
+                                        should_retry = True
 
                 if not should_retry and raw_stream is not None:
                     if stop.is_set():
