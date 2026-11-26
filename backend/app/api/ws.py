@@ -17,6 +17,8 @@ async def ws_events(websocket: WebSocket):
         await websocket.close(code=4403, reason="Forbidden origin")
         return
     if not container.auth.verify_websocket(websocket):
+        # Accept before closing so browsers receive close code 4401 instead of 1006.
+        await websocket.accept()
         await websocket.close(code=4401, reason="Unauthorized")
         return
     session_invalidated = container.auth.session_invalidated

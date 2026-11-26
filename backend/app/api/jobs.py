@@ -146,7 +146,7 @@ async def create_download_job(
                 "auto_upload": auto_upload,
                 "export_only": payload.export_only,
                 "add_to_auto_track": utype not in {"liked", "favorites"} and bool(payload.add_to_auto_track),
-                "subscribe_creator": (norm_site == "pornhub") and utype not in {"liked", "favorites"} and bool(payload.subscribe_creator),
+                "subscribe_creator": utype not in {"liked", "favorites"} and bool(payload.subscribe_creator),
             },
         )
         return {"job": job}

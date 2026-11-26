@@ -539,12 +539,12 @@ def test_target_validation_empty_username_fallback_public_auto_probe_and_case_co
         assert auto_res.json()["target"]["target_type"] == "pornstar"
         assert "star-public" in probed
 
-        # 4. PATCH /api/targets/{id} enforces case-insensitive uniqueness -> 409
+        # 4. PATCH /api/targets/{id} enforces case-insensitive uniqueness & mutual exclusion -> 409
         t_upper = client.post("/api/targets", json={"username": "Alice", "target_type": "model"}).json()["target"]
-        t_lower = client.post("/api/targets", json={"username": "alice", "target_type": "pornstar"}).json()["target"]
-        conflict = client.patch(f"/api/targets/{t_lower['id']}", json={"target_type": "model"})
+        t_other = client.post("/api/targets", json={"username": "bob", "target_type": "pornstar"}).json()["target"]
+        conflict = client.patch(f"/api/targets/{t_other['id']}", json={"username": "alice"})
         assert conflict.status_code == 409
-        assert t_upper["id"] != t_lower["id"]
+        assert t_upper["id"] != t_other["id"]
 
 
 async def test_bulk_cancel_pending_job_items_avoids_per_item_ws_flood(tmp_path: Path, monkeypatch):

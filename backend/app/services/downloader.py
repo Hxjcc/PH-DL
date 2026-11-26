@@ -23,6 +23,7 @@ from ..config import SelectorSettings
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.video import fetch_single_video_detail
 from .filename import is_valid_video_file, normalized_quality, video_filename_base
+from .http_proxy import effective_request_proxy
 
 DOWNLOAD_HEADERS = {
     "User-Agent": (
@@ -216,7 +217,7 @@ async def probe_download_size(
             download_url,
             headers=headers,
             allow_redirects=True,
-            proxy=proxy_url or None,
+            proxy=effective_request_proxy(session, proxy_url),
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as response:
             if response.status == 206:
@@ -369,7 +370,7 @@ async def download_mp4_with_resume(
             headers["Range"] = f"bytes={offset}-"
             headers["If-Range"] = checkpoint.etag
 
-        async with session.get(url, headers=headers, allow_redirects=True, proxy=proxy_url or None,
+        async with session.get(url, headers=headers, allow_redirects=True, proxy=effective_request_proxy(session, proxy_url),
                                auto_decompress=False) as response:
             if response.status not in {200, 206, 416}:
                 response.raise_for_status()
@@ -517,6 +518,8 @@ async def download_mp4_with_resume(
                     await until_stopped(refresh_link(), stop)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 last_error = f"下载连接中断: {type(err).__name__}"
+            except ValueError as err:
+                last_error = f"代理或下载参数无效: {err}"
             except _DiskSpaceError as err:
                 return incomplete(str(err), disk_wait_bytes=err.required_bytes)
 

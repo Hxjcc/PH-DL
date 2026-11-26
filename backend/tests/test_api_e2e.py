@@ -128,9 +128,12 @@ def test_auth_settings_targets_videos_jobs_and_ws(tmp_path: Path):
         assert client.delete(f"/api/targets/{tid}").status_code == 200
         assert client.get("/api/targets").json()["items"] == []
 
-        # Target PATCH conflict returns 409 instead of 500
+        # Target POST deduplicates mutually exclusive creator types, and PATCH conflict returns 409 instead of 500
         t1 = client.post("/api/targets", json={"username": "dupuser", "target_type": "model"}).json()["target"]
-        t2 = client.post("/api/targets", json={"username": "dupuser", "target_type": "pornstar"}).json()["target"]
+        t1_same = client.post("/api/targets", json={"username": "dupuser", "target_type": "pornstar"}).json()["target"]
+        assert t1_same["id"] == t1["id"]
+        t2 = client.post("/api/targets", json={"username": "dupuser", "target_type": "favorites"}).json()["target"]
+        assert t2["id"] != t1["id"]
         assert client.patch(f"/api/targets/{t2['id']}", json={"target_type": "model"}).status_code == 409
         assert client.delete(f"/api/targets/{t1['id']}").status_code == 200
         assert client.delete(f"/api/targets/{t2['id']}").status_code == 200

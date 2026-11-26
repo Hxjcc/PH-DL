@@ -63,7 +63,7 @@ async def list_videos(
         page_size=page_size,
     )
     facets = await container.repo.get_video_filter_facets(site=site) if include_meta else None
-    stats = await container.repo.get_video_stats() if include_meta else None
+    stats = await container.repo.get_video_stats(site=site) if include_meta else None
     return {
         "items": items,
         "total": total,

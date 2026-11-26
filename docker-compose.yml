@@ -12,6 +12,7 @@ services:
       - PHDL_SECRET_KEY=${PHDL_SECRET_KEY:-}
       - PHDL_COOKIE_SECURE=${PHDL_COOKIE_SECURE:-false}
       - PHDL_ALLOWED_ORIGINS=${PHDL_ALLOWED_ORIGINS:-}
+      - PHDL_TRUSTED_PROXIES=${PHDL_TRUSTED_PROXIES:-}
       - PHDL_ENABLE_DOCS=${PHDL_ENABLE_DOCS:-false}
     volumes:
       - ./data:/data

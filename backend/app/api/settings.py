@@ -93,20 +93,42 @@ async def update_settings(
     patch: Dict[str, Any],
     container: AppContainer = Depends(require_auth),
 ):
-    if "schedule_time" in patch and patch["schedule_time"]:
-        if parse_hhmm(str(patch["schedule_time"])) is None:
+    current = await container.repo.get_settings()
+    next_schedule_enabled = (
+        bool(patch["schedule_enabled"])
+        if "schedule_enabled" in patch
+        else current.schedule_enabled
+    )
+    next_schedule_time = (
+        str(patch["schedule_time"] or "").strip()
+        if "schedule_time" in patch
+        else (current.schedule_time or "").strip()
+    )
+    if "schedule_time" in patch and next_schedule_time:
+        if parse_hhmm(next_schedule_time) is None:
             raise HTTPException(status_code=400, detail="定时追更时间格式无效，应为 HH:MM（如 04:00）")
+    if next_schedule_enabled and (not next_schedule_time or parse_hhmm(next_schedule_time) is None):
+        raise HTTPException(status_code=400, detail="开启定时追更时必须设置有效时间（HH:MM，如 04:00）")
 
     try:
         updated = await container.repo.update_settings_patch(patch)
     except Exception as err:
         raise HTTPException(status_code=400, detail=f"配置校验失败: {err}") from err
 
+    if updated.ph_cookie != current.ph_cookie:
+        container.tasks.reset_cookie_status()
+    if updated.xh_cookie != current.xh_cookie:
+        container.tasks.reset_xh_cookie_status()
+
     if any(k in patch for k in ("rclone_remote", "rclone_backup_remotes", "rclone_remote_strategy")):
         container.tasks.clear_remote_cooldowns()
 
     container.events.broadcast("overview_changed", {})
-    return {"settings": updated.to_redacted_dict()}
+    return {
+        "settings": updated.to_redacted_dict(),
+        "cookie_status": container.tasks.cookie_status,
+        "xh_cookie_status": container.tasks.xh_cookie_status,
+    }
 
 
 @router.post("/cookie/test")

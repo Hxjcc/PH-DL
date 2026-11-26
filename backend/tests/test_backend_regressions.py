@@ -48,7 +48,7 @@ async def job_engine(tmp_path, monkeypatch):
     repo = Repository(db)
     await repo.update_settings_patch({
         "ph_cookie": "sess=fixture", "schedule_enabled": False, "uploader_enabled": True,
-        "min_free_disk_gb": 0, "min_file_size_bytes": 64, "page_delay_max": 0,
+        "min_free_disk_gb": 0, "min_file_size_bytes": 64, "page_delay_min": 0, "page_delay_max": 0,
     })
     manager = engine.TaskManager(env, repo, EventBus())
 

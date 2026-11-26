@@ -46,6 +46,7 @@ from ..parsers.xhamster import (
     resolve_xhamster_target_with_profile,
 )
 from ..services.cookie import (
+    CookieLoginResult,
     check_cookie_valid,
     format_cookie_valid_message,
     login_and_get_cookies,
@@ -59,6 +60,7 @@ from ..services.downloader import (
     read_download_checkpoint,
     remove_download_checkpoint,
 )
+from ..services.http_proxy import create_aiohttp_connector
 from ..services.hls_downloader import download_hls_to_mp4, is_hls_url
 from ..services.filename import (
     format_remote_video_filename,
@@ -321,6 +323,10 @@ class TaskManager:
         self._last_cookie_message = message
         self.events.broadcast("overview_changed", {})
 
+    def reset_cookie_status(self) -> None:
+        self._last_cookie_valid = None
+        self._last_cookie_message = "未检测"
+
     @property
     def xh_cookie_status(self) -> Dict[str, Any]:
         return {"valid": self._last_xh_cookie_valid, "message": self._last_xh_cookie_message}
@@ -328,6 +334,10 @@ class TaskManager:
     def set_xh_cookie_status(self, valid: Optional[bool], message: str) -> None:
         self._last_xh_cookie_valid = valid
         self._last_xh_cookie_message = message
+
+    def reset_xh_cookie_status(self) -> None:
+        self._last_xh_cookie_valid = None
+        self._last_xh_cookie_message = "未检测"
         self.events.broadcast("overview_changed", {})
 
     def _ctx_for_site(self, default_ctx: TaskHttpContext, site: str) -> TaskHttpContext:
@@ -410,6 +420,7 @@ class TaskManager:
         job_id: int,
         *,
         notify_on_failure: bool = False,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> Optional[RuntimeSettings]:
         self.events.emit_log("INFO", "[PornHub Cookie] 正在验证有效性...", job_id=job_id)
         if settings.ph_cookie.strip():
@@ -435,6 +446,19 @@ class TaskManager:
             self.events.emit_log("WARNING", "[PornHub Cookie] 未配置 Cookie，尝试自动登录刷新...", job_id=job_id)
 
         if settings.ph_username.strip() and settings.ph_password.strip():
+            persisted: List[RuntimeSettings] = []
+
+            async def _persist_ph(res: CookieLoginResult) -> None:
+                if not (res.success and res.cookie_str):
+                    return
+                patch: Dict[str, Any] = {"ph_cookie": res.cookie_str}
+                if res.logged_in_username:
+                    patch["ph_logged_in_username"] = res.logged_in_username
+                updated = await self.repo.update_settings_patch(patch)
+                resolved_user = (res.logged_in_username or updated.ph_logged_in_username or "").strip()
+                self.set_cookie_status(True, format_cookie_valid_message(resolved_user))
+                persisted.append(updated)
+
             login_res = await login_and_get_cookies(
                 settings.ph_username,
                 settings.ph_password,
@@ -445,15 +469,13 @@ class TaskManager:
                 yescaptcha_task_type=settings.yescaptcha_ph_task_type,
                 yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
                 on_log=lambda level, message: self.events.emit_log(level, message, job_id=job_id),
+                cancel_event=cancel_event,
+                on_success=_persist_ph,
             )
             if login_res.success and login_res.cookie_str:
-                patch: Dict[str, Any] = {"ph_cookie": login_res.cookie_str}
-                if login_res.logged_in_username:
-                    patch["ph_logged_in_username"] = login_res.logged_in_username
-                updated_settings = await self.repo.update_settings_patch(patch)
-                resolved_user = (login_res.logged_in_username or updated_settings.ph_logged_in_username or "").strip()
-                self.set_cookie_status(True, format_cookie_valid_message(resolved_user))
-                return updated_settings
+                if not persisted:
+                    await _persist_ph(login_res)
+                return persisted[-1]
             err_msg = login_res.message
         else:
             err_msg = "未配置有效 Cookie，且未填写 PornHub 账号密码"
@@ -565,6 +587,8 @@ class TaskManager:
         self,
         settings: RuntimeSettings,
         job_id: int,
+        *,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> Optional[RuntimeSettings]:
         self.events.emit_log("INFO", "[xHamster Cookie] 正在验证有效性...", job_id=job_id)
         if settings.xh_cookie.strip():
@@ -590,6 +614,19 @@ class TaskManager:
             self.events.emit_log("WARNING", "[xHamster Cookie] 未配置 Cookie，尝试自动登录刷新...", job_id=job_id)
 
         if settings.xh_username.strip() and settings.xh_password.strip():
+            persisted: List[RuntimeSettings] = []
+
+            async def _persist_xh(res: CookieLoginResult) -> None:
+                if not (res.success and res.cookie_str):
+                    return
+                patch: Dict[str, Any] = {"xh_cookie": res.cookie_str}
+                if res.logged_in_username:
+                    patch["xh_logged_in_username"] = res.logged_in_username
+                updated = await self.repo.update_settings_patch(patch)
+                resolved_user = (res.logged_in_username or updated.xh_logged_in_username or "").strip()
+                self.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
+                persisted.append(updated)
+
             login_res = await login_xhamster_and_get_cookies(
                 settings.xh_username,
                 settings.xh_password,
@@ -600,15 +637,13 @@ class TaskManager:
                 yescaptcha_task_type=settings.yescaptcha_xh_task_type,
                 yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
                 on_log=lambda lvl, message: self.events.emit_log(lvl, message, job_id=job_id),
+                cancel_event=cancel_event,
+                on_success=_persist_xh,
             )
             if login_res.success and login_res.cookie_str:
-                patch: Dict[str, Any] = {"xh_cookie": login_res.cookie_str}
-                if login_res.logged_in_username:
-                    patch["xh_logged_in_username"] = login_res.logged_in_username
-                settings = await self.repo.update_settings_patch(patch)
-                resolved_user = (login_res.logged_in_username or settings.xh_logged_in_username or "").strip()
-                self.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
-                return settings
+                if not persisted:
+                    await _persist_xh(login_res)
+                return persisted[-1]
             err_msg = login_res.message or "xHamster 自动登录失败"
         elif settings.xh_cookie.strip():
             err_msg = "xHamster Cookie 已失效，且未配置 xHamster 账号密码"
@@ -649,6 +684,7 @@ class TaskManager:
                     self._ensure_valid_cookie(
                         settings, job_id,
                         notify_on_failure=(kind == "auto_update" and job.get("trigger") == "schedule"),
+                        cancel_event=cancel_event,
                     ), cancel_event,
                 )
                 if checked_settings is None:
@@ -665,7 +701,7 @@ class TaskManager:
 
             if needs_xh_cookie:
                 checked_xh = await until_stopped(
-                    self._ensure_valid_xh_cookie(settings, job_id), cancel_event,
+                    self._ensure_valid_xh_cookie(settings, job_id, cancel_event=cancel_event), cancel_event,
                 )
                 if checked_xh is None:
                     failed = await self.repo.update_job(
@@ -687,7 +723,7 @@ class TaskManager:
             ):
                 # Best-effort login refresh for xHamster auto-subscribe; never block public downloads if login fails.
                 checked_xh = await until_stopped(
-                    self._ensure_valid_xh_cookie(settings, job_id), cancel_event,
+                    self._ensure_valid_xh_cookie(settings, job_id, cancel_event=cancel_event), cancel_event,
                 )
                 if checked_xh is not None:
                     settings = checked_xh
@@ -1267,7 +1303,8 @@ class TaskManager:
             dl_slots = max(1, int(settings.max_concurrent_downloads))
             conn_per_host = max(32, min(96, dl_slots * 12))
             conn_total = max(128, conn_per_host * 2)
-            connector = aiohttp.TCPConnector(
+            connector, _ = create_aiohttp_connector(
+                settings.normalized_proxy,
                 limit=conn_total,
                 limit_per_host=conn_per_host,
                 keepalive_timeout=60.0,
@@ -1278,7 +1315,6 @@ class TaskManager:
                 timeout=timeout,
                 connector=connector,
                 read_bufsize=2 * 1024 * 1024,
-                trust_env=True,
             ) as dl_session:
                 async def _dl_one(item_id: int) -> None:
                     if ctx.cancel_event.is_set():
@@ -1912,7 +1948,14 @@ class TaskManager:
             for fid in final_failed_ids:
                 row = await self.repo.get_job_item(fid)
                 if row and row.get("page_url"):
-                    folder = _target_folder_name(row.get("uploader"), row.get("target_type") or "model")
+                    row_site = normalize_site(
+                        row.get("site") or ("xhamster" if is_xhamster_url(row.get("page_url")) else "pornhub")
+                    )
+                    folder = _target_folder_name(
+                        row.get("uploader"),
+                        row.get("target_type") or "model",
+                        site=row_site,
+                    )
                     _record_failed_url(folder, row["page_url"])
         finally:
             if upload_tasks:
@@ -2503,10 +2546,13 @@ class TaskManager:
                 # Fallback to profile homepage only if list pages yielded no subscribe button.
                 if site == "xhamster":
                     profile_url = build_xhamster_profile_url(active_uname, active_utype)
+                    profile_headers: Optional[Dict[str, str]] = {"Referer": "https://xhamster.com/"}
                 else:
                     profile_url = f"{PH_ORIGIN}/{active_utype}/{urllib.parse.quote(active_uname, safe='')}"
+                    profile_headers = None
                 prof_res, _ = await site_ctx.fetch_with_pow(
                     profile_url,
+                    headers=profile_headers,
                     timeout=max(5.0, float(settings.request_timeout)),
                     max_retries=1,
                     log_label=f"获取博主主页 {active_uname}",
@@ -3338,8 +3384,15 @@ class TaskManager:
             f"开始补全 {len(candidates)} 条基线视频的画质和文件大小...",
             job_id=job_id,
         )
+        def _candidate_site(candidate: Dict[str, Any]) -> str:
+            return normalize_site(
+                candidate.get("site")
+                or ("xhamster" if is_xhamster_url(candidate.get("video_page_url")) else "pornhub")
+            )
+
         item_specs = [
             {
+                "site": _candidate_site(candidate),
                 "viewkey": candidate["viewkey"],
                 "title": candidate.get("title") or "",
                 "uploader": candidate.get("uploader") or "",
@@ -3361,39 +3414,46 @@ class TaskManager:
 
         size_limit = max(1, min(20, settings.max_concurrent_video_details))
         size_sem = asyncio.Semaphore(size_limit)
-        cookie_str = ctx.cookie_string()
 
         async def _probe(
             size_session: aiohttp.ClientSession,
             candidate: Dict[str, Any],
             detail: VideoDetail,
+            csite: str,
         ):
+            if csite == "xhamster" or is_hls_url(detail.download_url or ""):
+                return candidate, detail, None, False, True
             async with size_sem:
                 if ctx.cancel_event.is_set():
-                    return candidate, detail, None, True
+                    return candidate, detail, None, True, False
+                site_cookie = self._ctx_for_site(ctx, csite).cookie_string()
                 try:
                     size = await until_stopped(
                         probe_download_size(
                             size_session,
                             detail.download_url or "",
                             referer_url=detail.referer_url or detail.page_url,
-                            cookie_str=cookie_str,
+                            cookie_str=site_cookie,
                             proxy_url=settings.normalized_proxy,
                             timeout=settings.request_timeout,
                         ),
                         ctx.cancel_event,
                     )
                 except StopRequested:
-                    return candidate, detail, None, True
-                return candidate, detail, size, False
+                    return candidate, detail, None, True, False
+                return candidate, detail, size, False, False
 
         chunk_size = max(20, min(60, int(settings.max_concurrent_video_details) * 2))
         detail_failures = 0
         size_failures = 0
-        completed_with_size = 0
+        completed_count = 0
 
         timeout = aiohttp.ClientTimeout(total=25.0, connect=10.0, sock_read=20.0)
-        connector = aiohttp.TCPConnector(limit=size_limit + 8, limit_per_host=16)
+        connector, _ = create_aiohttp_connector(
+            settings.normalized_proxy,
+            limit=size_limit + 8,
+            limit_per_host=16,
+        )
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as size_session:
             for start in range(0, len(candidates), chunk_size):
                 if ctx.cancel_event.is_set():
@@ -3401,9 +3461,7 @@ class TaskManager:
                 batch = candidates[start : start + chunk_size]
                 by_site_batch: Dict[str, List[Tuple[str, int, int]]] = defaultdict(list)
                 for idx, candidate in enumerate(batch):
-                    csite = normalize_site(
-                        candidate.get("site") or ("xhamster" if is_xhamster_url(candidate.get("video_page_url")) else "pornhub")
-                    )
+                    csite = _candidate_site(candidate)
                     by_site_batch[csite].append((candidate["video_page_url"], 0, start + idx + 1))
                 details: List[VideoDetail] = []
                 for csite, c_items in by_site_batch.items():
@@ -3424,8 +3482,9 @@ class TaskManager:
                     detail.viewkey: detail for detail in details if detail.viewkey
                 }
 
-                ready: List[Tuple[Dict[str, Any], VideoDetail]] = []
+                ready: List[Tuple[Dict[str, Any], VideoDetail, str]] = []
                 for candidate in batch:
+                    csite = _candidate_site(candidate)
                     detail = detail_by_viewkey.get(candidate["viewkey"])
                     if detail is not None and detail.error == "操作已取消":
                         continue
@@ -3435,10 +3494,10 @@ class TaskManager:
                         await self.repo.update_job_item(
                             item_ids[candidate["viewkey"]],
                             status="failed",
-                            error_message=error or "没有可用 MP4",
+                            error_message=error or "没有可用媒体地址",
                         )
                         continue
-                    ready.append((candidate, detail))
+                    ready.append((candidate, detail, csite))
 
                 if ctx.cancel_event.is_set():
                     break
@@ -3446,30 +3505,41 @@ class TaskManager:
                 if ready:
                     probe_results = await asyncio.gather(
                         *[
-                            _probe(size_session, candidate, detail)
-                            for candidate, detail in ready
+                            _probe(size_session, candidate, detail, csite)
+                            for candidate, detail, csite in ready
                         ]
                     )
-                    for candidate, detail, file_size, cancelled in probe_results:
+                    for candidate, detail, file_size, cancelled, is_hls in probe_results:
                         if cancelled or ctx.cancel_event.is_set():
                             continue
-                        if file_size:
-                            completed_with_size += 1
+                        quality_val = (detail.quality or "").strip()
+                        if is_hls:
+                            item_ok = bool(quality_val)
+                            err_msg = "" if item_ok else "无法解析视频画质"
+                            if item_ok:
+                                completed_count += 1
+                            else:
+                                detail_failures += 1
                         else:
-                            size_failures += 1
+                            item_ok = bool(file_size)
+                            err_msg = "" if item_ok else "画质已保存，但无法确认媒体文件大小"
+                            if item_ok:
+                                completed_count += 1
+                            else:
+                                size_failures += 1
                         await self.repo.update_video_metadata(
                             candidate["viewkey"],
-                            quality=detail.quality or "",
+                            quality=quality_val,
                             file_size=int(file_size or 0),
                             published_at=detail.published_at or "",
                             duration_seconds=int(detail.duration_seconds or 0),
                         )
                         await self.repo.update_job_item(
                             item_ids[candidate["viewkey"]],
-                            status="done" if file_size else "failed",
-                            quality=detail.quality or "",
+                            status="done" if item_ok else "failed",
+                            quality=quality_val,
                             bytes_total=int(file_size or 0),
-                            error_message="" if file_size else "画质已保存，但无法确认媒体文件大小",
+                            error_message=err_msg,
                         )
 
                 if ctx.cancel_event.is_set():
@@ -3485,14 +3555,14 @@ class TaskManager:
             self.events.broadcast("job_items_changed", {"job_id": job_id})
             self.events.emit_log(
                 "WARNING",
-                f"元数据补全已取消：已完成 {completed_with_size} 条，其余条目已批量取消。",
+                f"元数据补全已取消：已完成 {completed_count} 条，其余条目已批量取消。",
                 job_id=job_id,
             )
             return
 
         self.events.emit_log(
             "INFO",
-            f"元数据补全完成：画质/大小均成功 {completed_with_size} 条，"
+            f"元数据补全完成：成功 {completed_count} 条，"
             f"详情失败 {detail_failures} 条，大小获取失败 {size_failures} 条。",
             job_id=job_id,
         )

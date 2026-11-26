@@ -69,6 +69,20 @@ class Repository:
             return RuntimeSettings()
         try:
             data = json.loads(row["value_json"])
+            if isinstance(data, dict):
+                # Safely normalize any legacy stored range inversions without dropping settings on upgrade.
+                if "page_delay_min" in data and "page_delay_max" in data:
+                    try:
+                        if float(data["page_delay_min"]) > float(data["page_delay_max"]):
+                            data["page_delay_min"] = float(data["page_delay_max"])
+                    except (TypeError, ValueError):
+                        pass
+                if "retry_delay_base" in data and "retry_delay_max" in data:
+                    try:
+                        if float(data["retry_delay_base"]) > float(data["retry_delay_max"]):
+                            data["retry_delay_base"] = float(data["retry_delay_max"])
+                    except (TypeError, ValueError):
+                        pass
             return RuntimeSettings.model_validate(data)
         except Exception:
             return RuntimeSettings()
@@ -255,6 +269,38 @@ class Repository:
             row["site"] = normalize_site(row.get("site"))
         return row
 
+    async def _find_target_by_identity(
+        self,
+        norm_site: str,
+        norm_user: str,
+        norm_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a target while respecting same-creator mutually exclusive types."""
+        if norm_site == "pornhub" and norm_type in ("model", "pornstar"):
+            return await self.db.fetch_one(
+                """
+                SELECT * FROM targets
+                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar')
+                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (norm_site, norm_user, norm_type),
+            )
+        if norm_site == "xhamster" and norm_type in ("creator", "pornstar"):
+            return await self.db.fetch_one(
+                """
+                SELECT * FROM targets
+                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('creator', 'pornstar')
+                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (norm_site, norm_user, norm_type),
+            )
+        return await self.db.fetch_one(
+            "SELECT * FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ?",
+            (norm_site, norm_user, norm_type),
+        )
+
     async def upsert_target(
         self,
         username: str,
@@ -269,10 +315,7 @@ class Repository:
         norm_type = (target_type or ("creator" if norm_site == "xhamster" else "model")).strip().lower()
         is_current_user = norm_type == "liked" or (norm_site == "xhamster" and norm_type == "favorites")
         norm_user = "_currentUser_" if is_current_user else username.strip()
-        existing = await self.db.fetch_one(
-            "SELECT * FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ?",
-            (norm_site, norm_user, norm_type),
-        )
+        existing = await self._find_target_by_identity(norm_site, norm_user, norm_type)
         if existing:
             await self.db.execute(
                 """
@@ -329,31 +372,7 @@ class Repository:
         norm_type = (target_type or ("creator" if norm_site == "xhamster" else "model")).strip().lower()
         is_current_user = norm_type == "liked" or (norm_site == "xhamster" and norm_type == "favorites")
         norm_user = "_currentUser_" if is_current_user else username.strip()
-        if norm_site == "pornhub" and norm_type in ("model", "pornstar"):
-            existing = await self.db.fetch_one(
-                """
-                SELECT * FROM targets
-                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar')
-                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
-                LIMIT 1
-                """,
-                (norm_site, norm_user, norm_type),
-            )
-        elif norm_site == "xhamster" and norm_type in ("creator", "pornstar"):
-            existing = await self.db.fetch_one(
-                """
-                SELECT * FROM targets
-                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('creator', 'pornstar')
-                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
-                LIMIT 1
-                """,
-                (norm_site, norm_user, norm_type),
-            )
-        else:
-            existing = await self.db.fetch_one(
-                "SELECT * FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ?",
-                (norm_site, norm_user, norm_type),
-            )
+        existing = await self._find_target_by_identity(norm_site, norm_user, norm_type)
         if existing:
             clean_avatar = avatar_url.strip()
             clean_name = display_name.strip()
@@ -622,31 +641,40 @@ class Repository:
         )
         return len(unique_keys)
 
-    async def count_baseline_metadata_candidates(self) -> int:
+    async def count_baseline_metadata_candidates(self, site: str = "") -> int:
+        site_filter = normalize_site(site) if (site or "").strip() else ""
+        where_site = " AND LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
+        params: List[Any] = [site_filter] if site_filter else []
         row = await self.db.fetch_one(
-            """
+            f"""
             SELECT COUNT(*) AS cnt
             FROM videos
             WHERE status = 'baseline'
               AND video_page_url != ''
-              AND (quality = '' OR file_size <= 0)
-            """
+              AND (quality = '' OR (LOWER(COALESCE(site, 'pornhub')) != 'xhamster' AND file_size <= 0))
+              {where_site}
+            """,
+            params,
         )
         return int(row["cnt"]) if row else 0
 
     async def list_baseline_metadata_candidates(
         self,
         limit: int = 0,
+        site: str = "",
     ) -> List[Dict[str, Any]]:
-        sql = """
+        site_filter = normalize_site(site) if (site or "").strip() else ""
+        where_site = " AND LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
+        sql = f"""
             SELECT viewkey, site, title, uploader, target_type, quality, file_size, video_page_url
             FROM videos
             WHERE status = 'baseline'
               AND video_page_url != ''
-              AND (quality = '' OR file_size <= 0)
+              AND (quality = '' OR (LOWER(COALESCE(site, 'pornhub')) != 'xhamster' AND file_size <= 0))
+              {where_site}
             ORDER BY created_at ASC, viewkey ASC
         """
-        params: List[Any] = []
+        params: List[Any] = [site_filter] if site_filter else []
         if limit > 0:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -1116,17 +1144,26 @@ class Repository:
         )
         site_rows = await self.db.fetch_all("SELECT DISTINCT site FROM videos WHERE site != '' ORDER BY site ASC")
         uploaders: List[str] = []
-        seen_up: Set[str] = set()
+        seen_up: Dict[str, int] = {}
         uploader_sites: Dict[str, str] = {}
         for r in uploader_rows:
-            u = r["uploader"]
-            if u not in seen_up:
-                seen_up.add(u)
+            u = str(r["uploader"] or "").strip()
+            if not u:
+                continue
+            low = u.lower()
+            idx = seen_up.get(low)
+            if idx is None:
+                seen_up[low] = len(uploaders)
                 uploaders.append(u)
-                uploader_sites[u] = normalize_site(r.get("site"))
-        if has_liked_row and not any(u.strip().lower() == "my_liked" for u in uploaders):
+                uploader_sites[low] = normalize_site(r.get("site"))
+            else:
+                # Prefer a mixed-case spelling over an all-lowercase duplicate when both exist.
+                prev = uploaders[idx]
+                if prev == prev.lower() and u != u.lower():
+                    uploaders[idx] = u
+        if has_liked_row and "my_liked" not in seen_up:
             uploaders.append("My_Liked")
-            uploader_sites["My_Liked"] = "pornhub"
+            uploader_sites["my_liked"] = "pornhub"
             uploaders.sort(key=lambda u: u.lower())
         uploader_labels: Dict[str, str] = {}
         for u in uploaders:
@@ -1136,7 +1173,7 @@ class Repository:
             elif low == "my_favorites":
                 uploader_labels[u] = "xHamster Favorites"
             else:
-                s_low = site_filter or uploader_sites.get(u, "pornhub")
+                s_low = site_filter or uploader_sites.get(low, "pornhub")
                 uploader_labels[u] = (
                     display_map.get((s_low, low))
                     or display_map.get(("pornhub", low))
@@ -1150,8 +1187,15 @@ class Repository:
             "qualities": [r["quality"] for r in qualities],
         }
 
-    async def get_video_stats(self) -> Dict[str, int]:
-        rows = await self.db.fetch_all("SELECT status, COUNT(*) AS cnt FROM videos GROUP BY status")
+    async def get_video_stats(self, site: str = "") -> Dict[str, int]:
+        site_filter = normalize_site(site) if (site or "").strip() else ""
+        where_site = " WHERE LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
+        and_site = " AND LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
+        site_params: Tuple[Any, ...] = (site_filter,) if site_filter else ()
+        rows = await self.db.fetch_all(
+            f"SELECT status, COUNT(*) AS cnt FROM videos{where_site} GROUP BY status",
+            site_params,
+        )
         counts = {"total": 0, "uploaded": 0, "downloaded": 0, "baseline": 0}
         for r in rows:
             c = int(r["cnt"])
@@ -1159,11 +1203,11 @@ class Repository:
             if r["status"] in counts:
                 counts[r["status"]] = c
         recent_row = await self.db.fetch_one(
-            "SELECT COUNT(*) AS cnt FROM videos WHERE published_at != '' AND published_at >= ?",
-            (local_date_days_ago(7),),
+            f"SELECT COUNT(*) AS cnt FROM videos WHERE published_at != '' AND published_at >= ?{and_site}",
+            (local_date_days_ago(7), *site_params),
         )
         counts["published_7d"] = int(recent_row["cnt"]) if recent_row else 0
-        counts["baseline_missing_metadata"] = await self.count_baseline_metadata_candidates()
+        counts["baseline_missing_metadata"] = await self.count_baseline_metadata_candidates(site=site_filter)
         return counts
 
     # ------------------------------------------------------------------

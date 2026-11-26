@@ -159,12 +159,16 @@ async def solve_recaptcha(
     base = normalize_api_base(api_base)
     started = time.perf_counter()
 
-    create_data = await _post_json(
+    if cancel_event is not None and cancel_event.is_set():
+        raise StopRequested
+
+    create_coro = _post_json(
         f"{base}/createTask",
         {"clientKey": key, "task": task},
         timeout=30.0,
         secret=key,
     )
+    create_data = await (until_stopped(create_coro, cancel_event) if cancel_event is not None else create_coro)
     _check_api_error(create_data, key)
     task_id = str(create_data.get("taskId") or "").strip()
     if not task_id:
@@ -175,23 +179,25 @@ async def solve_recaptcha(
     delay = max(0.05, min(float(poll_interval), MAX_POLL_SECONDS))
     polls = 0
     while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StopRequested
         remaining = max(0.0, deadline - time.monotonic())
         wait_for = min(delay, remaining)
         if wait_for > 0:
-            try:
-                if cancel_event is not None:
-                    await until_stopped(asyncio.sleep(wait_for), cancel_event)
-                else:
-                    await asyncio.sleep(wait_for)
-            except StopRequested:
-                raise
+            if cancel_event is not None:
+                await until_stopped(asyncio.sleep(wait_for), cancel_event)
+            else:
+                await asyncio.sleep(wait_for)
+        if cancel_event is not None and cancel_event.is_set():
+            raise StopRequested
         polls += 1
-        result = await _post_json(
+        result_coro = _post_json(
             f"{base}/getTaskResult",
             {"clientKey": key, "taskId": task_id},
             timeout=30.0,
             secret=key,
         )
+        result = await (until_stopped(result_coro, cancel_event) if cancel_event is not None else result_coro)
         _check_api_error(result, key)
         status = str(result.get("status") or "").lower()
         if status == "ready":

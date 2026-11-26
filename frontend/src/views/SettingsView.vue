@@ -511,6 +511,28 @@ onActivated(() => {
 
 async function saveAll() {
   if (!form.value) return
+  const schedTime = String(form.value.schedule_time || '').trim()
+  if (form.value.schedule_enabled) {
+    const m = /^(\d{2}):(\d{2})$/.exec(schedTime)
+    if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) {
+      store.notify('开启定时追更时必须填写有效时间（HH:MM，如 04:00）', 'error')
+      return
+    }
+  } else if (schedTime) {
+    const m = /^(\d{2}):(\d{2})$/.exec(schedTime)
+    if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) {
+      store.notify('定时追更时间格式无效，应为 HH:MM（如 04:00）', 'error')
+      return
+    }
+  }
+  if (Number(form.value.page_delay_min) > Number(form.value.page_delay_max)) {
+    store.notify('列表翻页最小间隔不能大于最大间隔', 'error')
+    return
+  }
+  if (Number(form.value.retry_delay_base) > Number(form.value.retry_delay_max)) {
+    store.notify('重试基础退避不能大于最大退避', 'error')
+    return
+  }
   saving.value = true
   try {
     const res = await api.saveSettings(form.value)

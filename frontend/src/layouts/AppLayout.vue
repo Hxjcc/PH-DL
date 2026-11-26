@@ -97,10 +97,26 @@ const diskInfo = computed(() => {
 })
 
 const cookieMeta = computed(() => {
-  const ck = store.overview?.cookie
-  if (!ck || !ck.configured) return { text: 'Cookie 未配置', dot: 'bg-amber-500 status-dot-glow-amber' }
-  if (ck.valid === true) return { text: 'Cookie 有效', dot: 'bg-emerald-500 status-dot-glow-emerald' }
-  if (ck.valid === false) return { text: 'Cookie 失效', dot: 'bg-red-500 status-dot-glow-red' }
+  const ph = store.overview?.cookie
+  const xh = store.overview?.xh_cookie
+  const configured = [
+    ph?.configured ? { name: 'PH', ...ph } : null,
+    xh?.configured ? { name: 'xH', ...xh } : null,
+  ].filter(Boolean)
+  if (configured.length === 0) {
+    return { text: 'Cookie 未配置', dot: 'bg-amber-500 status-dot-glow-amber' }
+  }
+  const invalid = configured.filter((c) => c.valid === false)
+  if (invalid.length > 0) {
+    const prefix =
+      configured.length > 1 || invalid[0].name === 'xH'
+        ? `${invalid.map((c) => c.name).join('/')} `
+        : ''
+    return { text: `${prefix}Cookie 失效`, dot: 'bg-red-500 status-dot-glow-red' }
+  }
+  if (configured.some((c) => c.valid === true)) {
+    return { text: 'Cookie 有效', dot: 'bg-emerald-500 status-dot-glow-emerald' }
+  }
   return { text: 'Cookie 已配置', dot: 'bg-zinc-400' }
 })
 

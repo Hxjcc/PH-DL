@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin, urlparse
 from weakref import WeakKeyDictionary
 
 from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
+from ..cancel import StopRequested, until_stopped
 from ..parsers.http_session import TaskHttpContext, parse_cookie_string
 from .captcha import CaptchaError, solve_recaptcha, solve_recaptcha_v2
 
@@ -29,12 +31,96 @@ XHAMSTER_CAPTCHA_V2_TASK_TYPES = ("NoCaptchaTaskProxyless", "RecaptchaV2TaskProx
 XHAMSTER_DEFAULT_CAPTCHA_V2_TASK_TYPE = "RecaptchaV2TaskProxyless"
 
 LogCallback = Callable[[str, str], None]
+SuccessCallback = Callable[["CookieLoginResult"], Awaitable[None]]
+
+
+class _InflightLogin:
+    """Shared single-flight login state supporting cooperative cancel and cookie persistence."""
+
+    def __init__(self) -> None:
+        self.cancel_event = asyncio.Event()
+        self.waiters = 0
+        self.log_listeners: List[LogCallback] = []
+        self.success_callbacks: List[SuccessCallback] = []
+        self.task: Optional[asyncio.Task["CookieLoginResult"]] = None
+
+    def emit_raw(self, level: str, message: str) -> None:
+        for cb in list(self.log_listeners):
+            with contextlib.suppress(Exception):
+                cb(level, message)
+
 
 # Coalesce concurrent auto-login calls per event loop + (account, proxy) to avoid
 # firing duplicate YesCaptcha solves or triggering PornHub's 1-hour account lock.
-_INFLIGHT_LOGINS: "WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[Tuple[str, str], asyncio.Task[CookieLoginResult]]]" = (
+_INFLIGHT_LOGINS: "WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[Tuple[str, str], _InflightLogin]]" = (
     WeakKeyDictionary()
 )
+
+
+async def _run_deduped_login(
+    dedup_key: Tuple[str, str],
+    site_label: str,
+    factory: Callable[[asyncio.Event, LogCallback], Awaitable["CookieLoginResult"]],
+    *,
+    on_log: Optional[LogCallback] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    on_success: Optional[SuccessCallback] = None,
+) -> "CookieLoginResult":
+    if cancel_event is not None and cancel_event.is_set():
+        raise StopRequested
+
+    emit = _make_site_logger(site_label, on_log)
+    loop = asyncio.get_running_loop()
+    inflight = _INFLIGHT_LOGINS.setdefault(loop, {})
+    existing = inflight.get(dedup_key)
+    if (
+        existing is not None
+        and existing.task is not None
+        and not existing.task.done()
+        and not existing.cancel_event.is_set()
+    ):
+        entry = existing
+        emit("INFO", "检测到已有正在进行的登录任务，复用本次结果...")
+    else:
+        entry = _InflightLogin()
+        inflight[dedup_key] = entry
+
+        async def _runner() -> CookieLoginResult:
+            result = await factory(entry.cancel_event, entry.emit_raw)
+            if result.success and result.cookie_str and entry.success_callbacks:
+                for cb in list(entry.success_callbacks):
+                    with contextlib.suppress(Exception):
+                        await cb(result)
+            return result
+
+        entry.task = asyncio.create_task(_runner())
+
+        def _cleanup(finished: asyncio.Task[CookieLoginResult], target: _InflightLogin = entry) -> None:
+            if inflight.get(dedup_key) is target:
+                inflight.pop(dedup_key, None)
+
+        entry.task.add_done_callback(_cleanup)
+
+    entry.waiters += 1
+    if on_log is not None:
+        entry.log_listeners.append(on_log)
+    if on_success is not None:
+        entry.success_callbacks.append(on_success)
+
+    assert entry.task is not None
+    try:
+        if cancel_event is not None:
+            return await until_stopped(asyncio.shield(entry.task), cancel_event)
+        return await asyncio.shield(entry.task)
+    finally:
+        if on_log is not None:
+            with contextlib.suppress(ValueError):
+                entry.log_listeners.remove(on_log)
+        entry.waiters = max(0, entry.waiters - 1)
+        if entry.waiters == 0 and not entry.task.done():
+            entry.cancel_event.set()
+            if inflight.get(dedup_key) is entry:
+                inflight.pop(dedup_key, None)
 
 
 @dataclass(frozen=True)
@@ -596,7 +682,8 @@ async def _login_with_captcha(
     yescaptcha_api_base: str,
     yescaptcha_task_type: str,
     yescaptcha_timeout_seconds: float,
-    on_log: Optional[LogCallback],
+    cancel_event: Optional[asyncio.Event] = None,
+    on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     """Refresh the login state, solve reCAPTCHA with YesCaptcha, then retry."""
 
@@ -636,9 +723,11 @@ async def _login_with_captcha(
             task_type=yescaptcha_task_type,
             timeout=yescaptcha_timeout_seconds,
             proxy=proxy_url,
-            cancel_event=ctx.cancel_event,
+            cancel_event=cancel_event or ctx.cancel_event,
             on_log=on_log,
         )
+    except StopRequested:
+        raise
     except CaptchaError as err:
         return CookieLoginResult(success=False, message=f"YesCaptcha 解题失败: {err}")
     except Exception as err:  # pragma: no cover - defensive
@@ -703,21 +792,18 @@ async def login_and_get_cookies(
     yescaptcha_task_type: str = "RecaptchaV2EnterpriseTaskProxyless",
     yescaptcha_timeout_seconds: float = 300.0,
     on_log: Optional[LogCallback] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    on_success: Optional[SuccessCallback] = None,
 ) -> CookieLoginResult:
     emit = _make_site_logger("PornHub", on_log)
     if not (username or "").strip() or not (password or "").strip():
         return _log_login_outcome(emit, CookieLoginResult(success=False, message="未配置 PornHub 账号或密码"))
 
-    loop = asyncio.get_running_loop()
-    inflight = _INFLIGHT_LOGINS.setdefault(loop, {})
     dedup_key = (username.strip().lower(), (proxy_url or "").strip())
-    existing = inflight.get(dedup_key)
-    if existing is not None and not existing.done():
-        emit("INFO", "检测到已有正在进行的登录任务，复用本次结果...")
-        return await asyncio.shield(existing)
-
-    task = asyncio.create_task(
-        _login_and_get_cookies_once(
+    return await _run_deduped_login(
+        dedup_key,
+        "PornHub",
+        lambda shared_cancel, shared_log: _login_and_get_cookies_once(
             username,
             password,
             proxy_url=proxy_url,
@@ -727,17 +813,13 @@ async def login_and_get_cookies(
             yescaptcha_api_base=yescaptcha_api_base,
             yescaptcha_task_type=yescaptcha_task_type,
             yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
-            on_log=on_log,
-        )
+            cancel_event=shared_cancel,
+            on_log=shared_log,
+        ),
+        on_log=on_log,
+        cancel_event=cancel_event,
+        on_success=on_success,
     )
-    inflight[dedup_key] = task
-
-    def _cleanup(finished: asyncio.Task[CookieLoginResult]) -> None:
-        if inflight.get(dedup_key) is finished:
-            inflight.pop(dedup_key, None)
-
-    task.add_done_callback(_cleanup)
-    return await asyncio.shield(task)
 
 
 async def _login_and_get_cookies_once(
@@ -751,12 +833,15 @@ async def _login_and_get_cookies_once(
     yescaptcha_api_base: str = "https://api.yescaptcha.com",
     yescaptcha_task_type: str = "RecaptchaV2EnterpriseTaskProxyless",
     yescaptcha_timeout_seconds: float = 300.0,
+    cancel_event: Optional[asyncio.Event] = None,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     emit = _make_site_logger("PornHub", on_log)
 
     async def _run() -> CookieLoginResult:
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                return CookieLoginResult(success=False, message="自动登录已取消")
             emit("INFO", "开始登录，正在加载登录页...")
             ctx = TaskHttpContext(
                 cookie_str="",
@@ -766,6 +851,7 @@ async def _login_and_get_cookies_once(
                 max_retries=1,
                 retry_delay_base=1.0,
                 retry_delay_max=2.0,
+                cancel_event=cancel_event,
                 on_log=emit,
             )
             async with ctx:
@@ -831,6 +917,7 @@ async def _login_and_get_cookies_once(
                             yescaptcha_api_base=yescaptcha_api_base,
                             yescaptcha_task_type=yescaptcha_task_type,
                             yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
+                            cancel_event=cancel_event,
                             on_log=emit,
                         )
 
@@ -861,6 +948,7 @@ async def _login_and_get_cookies_once(
                         yescaptcha_api_base=yescaptcha_api_base,
                         yescaptcha_task_type=yescaptcha_task_type,
                         yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
+                        cancel_event=cancel_event,
                         on_log=emit,
                     )
 
@@ -876,6 +964,8 @@ async def _login_and_get_cookies_once(
                     success=False,
                     message=f"自动登录失败，响应异常: {(auth_resp.text or '')[:200]}",
                 )
+        except StopRequested:
+            return CookieLoginResult(success=False, message="自动登录已取消")
         except Exception as err:
             return CookieLoginResult(success=False, message=f"自动登录异常: {err}")
 
@@ -1033,22 +1123,19 @@ async def login_xhamster_and_get_cookies(
     yescaptcha_api_base: str = "https://api.yescaptcha.com",
     yescaptcha_timeout_seconds: float = 300.0,
     on_log: Optional[LogCallback] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    on_success: Optional[SuccessCallback] = None,
 ) -> CookieLoginResult:
     """Authenticate against ``xhamster.com/api/front/user/login`` and return verified cookies."""
     emit = _make_site_logger("xHamster", on_log)
     if not (username or "").strip() or not (password or "").strip():
         return _log_login_outcome(emit, CookieLoginResult(success=False, message="未配置 xHamster 账号或密码"))
 
-    loop = asyncio.get_running_loop()
-    inflight = _INFLIGHT_LOGINS.setdefault(loop, {})
     dedup_key = (f"xh:{username.strip().lower()}", (proxy_url or "").strip())
-    existing = inflight.get(dedup_key)
-    if existing is not None and not existing.done():
-        emit("INFO", "检测到已有正在进行的登录任务，复用本次结果...")
-        return await asyncio.shield(existing)
-
-    task = asyncio.create_task(
-        _login_xhamster_once(
+    return await _run_deduped_login(
+        dedup_key,
+        "xHamster",
+        lambda shared_cancel, shared_log: _login_xhamster_once(
             username,
             password,
             proxy_url=proxy_url,
@@ -1058,17 +1145,13 @@ async def login_xhamster_and_get_cookies(
             yescaptcha_task_type=yescaptcha_task_type,
             yescaptcha_api_base=yescaptcha_api_base,
             yescaptcha_timeout_seconds=yescaptcha_timeout_seconds,
-            on_log=on_log,
-        )
+            cancel_event=shared_cancel,
+            on_log=shared_log,
+        ),
+        on_log=on_log,
+        cancel_event=cancel_event,
+        on_success=on_success,
     )
-    inflight[dedup_key] = task
-
-    def _cleanup(finished: asyncio.Task[CookieLoginResult]) -> None:
-        if inflight.get(dedup_key) is finished:
-            inflight.pop(dedup_key, None)
-
-    task.add_done_callback(_cleanup)
-    return await asyncio.shield(task)
 
 
 async def _login_xhamster_once(
@@ -1082,6 +1165,7 @@ async def _login_xhamster_once(
     yescaptcha_task_type: str = XHAMSTER_DEFAULT_CAPTCHA_V2_TASK_TYPE,
     yescaptcha_api_base: str = "https://api.yescaptcha.com",
     yescaptcha_timeout_seconds: float = 300.0,
+    cancel_event: Optional[asyncio.Event] = None,
     on_log: Optional[LogCallback] = None,
 ) -> CookieLoginResult:
     from ..parsers.xhamster import check_xhamster_cookie_valid
@@ -1090,6 +1174,8 @@ async def _login_xhamster_once(
 
     async def _run() -> CookieLoginResult:
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                return CookieLoginResult(success=False, message="xHamster 自动登录已取消")
             emit("INFO", "开始登录，正在加载登录页...")
             # xHamster uses a double-submit CSRF cookie (`x_csrf_token` cookie == `X-CSRF-Token` header).
             ctx = TaskHttpContext(
@@ -1100,6 +1186,7 @@ async def _login_xhamster_once(
                 max_retries=1,
                 retry_delay_base=1.0,
                 retry_delay_max=2.0,
+                cancel_event=cancel_event,
                 on_log=emit,
             )
             async with ctx:
@@ -1220,9 +1307,11 @@ async def _login_xhamster_once(
                             task_type=xh_task_type,
                             timeout=yescaptcha_timeout_seconds,
                             proxy=proxy_url,
-                            cancel_event=ctx.cancel_event,
+                            cancel_event=cancel_event or ctx.cancel_event,
                             on_log=emit,
                         )
+                    except StopRequested:
+                        raise
                     except CaptchaError as err:
                         return CookieLoginResult(
                             success=False,
@@ -1263,6 +1352,8 @@ async def _login_xhamster_once(
                     return _xhamster_login_failure(data, auth_resp)
 
                 return _xhamster_login_failure(data, auth_resp)
+        except StopRequested:
+            return CookieLoginResult(success=False, message="xHamster 自动登录已取消")
         except Exception as err:
             return CookieLoginResult(success=False, message=f"xHamster 自动登录异常: {err}")
 

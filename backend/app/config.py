@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import secrets
 from pathlib import Path
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REDACTED_PLACEHOLDER = "********"
@@ -61,6 +62,7 @@ class EnvSettings(BaseSettings):
     port: int = Field(default=8000)
     cookie_secure: bool = Field(default=False)
     allowed_origins: str = Field(default="")
+    trusted_proxies: str = Field(default="")
     enable_docs: bool = Field(default=False)
     session_ttl_hours: int = Field(default=168)  # 7 days
 
@@ -115,6 +117,31 @@ class EnvSettings(BaseSettings):
 
     def parsed_allowed_origins(self) -> List[str]:
         return [o.strip().rstrip("/") for o in self.allowed_origins.split(",") if o.strip()]
+
+    def parsed_trusted_proxies(
+        self,
+    ) -> Optional[Tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]]:
+        """Parse ``PHDL_TRUSTED_PROXIES`` into CIDR networks.
+
+        Returns ``None`` when unset (use safe defaults), an empty tuple when set to
+        ``none`` / ``off`` / ``false`` (disable trusting proxy headers), or the
+        parsed tuple of CIDR networks.
+        """
+        raw = (self.trusted_proxies or "").strip()
+        if not raw:
+            return None
+        if raw.lower() in {"none", "off", "false", "0"}:
+            return ()
+        nets: List[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for token in raw.split(","):
+            part = token.strip()
+            if not part:
+                continue
+            try:
+                nets.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                continue
+        return tuple(nets)
 
 
 class SelectorSettings(BaseModel):
@@ -240,6 +267,14 @@ class RuntimeSettings(BaseModel):
 
     # CSS Selectors
     selectors: SelectorSettings = Field(default_factory=SelectorSettings)
+
+    @model_validator(mode="after")
+    def _validate_delay_ranges(self) -> "RuntimeSettings":
+        if self.page_delay_min > self.page_delay_max:
+            raise ValueError("列表翻页最小间隔（page_delay_min）不能大于最大间隔（page_delay_max）")
+        if self.retry_delay_base > self.retry_delay_max:
+            raise ValueError("重试基础退避（retry_delay_base）不能大于最大退避（retry_delay_max）")
+        return self
 
     @property
     def normalized_proxy(self) -> Optional[str]:

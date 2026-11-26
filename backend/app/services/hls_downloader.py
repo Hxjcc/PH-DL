@@ -35,6 +35,7 @@ from .downloader import (
     _DiskSpaceError,
 )
 from .filename import _looks_like_ts, is_valid_video_file, normalized_quality, video_filename_base
+from .http_proxy import effective_request_proxy
 
 _EXT_X_MAP_URI_RE = re.compile(r'URI\s*=\s*"([^"]+)"', re.IGNORECASE)
 _EXT_X_KEY_METHOD_RE = re.compile(r"METHOD\s*=\s*([A-Z0-9-]+)", re.IGNORECASE)
@@ -618,7 +619,7 @@ async def _download_hls_aiohttp(
     headers: Dict[str, str] = {**DOWNLOAD_HEADERS, "Referer": referer}
     if cookie_str:
         headers["Cookie"] = cookie_str
-    proxy = proxy_url or None
+    proxy = effective_request_proxy(session, proxy_url)
     req_timeout = max(10.0, float(request_timeout))
     playlist_timeout = aiohttp.ClientTimeout(
         total=req_timeout,
@@ -653,6 +654,8 @@ async def _download_hls_aiohttp(
             effective_url = str(resp.url)
     except StopRequested:
         return _AiohttpHlsOutcome(cancelled=True)
+    except ValueError as err:
+        return _AiohttpHlsOutcome(fallback_to_ytdlp=True, error=f"HLS 代理不受当前会话支持: {err}")
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
         return _AiohttpHlsOutcome(error=f"HLS 清单请求失败: {err}")
 
@@ -822,7 +825,7 @@ async def _download_hls_aiohttp(
             except asyncio.CancelledError:
                 in_flight_bytes -= received
                 raise
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as err:
                 in_flight_bytes -= received
                 last_err = str(err) or type(err).__name__
 

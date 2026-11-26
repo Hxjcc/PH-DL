@@ -2,6 +2,10 @@
 
 推荐使用 Python 3.12、Node.js 22 和 npm。后端的最低 Python 版本见 `backend/pyproject.toml`。
 
+外部命令行工具（与 Docker 镜像一致）：
+- **FFmpeg**（`ffmpeg` 加入 `PATH`）：下载 xHamster HLS 视频并进行无损 MP4 封装时必需；仅下载 PornHub MP4 时可省略。
+- **rclone**（`rclone` 加入 `PATH`，或在设置中指定 `rclone_bin` 路径）：启用自动云端上传时必需；仅本地下载可省略。
+
 ## 安装依赖（Windows PowerShell）
 
 从项目根目录执行：
@@ -41,6 +45,7 @@ macOS／Linux 从 `backend/` 创建虚拟环境并安装 `.[dev]` 后，可用
 Push-Location backend
 .\.venv\Scripts\python.exe -m pytest -q
 Pop-Location
+npm.cmd --prefix frontend test
 npm.cmd --prefix frontend run build
 ```
 

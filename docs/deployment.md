@@ -14,6 +14,7 @@ install -m 600 .env.example .env
 
 在 `.env` 填写强密码 `PHDL_ADMIN_PASSWORD`。通过 HTTPS 域名访问时，把 `PHDL_COOKIE_SECURE` 设为 `true`。
 前端默认监听宿主机的 `127.0.0.1:8080`，地址和端口可分别通过 `PHDL_BIND_IP` 和 `PHDL_PORT` 调整。
+如无前置反代而是将前端直接暴露在局域网或 VPN 中（`PHDL_BIND_IP=0.0.0.0`），Nginx 与后端默认不会采信普通内网客户端伪造的 `X-Forwarded-For` / `X-Real-IP`；若环境存在 Docker NAT 网关转发且无前置反代，可设置 `PHDL_TRUSTED_PROXIES=none` 完全关闭代理头信任（反之如需信任自定义内网反代，可填逗号分隔 CIDR）。
 FastAPI 的 `/docs` 默认关闭，调试时可通过 `PHDL_ENABLE_DOCS=true` 临时启用。
 
 使用已有的 rclone 远端时，把 `RCLONE_CONFIG_PATH` 设为宿主机上 `rclone.conf` 所在的目录。

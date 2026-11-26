@@ -24,6 +24,7 @@ from ..parsers.http_session import TaskHttpContext
 from ..parsers.video import MediaSource, extract_viewkey_from_url, fetch_single_video_detail, is_video_url
 from ..parsers.xhamster import is_xhamster_host, is_xhamster_url
 from .downloader import DOWNLOAD_HEADERS
+from .http_proxy import create_aiohttp_connector, is_socks_proxy
 
 _PH_SITE = ("pornhub.com",)
 _MEDIA = ("pornhub.com", "phncdn.com", "phprcdn.com", "xhcdn.com")
@@ -170,27 +171,59 @@ class PlaybackService:
         self._resolve_slots = asyncio.Semaphore(4)
         self._stream_slots = asyncio.Semaphore(12)
         self._http_client: Optional[aiohttp.ClientSession] = None
+        self._socks_http_clients: dict[str, aiohttp.ClientSession] = {}
         self._client_lock = asyncio.Lock()
 
-    async def _get_http_client(self) -> aiohttp.ClientSession:
+    async def _get_http_client(
+        self, proxy_url: Optional[str] = None
+    ) -> tuple[aiohttp.ClientSession, Optional[str]]:
+        cleaned_proxy = (proxy_url or "").strip() or None
+        if cleaned_proxy and is_socks_proxy(cleaned_proxy):
+            existing = self._socks_http_clients.get(cleaned_proxy)
+            if existing is not None and not existing.closed:
+                return existing, None
+            async with self._client_lock:
+                existing = self._socks_http_clients.get(cleaned_proxy)
+                if existing is None or existing.closed:
+                    try:
+                        connector, _ = create_aiohttp_connector(
+                            cleaned_proxy,
+                            limit=32,
+                            limit_per_host=16,
+                        )
+                    except ValueError as err:
+                        raise HTTPException(502, "代理地址配置无效，无法连接视频源") from err
+                    existing = aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_read=25),
+                        connector=connector,
+                        cookie_jar=aiohttp.DummyCookieJar(),
+                        auto_decompress=False,
+                    )
+                    self._socks_http_clients[cleaned_proxy] = existing
+                return existing, None
+
         if self._http_client is not None and not self._http_client.closed:
-            return self._http_client
+            return self._http_client, cleaned_proxy
         async with self._client_lock:
             if self._http_client is None or self._http_client.closed:
-                connector = aiohttp.TCPConnector(limit=32, limit_per_host=16)
+                connector, _ = create_aiohttp_connector(None, limit=32, limit_per_host=16)
                 self._http_client = aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_read=25),
                     connector=connector,
                     cookie_jar=aiohttp.DummyCookieJar(),
                     auto_decompress=False,
                 )
-            return self._http_client
+            return self._http_client, cleaned_proxy
 
     async def aclose(self) -> None:
         async with self._client_lock:
             if self._http_client is not None and not self._http_client.closed:
                 await self._http_client.close()
             self._http_client = None
+            for client in list(self._socks_http_clients.values()):
+                if not client.closed:
+                    await client.close()
+            self._socks_http_clients.clear()
 
     async def resolve(self, record: dict, settings: RuntimeSettings) -> dict:
         viewkey = str(record["viewkey"])
@@ -391,7 +424,7 @@ class PlaybackService:
                 await setup.enter_async_context(self._stream_slots)
         except TimeoutError as err:
             raise HTTPException(503, "播放请求过多，请稍后重试") from err
-        client = await self._get_http_client()
+        client, request_proxy = await self._get_http_client(entry.proxy_url)
         upstream = None
         current_url = url
         try:
@@ -406,7 +439,7 @@ class PlaybackService:
                 if entry.cookie and _site_url(current_url):
                     headers["Cookie"] = entry.cookie
                 candidate = await client.get(
-                    current_url, headers=headers, proxy=entry.proxy_url,
+                    current_url, headers=headers, proxy=request_proxy,
                     allow_redirects=False,
                 )
                 if candidate.status not in _REDIRECTS:
@@ -419,7 +452,7 @@ class PlaybackService:
                     candidate.close()
                     raise HTTPException(502, "源站的播放跳转无效") from err
                 await candidate.release()
-        except (aiohttp.ClientError, TimeoutError) as err:
+        except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as err:
             raise HTTPException(502, "无法连接视频源，请重新获取播放地址") from err
 
         if upstream is None:
