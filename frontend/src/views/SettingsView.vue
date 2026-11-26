@@ -294,15 +294,15 @@ const backupRemoteList = computed(() =>
   parseBackupRemoteList(form.value?.rclone_backup_remotes, form.value?.rclone_remote)
 )
 
-const backupCandidateRemotes = computed(() => {
-  const primaryLower = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '').toLowerCase()
-  return rcloneRemotes.value.filter((r) => r.name.toLowerCase() !== primaryLower)
-})
-
 const activeRemoteChain = computed(() => {
   const primary = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '')
   return primary ? [primary, ...backupRemoteList.value] : [...backupRemoteList.value]
 })
+
+function isPrimaryRemote(name) {
+  const primary = String(form.value?.rclone_remote || '').trim().replace(/:+$/, '').toLowerCase()
+  return Boolean(primary) && primary === String(name || '').trim().toLowerCase()
+}
 
 function backupRemoteOrder(name) {
   const key = String(name || '').trim().toLowerCase()
@@ -1106,35 +1106,17 @@ async function handleTestNotify() {
             </div>
           </div>
 
-          <div class="flex flex-wrap items-center gap-2 sm:ml-auto">
-            <div v-if="rcloneRemotes.length > 0" class="flex flex-wrap items-center gap-1.5">
-              <Button
-                v-for="r in rcloneRemotes"
-                :key="r.name"
-                variant="outline"
-                size="xs"
-                :aria-pressed="String(form.rclone_remote || '').trim().toLowerCase() === r.name.toLowerCase()"
-                :class="[
-                  'h-7 gap-1.5 px-2.5 rounded-full text-xs font-medium shadow-none hover:shadow-none',
-                  String(form.rclone_remote || '').trim().toLowerCase() === r.name.toLowerCase()
-                    ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                    : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-foreground/20',
-                ]"
-                @click="selectRcloneRemote(r)"
-              >
-                <span class="font-mono">{{ r.name }}</span>
-                <span class="text-[10px] opacity-75">{{ formatRemoteType(r.type) }}</span>
-              </Button>
-            </div>
+          <div class="flex items-center gap-2 sm:ml-auto">
             <Button
-              variant="ghost"
-              size="icon"
-              class="h-7 w-7 text-muted-foreground"
+              variant="outline"
+              size="xs"
+              class="h-8"
               title="重新扫描 rclone.conf"
               :disabled="loadingRemotes"
               @click="loadRcloneRemotes({ force: true })"
             >
               <RefreshCw :class="['w-3.5 h-3.5', loadingRemotes ? 'animate-spin' : '']" />
+              扫描配置
             </Button>
             <Button variant="outline" size="xs" class="h-8" :disabled="busyTool !== ''" @click="handleTestRclone">
               <PlugZap class="w-3.5 h-3.5" />
@@ -1143,7 +1125,7 @@ async function handleTestNotify() {
           </div>
         </div>
 
-        <!-- Section 1: Remote Targets & Multi-Remote Failover -->
+        <!-- Section 1: Remote Targets & Multi-Remote Failover (Aligned 3-Column Grid) -->
         <div class="p-4 sm:p-5 space-y-3.5">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="flex flex-wrap items-center gap-2">
@@ -1155,54 +1137,82 @@ async function handleTestNotify() {
                 {{ activeRemoteChain.join(' → ') }}
               </span>
             </div>
-            <div v-if="backupCandidateRemotes.length > 0" class="flex flex-wrap items-center gap-1.5">
-              <span class="text-[11px] text-muted-foreground">快捷加入备用：</span>
-              <Button
-                v-for="r in backupCandidateRemotes"
-                :key="r.name"
-                variant="outline"
-                size="xs"
-                :aria-pressed="backupRemoteOrder(r.name) > 0"
-                :class="[
-                  'h-6 gap-1.5 px-2.5 rounded-full text-[11px] font-medium shadow-none hover:shadow-none',
-                  backupRemoteOrder(r.name) > 0
-                    ? 'border-brand/40 bg-brand/10 dark:bg-brand/15 text-brand hover:border-brand/40 hover:bg-brand/10 dark:hover:bg-brand/15 hover:text-brand'
-                    : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-foreground/20',
-                ]"
-                @click="toggleBackupRemote(r)"
-              >
-                <span v-if="backupRemoteOrder(r.name) > 0" class="font-mono text-[10px]">
-                  #{{ backupRemoteOrder(r.name) }}
-                </span>
-                <span class="font-mono">{{ r.name }}</span>
-                <span class="text-[10px] opacity-75">{{ formatRemoteType(r.type) }}</span>
-              </Button>
-            </div>
+            <span v-if="rcloneRemotes.length > 0" class="text-[11px] text-muted-foreground">
+              点击名称切换主盘，点右侧「+ 备」加入备用顺位
+            </span>
           </div>
 
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-            <div class="space-y-1 sm:order-1 lg:order-none">
+          <div v-if="rcloneRemotes.length > 0" class="flex flex-wrap items-center gap-2">
+            <template v-for="r in rcloneRemotes" :key="r.name">
+              <div
+                v-if="isPrimaryRemote(r.name)"
+                class="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-full border border-brand/40 bg-brand/10 dark:bg-brand/15 text-xs font-medium text-brand select-none"
+              >
+                <span class="rounded-full bg-brand text-white dark:text-zinc-950 px-1.5 py-px text-[10px] font-semibold leading-tight">
+                  主
+                </span>
+                <span class="font-mono">{{ r.name }}</span>
+                <span class="text-[10px] opacity-80">{{ formatRemoteType(r.type) }}</span>
+              </div>
+              <div
+                v-else
+                :class="[
+                  'inline-flex items-center h-7 rounded-full border overflow-hidden text-xs font-medium transition-colors',
+                  backupRemoteOrder(r.name) > 0
+                    ? 'border-emerald-500/40 bg-emerald-500/8 dark:bg-emerald-500/12'
+                    : 'border-border bg-card',
+                ]"
+              >
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1.5 h-full pl-2.5 pr-2 text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors cursor-pointer"
+                  :title="`设 ${r.name} 为主 Remote`"
+                  @click="selectRcloneRemote(r)"
+                >
+                  <span class="font-mono text-foreground/90">{{ r.name }}</span>
+                  <span class="text-[10px] opacity-75">{{ formatRemoteType(r.type) }}</span>
+                </button>
+                <button
+                  type="button"
+                  :aria-pressed="backupRemoteOrder(r.name) > 0"
+                  :class="[
+                    'inline-flex items-center h-full px-2 border-l text-[10px] font-medium transition-colors cursor-pointer',
+                    backupRemoteOrder(r.name) > 0
+                      ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/25'
+                      : 'border-border/80 text-muted-foreground hover:text-brand hover:bg-brand/8',
+                  ]"
+                  :title="backupRemoteOrder(r.name) > 0 ? `从备用列表移除 ${r.name}` : `将 ${r.name} 加入备用列表`"
+                  @click="toggleBackupRemote(r)"
+                >
+                  {{ backupRemoteOrder(r.name) > 0 ? `备 #${backupRemoteOrder(r.name)}` : '+ 备' }}
+                </button>
+              </div>
+            </template>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+            <div class="space-y-1">
               <label class="text-xs font-medium text-foreground">主 Remote 名称</label>
               <Input v-model="form.rclone_remote" placeholder="pikpak 或 gd" />
             </div>
-            <div class="space-y-1 sm:col-span-2 sm:order-3 lg:order-none">
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">PornHub 远端目录</label>
+              <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
+            </div>
+            <div class="space-y-1 sm:col-span-2 lg:col-span-1">
+              <label class="text-xs font-medium text-foreground">xHamster 远端目录</label>
+              <Input v-model="form.rclone_xh_remote_base_dir" placeholder="xHamster" />
+            </div>
+            <div class="space-y-1 sm:col-span-2">
               <label class="text-xs font-medium text-foreground">备用 Remote（限额自动切换，逗号分隔）</label>
               <Input
                 v-model="form.rclone_backup_remotes"
                 placeholder="留空表示单盘；例如 gd2, gd3"
               />
             </div>
-            <div class="space-y-1 sm:order-2 lg:order-none">
+            <div class="space-y-1 sm:col-span-2 lg:col-span-1">
               <label class="text-xs font-medium text-foreground">多盘调度策略</label>
               <Select v-model="form.rclone_remote_strategy" :options="RCLONE_STRATEGY_OPTIONS" />
-            </div>
-            <div class="space-y-1 sm:order-4 lg:order-none lg:col-span-2">
-              <label class="text-xs font-medium text-foreground">PornHub 远端基础目录</label>
-              <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
-            </div>
-            <div class="space-y-1 sm:order-5 lg:order-none lg:col-span-2">
-              <label class="text-xs font-medium text-foreground">xHamster 远端基础目录</label>
-              <Input v-model="form.rclone_xh_remote_base_dir" placeholder="xHamster" />
             </div>
           </div>
 
