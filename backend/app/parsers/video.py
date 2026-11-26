@@ -17,6 +17,11 @@ from ..config import SelectorSettings
 from ..services.filename import extract_date_from_cdn_url, normalize_published_date
 from .http_session import TaskHttpContext
 from .target import SubscribeAction, extract_subscribe_action, select_one
+from .xhamster import (
+    extract_xhamster_viewkey,
+    fetch_xhamster_video_detail,
+    is_xhamster_url,
+)
 
 _FLASHVARS_START_RE = re.compile(r"var\s+flashvars_\d+\s*=\s*\{")
 _JSONLD_SCRIPT_RE = re.compile(
@@ -139,6 +144,8 @@ class VideoDetail:
 def extract_viewkey_from_url(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
+    if is_xhamster_url(url):
+        return extract_xhamster_viewkey(url)
     m = re.search(r"(?:viewkey=|/embed/|/shorties/)([a-zA-Z0-9]+)", url)
     return m.group(1) if m else None
 
@@ -147,6 +154,8 @@ def _video_url_key(url: str) -> Optional[str]:
     u = (url or "").strip()
     if "\\" in u or any(char.isspace() for char in u):
         return None
+    if is_xhamster_url(u):
+        return extract_xhamster_viewkey(u)
     try:
         parsed = urllib.parse.urlparse(u)
     except ValueError:
@@ -449,10 +458,25 @@ async def fetch_single_video_detail(
     uploader_hint: Optional[Tuple[str, str]] = None,
     skip_dom: bool = False,
     include_mp4_sources: bool = False,
+    xh_preferred_codec: str = "h264",
     page_num: int = 0,
     item_num: int = 0,
     timeout: Optional[float] = None,
 ) -> VideoDetail:
+    if is_xhamster_url(page_url):
+        return await fetch_xhamster_video_detail(
+            ctx,
+            page_url,
+            preferred_qualities=preferred_qualities,
+            include_keywords=include_keywords,
+            exclude_keywords=exclude_keywords,
+            uploader_hint=uploader_hint,
+            include_mp4_sources=include_mp4_sources,
+            preferred_codec=xh_preferred_codec,
+            page_num=page_num,
+            item_num=item_num,
+            timeout=timeout,
+        )
     vkey = extract_viewkey_from_url(page_url) or ""
     page_timeout = max(5.0, float(timeout or 15.0))
     media_timeout = max(5.0, float(timeout or 12.0))
@@ -651,6 +675,7 @@ async def fetch_video_details_batch(
     on_parsed: Optional[Callable[[int, int, VideoDetail], None]] = None,
     semaphore: Optional[asyncio.Semaphore] = None,
     skip_dom: bool = False,
+    xh_preferred_codec: str = "h264",
     timeout: Optional[float] = None,
 ) -> List[VideoDetail]:
     if not items:
@@ -679,6 +704,7 @@ async def fetch_video_details_batch(
                 exclude_keywords=exclude_keywords,
                 uploader_hint=uploader_hint,
                 skip_dom=skip_dom,
+                xh_preferred_codec=xh_preferred_codec,
                 page_num=page_num,
                 item_num=item_num,
                 timeout=timeout,

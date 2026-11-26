@@ -8,6 +8,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from ..db.repo import normalize_site
 from ..parsers.list_scanner import parse_page_specs, parse_page_video_specs
 from ..parsers.video import collect_video_urls
 from .deps import AppContainer, require_auth
@@ -18,8 +19,9 @@ _INVALID_USERNAME_RE = re.compile(r"[/\\:?#\s]")
 
 class CreateManualDownloadRequest(BaseModel):
     source_mode: str = Field(default="target", pattern="^(target|urls)$")
+    site: str = "pornhub"
     usernames: List[str] = Field(default_factory=list)
-    target_type: str = "auto"  # auto / model / pornstar / favorites / liked
+    target_type: str = "auto"  # PH: auto/model/pornstar/favorites/liked; XH: auto/creator/pornstar/users/channel/favorites
     urls: List[str] = Field(default_factory=list)
     group_by_uploader: bool = True
     batch_name: str = "url_batch"
@@ -87,8 +89,16 @@ async def create_download_job(
     auto_upload = settings.uploader_enabled if payload.auto_upload is None else bool(payload.auto_upload)
 
     if payload.source_mode == "target":
+        norm_site = normalize_site(payload.site)
         utype = (payload.target_type or "auto").strip().lower()
-        if utype not in {"auto", "model", "pornstar", "favorites", "liked"}:
+        if norm_site == "xhamster" and utype == "user":
+            utype = "users"
+        valid_types = (
+            {"auto", "creator", "pornstar", "users", "channel", "favorites"}
+            if norm_site == "xhamster"
+            else {"auto", "model", "pornstar", "favorites", "liked"}
+        )
+        if utype not in valid_types:
             raise HTTPException(status_code=400, detail="不支持的目标类型")
         try:
             parse_page_specs(payload.pages)
@@ -97,15 +107,16 @@ async def create_download_job(
             raise HTTPException(status_code=400, detail=str(err)) from err
         if payload.pages.strip() and payload.videos.strip():
             raise HTTPException(status_code=400, detail="页码范围和指定视频不能同时使用")
+        is_self_collection = utype == "liked" or (norm_site == "xhamster" and utype == "favorites")
         clean_users = [u.strip() for u in payload.usernames if u and u.strip()]
-        if utype != "liked":
+        if not is_self_collection:
             for u in clean_users:
                 if _INVALID_USERNAME_RE.search(u):
                     raise HTTPException(
                         status_code=400,
                         detail=f"用户名格式无效 '{u}'：请输入博主用户名，不要粘贴视频或频道链接",
                     )
-        if utype != "liked" and not clean_users:
+        if not is_self_collection and not clean_users:
             if utype == "favorites" and settings.ph_logged_in_username:
                 clean_users = [settings.ph_logged_in_username]
             else:
@@ -113,13 +124,17 @@ async def create_download_job(
 
         if utype == "liked":
             label_target = "Liked Videos"
+        elif norm_site == "xhamster" and utype == "favorites":
+            label_target = "xHamster Favorites"
         else:
             label_target = ", ".join(clean_users[:3]) + (f" 等 {len(clean_users)} 人" if len(clean_users) > 3 else "")
+        site_prefix = "[xHamster] " if norm_site == "xhamster" else ""
         prefix = "导出页面链接" if payload.export_only else "下载目标"
         job = await container.tasks.enqueue_job(
             kind="manual_target",
-            label=f"{prefix}: {label_target}",
+            label=f"{site_prefix}{prefix}: {label_target}",
             params={
+                "site": norm_site,
                 "usernames": clean_users,
                 "target_type": utype,
                 "quality": payload.quality,
@@ -131,7 +146,7 @@ async def create_download_job(
                 "auto_upload": auto_upload,
                 "export_only": payload.export_only,
                 "add_to_auto_track": utype not in {"liked", "favorites"} and bool(payload.add_to_auto_track),
-                "subscribe_creator": utype not in {"liked", "favorites"} and bool(payload.subscribe_creator),
+                "subscribe_creator": (norm_site == "pornhub") and utype not in {"liked", "favorites"} and bool(payload.subscribe_creator),
             },
         )
         return {"job": job}

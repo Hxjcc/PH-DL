@@ -18,7 +18,7 @@ import {
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
-import { formatBytes, formatDateTime, formatPublishedDate, formatVideoDuration, videoStatusMeta } from '../utils/format'
+import { formatBytes, formatDateTime, formatPublishedDate, formatVideoDuration, siteMeta, videoStatusMeta } from '../utils/format'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
@@ -66,6 +66,7 @@ const stats = ref(
 )
 
 const filters = reactive({
+  site: '',
   search: '',
   uploader: '',
   status: '',
@@ -75,6 +76,12 @@ const filters = reactive({
   page: 1,
   page_size: store.historyPageSize,
 })
+
+const siteOptions = [
+  { label: '全部站点', value: '' },
+  { label: 'PornHub', value: 'pornhub' },
+  { label: 'xHamster', value: 'xhamster' },
+]
 
 const timeRangeOptions = [
   { label: '全部时间', value: '' },
@@ -231,6 +238,7 @@ const inflightPrefetches = new Map()
 
 function buildQueryCacheKey(page = filters.page) {
   return [
+    filters.site,
     filters.search.trim(),
     filters.uploader,
     filters.status,
@@ -284,6 +292,7 @@ function prefetchPage(targetPage) {
 
   const controller = new AbortController()
   const query = {
+    site: filters.site,
     search: filters.search,
     uploader: filters.uploader,
     status: filters.status,
@@ -344,6 +353,7 @@ function openDeleteRowPopoverNow(viewkey) {
 
 function isDefaultFilters() {
   return (
+    !filters.site &&
     !filters.search &&
     !filters.uploader &&
     !filters.status &&
@@ -482,6 +492,14 @@ function changeFilter() {
   cancelAllPrefetches()
   clearTimeout(debounceTimer)
   loadVideos({ includeMeta: false, useCache: true })
+}
+
+function changeSiteFilter() {
+  filters.uploader = ''
+  filters.page = 1
+  cancelAllPrefetches()
+  clearTimeout(debounceTimer)
+  loadVideos({ includeMeta: true, useCache: false })
 }
 
 function changePageSize(value) {
@@ -661,8 +679,12 @@ watch(
 
 function applyRouteUploaderQuery() {
   const raw = typeof route.query.uploader === 'string' ? route.query.uploader.trim() : ''
-  if (!raw) return false
-  const exact = (facets.value.uploaders || []).find((u) => u.toLowerCase() === raw.toLowerCase())
+  const rawSite = typeof route.query.site === 'string' ? route.query.site.trim().toLowerCase() : ''
+  if (!raw && !rawSite) return false
+  const exact = raw
+    ? (facets.value.uploaders || []).find((u) => u.toLowerCase() === raw.toLowerCase())
+    : ''
+  filters.site = rawSite === 'xhamster' || rawSite === 'pornhub' ? rawSite : ''
   filters.uploader = exact || raw
   filters.status = ''
   filters.quality = ''
@@ -800,9 +822,16 @@ onDeactivated(() => {
 
         <div class="grid grid-cols-2 gap-2 sm:contents">
           <Select
+            v-model="filters.site"
+            :options="siteOptions"
+            class="w-full sm:w-28"
+            aria-label="筛选站点"
+            @change="changeSiteFilter"
+          />
+          <Select
             v-model="filters.uploader"
             :options="uploaderOptions"
-            class="w-full col-span-2 sm:w-40"
+            class="w-full sm:w-40"
             @change="changeFilter"
           />
           <Select
@@ -952,6 +981,12 @@ onDeactivated(() => {
                   </div>
 
                   <div class="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
+                    <span
+                      v-if="v.site === 'xhamster'"
+                      :class="['inline-flex items-center rounded border px-1 py-0 text-[9px] font-semibold leading-3.5', siteMeta('xhamster').pillClass]"
+                    >
+                      XH
+                    </span>
                     <span v-if="v.uploader_display_name || v.uploader" class="font-medium text-foreground/80 truncate max-w-[140px]">
                       {{ v.uploader_display_name || v.uploader }}
                     </span>
@@ -1137,6 +1172,13 @@ onDeactivated(() => {
                     {{ v.title || v.viewkey }}
                   </div>
                   <div class="flex items-center gap-1.5 text-[11px] font-mono text-muted-foreground mt-0.5 tabular-nums">
+                    <span
+                      v-if="v.site === 'xhamster'"
+                      :class="['inline-flex items-center rounded border px-1 py-0 font-sans text-[9px] font-semibold leading-3.5', siteMeta('xhamster').pillClass]"
+                      title="xHamster"
+                    >
+                      XH
+                    </span>
                     <span>{{ v.viewkey }}</span>
                     <template v-if="formatPublishedDate(v.published_at)">
                       <span class="opacity-45 select-none">·</span>

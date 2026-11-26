@@ -49,8 +49,11 @@ export const api = {
 
   // Overview & Subscriptions
   overview: () => request('/api/overview'),
-  subscriptions: (username = '') => {
-    const qs = username ? `?username=${encodeURIComponent(username)}` : ''
+  subscriptions: (username = '', site = 'pornhub') => {
+    const sp = new URLSearchParams()
+    if (username) sp.set('username', username)
+    if (site && site !== 'pornhub') sp.set('site', site)
+    const qs = sp.toString() ? `?${sp.toString()}` : ''
     return request(`/api/subscriptions${qs}`)
   },
 
@@ -113,6 +116,8 @@ export const api = {
   testCookie: () => request('/api/settings/cookie/test', { method: 'POST' }),
   importCookie: (cookie) => request('/api/settings/cookie/import', { method: 'POST', body: { cookie } }),
   refreshCookie: () => request('/api/settings/cookie/refresh', { method: 'POST' }),
+  testXhCookie: () => request('/api/settings/xh-cookie/test', { method: 'POST' }),
+  importXhCookie: (cookie) => request('/api/settings/xh-cookie/import', { method: 'POST', body: { cookie } }),
   testYescaptcha: () => request('/api/settings/yescaptcha/test', { method: 'POST' }),
   listRcloneRemotes: () => request('/api/settings/rclone/remotes'),
   testRclone: () => request('/api/settings/rclone/test', { method: 'POST' }),

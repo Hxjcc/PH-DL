@@ -17,6 +17,7 @@ from ..services.filename import extract_date_from_cdn_url
 from .http_session import TaskHttpContext
 from .target import SubscribeAction, extract_subscribe_action, select_many, select_one
 from .video import parse_duration_seconds
+from .xhamster import build_xhamster_list_url, is_xhamster_url, scan_xhamster_list_pages
 
 PH_BASE_URL = "https://www.pornhub.com"
 _MAX_SCOPE = 10_000
@@ -233,7 +234,9 @@ def parse_page_video_specs(spec_str: Optional[str]) -> Optional[Dict[int, Set[in
     return result
 
 
-def build_target_list_url(username: Optional[str], target_type: str) -> str:
+def build_target_list_url(username: Optional[str], target_type: str, site: str = "pornhub") -> str:
+    if (site or "pornhub").strip().lower() in {"xhamster", "xh"}:
+        return build_xhamster_list_url(username, target_type, page=1)
     t = (target_type or "model").strip().lower()
     if t == "liked":
         return f"{PH_BASE_URL}/likedvideos"
@@ -536,6 +539,26 @@ async def scan_list_pages(
     on_error: Optional[Callable[[str], None]] = None,
 ) -> List[ListedVideo]:
     """Scan list pages with bounded prefetch, optionally streaming each page to a callback."""
+    if is_xhamster_url(initial_url):
+        return await scan_xhamster_list_pages(
+            ctx,
+            initial_url,
+            target_type=target_type,
+            pages_spec=pages_spec,
+            videos_spec=videos_spec,
+            catch_up=catch_up,
+            skip_vkeys=skip_vkeys,
+            delay_min=delay_min,
+            delay_max=delay_max,
+            page_concurrency=page_concurrency,
+            timeout=timeout,
+            profile_username=profile_username,
+            on_profile=on_profile,
+            on_canonical_target=on_canonical_target,
+            on_page=on_page,
+            on_page_progress=on_page_progress,
+            on_error=on_error,
+        )
     specific_map = {} if catch_up else (parse_page_video_specs(videos_spec) or {})
     if catch_up:
         explicit_pages: Optional[List[int]] = None

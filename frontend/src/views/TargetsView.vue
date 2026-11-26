@@ -27,8 +27,8 @@ import {
 } from 'lucide-vue-next'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/app'
-import { avatarGradient, formatDateTime, targetTypeMeta } from '../utils/format'
-import { buildTargetProfileVideosUrl, parseTargetUsernames } from '../utils/targetInput'
+import { avatarGradient, formatDateTime, siteMeta, targetTypeMeta } from '../utils/format'
+import { buildTargetProfileVideosUrl, extractTargetFromInput, parseTargetUsernames } from '../utils/targetInput'
 import {
   TARGETS_PAGE_SIZES,
   readListPreference,
@@ -81,6 +81,7 @@ function loadInitialSortBy() {
 const targets = ref(store.targetsCache ? [...store.targetsCache] : [])
 const loading = ref(false)
 const search = ref('')
+const siteFilter = ref('all')
 const statusFilter = ref('all')
 const sortBy = ref(loadInitialSortBy())
 const pageSize = ref(readListPreference('targets', TARGETS_PAGE_SIZES, 24))
@@ -100,6 +101,7 @@ const editModalOpen = ref(false)
 const editingSubmitting = ref(false)
 const editForm = reactive({
   id: null,
+  site: 'pornhub',
   username: '',
   original_username: '',
   original_type: 'model',
@@ -107,11 +109,32 @@ const editForm = reactive({
   target_type: 'model',
   preferred_quality: '',
 })
-const editTargetTypeOptions = [
+const SITE_CHOICES = [
+  { label: 'PornHub', value: 'pornhub' },
+  { label: 'xHamster', value: 'xhamster' },
+]
+const SITE_FILTER_OPTIONS = [
+  { label: '全部站点', value: 'all' },
+  { label: 'PornHub', value: 'pornhub' },
+  { label: 'xHamster', value: 'xhamster' },
+]
+const PH_EDIT_TYPE_OPTIONS = [
   { label: 'Model', value: 'model' },
   { label: 'Pornstar', value: 'pornstar' },
   { label: 'Favorites (收藏夹)', value: 'favorites' },
 ]
+const XH_EDIT_TYPE_OPTIONS = [
+  { label: 'Creator', value: 'creator' },
+  { label: 'Pornstar', value: 'pornstar' },
+  { label: 'User', value: 'users' },
+  { label: 'Channel', value: 'channel' },
+]
+const editTargetTypeOptions = computed(() =>
+  editForm.site === 'xhamster' ? XH_EDIT_TYPE_OPTIONS : PH_EDIT_TYPE_OPTIONS
+)
+const isEditLockedCollection = computed(
+  () => editForm.target_type === 'liked' || (editForm.site === 'xhamster' && editForm.target_type === 'favorites')
+)
 const qualityPresetChoices = ['2160', '1440', '1080', '720', '480']
 
 const schedule = reactive({
@@ -135,6 +158,7 @@ const UPDATE_SCAN_MODES = [
 ]
 
 const newTarget = reactive({
+  site: 'pornhub',
   username: '',
   target_type: 'auto',
   preferred_quality: '',
@@ -142,13 +166,59 @@ const newTarget = reactive({
   baseline_pages: 'all',
 })
 
-const targetTypeOptions = [
+const PH_TARGET_TYPE_OPTIONS = [
   { label: '自动识别', value: 'auto' },
   { label: 'Model', value: 'model' },
   { label: 'Pornstar', value: 'pornstar' },
   { label: 'Favorites (收藏夹)', value: 'favorites' },
   { label: 'Liked (我的点赞)', value: 'liked' },
 ]
+
+const XH_TARGET_TYPE_OPTIONS = [
+  { label: '自动识别', value: 'auto' },
+  { label: 'Creator (创作者)', value: 'creator' },
+  { label: 'Pornstar (明星)', value: 'pornstar' },
+  { label: 'User (普通用户)', value: 'users' },
+  { label: 'Channel (频道)', value: 'channel' },
+  { label: 'Favorites (我的收藏)', value: 'favorites' },
+]
+
+const targetTypeOptions = computed(() =>
+  newTarget.site === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS
+)
+
+const isNewSelfCollection = computed(
+  () => newTarget.target_type === 'liked' || (newTarget.site === 'xhamster' && newTarget.target_type === 'favorites')
+)
+
+watch(
+  () => newTarget.site,
+  (nextSite) => {
+    const valid = new Set((nextSite === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS).map((o) => o.value))
+    if (!valid.has(newTarget.target_type)) {
+      newTarget.target_type = 'auto'
+    }
+  }
+)
+
+watch(
+  () => newTarget.username,
+  (val) => {
+    const text = String(val || '').trim()
+    if (!text || /[\s,，;；]/.test(text)) return
+    const detected = extractTargetFromInput(text)
+    if (!detected) return
+    if (detected.site !== newTarget.site) {
+      newTarget.site = detected.site
+    }
+    if (detected.target_type === 'liked' || (detected.site === 'xhamster' && detected.target_type === 'favorites')) {
+      newTarget.target_type = detected.target_type
+      newTarget.username = ''
+    } else if (detected.target_type) {
+      newTarget.target_type = detected.target_type
+    }
+  }
+)
 
 function isLocalToday(iso) {
   if (!iso) return false
@@ -212,10 +282,18 @@ function targetVideoCountTitle(t) {
   return `共索引 ${total} 个视频（已入库 ${saved} · 仅基线 ${baseline}），点击前往历史记录查看`
 }
 
+const hasXhTargets = computed(() => targets.value.some((t) => (t.site || 'pornhub') === 'xhamster'))
+
 function openTargetHistory(t) {
-  const uploader = t.target_type === 'liked' ? 'My_Liked' : String(t.username || '').trim()
+  const site = t.site || 'pornhub'
+  const uploader =
+    t.target_type === 'liked'
+      ? 'My_Liked'
+      : site === 'xhamster' && t.target_type === 'favorites'
+        ? 'My_Favorites'
+        : String(t.username || '').trim()
   if (!uploader) return
-  router.push({ name: 'history', query: { uploader } })
+  router.push({ name: 'history', query: { uploader, site } })
 }
 
 function parseCreatedTs(iso) {
@@ -227,12 +305,14 @@ function parseCreatedTs(iso) {
 const filteredTargets = computed(() => {
   const q = search.value.trim().toLowerCase()
   const list = targets.value.filter((t) => {
+    const tSite = t.site || 'pornhub'
+    if (siteFilter.value !== 'all' && tSite !== siteFilter.value) return false
     if (statusFilter.value === 'updated_today' && !isUpdatedToday(t)) return false
     if (statusFilter.value === 'enabled' && !t.enabled) return false
     if (statusFilter.value === 'disabled' && t.enabled) return false
     if (statusFilter.value === 'error' && !t.last_error) return false
     if (q) {
-      const names = [targetDisplayName(t), t.username, t.display_name]
+      const names = [targetDisplayName(t), t.username, t.display_name, siteMeta(tSite).label]
         .map((value) => String(value || '').toLowerCase())
       const typeLabel = String(targetTypeMeta(t.target_type) || '').toLowerCase()
       if (!names.some((name) => name.includes(q)) && !typeLabel.includes(q)) return false
@@ -287,7 +367,7 @@ const pagedTargets = computed(() => {
   return filteredTargets.value.slice(start, start + pageSize.value)
 })
 
-watch([search, statusFilter, sortBy, pageSize], () => {
+watch([search, siteFilter, statusFilter, sortBy, pageSize], () => {
   currentPage.value = 1
 })
 
@@ -325,6 +405,9 @@ function setViewMode(mode) {
 
 function targetDisplayName(t) {
   if (t.target_type === 'liked') return 'Liked Videos'
+  if (t.site === 'xhamster' && t.target_type === 'favorites') {
+    return (t.display_name || '').trim() || 'xHamster Favorites'
+  }
   return (t.display_name || '').trim() || t.username
 }
 
@@ -435,10 +518,10 @@ const parsedNewUsernames = computed(() => parseTargetUsernames(newTarget.usernam
 
 async function handleAddTarget() {
   if (newTarget.init_baseline && !newBaselineValid.value) return
-  if (newTarget.target_type !== 'liked' && parsedNewUsernames.value.length === 0) {
+  if (!isNewSelfCollection.value && parsedNewUsernames.value.length === 0) {
     store.notify(
       newTarget.username.trim()
-        ? '未识别到有效的博主用户名（请勿粘贴视频或频道链接）'
+        ? '未识别到有效的博主用户名（请勿粘贴视频链接）'
         : '请输入至少一个用户名',
       'warning'
     )
@@ -446,8 +529,8 @@ async function handleAddTarget() {
   }
   adding.value = true
   try {
-    if (newTarget.target_type === 'liked' || parsedNewUsernames.value.length === 1) {
-      const singleUsername = newTarget.target_type === 'liked' ? '' : parsedNewUsernames.value[0]
+    if (isNewSelfCollection.value || parsedNewUsernames.value.length === 1) {
+      const singleUsername = isNewSelfCollection.value ? '' : parsedNewUsernames.value[0]
       const res = await api.createTarget({ ...newTarget, username: singleUsername })
       const addedName = res.target.display_name || res.target.username
       store.notify(
@@ -459,6 +542,7 @@ async function handleAddTarget() {
     } else {
       const res = await api.batchCreateTargets({
         items: parsedNewUsernames.value.map((username) => ({
+          site: newTarget.site,
           username,
           target_type: newTarget.target_type,
           preferred_quality: newTarget.preferred_quality.trim(),
@@ -493,6 +577,7 @@ async function handleImportSubs(picked, opts = {}) {
   try {
     const res = await api.batchCreateTargets({
       items: picked.map((p) => ({
+        site: p.site || opts?.site || 'pornhub',
         username: p.username,
         target_type: p.type,
         display_name: p.display_name || p.username,
@@ -552,6 +637,7 @@ function openBaselineDialog(target) {
 
 function openEditDialog(target) {
   editForm.id = target.id
+  editForm.site = target.site || 'pornhub'
   editForm.username = target.username
   editForm.original_username = target.username
   editForm.original_type = target.target_type
@@ -589,7 +675,7 @@ async function handleSaveTargetEdit() {
     preferred_quality: editForm.preferred_quality.trim(),
   }
   let identityChanged = false
-  if (editForm.target_type !== 'liked') {
+  if (!isEditLockedCollection.value) {
     const rawUsername = String(editForm.username || '').trim()
     const parsed = parseTargetUsernames(rawUsername)
     const normalizedUsername = parsed.length === 1 ? parsed[0] : rawUsername
@@ -820,6 +906,13 @@ async function handleDelete(t) {
 
           <div class="grid grid-cols-2 gap-2 sm:flex sm:items-center">
             <Select
+              v-if="hasXhTargets"
+              v-model="siteFilter"
+              :options="SITE_FILTER_OPTIONS"
+              aria-label="筛选站点"
+              class="h-9 w-full sm:w-28 text-xs"
+            />
+            <Select
               :model-value="sortBy"
               :options="TARGET_SORT_OPTIONS"
               aria-label="排序方式"
@@ -968,6 +1061,13 @@ async function handleDelete(t) {
                   {{ targetDisplayName(t) }}
                 </div>
                 <div class="mt-1 flex flex-wrap items-center gap-1.5">
+                  <span
+                    v-if="t.site === 'xhamster'"
+                    :class="['inline-flex items-center rounded-md border px-1.5 py-0 text-[10px] font-semibold leading-4', siteMeta('xhamster').pillClass]"
+                    title="xHamster 监控目标"
+                  >
+                    XH
+                  </span>
                   <Badge variant="secondary" class="text-[11px] px-2 py-0">
                     {{ targetTypeMeta(t.target_type) }}
                   </Badge>
@@ -1135,7 +1235,15 @@ async function handleDelete(t) {
                   </div>
                 </td>
                 <td class="px-5 py-3.5 whitespace-nowrap">
-                  <Badge variant="secondary">{{ targetTypeMeta(t.target_type) }}</Badge>
+                  <div class="inline-flex items-center gap-1.5">
+                    <span
+                      v-if="t.site === 'xhamster'"
+                      :class="['inline-flex items-center rounded-md border px-1.5 py-0 text-[10px] font-semibold leading-4', siteMeta('xhamster').pillClass]"
+                    >
+                      XH
+                    </span>
+                    <Badge variant="secondary">{{ targetTypeMeta(t.target_type) }}</Badge>
+                  </div>
                 </td>
                 <td class="px-5 py-3.5 whitespace-nowrap">
                   <button
@@ -1270,9 +1378,30 @@ async function handleDelete(t) {
     >
       <form id="add-target-form" class="space-y-4" @submit.prevent="handleAddTarget">
         <div class="space-y-1.5">
+          <label class="text-xs font-medium text-foreground">目标站点</label>
+          <div class="inline-flex items-center rounded-lg border border-border bg-surface-subtle/70 p-0.5" role="group" aria-label="选择目标站点">
+            <button
+              v-for="opt in SITE_CHOICES"
+              :key="opt.value"
+              type="button"
+              :aria-pressed="newTarget.site === opt.value"
+              :class="[
+                'h-7 px-3 rounded-md text-xs font-medium transition-colors cursor-pointer select-none',
+                newTarget.site === opt.value
+                  ? 'bg-card text-foreground shadow-xs ring-1 ring-border/70'
+                  : 'text-muted-foreground hover:text-foreground',
+              ]"
+              @click="newTarget.site = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+        </div>
+
+        <div class="space-y-1.5">
           <div class="flex items-center justify-between gap-2">
             <label class="text-xs font-medium text-foreground">用户名</label>
-            <span v-if="newTarget.target_type !== 'liked' && parsedNewUsernames.length > 1" class="text-[11px] font-medium text-brand tabular-nums">
+            <span v-if="!isNewSelfCollection && parsedNewUsernames.length > 1" class="text-[11px] font-medium text-brand tabular-nums">
               将添加 {{ parsedNewUsernames.length }} 个目标
             </span>
             <span v-else class="text-[11px] text-muted-foreground">支持多个（逗号、空格或换行分隔）</span>
@@ -1280,8 +1409,16 @@ async function handleDelete(t) {
           <Textarea
             v-model="newTarget.username"
             :rows="2"
-            :disabled="newTarget.target_type === 'liked'"
-            :placeholder="newTarget.target_type === 'liked' ? 'Liked 模式无需输入用户名' : '例如: candy-love, alice（也可换行或粘贴主页链接批量添加）'"
+            :disabled="isNewSelfCollection"
+            :placeholder="
+              newTarget.target_type === 'liked'
+                ? 'Liked 模式无需输入用户名'
+                : isNewSelfCollection
+                  ? 'xHamster 收藏模式无需输入用户名'
+                  : newTarget.site === 'xhamster'
+                    ? '例如: fragile-tempt, webtolove（也可直接粘贴 xHamster 主页链接）'
+                    : '例如: candy-love, alice（也可换行或粘贴主页链接批量添加）'
+            "
           />
         </div>
 
@@ -1319,10 +1456,10 @@ async function handleDelete(t) {
           type="submit"
           form="add-target-form"
           size="sm"
-          :disabled="adding || (newTarget.target_type !== 'liked' && parsedNewUsernames.length === 0) || (newTarget.init_baseline && !newBaselineValid)"
+          :disabled="adding || (!isNewSelfCollection && parsedNewUsernames.length === 0) || (newTarget.init_baseline && !newBaselineValid)"
         >
           <Loader2 v-if="adding" class="w-3.5 h-3.5 animate-spin" />
-          {{ adding ? '保存中...' : parsedNewUsernames.length > 1 && newTarget.target_type !== 'liked' ? `确认添加 (${parsedNewUsernames.length})` : '确认添加' }}
+          {{ adding ? '保存中...' : parsedNewUsernames.length > 1 && !isNewSelfCollection ? `确认添加 (${parsedNewUsernames.length})` : '确认添加' }}
         </Button>
       </template>
     </Dialog>
@@ -1359,14 +1496,20 @@ async function handleDelete(t) {
       @close="editModalOpen = false"
     >
       <form id="edit-target-form" class="space-y-4" @submit.prevent="handleSaveTargetEdit">
+        <div class="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>所属站点：</span>
+          <span :class="['inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium', siteMeta(editForm.site).pillClass]">
+            {{ siteMeta(editForm.site).label }}
+          </span>
+        </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">
-              {{ editForm.target_type === 'liked' ? '目标标识（只读）' : '目标标识（用户名）' }}
+              {{ isEditLockedCollection ? '目标标识（只读）' : '目标标识（用户名）' }}
             </label>
             <Input
-              v-if="editForm.target_type === 'liked'"
-              model-value="Liked Videos"
+              v-if="isEditLockedCollection"
+              :model-value="editForm.target_type === 'liked' ? 'Liked Videos' : 'xHamster Favorites'"
               disabled
             />
             <Input
@@ -1377,7 +1520,11 @@ async function handleDelete(t) {
           </div>
           <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">目标类型</label>
-            <Input v-if="editForm.target_type === 'liked'" model-value="我的点赞 (Liked)" disabled />
+            <Input
+              v-if="isEditLockedCollection"
+              :model-value="editForm.target_type === 'liked' ? '我的点赞 (Liked)' : '我的收藏 (Favorites)'"
+              disabled
+            />
             <Select v-else v-model="editForm.target_type" :options="editTargetTypeOptions" />
           </div>
         </div>
@@ -1386,7 +1533,7 @@ async function handleDelete(t) {
           <label class="text-xs font-medium text-foreground">自定义显示名称（可选）</label>
           <Input
             v-model="editForm.display_name"
-            :disabled="editForm.target_type === 'liked'"
+            :disabled="isEditLockedCollection"
             placeholder="留空则显示网站名称或用户名"
           />
         </div>

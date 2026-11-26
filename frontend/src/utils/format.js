@@ -98,13 +98,33 @@ export function videoStatusMeta(status) {
 export function targetTypeMeta(targetType) {
   const map = {
     model: 'Model',
+    creator: 'Creator',
     pornstar: 'Pornstar',
+    channel: 'Channel',
     users: 'User',
     favorites: '收藏夹',
     liked: '我的点赞',
     auto: '自动',
   }
   return map[targetType] || targetType || '未知'
+}
+
+export function siteMeta(site) {
+  const norm = String(site || 'pornhub').trim().toLowerCase()
+  if (norm === 'xhamster' || norm === 'xh') {
+    return {
+      key: 'xhamster',
+      code: 'XH',
+      label: 'xHamster',
+      pillClass: 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400',
+    }
+  }
+  return {
+    key: 'pornhub',
+    code: 'PH',
+    label: 'PornHub',
+    pillClass: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  }
 }
 
 const AVATAR_PALETTES = [

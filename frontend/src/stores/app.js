@@ -7,6 +7,7 @@ import { appendLiveLog, mergeLogsSnapshot } from '../utils/logBuffer'
 import { JOB_LIMITS, HISTORY_PAGE_SIZES, readListPreference, saveListPreference } from '../utils/listPreferences'
 
 export const DEFAULT_HISTORY_FILTERS = Object.freeze({
+  site: '',
   search: '',
   uploader: '',
   status: '',
@@ -339,6 +340,13 @@ export const useAppStore = defineStore('app', {
         ''
       ).trim()
     },
+    xhAccountUsername(state) {
+      return String(
+        state.settingsCache?.xh_logged_in_username ||
+        state.overview?.xh_cookie?.username ||
+        ''
+      ).trim()
+    },
     accountAvatarUrl(state) {
       if (state.settingsCache && typeof state.settingsCache.account_avatar_version === 'string') {
         return state.settingsCache.account_avatar_version
@@ -550,9 +558,14 @@ export const useAppStore = defineStore('app', {
       }, delayMs)
     },
 
-    getCachedSubscriptions(username = '') {
-      const source = username.trim() || this.settingsCache?.ph_logged_in_username || this.subscriptionsLastSource
-      const entry = this.subscriptionsCache[source.toLowerCase()]
+    getCachedSubscriptions(username = '', site = 'pornhub') {
+      const normSite = String(site || 'pornhub').toLowerCase() === 'xhamster' ? 'xhamster' : 'pornhub'
+      const source =
+        normSite === 'xhamster'
+          ? 'self'
+          : (username.trim() || this.settingsCache?.ph_logged_in_username || this.subscriptionsLastSource)
+      const cacheKey = normSite === 'xhamster' ? 'xhamster:self' : source.toLowerCase()
+      const entry = this.subscriptionsCache[cacheKey]
       const fresh = entry && Date.now() - entry.fetchedAt < SUBSCRIPTIONS_CACHE_TTL_MS
       if (!fresh || !Array.isArray(entry.subscriptions)) return null
       // Older subscription entries predate avatar_url and need one fresh pull.
@@ -565,22 +578,35 @@ export const useAppStore = defineStore('app', {
       this.persistCache()
     },
 
-    async loadSubscriptions(username = '', force = false) {
-      if (!username.trim() && this.settingsCache === null) await this.ensureSettings()
-      const source = username.trim() || this.settingsCache?.ph_logged_in_username || this.subscriptionsLastSource
-      const cached = this.getCachedSubscriptions(source)
+    async loadSubscriptions(username = '', force = false, site = 'pornhub') {
+      const normSite = String(site || 'pornhub').toLowerCase() === 'xhamster' ? 'xhamster' : 'pornhub'
+      if (normSite === 'pornhub' && !username.trim() && this.settingsCache === null) await this.ensureSettings()
+      const source =
+        normSite === 'xhamster'
+          ? ''
+          : (username.trim() || this.settingsCache?.ph_logged_in_username || this.subscriptionsLastSource)
+      const cached = this.getCachedSubscriptions(source, normSite)
       if (cached && !force) return { ...cached, fromCache: true }
-      const key = `subscriptions:${source.toLowerCase()}`
+      const cacheKey = normSite === 'xhamster' ? 'xhamster:self' : source.toLowerCase()
+      const key = `subscriptions:${normSite}:${cacheKey}`
       if (inflight.has(key)) return inflight.get(key)
       return runRequest(key, async ({ isLatest }) => {
-        const res = await api.subscriptions(source)
-        const entry = { username: res.username || source, subscriptions: res.subscriptions || [], fetchedAt: Date.now() }
+        const res = await api.subscriptions(source, normSite)
+        const entry = {
+          site: normSite,
+          username: res.username || source,
+          subscriptions: res.subscriptions || [],
+          fetchedAt: Date.now(),
+        }
         if (isLatest()) {
-          const cache = { ...this.subscriptionsCache, [entry.username.toLowerCase()]: entry }
+          const storeKey = normSite === 'xhamster' ? 'xhamster:self' : entry.username.toLowerCase()
+          const cache = { ...this.subscriptionsCache, [storeKey]: entry }
           this.subscriptionsCache = Object.fromEntries(Object.entries(cache)
             .filter(([, value]) => Date.now() - value.fetchedAt < SUBSCRIPTIONS_CACHE_TTL_MS)
-            .sort((a, b) => b[1].fetchedAt - a[1].fetchedAt).slice(0, 3))
-          this.subscriptionsLastSource = entry.username
+            .sort((a, b) => b[1].fetchedAt - a[1].fetchedAt).slice(0, 4))
+          if (normSite === 'pornhub') {
+            this.subscriptionsLastSource = entry.username
+          }
           this.persistCache()
         }
         return { ...entry, fromCache: false }

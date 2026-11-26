@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from ..engine.scheduler import parse_hhmm
+from ..parsers.xhamster import check_xhamster_cookie_valid
 from ..services.captcha import CaptchaError, get_yescaptcha_balance
 from ..services.cookie import check_cookie_valid, login_and_get_cookies
 from ..services.notifier import send_serverchan
@@ -77,6 +78,7 @@ async def get_settings(container: AppContainer = Depends(require_auth)):
     return {
         "settings": settings.to_redacted_dict(),
         "cookie_status": container.tasks.cookie_status,
+        "xh_cookie_status": container.tasks.xh_cookie_status,
     }
 
 
@@ -161,6 +163,46 @@ async def refresh_cookie(container: AppContainer = Depends(require_auth)):
         "success": True,
         "logged_in_username": res.logged_in_username,
         "message": res.message,
+    }
+
+
+@router.post("/xh-cookie/test")
+async def test_xh_cookie(container: AppContainer = Depends(require_auth)):
+    settings = await container.repo.get_settings()
+    valid, message, username = await check_xhamster_cookie_valid(
+        settings.xh_cookie,
+        proxy_url=settings.normalized_proxy,
+        timeout=settings.request_timeout,
+    )
+    if valid and username and username != settings.xh_logged_in_username:
+        await container.repo.update_settings_patch({"xh_logged_in_username": username})
+    container.tasks.set_xh_cookie_status(valid, message)
+    return {"valid": valid, "message": message, "logged_in_username": username}
+
+
+@router.post("/xh-cookie/import")
+async def import_xh_cookie(
+    payload: CookieImportRequest,
+    container: AppContainer = Depends(require_auth),
+):
+    raw = (payload.cookie or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="xHamster Cookie 内容不能为空")
+
+    settings = await container.repo.update_settings_patch({"xh_cookie": raw})
+    valid, message, username = await check_xhamster_cookie_valid(
+        settings.xh_cookie,
+        proxy_url=settings.normalized_proxy,
+        timeout=settings.request_timeout,
+    )
+    if valid and username:
+        await container.repo.update_settings_patch({"xh_logged_in_username": username})
+    container.tasks.set_xh_cookie_status(valid, message)
+    return {
+        "saved": True,
+        "valid": valid,
+        "message": message,
+        "logged_in_username": username,
     }
 
 

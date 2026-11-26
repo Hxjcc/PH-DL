@@ -29,10 +29,10 @@ import {
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
-import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta } from '../utils/format'
+import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta, siteMeta } from '../utils/format'
 import { computeJobLiveMetrics, resolveJobVisual } from '../utils/jobMeta'
 import { parseVideoLinks } from '../utils/videoLinks'
-import { parseTargetUsernames } from '../utils/targetInput'
+import { extractTargetFromInput, parseTargetUsernames } from '../utils/targetInput'
 import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../utils/specificVideos'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
@@ -62,13 +62,31 @@ const sourceTabs = [
   { value: 'urls', label: '视频链接 / TXT' },
 ]
 
-const targetTypeOptions = [
+const SITE_OPTIONS = [
+  { label: 'PornHub', value: 'pornhub' },
+  { label: 'xHamster', value: 'xhamster' },
+]
+
+const PH_TARGET_TYPE_OPTIONS = [
   { label: '自动识别', value: 'auto' },
   { label: 'Model / 个人', value: 'model' },
   { label: 'Pornstar / 明星', value: 'pornstar' },
   { label: '收藏夹 (Favorites)', value: 'favorites' },
   { label: '我的点赞 (Liked)', value: 'liked' },
 ]
+
+const XH_TARGET_TYPE_OPTIONS = [
+  { label: '自动识别', value: 'auto' },
+  { label: 'Creator / 创作者', value: 'creator' },
+  { label: 'Pornstar / 明星', value: 'pornstar' },
+  { label: 'User / 普通用户', value: 'users' },
+  { label: 'Channel / 频道', value: 'channel' },
+  { label: '我的收藏 (Favorites)', value: 'favorites' },
+]
+
+const targetTypeOptions = computed(() =>
+  form.site === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS
+)
 
 const qualityChoices = ['2160', '1440', '1080', '720', '480']
 const pageMode = ref('all')
@@ -166,6 +184,7 @@ watch([videoMode, specificPage, specificPositions], () => {
 })
 
 const form = reactive({
+  site: 'pornhub',
   usernames: '',
   target_type: 'auto',
   urlsText: '',
@@ -186,8 +205,47 @@ const form = reactive({
   subscribe_creator: false,
 })
 
+const isSelfCollectionTarget = computed(
+  () => form.target_type === 'liked' || (form.site === 'xhamster' && form.target_type === 'favorites')
+)
+
 const creatorActionsDisabled = computed(
   () => sourceTab.value === 'target' && (form.target_type === 'liked' || form.target_type === 'favorites')
+)
+
+const subscribeCreatorDisabled = computed(
+  () => creatorActionsDisabled.value || (sourceTab.value === 'target' && form.site === 'xhamster')
+)
+
+watch(
+  () => form.site,
+  (nextSite) => {
+    const validValues = new Set(
+      (nextSite === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS).map((o) => o.value)
+    )
+    if (!validValues.has(form.target_type)) {
+      form.target_type = 'auto'
+    }
+  }
+)
+
+watch(
+  () => form.usernames,
+  (val) => {
+    const text = String(val || '').trim()
+    if (!text || /[\s,，;；]/.test(text)) return
+    const detected = extractTargetFromInput(text)
+    if (!detected) return
+    if (detected.site !== form.site) {
+      form.site = detected.site
+    }
+    if (detected.target_type === 'liked' || (detected.site === 'xhamster' && detected.target_type === 'favorites')) {
+      form.target_type = detected.target_type
+      form.usernames = ''
+    } else if (detected.target_type) {
+      form.target_type = detected.target_type
+    }
+  }
 )
 
 const isPartialDownloadScope = computed(() => {
@@ -268,8 +326,10 @@ const quickTargets = computed(() =>
 const quickTargetsByName = computed(() => {
   const map = new Map()
   for (const t of quickTargets.value) {
-    if (t.target_type !== 'liked' && t.username) {
-      map.set(t.username.toLowerCase(), t)
+    const tSite = t.site || 'pornhub'
+    const isSelf = t.target_type === 'liked' || (tSite === 'xhamster' && t.target_type === 'favorites')
+    if (!isSelf && t.username) {
+      map.set(`${tSite}:${t.username.toLowerCase()}`, t)
     }
   }
   return map
@@ -279,12 +339,18 @@ const selectedUsernameSet = computed(() => new Set(selectedUsernameList.value.ma
 
 function targetName(target) {
   if (target.target_type === 'liked') return 'Liked Videos'
+  if (target.site === 'xhamster' && target.target_type === 'favorites') {
+    return (target.display_name || '').trim() || 'xHamster Favorites'
+  }
   return (target.display_name || '').trim() || target.username
 }
 
 function isQuickTargetSelected(target) {
+  const tSite = target.site || 'pornhub'
+  if (tSite !== form.site) return false
   if (target.target_type === 'liked') return form.target_type === 'liked'
-  return form.target_type !== 'liked' && selectedUsernameSet.value.has(target.username.toLowerCase())
+  if (tSite === 'xhamster' && target.target_type === 'favorites') return form.target_type === 'favorites'
+  return !isSelfCollectionTarget.value && selectedUsernameSet.value.has(target.username.toLowerCase())
 }
 
 function syncTargetTypeForNames(names) {
@@ -294,7 +360,7 @@ function syncTargetTypeForNames(names) {
   }
   const types = new Set()
   for (const name of names) {
-    const matched = quickTargetsByName.value.get(name.toLowerCase())
+    const matched = quickTargetsByName.value.get(`${form.site}:${name.toLowerCase()}`)
     if (!matched) {
       form.target_type = 'auto'
       return
@@ -306,22 +372,30 @@ function syncTargetTypeForNames(names) {
 
 function fillQuickTarget(target) {
   sourceTab.value = 'target'
-  if (target.target_type === 'liked') {
-    if (form.target_type === 'liked') {
+  const tSite = target.site || 'pornhub'
+  const siteChanged = tSite !== form.site
+  if (siteChanged) {
+    form.site = tSite
+    form.usernames = ''
+    form.target_type = 'auto'
+  }
+  const isSelf = target.target_type === 'liked' || (tSite === 'xhamster' && target.target_type === 'favorites')
+  if (isSelf) {
+    if (!siteChanged && form.target_type === target.target_type) {
       form.target_type = 'auto'
     } else {
-      form.target_type = 'liked'
+      form.target_type = target.target_type
       form.usernames = ''
     }
     return
   }
 
-  if (form.target_type === 'liked') {
+  if (isSelfCollectionTarget.value) {
     form.target_type = 'auto'
   }
   const key = target.username.toLowerCase()
-  const current = selectedUsernameList.value
-  const next = selectedUsernameSet.value.has(key)
+  const current = siteChanged ? [] : selectedUsernameList.value
+  const next = !siteChanged && selectedUsernameSet.value.has(key)
     ? current.filter((u) => u.toLowerCase() !== key)
     : [...current, target.username]
   form.usernames = next.join(', ')
@@ -330,7 +404,7 @@ function fillQuickTarget(target) {
 
 function clearTargetUsernames() {
   form.usernames = ''
-  if (form.target_type !== 'liked') form.target_type = 'auto'
+  if (!isSelfCollectionTarget.value) form.target_type = 'auto'
 }
 
 const quickRailRef = ref(null)
@@ -551,9 +625,15 @@ function clearUrls() {
   form.urlsText = ''
 }
 
-function handleSubsPicked(picked) {
+function handleSubsPicked(picked, opts = {}) {
+  const nextSite = opts?.site || picked?.[0]?.site || form.site
+  const switchedSite = nextSite !== form.site
+  if (switchedSite) {
+    form.site = nextSite
+    form.usernames = ''
+  }
   const names = picked.map((p) => p.username)
-  const existing = parseTargetUsernames(form.usernames)
+  const existing = switchedSite ? [] : parseTargetUsernames(form.usernames)
   const merged = parseTargetUsernames([...existing, ...names].join(','))
   form.usernames = merged.join(', ')
   form.target_type = 'auto'
@@ -565,7 +645,7 @@ async function submitDownload() {
     if (!submitting.value) store.notify('请粘贴或导入至少一条有效视频链接', 'warning')
     return
   }
-  if (sourceTab.value === 'target' && form.target_type !== 'liked') {
+  if (sourceTab.value === 'target' && !isSelfCollectionTarget.value) {
     const parsed = parseTargetUsernames(form.usernames)
     if (form.usernames.trim() && parsed.length === 0) {
       store.notify('未识别到有效的博主用户名（视频链接请切换到「视频链接 / TXT」标签）', 'warning')
@@ -587,12 +667,13 @@ async function submitDownload() {
       auto_upload: !form.export_only && form.auto_upload,
       export_only: form.export_only,
       add_to_auto_track: !creatorActionsDisabled.value && form.add_to_auto_track,
-      subscribe_creator: !creatorActionsDisabled.value && form.subscribe_creator,
+      subscribe_creator: !subscribeCreatorDisabled.value && form.subscribe_creator,
     }
     if (sourceTab.value === 'target') {
+      payload.site = form.site
       payload.pages = form.pages.trim()
       payload.videos = form.videos.trim()
-      payload.usernames = parseTargetUsernames(form.usernames)
+      payload.usernames = isSelfCollectionTarget.value ? [] : parseTargetUsernames(form.usernames)
       payload.target_type = form.target_type
     } else {
       payload.urls = parsedUrls.value
@@ -811,13 +892,36 @@ async function handleClearTemp() {
                 :inert="sourceTab !== 'target'"
                 :aria-hidden="sourceTab !== 'target'"
               >
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="inline-flex items-center rounded-lg border border-border bg-surface-subtle/70 p-0.5" role="group" aria-label="目标站点">
+                    <button
+                      v-for="opt in SITE_OPTIONS"
+                      :key="opt.value"
+                      type="button"
+                      :aria-pressed="form.site === opt.value"
+                      :class="[
+                        'h-7 px-3 rounded-md text-xs font-medium transition-colors cursor-pointer select-none',
+                        form.site === opt.value
+                          ? 'bg-card text-foreground shadow-xs ring-1 ring-border/70'
+                          : 'text-muted-foreground hover:text-foreground',
+                      ]"
+                      @click="form.site = opt.value"
+                    >
+                      {{ opt.label }}
+                    </button>
+                  </div>
+                  <span v-if="form.site === 'xhamster'" class="text-[11px] text-muted-foreground">
+                    公开博主/频道免 Cookie · 4K HLS 自动封装 MP4
+                  </span>
+                </div>
+
                 <div class="target-source">
                   <div class="username-field field">
                     <div class="field-heading">
                       <label for="download-usernames">用户名</label>
                       <span>多个以逗号或空格分隔</span>
                       <button
-                        v-if="form.target_type !== 'liked' && selectedUsernameList.length > 0"
+                        v-if="!isSelfCollectionTarget && selectedUsernameList.length > 0"
                         type="button"
                         class="ml-auto text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
                         @click="clearTargetUsernames"
@@ -828,8 +932,16 @@ async function handleClearTemp() {
                     <Input
                       id="download-usernames"
                       v-model="form.usernames"
-                      :disabled="form.target_type === 'liked'"
-                      :placeholder="form.target_type === 'liked' ? 'Liked 模式无需输入用户名' : '例如: blowketing, candy-love'"
+                      :disabled="isSelfCollectionTarget"
+                      :placeholder="
+                        form.target_type === 'liked'
+                          ? 'Liked 模式无需输入用户名'
+                          : isSelfCollectionTarget
+                            ? 'xHamster 收藏模式无需输入用户名'
+                            : form.site === 'xhamster'
+                              ? '例如: fragile-tempt, webtolove（支持粘贴主页链接）'
+                              : '例如: blowketing, candy-love（支持粘贴主页链接）'
+                      "
                     />
                   </div>
                   <div class="field">
@@ -839,7 +951,7 @@ async function handleClearTemp() {
                   <Button
                     variant="outline"
                     class="subscription-picker text-xs"
-                    :disabled="form.target_type === 'liked'"
+                    :disabled="isSelfCollectionTarget"
                     @click="subsModalOpen = true"
                   >
                     <Users class="w-3.5 h-3.5" />
@@ -885,6 +997,12 @@ async function handleClearTemp() {
                           />
                         </span>
                         <span class="max-w-24 truncate">{{ targetName(target) }}</span>
+                        <span
+                          v-if="target.site === 'xhamster'"
+                          :class="['rounded px-1 py-0 text-[9px] font-semibold border leading-3.5', siteMeta('xhamster').pillClass]"
+                        >
+                          XH
+                        </span>
                       </Button>
                     </div>
 
@@ -945,11 +1063,11 @@ async function handleClearTemp() {
                       id="download-urls"
                       v-model="form.urlsText"
                       :rows="2"
-                      placeholder="每行粘贴一个视频页链接&#10;https://www.pornhub.com/view_video.php?viewkey=..."
+                      placeholder="每行粘贴一个视频页链接（支持 PornHub 与 xHamster 混合粘贴）&#10;https://www.pornhub.com/view_video.php?viewkey=...&#10;https://xhamster.com/videos/...-xhOwQIZ"
                       class="url-textarea font-mono text-xs"
                     />
                     <p class="source-note">
-                      {{ ignoredLinksText ? `已忽略 ${ignoredLinksText}。` : '支持 view_video、embed 和 shorties 链接，重复视频自动去重。' }}
+                      {{ ignoredLinksText ? `已忽略 ${ignoredLinksText}。` : '支持 PornHub（view_video/embed/shorties）与 xHamster 视频链接，重复视频自动去重。' }}
                     </p>
                   </div>
 
@@ -1004,10 +1122,10 @@ async function handleClearTemp() {
                 <span>同时加入自动追更</span>
               </label>
               <label
-                :class="{ 'download-option-disabled': creatorActionsDisabled }"
-                :title="creatorActionsDisabled ? '仅对博主目标或视频链接生效' : '使用当前登录 Cookie 自动在 PornHub 订阅该博主（已订阅自动跳过）'"
+                :class="{ 'download-option-disabled': subscribeCreatorDisabled }"
+                :title="subscribeCreatorDisabled ? '仅对 PornHub 博主目标或视频链接生效' : '使用当前登录 Cookie 自动在 PornHub 订阅该博主（已订阅自动跳过）'"
               >
-                <Switch v-model="form.subscribe_creator" :disabled="creatorActionsDisabled" />
+                <Switch v-model="form.subscribe_creator" :disabled="subscribeCreatorDisabled" />
                 <span>同时订阅博主</span>
               </label>
             </div>
@@ -1260,6 +1378,7 @@ async function handleClearTemp() {
 
     <SubsPickerModal
       :open="subsModalOpen"
+      :site="form.site"
       confirm-label="填入用户名"
       @close="subsModalOpen = false"
       @confirm="handleSubsPicked"

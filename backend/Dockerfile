@@ -1,4 +1,5 @@
 FROM rclone/rclone:1.68.2 AS rclone
+FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg
 
 FROM python:3.12-slim
 
@@ -6,13 +7,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Minimal certs & tzdata; copy static rclone binary from official image (NO ffmpeg required!)
+# Minimal certs & tzdata; copy static rclone and ffmpeg binaries (ffmpeg is used for xHamster HLS remuxing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 
 WORKDIR /app
 

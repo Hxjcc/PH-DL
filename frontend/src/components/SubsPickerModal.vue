@@ -15,11 +15,13 @@ import BaselineScopeFields from './BaselineScopeFields.vue'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
+  site: { type: String, default: 'pornhub' },
   confirmLabel: { type: String, default: '确认选择' },
   showBaselineOption: { type: Boolean, default: false },
 })
 const emit = defineEmits(['close', 'confirm'])
 const store = useAppStore()
+const activeSite = ref('pornhub')
 const loading = ref(false)
 const error = ref('')
 const sourceUser = ref('')
@@ -43,8 +45,18 @@ const fromCache = ref(false)
 const failedAvatarUrls = ref(new Set())
 let requestVersion = 0
 
-const defaultSource = computed(() => store.accountUsername || store.subscriptionsLastSource || '')
+const SITE_OPTIONS = [
+  { value: 'pornhub', label: 'PornHub' },
+  { value: 'xhamster', label: 'xHamster' },
+]
+
+const defaultSource = computed(() =>
+  activeSite.value === 'xhamster'
+    ? (store.xhAccountUsername || '')
+    : (store.accountUsername || store.subscriptionsLastSource || '')
+)
 const isOwnAccount = computed(() => {
+  if (activeSite.value === 'xhamster') return false
   const cur = sourceUser.value.trim().toLowerCase()
   const own = defaultSource.value.trim().toLowerCase()
   return !cur || (own && cur === own) || !manualSource.value
@@ -54,26 +66,42 @@ const sourceAvatar = computed(() => {
     return store.accountAvatarUrl
   }
   return store.targetsCache?.find(
-    (target) => target.username.toLowerCase() === sourceUser.value.toLowerCase() && canShowAvatar(target.avatar_url)
+    (target) =>
+      String(target.site || 'pornhub') === activeSite.value &&
+      target.username.toLowerCase() === sourceUser.value.toLowerCase() &&
+      canShowAvatar(target.avatar_url)
   )?.avatar_url || ''
 })
 const trackedAvatars = computed(() => new Map(
   (store.targetsCache || [])
-    .filter((target) => target.avatar_url)
+    .filter((target) => target.avatar_url && String(target.site || 'pornhub') === activeSite.value)
     .map((target) => [avatarKey(target.target_type, target.username), target.avatar_url])
 ))
 const availableItems = computed(() =>
-  items.value.filter((sub) => sub.type !== 'channel' && sub.type !== 'users' && sub.type !== 'user')
+  activeSite.value === 'xhamster'
+    ? items.value
+    : items.value.filter((sub) => sub.type !== 'channel' && sub.type !== 'users' && sub.type !== 'user')
 )
-const typeOptions = [
-  { label: '全部类型', value: 'all' },
-  { label: 'Model', value: 'model' },
-  { label: 'Pornstar', value: 'pornstar' },
-]
+const typeOptions = computed(() =>
+  activeSite.value === 'xhamster'
+    ? [
+        { label: '全部类型', value: 'all' },
+        { label: 'Creator', value: 'creator' },
+        { label: 'Pornstar', value: 'pornstar' },
+        { label: 'Channel', value: 'channel' },
+        { label: 'User', value: 'users' },
+      ]
+    : [
+        { label: '全部类型', value: 'all' },
+        { label: 'Model', value: 'model' },
+        { label: 'Pornstar', value: 'pornstar' },
+      ]
+)
 const trackedTargetsMap = computed(() => {
   const byPair = new Map()
   const byUser = new Map()
   for (const target of store.targetsCache || []) {
+    if (String(target?.site || 'pornhub') !== activeSite.value) continue
     const tType = String(target?.target_type || '').toLowerCase()
     const uLow = String(target?.username || '').trim().toLowerCase()
     if (!uLow || tType === 'liked' || tType === 'favorites') continue
@@ -123,8 +151,9 @@ function handleOpenAutoFocus(event) {
 
 async function loadSubs(force = false) {
   const version = ++requestVersion
+  const targetSite = activeSite.value
   error.value = ''
-  const cached = !force && store.getCachedSubscriptions(sourceUser.value)
+  const cached = !force && store.getCachedSubscriptions(sourceUser.value, targetSite)
   if (cached) {
     items.value = cached.subscriptions
     sourceUser.value = cached.username
@@ -136,8 +165,8 @@ async function loadSubs(force = false) {
   }
   loading.value = true
   try {
-    const res = await store.loadSubscriptions(sourceUser.value, force)
-    if (version !== requestVersion || !props.open) return
+    const res = await store.loadSubscriptions(sourceUser.value, force, targetSite)
+    if (version !== requestVersion || !props.open || activeSite.value !== targetSite) return
     items.value = res.subscriptions
     const availableKeys = new Set(res.subscriptions.map(subKey))
     selected.value = new Set([...selected.value].filter((key) => availableKeys.has(key)))
@@ -153,7 +182,23 @@ async function loadSubs(force = false) {
   }
 }
 
+function switchSite(nextSite) {
+  if (activeSite.value === nextSite) return
+  activeSite.value = nextSite
+  items.value = []
+  selected.value = new Set()
+  query.value = ''
+  typeFilter.value = 'all'
+  trackFilter.value = 'all'
+  editingSource.value = false
+  manualSource.value = false
+  fetchedAt.value = 0
+  sourceUser.value = defaultSource.value
+  loadSubs()
+}
+
 async function editSource() {
+  if (activeSite.value === 'xhamster') return
   sourceDraft.value = sourceUser.value || defaultSource.value
   editingSource.value = true
   await nextTick()
@@ -176,8 +221,10 @@ async function applySource() {
 
 watch(() => props.open, (isOpen) => {
   if (isOpen) {
+    activeSite.value = props.site === 'xhamster' ? 'xhamster' : 'pornhub'
     failedAvatarUrls.value.clear()
     selected.value = new Set()
+    items.value = []
     query.value = ''
     typeFilter.value = 'all'
     trackFilter.value = 'all'
@@ -185,7 +232,7 @@ watch(() => props.open, (isOpen) => {
     baselinePages.value = 'all'
     baselinePagesValid.value = true
     editingSource.value = false
-    if (!manualSource.value) sourceUser.value = defaultSource.value
+    if (!manualSource.value || activeSite.value === 'xhamster') sourceUser.value = defaultSource.value
     if (store.targetsCache === null) store.ensureTargets()
     loadSubs()
   } else {
@@ -238,8 +285,9 @@ function confirm() {
   if (props.showBaselineOption && initBaseline.value && !baselinePagesValid.value) return
   const picked = availableItems.value
     .filter((sub) => selected.value.has(subKey(sub)))
-    .map((sub) => ({ ...sub, avatar_url: avatarFor(sub) }))
+    .map((sub) => ({ ...sub, site: activeSite.value, avatar_url: avatarFor(sub) }))
   emit('confirm', picked, {
+    site: activeSite.value,
     initBaseline: initBaseline.value,
     baselinePages: baselinePages.value,
   })
@@ -257,8 +305,31 @@ function confirm() {
     @close="emit('close')"
   >
     <div class="space-y-3.5">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="inline-flex items-center rounded-lg border border-border bg-surface-subtle/70 p-0.5" role="group" aria-label="订阅站点">
+          <button
+            v-for="opt in SITE_OPTIONS"
+            :key="opt.value"
+            type="button"
+            :aria-pressed="activeSite === opt.value"
+            :class="[
+              'h-7 px-3 rounded-md text-xs font-medium transition-colors cursor-pointer select-none',
+              activeSite === opt.value
+                ? 'bg-card text-foreground shadow-xs ring-1 ring-border/70'
+                : 'text-muted-foreground hover:text-foreground',
+            ]"
+            @click="switchSite(opt.value)"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
+        <span v-if="activeSite === 'xhamster'" class="text-[11px] text-muted-foreground">
+          支持导入创作者、明星、频道与已关注用户
+        </span>
+      </div>
+
       <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-surface-subtle px-3 py-2.5">
-        <div v-if="editingSource" class="flex w-full items-center gap-2">
+        <div v-if="editingSource && activeSite === 'pornhub'" class="flex w-full items-center gap-2">
           <Input ref="sourceInput" v-model="sourceDraft" class="min-w-0 flex-1" placeholder="源账号，留空使用已登录账号" aria-label="订阅源账号" @keydown.enter.prevent="applySource" />
           <Button size="sm" @click="applySource">获取</Button>
           <Button size="sm" variant="ghost" @click="editingSource = false; focusSearch()">取消</Button>
@@ -296,10 +367,10 @@ function confirm() {
               @change="handleAvatarPicked"
             />
             <div class="min-w-0">
-              <div class="text-[10px] text-muted-foreground">订阅账号</div>
-              <div class="max-w-44 truncate text-sm font-medium" :title="sourceUser">{{ sourceUser || '当前登录账号' }}</div>
+              <div class="text-[10px] text-muted-foreground">{{ activeSite === 'xhamster' ? 'xHamster 订阅账号' : '订阅账号' }}</div>
+              <div class="max-w-44 truncate text-sm font-medium" :title="sourceUser">{{ sourceUser || (activeSite === 'xhamster' ? '当前 xHamster 账号' : '当前登录账号') }}</div>
             </div>
-            <Button variant="ghost" size="xs" :disabled="loading" class="text-muted-foreground" @click="editSource">更换</Button>
+            <Button v-if="activeSite === 'pornhub'" variant="ghost" size="xs" :disabled="loading" class="text-muted-foreground" @click="editSource">更换</Button>
           </div>
           <Button variant="outline" size="sm" :disabled="loading" @click="loadSubs(true)">
             <Spinner v-if="loading" class="w-4 h-4" />

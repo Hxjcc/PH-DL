@@ -412,9 +412,13 @@ async def detect_remote_type(
     return "pikpak" if remote.lower() == "pikpak" else None
 
 
-def build_remote_dir(settings: RuntimeSettings, uploader_folder: str) -> str:
+def build_remote_dir(settings: RuntimeSettings, uploader_folder: str, site: str = "pornhub") -> str:
     remote = (settings.rclone_remote or "pikpak").strip().rstrip(":")
-    base = (settings.rclone_remote_base_dir or "Pornhub").strip().strip("/")
+    norm_site = (site or "pornhub").strip().lower()
+    if norm_site in {"xhamster", "xh"}:
+        base = (getattr(settings, "rclone_xh_remote_base_dir", "xHamster") or "xHamster").strip().strip("/")
+    else:
+        base = (settings.rclone_remote_base_dir or "Pornhub").strip().strip("/")
     sub = (uploader_folder or "Ungrouped").strip().strip("/")
     return f"{remote}:{base}/{sub}" if base else f"{remote}:{sub}"
 
@@ -691,9 +695,10 @@ async def upload_file_batch(
     session_cache: Optional[UploadSessionCache] = None,
     on_progress: Optional[UploadProgressCallback] = None,
     remote_names_by_viewkey: Optional[Dict[str, str]] = None,
+    site: str = "pornhub",
 ) -> UploadBatchResult:
     """Copy and verify the batch. The caller records success before deleting any source."""
-    remote_dir = build_remote_dir(settings, uploader_folder)
+    remote_dir = build_remote_dir(settings, uploader_folder, site=site)
     result = UploadBatchResult(remote_dir=remote_dir)
     if not files_by_viewkey:
         return result

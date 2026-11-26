@@ -39,6 +39,7 @@ def _safe_unlink_downloaded_video(downloads_dir: Path, raw_path: str) -> bool:
 
 @router.get("")
 async def list_videos(
+    site: str = Query(default=""),
     search: str = Query(default=""),
     uploader: str = Query(default=""),
     status: str = Query(default=""),
@@ -51,6 +52,7 @@ async def list_videos(
     container: AppContainer = Depends(require_auth),
 ):
     items, total = await container.repo.query_videos(
+        site=site,
         search=search,
         uploader=uploader,
         status=status,
@@ -60,7 +62,7 @@ async def list_videos(
         page=page,
         page_size=page_size,
     )
-    facets = await container.repo.get_video_filter_facets() if include_meta else None
+    facets = await container.repo.get_video_filter_facets(site=site) if include_meta else None
     stats = await container.repo.get_video_stats() if include_meta else None
     return {
         "items": items,
@@ -162,7 +164,12 @@ async def redownload_video(viewkey: str, container: AppContainer = Depends(requi
         raise HTTPException(status_code=404, detail="视频记录不存在")
 
     settings = await container.repo.get_settings()
-    page_url = record.get("video_page_url") or f"https://www.pornhub.com/view_video.php?viewkey={viewkey.strip()}"
+    default_url = (
+        f"https://xhamster.com/videos/{viewkey.strip()}"
+        if str(record.get("site") or "").strip().lower() == "xhamster"
+        else f"https://www.pornhub.com/view_video.php?viewkey={viewkey.strip()}"
+    )
+    page_url = record.get("video_page_url") or default_url
     job = await container.tasks.enqueue_job(
         kind="manual_urls",
         label=f"重新下载: {record.get('title') or viewkey}",

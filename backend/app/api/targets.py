@@ -9,14 +9,17 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from ..db.repo import normalize_site
 from ..parsers.list_scanner import parse_page_specs
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.target import resolve_target_type
+from ..parsers.xhamster import resolve_xhamster_target_type
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api/targets", tags=["targets"])
 
-VALID_TYPES = {"auto", "model", "pornstar", "favorites", "liked"}
+VALID_PH_TYPES = {"auto", "model", "pornstar", "favorites", "liked"}
+VALID_XH_TYPES = {"auto", "creator", "pornstar", "users", "channel", "favorites"}
 _INVALID_USERNAME_RE = re.compile(r"[/\\:?#\s]")
 
 
@@ -36,6 +39,7 @@ def _validate_baseline_pages(pages: str) -> None:
 
 
 class TargetCreateRequest(BaseModel):
+    site: str = "pornhub"
     username: str = ""
     target_type: str = "auto"
     display_name: str = ""
@@ -46,6 +50,7 @@ class TargetCreateRequest(BaseModel):
 
 
 class TargetBatchItem(BaseModel):
+    site: str = "pornhub"
     username: str
     target_type: str = "model"
     display_name: str = ""
@@ -85,12 +90,17 @@ async def create_target(
 ):
     if payload.init_baseline:
         _validate_baseline_pages(payload.baseline_pages)
+    norm_site = normalize_site(payload.site)
     raw_type = (payload.target_type or "auto").strip().lower()
-    if raw_type not in VALID_TYPES:
+    valid_types = VALID_XH_TYPES if norm_site == "xhamster" else VALID_PH_TYPES
+    if norm_site == "xhamster" and raw_type == "user":
+        raw_type = "users"
+    if raw_type not in valid_types:
         raise HTTPException(status_code=400, detail=f"不支持的目标类型: {raw_type}")
 
-    uname = payload.username.strip()
-    if raw_type != "liked":
+    is_self_collection = raw_type == "liked" or (norm_site == "xhamster" and raw_type == "favorites")
+    uname = "_currentUser_" if is_self_collection else payload.username.strip()
+    if not is_self_collection:
         if not uname:
             raise HTTPException(status_code=400, detail="请输入用户名")
         _validate_target_username(uname)
@@ -100,23 +110,28 @@ async def create_target(
         settings = await container.repo.get_settings()
         probe_timeout = min(float(settings.request_timeout), 10.0)
         async with TaskHttpContext(
-            cookie_str=settings.ph_cookie,
+            cookie_str=settings.xh_cookie if norm_site == "xhamster" else settings.ph_cookie,
             proxy_url=settings.normalized_proxy,
             concurrency=2,
             timeout=probe_timeout,
             max_retries=1,
         ) as ctx:
-            detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
-            if detected == "channel":
-                raise HTTPException(status_code=400, detail=f"目标 '{uname}' 是 Channel，暂不支持")
-            resolved_type = detected or "model"
+            if norm_site == "xhamster":
+                detected = await resolve_xhamster_target_type(ctx, uname, timeout=probe_timeout)
+                resolved_type = detected or "creator"
+            else:
+                detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
+                if detected == "channel":
+                    raise HTTPException(status_code=400, detail=f"目标 '{uname}' 是 Channel，暂不支持")
+                resolved_type = detected or "model"
 
     target = await container.repo.upsert_target(
         username=uname,
         target_type=resolved_type,
         enabled=payload.enabled,
         preferred_quality=payload.preferred_quality,
-        display_name=payload.display_name,
+        display_name=payload.display_name or ("xHamster Favorites" if norm_site == "xhamster" and resolved_type == "favorites" else ""),
+        site=norm_site,
     )
 
     baseline_job = None
@@ -144,55 +159,98 @@ async def batch_create_targets(
     skipped_channels = []
 
     for item in payload.items:
-        raw_t = (item.target_type or "model").strip().lower()
+        item_site = normalize_site(item.site)
+        raw_t = (item.target_type or ("creator" if item_site == "xhamster" else "model")).strip().lower()
         u_clean = item.username.strip()
-        if raw_t != "liked":
+        is_self = raw_t == "liked" or (item_site == "xhamster" and raw_t == "favorites")
+        if not is_self:
             _validate_target_username(u_clean)
 
-    needs_auto_resolve = any(
-        (item.target_type or "").strip().lower() == "auto" and item.username.strip()
+    needs_ph_auto = any(
+        normalize_site(item.site) == "pornhub"
+        and (item.target_type or "").strip().lower() == "auto"
+        and item.username.strip()
         for item in payload.items
     )
-    resolved_types: dict[str, str] = {}
-    if needs_auto_resolve:
+    needs_xh_auto = any(
+        normalize_site(item.site) == "xhamster"
+        and (item.target_type or "").strip().lower() == "auto"
+        and item.username.strip()
+        for item in payload.items
+    )
+    resolved_types: dict[tuple[str, str], str] = {}
+    if needs_ph_auto or needs_xh_auto:
         settings = await container.repo.get_settings()
         probe_timeout = min(float(settings.request_timeout), 10.0)
-        async with TaskHttpContext(
-            cookie_str=settings.ph_cookie,
-            proxy_url=settings.normalized_proxy,
-            concurrency=3,
-            timeout=probe_timeout,
-            max_retries=1,
-        ) as ctx:
-            seen_auto: set[str] = set()
-            for item in payload.items:
-                if (item.target_type or "").strip().lower() != "auto":
-                    continue
-                uname = item.username.strip()
-                key = uname.lower()
-                if not uname or key in seen_auto:
-                    continue
-                seen_auto.add(key)
-                detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
-                resolved_types[key] = detected or "model"
+        if needs_ph_auto:
+            async with TaskHttpContext(
+                cookie_str=settings.ph_cookie,
+                proxy_url=settings.normalized_proxy,
+                concurrency=3,
+                timeout=probe_timeout,
+                max_retries=1,
+            ) as ctx:
+                seen_auto: set[str] = set()
+                for item in payload.items:
+                    if normalize_site(item.site) != "pornhub" or (item.target_type or "").strip().lower() != "auto":
+                        continue
+                    uname = item.username.strip()
+                    key = uname.lower()
+                    if not uname or key in seen_auto:
+                        continue
+                    seen_auto.add(key)
+                    detected = await resolve_target_type(ctx, uname, timeout=probe_timeout)
+                    resolved_types[("pornhub", key)] = detected or "model"
+        if needs_xh_auto:
+            async with TaskHttpContext(
+                cookie_str=settings.xh_cookie,
+                proxy_url=settings.normalized_proxy,
+                concurrency=3,
+                timeout=probe_timeout,
+                max_retries=1,
+            ) as ctx:
+                seen_auto_xh: set[str] = set()
+                for item in payload.items:
+                    if normalize_site(item.site) != "xhamster" or (item.target_type or "").strip().lower() != "auto":
+                        continue
+                    uname = item.username.strip()
+                    key = uname.lower()
+                    if not uname or key in seen_auto_xh:
+                        continue
+                    seen_auto_xh.add(key)
+                    detected = await resolve_xhamster_target_type(ctx, uname, timeout=probe_timeout)
+                    resolved_types[("xhamster", key)] = detected or "creator"
 
     for item in payload.items:
-        raw_type = (item.target_type or "model").strip().lower()
+        item_site = normalize_site(item.site)
+        raw_type = (item.target_type or ("creator" if item_site == "xhamster" else "model")).strip().lower()
         uname = item.username.strip()
         if raw_type == "auto":
-            utype = resolved_types.get(uname.lower(), "model")
+            utype = resolved_types.get((item_site, uname.lower()), "creator" if item_site == "xhamster" else "model")
         else:
             utype = raw_type
-        if utype == "channel":
-            if uname:
-                skipped_channels.append(uname)
-            continue
-        if utype in {"user", "users"}:
-            continue
-        if utype not in {"model", "pornstar", "favorites", "liked"}:
-            utype = "model"
-        if utype != "liked" and not uname:
-            continue
+
+        if item_site == "xhamster":
+            if utype == "user":
+                utype = "users"
+            if utype not in {"creator", "pornstar", "users", "channel", "favorites"}:
+                utype = "creator"
+            if utype == "favorites":
+                uname = "_currentUser_"
+            elif not uname:
+                continue
+        else:
+            if utype == "channel":
+                if uname:
+                    skipped_channels.append(uname)
+                continue
+            if utype in {"user", "users"}:
+                continue
+            if utype not in {"model", "pornstar", "favorites", "liked"}:
+                utype = "model"
+            if utype != "liked" and not uname:
+                continue
+
         t = await container.repo.upsert_target(
             uname,
             utype,
@@ -200,6 +258,7 @@ async def batch_create_targets(
             preferred_quality=item.preferred_quality,
             display_name=item.display_name,
             avatar_url=item.avatar_url,
+            site=item_site,
         )
         created.append(t)
         if payload.init_baseline and t.get("id"):
@@ -230,12 +289,16 @@ async def update_target(
     if not existing:
         raise HTTPException(status_code=404, detail="目标不存在")
 
+    existing_site = normalize_site(existing.get("site"))
+    existing_type = str(existing.get("target_type") or "").strip().lower()
+    is_locked_collection = existing_type == "liked" or (existing_site == "xhamster" and existing_type == "favorites")
+
     patch = payload.model_dump(exclude_none=True)
-    if existing.get("target_type") == "liked":
+    if is_locked_collection:
         if "username" in patch and patch["username"].strip() != str(existing.get("username") or ""):
-            raise HTTPException(status_code=400, detail="Liked 目标不支持修改标识")
-        if "target_type" in patch and patch["target_type"].strip().lower() != "liked":
-            raise HTTPException(status_code=400, detail="Liked 目标不支持修改类型")
+            raise HTTPException(status_code=400, detail="内置收藏/点赞目标不支持修改标识")
+        if "target_type" in patch and patch["target_type"].strip().lower() != existing_type:
+            raise HTTPException(status_code=400, detail="内置收藏/点赞目标不支持修改类型")
         patch.pop("username", None)
         patch.pop("target_type", None)
     else:
@@ -247,7 +310,13 @@ async def update_target(
             patch["username"] = uname
         if "target_type" in patch:
             t = patch["target_type"].strip().lower()
-            if t not in {"model", "pornstar", "favorites"}:
+            if existing_site == "xhamster":
+                if t == "user":
+                    t = "users"
+                allowed_types = {"creator", "pornstar", "users", "channel"}
+            else:
+                allowed_types = {"model", "pornstar", "favorites"}
+            if t not in allowed_types:
                 raise HTTPException(status_code=400, detail=f"不支持的目标类型: {t}")
             patch["target_type"] = t
 

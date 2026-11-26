@@ -20,7 +20,7 @@ import aiohttp
 
 from ..cancel import StopRequested, until_stopped
 from ..config import EnvSettings, RuntimeSettings
-from ..db.repo import Repository, utc_now_iso
+from ..db.repo import Repository, normalize_site, utc_now_iso
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.list_scanner import ListedVideo, build_target_list_url, scan_list_pages
 from ..parsers.target import (
@@ -37,6 +37,12 @@ from ..parsers.video import (
     extract_viewkey_from_url,
     fetch_video_details_batch,
 )
+from ..parsers.xhamster import (
+    check_xhamster_cookie_valid,
+    detect_site_from_url,
+    is_xhamster_url,
+    resolve_xhamster_target_type,
+)
 from ..services.cookie import check_cookie_valid, login_and_get_cookies
 from ..services.downloader import (
     DownloadDiskBudget,
@@ -45,6 +51,7 @@ from ..services.downloader import (
     read_download_checkpoint,
     remove_download_checkpoint,
 )
+from ..services.hls_downloader import download_hls_to_mp4, is_hls_url
 from ..services.filename import (
     format_remote_video_filename,
     is_valid_video_file,
@@ -55,6 +62,7 @@ from ..services.filename import (
 from ..services.notifier import build_auto_update_report, send_serverchan
 from ..services.uploader import (
     UploadSessionCache,
+    build_remote_dir,
     delete_verified_source,
     file_snapshot,
     upload_file_batch,
@@ -76,10 +84,13 @@ def _quality_set(raw: Optional[str]) -> Optional[Set[str]]:
     return {q for part in (_split_csv_set(raw) or ()) if (q := normalized_quality(part))} or None
 
 
-def _target_folder_name(username: Optional[str], target_type: str) -> str:
+def _target_folder_name(username: Optional[str], target_type: str, site: str = "pornhub") -> str:
     t = (target_type or "model").strip().lower()
+    s = normalize_site(site)
     if t == "liked":
         return "My_Liked_Videos"
+    if s == "xhamster" and t == "favorites":
+        return "My_Favorites"
     clean = sanitize_filename(username or "Ungrouped")
     if t == "favorites":
         return f"{clean}_favorites"
@@ -96,6 +107,7 @@ class _PendingParseSpec:
     default_type: str
     group_by_uploader: bool = False
     uploader_hint: Optional[Tuple[str, str]] = None
+    site: str = "pornhub"
 
 
 async def _invoke_upload_file_batch(
@@ -108,6 +120,7 @@ async def _invoke_upload_file_batch(
     session_cache: UploadSessionCache,
     on_progress: Optional[Callable[[str, int, int, float, str], None]],
     remote_names_by_viewkey: Optional[Dict[str, str]] = None,
+    site: str = "pornhub",
 ):
     """Invoke `upload_file_batch`, staying compatible with legacy 5-arg test mocks."""
     params = inspect.signature(upload_file_batch).parameters
@@ -125,6 +138,8 @@ async def _invoke_upload_file_batch(
         kwargs["on_progress"] = on_progress
     if remote_names_by_viewkey and (has_var_kw or "remote_names_by_viewkey" in params):
         kwargs["remote_names_by_viewkey"] = remote_names_by_viewkey
+    if has_var_kw or "site" in params:
+        kwargs["site"] = normalize_site(site)
     return await upload_file_batch(**kwargs)
 
 
@@ -144,6 +159,9 @@ class TaskManager:
         self._cancelled_queued_ids: Set[int] = set()
         self._last_cookie_valid: Optional[bool] = None
         self._last_cookie_message: str = "未检测"
+        self._last_xh_cookie_valid: Optional[bool] = None
+        self._last_xh_cookie_message: str = "未检测"
+        self._current_xh_ctx: Optional[TaskHttpContext] = None
 
     def start(self) -> None:
         if self._worker_task is None or self._worker_task.done():
@@ -180,6 +198,20 @@ class TaskManager:
         self._last_cookie_valid = valid
         self._last_cookie_message = message
         self.events.broadcast("overview_changed", {})
+
+    @property
+    def xh_cookie_status(self) -> Dict[str, Any]:
+        return {"valid": self._last_xh_cookie_valid, "message": self._last_xh_cookie_message}
+
+    def set_xh_cookie_status(self, valid: Optional[bool], message: str) -> None:
+        self._last_xh_cookie_valid = valid
+        self._last_xh_cookie_message = message
+        self.events.broadcast("overview_changed", {})
+
+    def _ctx_for_site(self, default_ctx: TaskHttpContext, site: str) -> TaskHttpContext:
+        if normalize_site(site) == "xhamster" and self._current_xh_ctx is not None:
+            return self._current_xh_ctx
+        return default_ctx
 
     async def enqueue_job(
         self,
@@ -307,6 +339,124 @@ class TaskManager:
             )
         return None
 
+    async def _job_site_requirements(
+        self,
+        kind: str,
+        params: Dict[str, Any],
+    ) -> Tuple[bool, bool, bool]:
+        """Return ``(needs_ph_cookie, needs_xh_cookie, needs_xh_ctx)`` for a job."""
+        if kind == "manual_target":
+            site = normalize_site(params.get("site"))
+            if site == "xhamster":
+                utype = str(params.get("target_type") or "").strip().lower()
+                return False, utype == "favorites", True
+            return True, False, False
+
+        if kind == "manual_urls":
+            urls = [str(u).strip() for u in (params.get("urls") or []) if str(u).strip()]
+            if not urls:
+                return True, False, False
+            has_xh = any(is_xhamster_url(u) for u in urls)
+            has_ph = any(not is_xhamster_url(u) for u in urls)
+            return has_ph, False, has_xh
+
+        if kind == "baseline_sync":
+            target_id = params.get("target_id")
+            target = await self.repo.get_target(int(target_id)) if target_id else None
+            if target and normalize_site(target.get("site")) == "xhamster":
+                return False, str(target.get("target_type") or "").lower() == "favorites", True
+            return True, False, False
+
+        if kind in {"auto_update", "check_updates"}:
+            target_ids = params.get("target_ids")
+            if target_ids:
+                targets = []
+                for tid in target_ids:
+                    row = await self.repo.get_target(int(tid))
+                    if row:
+                        targets.append(row)
+            else:
+                targets = await self.repo.list_targets(enabled_only=True)
+            if not targets:
+                return True, False, False
+            has_ph = any(normalize_site(t.get("site")) == "pornhub" for t in targets)
+            has_xh = any(normalize_site(t.get("site")) == "xhamster" for t in targets)
+            needs_xh_cookie = any(
+                normalize_site(t.get("site")) == "xhamster"
+                and str(t.get("target_type") or "").lower() == "favorites"
+                for t in targets
+            )
+            return has_ph, needs_xh_cookie, has_xh
+
+        if kind == "retry_items":
+            source_job_id = int(params.get("source_job_id") or 0)
+            source_items = await self.repo.list_job_items(source_job_id) if source_job_id else []
+            retryable = [
+                it for it in source_items
+                if it["status"] in {"failed", "cancelled", "pending", "downloaded", "uploading"}
+            ]
+            if not retryable:
+                return True, False, False
+            has_xh = any(
+                normalize_site(it.get("site")) == "xhamster" or is_xhamster_url(it.get("page_url"))
+                for it in retryable
+            )
+            has_ph = any(
+                normalize_site(it.get("site")) == "pornhub" and not is_xhamster_url(it.get("page_url"))
+                for it in retryable
+            )
+            return has_ph, False, has_xh
+
+        if kind == "resume_temp":
+            temp_files = self.list_temp_files()
+            if not temp_files:
+                return True, False, False
+            has_xh = any(tf.get("site") == "xhamster" for tf in temp_files)
+            has_ph = any(tf.get("site") != "xhamster" for tf in temp_files)
+            return has_ph, False, has_xh
+
+        if kind == "enrich_metadata":
+            limit = int(params.get("limit") or 0)
+            candidates = await self.repo.list_baseline_metadata_candidates(limit=limit)
+            if not candidates:
+                return True, False, False
+            has_xh = any(
+                normalize_site(c.get("site")) == "xhamster" or is_xhamster_url(c.get("video_page_url"))
+                for c in candidates
+            )
+            has_ph = any(
+                normalize_site(c.get("site")) == "pornhub" and not is_xhamster_url(c.get("video_page_url"))
+                for c in candidates
+            )
+            return has_ph, False, has_xh
+
+        return True, False, False
+
+    async def _ensure_valid_xh_cookie(
+        self,
+        settings: RuntimeSettings,
+        job_id: int,
+    ) -> Optional[RuntimeSettings]:
+        self.events.emit_log("INFO", "正在验证 xHamster Cookie 有效性...", job_id=job_id)
+        if not settings.xh_cookie.strip():
+            msg = "xHamster 收藏夹需要配置有效的 xHamster Cookie，请在【系统设置 → Cookie 与账号】中导入"
+            self.set_xh_cookie_status(False, msg)
+            self.events.emit_log("ERROR", msg, job_id=job_id)
+            return None
+        valid, msg, username = await check_xhamster_cookie_valid(
+            settings.xh_cookie,
+            proxy_url=settings.normalized_proxy,
+            timeout=settings.request_timeout,
+        )
+        self.set_xh_cookie_status(valid, msg)
+        if not valid:
+            self.events.emit_log("ERROR", f"xHamster Cookie 校验失败: {msg}", job_id=job_id)
+            return None
+        if username and username != settings.xh_logged_in_username:
+            settings = await self.repo.update_settings_patch({"xh_logged_in_username": username})
+        self.events.emit_log("INFO", f"xHamster {msg}。", job_id=job_id)
+        return settings
+
     async def _run_job(self, job_id: int) -> None:
         job = await self.repo.get_job(job_id)
         if not job or job["status"] != "queued":
@@ -316,6 +466,7 @@ class TaskManager:
         self._current_job_id = job_id
         self._current_cancel_event = cancel_event
         self._current_halt_reason = ""
+        self._current_xh_ctx = None
 
         started = await self.repo.claim_queued_job(job_id)
         if not started:
@@ -327,70 +478,109 @@ class TaskManager:
         kind = job["kind"]
         params = job.get("params") or {}
 
-        # Validate cookie before any network work
+        needs_ph_cookie, needs_xh_cookie, needs_xh_ctx = await self._job_site_requirements(kind, params)
+
+        # Validate required site cookie(s) before network work
         try:
-            checked_settings = await until_stopped(
-                self._ensure_valid_cookie(
-                    settings, job_id,
-                    notify_on_failure=(kind == "auto_update" and job.get("trigger") == "schedule"),
-                ), cancel_event,
-            )
+            if needs_ph_cookie:
+                checked_settings = await until_stopped(
+                    self._ensure_valid_cookie(
+                        settings, job_id,
+                        notify_on_failure=(kind == "auto_update" and job.get("trigger") == "schedule"),
+                    ), cancel_event,
+                )
+                if checked_settings is None:
+                    failed = await self.repo.update_job(
+                        job_id,
+                        status="failed",
+                        error_message=self._last_cookie_message,
+                        finished_at=utc_now_iso(),
+                    )
+                    if failed:
+                        self.events.broadcast("job_updated", failed)
+                    return
+                settings = checked_settings
+
+            if needs_xh_cookie:
+                checked_xh = await until_stopped(
+                    self._ensure_valid_xh_cookie(settings, job_id), cancel_event,
+                )
+                if checked_xh is None:
+                    failed = await self.repo.update_job(
+                        job_id,
+                        status="failed",
+                        error_message=self._last_xh_cookie_message,
+                        finished_at=utc_now_iso(),
+                    )
+                    if failed:
+                        self.events.broadcast("job_updated", failed)
+                    return
+                settings = checked_xh
         except StopRequested:
             stopped = await self.repo.update_job(job_id, status="cancelled", error_message="已取消", finished_at=utc_now_iso())
             if stopped:
                 self.events.broadcast("job_updated", stopped)
             return
-        if checked_settings is None:
-            failed = await self.repo.update_job(
-                job_id,
-                status="failed",
-                error_message=self._last_cookie_message,
-                finished_at=utc_now_iso(),
-            )
-            if failed:
-                self.events.broadcast("job_updated", failed)
-            return
-        settings = checked_settings
 
-        async with TaskHttpContext(
-            cookie_str=settings.ph_cookie,
-            proxy_url=settings.normalized_proxy,
-            concurrency=settings.max_concurrent_video_details,
-            timeout=settings.request_timeout,
-            max_retries=settings.max_retries_page_fetch,
-            retry_delay_base=settings.retry_delay_base,
-            retry_delay_max=settings.retry_delay_max,
-            cancel_event=cancel_event,
-            on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
-        ) as ctx:
-            if kind == "manual_target":
-                await self._exec_manual_target(job_id, params, settings, ctx)
-            elif kind == "manual_urls":
-                await self._exec_manual_urls(job_id, params, settings, ctx)
-            elif kind in {"auto_update", "check_updates"}:
-                await self._exec_update_check(
-                    job_id,
-                    params,
-                    settings,
-                    ctx,
-                    auto_download=(kind == "auto_update"),
+        async with contextlib.AsyncExitStack() as stack:
+            ctx = await stack.enter_async_context(
+                TaskHttpContext(
+                    cookie_str=settings.ph_cookie,
+                    proxy_url=settings.normalized_proxy,
+                    concurrency=settings.max_concurrent_video_details,
+                    timeout=settings.request_timeout,
+                    max_retries=settings.max_retries_page_fetch,
+                    retry_delay_base=settings.retry_delay_base,
+                    retry_delay_max=settings.retry_delay_max,
+                    cancel_event=cancel_event,
+                    on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
                 )
-            elif kind == "baseline_sync":
-                await self._exec_baseline_sync(job_id, params, settings, ctx)
-            elif kind == "enrich_metadata":
-                await self._exec_enrich_metadata(job_id, params, settings, ctx)
-            elif kind == "retry_items":
-                await self._exec_retry_items(job_id, params, settings, ctx)
-            elif kind == "resume_temp":
-                await self._exec_resume_temp(job_id, params, settings, ctx)
-            else:
-                await self.repo.update_job(
-                    job_id,
-                    status="failed",
-                    error_message=f"未知任务类型: {kind}",
-                    finished_at=utc_now_iso(),
+            )
+            if needs_xh_ctx:
+                self._current_xh_ctx = await stack.enter_async_context(
+                    TaskHttpContext(
+                        cookie_str=settings.xh_cookie,
+                        proxy_url=settings.normalized_proxy,
+                        concurrency=settings.max_concurrent_video_details,
+                        timeout=settings.request_timeout,
+                        max_retries=settings.max_retries_page_fetch,
+                        retry_delay_base=settings.retry_delay_base,
+                        retry_delay_max=settings.retry_delay_max,
+                        cancel_event=cancel_event,
+                        on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
+                    )
                 )
-                return
+            try:
+                if kind == "manual_target":
+                    await self._exec_manual_target(job_id, params, settings, ctx)
+                elif kind == "manual_urls":
+                    await self._exec_manual_urls(job_id, params, settings, ctx)
+                elif kind in {"auto_update", "check_updates"}:
+                    await self._exec_update_check(
+                        job_id,
+                        params,
+                        settings,
+                        ctx,
+                        auto_download=(kind == "auto_update"),
+                    )
+                elif kind == "baseline_sync":
+                    await self._exec_baseline_sync(job_id, params, settings, ctx)
+                elif kind == "enrich_metadata":
+                    await self._exec_enrich_metadata(job_id, params, settings, ctx)
+                elif kind == "retry_items":
+                    await self._exec_retry_items(job_id, params, settings, ctx)
+                elif kind == "resume_temp":
+                    await self._exec_resume_temp(job_id, params, settings, ctx)
+                else:
+                    await self.repo.update_job(
+                        job_id,
+                        status="failed",
+                        error_message=f"未知任务类型: {kind}",
+                        finished_at=utc_now_iso(),
+                    )
+                    return
+            finally:
+                self._current_xh_ctx = None
 
         uses_job_items = kind not in {"baseline_sync", "check_updates"} and not bool(params.get("export_only", False))
         final_job = (
@@ -524,11 +714,8 @@ class TaskManager:
 
             uploader_folder = chunk[0].uploader_folder
             download_dir = chunk[0].download_dir
-            remote_target = (
-                f"{settings.rclone_remote}:{settings.rclone_remote_base_dir}/{uploader_folder}"
-                if settings.rclone_remote_base_dir
-                else f"{settings.rclone_remote}:{uploader_folder}"
-            )
+            chunk_site = normalize_site(chunk[0].site)
+            remote_target = build_remote_dir(settings, uploader_folder, site=chunk_site)
             vk_to_entry = {e.viewkey: e for e in chunk}
             chunk_bytes = sum(e.file_size for e in chunk)
 
@@ -592,6 +779,7 @@ class TaskManager:
                     session_cache=upload_session_cache,
                     on_progress=_on_upload_progress,
                     remote_names_by_viewkey=remote_names_map or None,
+                    site=chunk_site,
                 )
                 elapsed = max(0.0, time.monotonic() - upload_started)
                 uploaded_set = set(up_res.uploaded_viewkeys)
@@ -712,6 +900,7 @@ class TaskManager:
             page_url: str,
             file_size: int,
             published_at: str = "",
+            site: str = "pornhub",
         ) -> None:
             size = int(file_size or 0)
             if size <= 0:
@@ -728,6 +917,7 @@ class TaskManager:
                     page_url=page_url,
                     file_size=size,
                     published_at=(published_at or "").strip(),
+                    site=normalize_site(site),
                 )
             )
 
@@ -778,9 +968,22 @@ class TaskManager:
                         return
 
                     vkey = item["viewkey"]
-                    uploader_folder = _target_folder_name(item["uploader"], item["target_type"])
-                    dl_dir = self.env.downloads_dir / uploader_folder
-                    tmp_dir = self.env.temp_dir / uploader_folder
+                    item_site = normalize_site(
+                        item.get("site") or ("xhamster" if is_xhamster_url(item.get("page_url")) else "pornhub")
+                    )
+                    site_ctx = self._ctx_for_site(ctx, item_site)
+                    site_cookie = settings.xh_cookie if item_site == "xhamster" else settings.ph_cookie
+                    uploader_folder = _target_folder_name(item["uploader"], item["target_type"], site=item_site)
+                    dl_dir = (
+                        (self.env.downloads_dir / "xHamster" / uploader_folder)
+                        if item_site == "xhamster"
+                        else (self.env.downloads_dir / uploader_folder)
+                    )
+                    tmp_dir = (
+                        (self.env.temp_dir / "xHamster" / uploader_folder)
+                        if item_site == "xhamster"
+                        else (self.env.temp_dir / uploader_folder)
+                    )
                     partial_path = Path(item["temp_path"]) if item.get("temp_path") else None
                     if partial_path is not None and partial_path.resolve().is_relative_to(self.env.temp_dir.resolve()):
                         tmp_dir = partial_path.parent
@@ -797,11 +1000,16 @@ class TaskManager:
 
                     if ledger and ledger["status"] == "uploaded" and (not requested or quality_matches):
                         cleaned_stale = False
-                        if partial_path is not None and partial_path.name.endswith(".mp4.tmp") and partial_path.is_file():
-                            with contextlib.suppress(OSError):
-                                partial_path.unlink(missing_ok=True)
-                                remove_download_checkpoint(partial_path)
-                                cleaned_stale = True
+                        if partial_path is not None:
+                            if partial_path.name.endswith(".mp4.tmp") and partial_path.is_file():
+                                with contextlib.suppress(OSError):
+                                    partial_path.unlink(missing_ok=True)
+                                    remove_download_checkpoint(partial_path)
+                                    cleaned_stale = True
+                            elif partial_path.name.endswith(".hls") and partial_path.is_dir():
+                                with contextlib.suppress(OSError):
+                                    shutil.rmtree(partial_path, ignore_errors=True)
+                                    cleaned_stale = True
                         it = await self.repo.update_job_item(
                             item_id,
                             status="skipped",
@@ -830,6 +1038,7 @@ class TaskManager:
                             dur_sec = int(item.get("duration_seconds") or ledger.get("duration_seconds") or 0)
                             await self.repo.upsert_video(
                                 vkey,
+                                site=item_site,
                                 status="downloaded",
                                 local_path=str(existing_local),
                                 file_size=existing_size,
@@ -859,6 +1068,7 @@ class TaskManager:
                                     page_url=item["page_url"],
                                     file_size=existing_size,
                                     published_at=pub_date,
+                                    site=item_site,
                                 )
                             await _refresh_job_progress()
                             return
@@ -909,33 +1119,67 @@ class TaskManager:
                                 )
                                 scheduler.emit_status()
 
-                            outcome = await download_mp4_with_resume(
-                                session=dl_session,
-                                parse_ctx=ctx,
-                                selectors=settings.selectors,
-                                viewkey=vkey,
-                                title=item["title"],
-                                download_url=item["download_url"],
-                                page_url=item["page_url"],
-                                referer_url=item["referer_url"],
-                                quality=item["quality"],
-                                download_dir=dl_dir,
-                                temp_dir=tmp_dir,
-                                partial_path=partial_path,
-                                replace_existing=redownload,
-                                disk_budget=disk_budget,
-                                cookie_str=settings.ph_cookie,
-                                proxy_url=settings.normalized_proxy,
-                                preferred_qualities=requested,
-                                max_attempts=settings.download_attempts,
-                                retry_delay_base=settings.retry_delay_base,
-                                retry_delay_max=settings.retry_delay_max,
-                                request_timeout=settings.request_timeout,
-                                min_file_size_bytes=settings.min_file_size_bytes,
-                                cancel_event=ctx.cancel_event,
-                                on_progress=_on_progress,
-                                on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
+                            use_hls = is_hls_url(item["download_url"]) or (
+                                partial_path is not None and partial_path.name.endswith(".hls")
                             )
+                            if use_hls:
+                                outcome = await download_hls_to_mp4(
+                                    session=dl_session,
+                                    parse_ctx=site_ctx,
+                                    selectors=settings.selectors,
+                                    viewkey=vkey,
+                                    title=item["title"],
+                                    playlist_url=item["download_url"],
+                                    page_url=item["page_url"],
+                                    referer_url=item["referer_url"],
+                                    quality=item["quality"],
+                                    download_dir=dl_dir,
+                                    temp_dir=tmp_dir,
+                                    partial_path=partial_path,
+                                    replace_existing=redownload,
+                                    disk_budget=disk_budget,
+                                    cookie_str=site_cookie,
+                                    proxy_url=settings.normalized_proxy,
+                                    preferred_qualities=requested,
+                                    xh_preferred_codec=settings.xh_preferred_codec,
+                                    max_attempts=settings.download_attempts,
+                                    retry_delay_base=settings.retry_delay_base,
+                                    retry_delay_max=settings.retry_delay_max,
+                                    request_timeout=settings.request_timeout,
+                                    min_file_size_bytes=settings.min_file_size_bytes,
+                                    cancel_event=ctx.cancel_event,
+                                    on_progress=_on_progress,
+                                    on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
+                                )
+                            else:
+                                outcome = await download_mp4_with_resume(
+                                    session=dl_session,
+                                    parse_ctx=site_ctx,
+                                    selectors=settings.selectors,
+                                    viewkey=vkey,
+                                    title=item["title"],
+                                    download_url=item["download_url"],
+                                    page_url=item["page_url"],
+                                    referer_url=item["referer_url"],
+                                    quality=item["quality"],
+                                    download_dir=dl_dir,
+                                    temp_dir=tmp_dir,
+                                    partial_path=partial_path,
+                                    replace_existing=redownload,
+                                    disk_budget=disk_budget,
+                                    cookie_str=site_cookie,
+                                    proxy_url=settings.normalized_proxy,
+                                    preferred_qualities=requested,
+                                    xh_preferred_codec=settings.xh_preferred_codec,
+                                    max_attempts=settings.download_attempts,
+                                    retry_delay_base=settings.retry_delay_base,
+                                    retry_delay_max=settings.retry_delay_max,
+                                    request_timeout=settings.request_timeout,
+                                    min_file_size_bytes=settings.min_file_size_bytes,
+                                    cancel_event=ctx.cancel_event,
+                                    on_progress=_on_progress,
+                                    on_log=lambda lvl, msg: self.events.emit_log(lvl, msg, job_id=job_id),
+                                )
                         finally:
                             self.events.clear_item_progress(item_id)
                             await scheduler.release_download_slot()
@@ -1021,6 +1265,7 @@ class TaskManager:
                                 dur_sec = int(existing_video.get("duration_seconds") or 0)
                     await self.repo.upsert_video(
                         vkey,
+                        site=item_site,
                         title=item["title"],
                         uploader=item["uploader"],
                         target_type=item["target_type"],
@@ -1066,6 +1311,7 @@ class TaskManager:
                             page_url=item["page_url"],
                             file_size=outcome.file_size,
                             published_at=pub_date,
+                            site=item_site,
                         )
 
                     await _refresh_job_progress()
@@ -1115,7 +1361,7 @@ class TaskManager:
                                                 continue
 
                                             details = await fetch_video_details_batch(
-                                                ctx,
+                                                self._ctx_for_site(ctx, spec.site),
                                                 [(spec.page_url, spec.page_num, spec.item_num)],
                                                 settings.selectors,
                                                 concurrency=1,
@@ -1123,6 +1369,7 @@ class TaskManager:
                                                 include_keywords=include_keywords,
                                                 exclude_keywords=exclude_keywords,
                                                 uploader_hint=spec.uploader_hint,
+                                                xh_preferred_codec=settings.xh_preferred_codec,
                                                 timeout=settings.request_timeout,
                                             )
                                             detail = details[0] if details else VideoDetail(
@@ -1284,27 +1531,31 @@ class TaskManager:
                     f"首轮有 {len(failed_item_ids_pass1)} 个下载失败，自动重新解析直链并重试...",
                     job_id=job_id,
                 )
-                retry_candidates: List[Tuple[int, str]] = []
+                retry_candidates: List[Tuple[int, str, str]] = []
                 for fid in failed_item_ids_pass1:
                     row = await self.repo.get_job_item(fid)
                     if row and row.get("page_url"):
-                        retry_candidates.append((fid, row["page_url"]))
+                        r_site = normalize_site(
+                            row.get("site") or ("xhamster" if is_xhamster_url(row.get("page_url")) else "pornhub")
+                        )
+                        retry_candidates.append((fid, row["page_url"], r_site))
 
                 if retry_candidates:
-                    grouped_candidates: Dict[Optional[Tuple[str, ...]], List[Tuple[int, str]]] = defaultdict(list)
-                    for fid, purl in retry_candidates:
+                    grouped_candidates: Dict[Tuple[str, Optional[Tuple[str, ...]]], List[Tuple[int, str]]] = defaultdict(list)
+                    for fid, purl, r_site in retry_candidates:
                         q_set = _resolve_item_qualities(fid)
                         q_key = tuple(sorted(q_set)) if q_set else None
-                        grouped_candidates[q_key].append((fid, purl))
+                        grouped_candidates[(r_site, q_key)].append((fid, purl))
 
                     by_url: Dict[str, VideoDetail] = {}
-                    for q_key, group_rows in grouped_candidates.items():
+                    for (grp_site, q_key), group_rows in grouped_candidates.items():
                         reparsed = await fetch_video_details_batch(
-                            ctx,
+                            self._ctx_for_site(ctx, grp_site),
                             [(u, 0, idx + 1) for idx, (_, u) in enumerate(group_rows)],
                             settings.selectors,
                             concurrency=settings.max_concurrent_video_details,
                             preferred_qualities=set(q_key) if q_key else None,
+                            xh_preferred_codec=settings.xh_preferred_codec,
                             timeout=settings.request_timeout,
                         )
                         for d in reparsed:
@@ -1312,7 +1563,7 @@ class TaskManager:
 
                     ready_for_pass2: List[int] = []
                     unresolved_ids: List[int] = []
-                    for fid, purl in retry_candidates:
+                    for fid, purl, _ in retry_candidates:
                         d = by_url.get(purl)
                         if d and d.download_url:
                             patch: Dict[str, Any] = {
@@ -1362,7 +1613,9 @@ class TaskManager:
         default_type: str = "model",
         group_by_uploader: bool = True,
         upload_requested: bool = False,
+        site: str = "pornhub",
     ) -> List[int]:
+        norm_site = normalize_site(site)
         item_ids: List[int] = []
         selected: Dict[str, VideoDetail] = {}
         for detail in details:
@@ -1377,11 +1630,13 @@ class TaskManager:
         for detail in selected.values():
             uploader = (detail.uploader_username or default_uploader) if group_by_uploader else default_uploader
             utype = (detail.uploader_type or default_type) if group_by_uploader else default_type
+            item_site = "xhamster" if (norm_site == "xhamster" or is_xhamster_url(detail.page_url)) else "pornhub"
             error = detail.error or (
-                "未解析到视频标识或 MP4 直链" if not detail.download_url or not detail.viewkey else ""
+                "未解析到视频标识或媒体直链" if not detail.download_url or not detail.viewkey else ""
             )
             specs.append(
                 {
+                    "site": item_site,
                     "viewkey": detail.viewkey,
                     "title": detail.title,
                     "uploader": uploader,
@@ -1462,6 +1717,7 @@ class TaskManager:
         list_url: str,
         target_type: str,
         settings: RuntimeSettings,
+        site: str = "pornhub",
         pages_spec: Optional[str] = None,
         videos_spec: Optional[str] = None,
         catch_up: bool = False,
@@ -1477,20 +1733,21 @@ class TaskManager:
         on_scan_error: Optional[Callable[[str], None]] = None,
     ) -> Tuple[List[ListedVideo], List[VideoDetail]]:
         """Scan list pages with 4-way prefetch and stream details through one concurrency limit."""
+        site_ctx = self._ctx_for_site(ctx, site)
         detail_semaphore = asyncio.Semaphore(max(1, settings.max_concurrent_video_details))
         page_detail_tasks: List[asyncio.Task] = []
         active_hint: Optional[Tuple[str, str]] = uploader_hint
 
         async def _handle_canonical(canon_type: str, canon_user: str) -> None:
             nonlocal active_hint
-            if active_hint is not None and active_hint[0] != "My_Liked":
+            if active_hint is not None and active_hint[0] not in {"My_Liked", "My_Favorites"}:
                 active_hint = (canon_user, canon_type)
             if on_canonical_target is not None:
                 await on_canonical_target(canon_type, canon_user)
 
         async def _parse_page_details(page_items: List[ListedVideo]) -> List[VideoDetail]:
             return await fetch_video_details_batch(
-                ctx,
+                site_ctx,
                 [(lv.url, lv.page_num, lv.item_num) for lv in page_items],
                 settings.selectors,
                 concurrency=settings.max_concurrent_video_details,
@@ -1499,6 +1756,7 @@ class TaskManager:
                 exclude_keywords=exclude_keywords,
                 uploader_hint=active_hint,
                 semaphore=detail_semaphore,
+                xh_preferred_codec=settings.xh_preferred_codec,
                 timeout=settings.request_timeout,
             )
 
@@ -1534,7 +1792,7 @@ class TaskManager:
             if on_page_progress is not None:
                 scan_kwargs["on_page_progress"] = on_page_progress
             listed = await scan_list_pages(
-                ctx,
+                site_ctx,
                 list_url,
                 settings.selectors,
                 **scan_kwargs,
@@ -1578,18 +1836,21 @@ class TaskManager:
         display_name: str = "",
         avatar_url: str = "",
         tracked_keys: Set[Tuple[str, str]],
+        site: str = "pornhub",
     ) -> None:
+        norm_site = normalize_site(site)
         uname = (username or "").strip()
-        utype = (target_type or "model").strip().lower()
+        utype = (target_type or ("creator" if norm_site == "xhamster" else "model")).strip().lower()
         if not uname or uname == "_currentUser_":
             return
-        if utype not in {"model", "pornstar"}:
-            dedup = (utype, uname.lower())
+        allowed_types = {"creator", "pornstar", "users", "channel"} if norm_site == "xhamster" else {"model", "pornstar"}
+        if utype not in allowed_types:
+            dedup = (f"{norm_site}:{utype}", uname.lower())
             if dedup not in tracked_keys and utype == "channel":
                 tracked_keys.add(dedup)
                 self.events.emit_log("INFO", f"跳过加入自动追更 '{uname}'：暂不支持 Channel 类型追更。", job_id=job_id)
             return
-        dedup = (utype, uname.lower())
+        dedup = (f"{norm_site}:{utype}", uname.lower())
         if dedup in tracked_keys:
             return
         tracked_keys.add(dedup)
@@ -1598,6 +1859,7 @@ class TaskManager:
             utype,
             avatar_url=avatar_url,
             display_name=display_name,
+            site=norm_site,
         )
         shown = (target or {}).get("display_name") or display_name or uname
         if created:
@@ -1649,8 +1911,12 @@ class TaskManager:
         settings: RuntimeSettings,
         ctx: TaskHttpContext,
     ) -> None:
+        site = normalize_site(params.get("site"))
+        site_ctx = self._ctx_for_site(ctx, site)
         usernames: List[str] = [str(u).strip() for u in (params.get("usernames") or []) if str(u).strip()]
         raw_type = (params.get("target_type") or "").strip().lower()
+        if site == "xhamster" and raw_type == "user":
+            raw_type = "users"
         quality_setting = params.get("quality")
         qualities = _quality_set(settings.preferred_quality if quality_setting is None else quality_setting)
         include_kw = _split_csv_set(params.get("keywords"), lower=True)
@@ -1661,23 +1927,34 @@ class TaskManager:
         export_only = bool(params.get("export_only", False))
         auto_upload = bool(params.get("auto_upload", settings.uploader_enabled))
         add_to_auto_track = bool(params.get("add_to_auto_track", False))
-        subscribe_creator = bool(params.get("subscribe_creator", False))
+        subscribe_creator = (site == "pornhub") and bool(params.get("subscribe_creator", False))
 
         targets: List[Tuple[str, str]] = []
         if raw_type == "liked":
             targets.append(("_currentUser_", "liked"))
+        elif site == "xhamster" and raw_type == "favorites":
+            targets.append(("_currentUser_", "favorites"))
         else:
-            if not usernames and raw_type == "favorites" and settings.ph_logged_in_username:
+            if not usernames and raw_type == "favorites" and site == "pornhub" and settings.ph_logged_in_username:
                 usernames = [settings.ph_logged_in_username]
             seen_users: Set[str] = set()
+            explicit_types = (
+                {"creator", "pornstar", "users", "channel"}
+                if site == "xhamster"
+                else {"model", "pornstar", "favorites"}
+            )
             for uname in usernames:
                 if uname.casefold() in seen_users:
                     continue
                 seen_users.add(uname.casefold())
-                if raw_type in {"model", "pornstar", "favorites"}:
+                if raw_type in explicit_types:
                     resolved = raw_type
+                elif site == "xhamster":
+                    detected = await resolve_xhamster_target_type(site_ctx, uname, timeout=settings.request_timeout)
+                    resolved = detected or "creator"
+                    self.events.emit_log("INFO", f"自动识别 xHamster 目标 '{uname}' 类型为 '{resolved}'。", job_id=job_id)
                 else:
-                    detected = await resolve_target_type(ctx, uname, timeout=settings.request_timeout)
+                    detected = await resolve_target_type(site_ctx, uname, timeout=settings.request_timeout)
                     if detected == "channel":
                         self.events.emit_log("WARNING", f"跳过 '{uname}'：识别为 Channel，当前不支持 Channel。", job_id=job_id)
                         continue
@@ -1703,8 +1980,13 @@ class TaskManager:
         for target_idx, (uname, utype) in enumerate(targets):
             if ctx.cancel_event.is_set():
                 break
-            list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
-            target_display = "Liked Videos" if utype == "liked" else (profile_names.get(uname) or uname)
+            list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype, site=site)
+            if utype == "liked":
+                target_display = "Liked Videos"
+            elif site == "xhamster" and utype == "favorites":
+                target_display = "xHamster Favorites"
+            else:
+                target_display = profile_names.get(uname) or uname
 
             def _emit_manual_page_progress(
                 page_num: int,
@@ -1729,7 +2011,12 @@ class TaskManager:
 
             active_uname = uname
             active_utype = utype
-            resolved_user = uname if uname != "_currentUser_" else "My_Liked"
+            if utype == "liked":
+                resolved_user = "My_Liked"
+            elif site == "xhamster" and utype == "favorites":
+                resolved_user = "My_Favorites"
+            else:
+                resolved_user = uname
 
             async def _save_target_profile(
                 url: str,
@@ -1742,6 +2029,7 @@ class TaskManager:
                     target_type,
                     avatar_url=url,
                     display_name=display_name,
+                    site=site,
                 )
                 if target_user == "_currentUser_":
                     return
@@ -1761,7 +2049,10 @@ class TaskManager:
                     if updated_job:
                         self.events.broadcast("job_updated", updated_job)
 
-            can_link_creator = utype in {"model", "pornstar"} and uname != "_currentUser_"
+            can_link_creator = (
+                utype in ({"creator", "pornstar", "users", "channel"} if site == "xhamster" else {"model", "pornstar"})
+                and uname != "_currentUser_"
+            )
             subscribe_attempted = False
 
             async def _handle_list_subscribe(
@@ -1775,7 +2066,7 @@ class TaskManager:
                 label = profile_names.get(target_user) or target_user
                 sub_res = await self._maybe_subscribe_creator(
                     job_id,
-                    ctx,
+                    site_ctx,
                     action,
                     referer_url=referer_url,
                     creator_label=label,
@@ -1813,6 +2104,7 @@ class TaskManager:
                     list_url=list_url,
                     target_type=utype,
                     settings=settings,
+                    site=site,
                     pages_spec=pages_spec,
                     videos_spec=videos_spec,
                     skip_vkeys=known_vkeys,
@@ -1848,7 +2140,7 @@ class TaskManager:
                 if on_sub_cb is not None:
                     scan_kwargs["on_subscribe_action"] = on_sub_cb
                 listed = await scan_list_pages(
-                    ctx,
+                    site_ctx,
                     list_url,
                     settings.selectors,
                     **scan_kwargs,
@@ -1859,7 +2151,7 @@ class TaskManager:
             if subscribe_creator and can_link_creator and not subscribe_attempted and not ctx.cancel_event.is_set():
                 # Fallback to profile homepage only if list pages yielded no subscribe button.
                 profile_url = f"{PH_ORIGIN}/{active_utype}/{urllib.parse.quote(active_uname, safe='')}"
-                prof_res, _ = await ctx.fetch_with_pow(
+                prof_res, _ = await site_ctx.fetch_with_pow(
                     profile_url,
                     timeout=max(5.0, float(settings.request_timeout)),
                     max_retries=1,
@@ -1883,6 +2175,7 @@ class TaskManager:
                     display_name=profile_names.get(active_uname) or profile_names.get(uname) or "",
                     avatar_url=profile_avatars.get(active_uname) or profile_avatars.get(uname) or "",
                     tracked_keys=tracked_keys,
+                    site=site,
                 )
 
             if not listed:
@@ -1910,6 +2203,7 @@ class TaskManager:
         listed_entries = list(scoped_listed.values())
         item_specs = [
             {
+                "site": site,
                 "viewkey": lv.viewkey,
                 "title": lv.title or lv.viewkey or lv.url,
                 "uploader": uname,
@@ -1941,6 +2235,7 @@ class TaskManager:
                 default_type=utype,
                 group_by_uploader=False,
                 uploader_hint=(uname, utype),
+                site=site,
             )
             self.events.broadcast("item_updated", row)
         updated_job = await self.repo.recalculate_job_counts(job_id)
@@ -2003,11 +2298,14 @@ class TaskManager:
             if not (add_to_auto_track or subscribe_creator) or ctx.cancel_event.is_set():
                 return
             async with creator_link_lock:
+                detail_site = detect_site_from_url(detail.page_url)
                 sub_res: Optional[SubscribeResult] = None
                 uploader_name = (detail.uploader_username or "").strip()
-                uploader_type = (detail.uploader_type or "model").strip().lower()
+                uploader_type = (
+                    detail.uploader_type or ("creator" if detail_site == "xhamster" else "model")
+                ).strip().lower()
                 creator_label = uploader_name or (detail.subscribe_action.creator_id if detail.subscribe_action else "") or detail.viewkey
-                if subscribe_creator:
+                if subscribe_creator and detail_site == "pornhub":
                     dedup_key = f"{uploader_type}:{uploader_name.lower()}" if uploader_name else (detail.viewkey or detail.page_url)
                     sub_res = await self._maybe_subscribe_creator(
                         job_id,
@@ -2026,20 +2324,30 @@ class TaskManager:
                         uploader_type,
                         avatar_url=sub_res.avatar_url if sub_res else "",
                         tracked_keys=tracked_keys,
+                        site=detail_site,
                     )
 
         if export_only:
             self.events.emit_log("INFO", f"正在并发解析 {len(video_urls)} 条视频链接...", job_id=job_id)
-            details = await fetch_video_details_batch(
-                ctx,
-                [(u, 1, idx + 1) for idx, u in enumerate(video_urls)],
-                settings.selectors,
-                concurrency=settings.max_concurrent_video_details,
-                preferred_qualities=qualities,
-                include_keywords=include_kw,
-                exclude_keywords=exclude_kw,
-                timeout=settings.request_timeout,
-            )
+            by_site_urls: Dict[str, List[Tuple[str, int, int]]] = defaultdict(list)
+            for idx, u in enumerate(video_urls, start=1):
+                by_site_urls[detect_site_from_url(u)].append((u, 1, idx))
+            details: List[VideoDetail] = []
+            for url_site, url_entries in by_site_urls.items():
+                details.extend(
+                    await fetch_video_details_batch(
+                        self._ctx_for_site(ctx, url_site),
+                        url_entries,
+                        settings.selectors,
+                        concurrency=settings.max_concurrent_video_details,
+                        preferred_qualities=qualities,
+                        include_keywords=include_kw,
+                        exclude_keywords=exclude_kw,
+                        xh_preferred_codec=settings.xh_preferred_codec,
+                        timeout=settings.request_timeout,
+                    )
+                )
+            details.sort(key=lambda d: (d.page_num, d.item_num))
             if add_to_auto_track or subscribe_creator:
                 for d in details:
                     if not d.error or d.filtered_out:
@@ -2049,10 +2357,11 @@ class TaskManager:
 
         item_specs = [
             {
+                "site": detect_site_from_url(u),
                 "viewkey": extract_viewkey_from_url(u) or "",
                 "title": extract_viewkey_from_url(u) or u,
                 "uploader": batch_folder,
-                "target_type": "model",
+                "target_type": "creator" if is_xhamster_url(u) else "model",
                 "page_url": u,
                 "download_url": "",
                 "referer_url": u,
@@ -2069,14 +2378,16 @@ class TaskManager:
         for idx, (row, u) in enumerate(zip(rows, video_urls), start=1):
             iid = int(row["id"])
             item_ids.append(iid)
+            url_site = detect_site_from_url(u)
             parse_specs[iid] = _PendingParseSpec(
                 item_id=iid,
                 page_url=u,
                 page_num=1,
                 item_num=idx,
                 default_uploader=batch_folder,
-                default_type="model",
+                default_type="creator" if url_site == "xhamster" else "model",
                 group_by_uploader=group_by_uploader,
+                site=url_site,
             )
             self.events.broadcast("item_updated", row)
         updated_job = await self.repo.recalculate_job_counts(job_id)
@@ -2152,12 +2463,17 @@ class TaskManager:
 
             pending_specs = [
                 {
+                    "site": normalize_site(video.get("site") or ("xhamster" if is_xhamster_url(video.get("video_page_url")) else "pornhub")),
                     "viewkey": str(video.get("viewkey") or ""),
                     "title": str(video.get("title") or ""),
                     "uploader": str(video.get("uploader") or ""),
                     "target_type": str(video.get("target_type") or "model"),
                     "page_url": video.get("video_page_url")
-                    or f"https://www.pornhub.com/view_video.php?viewkey={video['viewkey']}",
+                    or (
+                        f"https://xhamster.com/videos/{video['viewkey']}"
+                        if normalize_site(video.get("site")) == "xhamster"
+                        else f"https://www.pornhub.com/view_video.php?viewkey={video['viewkey']}"
+                    ),
                     "quality": str(video.get("quality") or ""),
                     "status": "pending",
                     "local_path": str(video.get("local_path") or "").strip(),
@@ -2225,10 +2541,22 @@ class TaskManager:
                     except StopRequested:
                         return
                 tid = int(target["id"])
+                tsite = normalize_site(target.get("site"))
                 uname = target["username"]
                 utype = target["target_type"]
-                display = "Liked Videos" if utype == "liked" else uname
-                display_label = "Liked Videos" if utype == "liked" else ((target.get("display_name") or "").strip() or uname)
+                is_self_col = utype == "liked" or (tsite == "xhamster" and utype == "favorites")
+                if utype == "liked":
+                    display = "Liked Videos"
+                    display_label = "Liked Videos"
+                    default_uploader = "My_Liked"
+                elif tsite == "xhamster" and utype == "favorites":
+                    display = "xHamster Favorites"
+                    display_label = (target.get("display_name") or "").strip() or "xHamster Favorites"
+                    default_uploader = "My_Favorites"
+                else:
+                    display = uname
+                    display_label = (target.get("display_name") or "").strip() or uname
+                    default_uploader = uname
                 qual_set = _quality_set(target.get("preferred_quality") or settings.preferred_quality)
 
                 self.events.emit_scan_status(
@@ -2258,8 +2586,8 @@ class TaskManager:
                     canon_user: str,
                     target_id: int = tid,
                 ) -> None:
-                    nonlocal uname, utype, display
-                    if utype == "liked" or uname == "_currentUser_":
+                    nonlocal uname, utype, display, default_uploader
+                    if is_self_col or uname == "_currentUser_":
                         return
                     prev_uname, prev_utype = uname, utype
                     try:
@@ -2269,6 +2597,7 @@ class TaskManager:
                         )
                         uname, utype = canon_user, canon_type
                         display = canon_user
+                        default_uploader = canon_user
                         self.events.broadcast("overview_changed", {})
                         self.events.emit_log(
                             "INFO",
@@ -2278,13 +2607,14 @@ class TaskManager:
                     except sqlite3.IntegrityError:
                         uname, utype = canon_user, canon_type
                         display = canon_user
+                        default_uploader = canon_user
                         self.events.emit_log(
                             "WARNING",
                             f"目标 '{prev_uname}' 已重定向至 '{canon_user}' ({canon_type})，但监控列表中已存在同名目标，未自动覆盖（请清理重复目标）。",
                             job_id=job_id,
                         )
 
-                list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
+                list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype, site=tsite)
                 page_errors: List[str] = []
                 previous_error = str(target.get("last_error") or "")
                 # A prior pass may have saved videos before and after a failed page.
@@ -2309,12 +2639,13 @@ class TaskManager:
                         list_url=list_url,
                         target_type=utype,
                         settings=settings,
+                        site=tsite,
                         catch_up=(not full_scan and not needs_rescan),
                         skip_vkeys=known_vkeys,
                         preferred_qualities=qual_set,
-                        uploader_hint=(uname if uname != "_currentUser_" else "My_Liked", utype),
+                        uploader_hint=(default_uploader, utype),
                         on_profile=_save_profile,
-                        on_canonical_target=_sync_canonical_target if utype != "liked" else None,
+                        on_canonical_target=_sync_canonical_target if not is_self_col else None,
                         on_scan_error=page_errors.append,
                     )
                 except Exception as err:
@@ -2351,7 +2682,7 @@ class TaskManager:
                     target_error_count += 1
                 await self.repo.mark_target_checked(tid, len(valid_new), error="；".join(errors[:3]))
 
-                folder = _target_folder_name(uname, utype)
+                folder = _target_folder_name(uname, utype, site=tsite)
                 if valid_new:
                     new_by_target[folder] = new_by_target.get(folder, 0) + len(valid_new)
                     for d in valid_new:
@@ -2371,7 +2702,9 @@ class TaskManager:
 
                 if valid_new or detail_failures:
                     ordered_outcomes[target_idx] = {
+                        "site": tsite,
                         "uname": uname,
+                        "default_uploader": default_uploader,
                         "utype": utype,
                         "display": display,
                         "qual_set": qual_set,
@@ -2391,7 +2724,8 @@ class TaskManager:
         for outcome in ordered_outcomes:
             if outcome is None or ctx.cancel_event.is_set():
                 continue
-            uname = outcome["uname"]
+            tsite = outcome["site"]
+            default_uploader = outcome["default_uploader"]
             utype = outcome["utype"]
             display = outcome["display"]
             qual_set = outcome["qual_set"]
@@ -2401,10 +2735,11 @@ class TaskManager:
                 created = await self._create_items_from_details(
                     job_id,
                     candidates,
-                    default_uploader=uname if uname != "_currentUser_" else "My_Liked",
+                    default_uploader=default_uploader,
                     default_type=utype,
                     group_by_uploader=False,
                     upload_requested=settings.uploader_enabled,
+                    site=tsite,
                 )
                 new_item_ids.extend(created)
                 for cid in created:
@@ -2504,10 +2839,13 @@ class TaskManager:
             self.events.emit_log("ERROR", "基线初始化失败：目标不存在。", job_id=job_id)
             return
 
+        tsite = normalize_site(target.get("site"))
+        site_ctx = self._ctx_for_site(ctx, tsite)
         uname = target["username"]
         utype = target["target_type"]
+        is_self_col = utype == "liked" or (tsite == "xhamster" and utype == "favorites")
         pages_spec = (params.get("pages") or "").strip() or None
-        list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype)
+        list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype, site=tsite)
 
         async def _save_profile(url: str, display_name: str) -> None:
             await self.repo.update_target_profile(
@@ -2518,7 +2856,7 @@ class TaskManager:
 
         async def _sync_baseline_canonical(canon_type: str, canon_user: str) -> None:
             nonlocal uname, utype
-            if utype == "liked" or uname == "_currentUser_":
+            if is_self_col or uname == "_currentUser_":
                 return
             prev_uname, prev_utype = uname, utype
             try:
@@ -2541,7 +2879,15 @@ class TaskManager:
                     job_id=job_id,
                 )
 
-        target_label = "Liked Videos" if utype == "liked" else ((target.get("display_name") or "").strip() or uname)
+        if utype == "liked":
+            target_label = "Liked Videos"
+            default_uploader = "My_Liked"
+        elif tsite == "xhamster" and utype == "favorites":
+            target_label = (target.get("display_name") or "").strip() or "xHamster Favorites"
+            default_uploader = "My_Favorites"
+        else:
+            target_label = (target.get("display_name") or "").strip() or uname
+            default_uploader = uname
 
         def _emit_baseline_page_progress(page_num: int, _page_total: int, found_count: int) -> None:
             self.events.emit_scan_status(
@@ -2569,10 +2915,10 @@ class TaskManager:
             "on_page_progress": _emit_baseline_page_progress,
             "on_error": page_errors.append,
         }
-        if utype != "liked":
+        if not is_self_col:
             scan_kwargs["on_canonical_target"] = _sync_baseline_canonical
         listed = await scan_list_pages(
-            ctx,
+            site_ctx,
             list_url,
             settings.selectors,
             **scan_kwargs,
@@ -2584,9 +2930,10 @@ class TaskManager:
                 break
             batch_records.append(
                 {
+                    "site": tsite,
                     "viewkey": lv.viewkey,
                     "title": lv.title,
-                    "uploader": "My_Liked" if (utype == "liked" or uname == "_currentUser_") else uname,
+                    "uploader": default_uploader if is_self_col else uname,
                     "target_type": utype,
                     "video_page_url": lv.url,
                     "status": "baseline",
@@ -2681,17 +3028,25 @@ class TaskManager:
                 if ctx.cancel_event.is_set():
                     break
                 batch = candidates[start : start + chunk_size]
-                details = await fetch_video_details_batch(
-                    ctx,
-                    [
-                        (candidate["video_page_url"], 0, start + idx + 1)
-                        for idx, candidate in enumerate(batch)
-                    ],
-                    settings.selectors,
-                    concurrency=settings.max_concurrent_video_details,
-                    skip_dom=True,
-                    timeout=settings.request_timeout,
-                )
+                by_site_batch: Dict[str, List[Tuple[str, int, int]]] = defaultdict(list)
+                for idx, candidate in enumerate(batch):
+                    csite = normalize_site(
+                        candidate.get("site") or ("xhamster" if is_xhamster_url(candidate.get("video_page_url")) else "pornhub")
+                    )
+                    by_site_batch[csite].append((candidate["video_page_url"], 0, start + idx + 1))
+                details: List[VideoDetail] = []
+                for csite, c_items in by_site_batch.items():
+                    details.extend(
+                        await fetch_video_details_batch(
+                            self._ctx_for_site(ctx, csite),
+                            c_items,
+                            settings.selectors,
+                            concurrency=settings.max_concurrent_video_details,
+                            skip_dom=True,
+                            xh_preferred_codec=settings.xh_preferred_codec,
+                            timeout=settings.request_timeout,
+                        )
+                    )
                 if ctx.cancel_event.is_set():
                     break
                 detail_by_viewkey = {
@@ -2778,6 +3133,13 @@ class TaskManager:
             p = Path(temp_path_str)
             if p.is_file():
                 return p.stat().st_size
+            if p.is_dir():
+                total = 0
+                for child in p.iterdir():
+                    if child.is_file():
+                        with contextlib.suppress(OSError):
+                            total += child.stat().st_size
+                return total
         except OSError:
             pass
         return 0
@@ -2800,74 +3162,85 @@ class TaskManager:
             self.events.emit_log("INFO", f"源任务 #{source_job_id} 没有可重试/续传的条目。", job_id=job_id)
             return
 
-        # Prioritize items that already have a partial .mp4.tmp file on disk while keeping relative order
+        # Prioritize items that already have a partial .mp4.tmp file or .hls dir on disk while keeping relative order
         annotated = []
         for idx, old in enumerate(retryable):
+            old_site = normalize_site(
+                old.get("site") or ("xhamster" if is_xhamster_url(old.get("page_url")) else "pornhub")
+            )
             tmp_size = self._existing_temp_size(old.get("temp_path") or "")
             if tmp_size == 0 and old.get("viewkey"):
-                folder = _target_folder_name(old.get("uploader"), old.get("target_type") or "model")
-                candidate = self.env.temp_dir / folder / f"{video_filename_base(old.get('title') or '', old['viewkey'])}.mp4.tmp"
-                tmp_size = self._existing_temp_size(str(candidate))
-                if tmp_size > 0:
-                    old = {**old, "temp_path": str(candidate)}
-            annotated.append((0 if tmp_size > 0 else 1, idx, old, tmp_size))
+                folder = _target_folder_name(old.get("uploader"), old.get("target_type") or "model", site=old_site)
+                base_tmp_dir = (self.env.temp_dir / "xHamster" / folder) if old_site == "xhamster" else (self.env.temp_dir / folder)
+                base_name = video_filename_base(old.get("title") or "", old["viewkey"])
+                for candidate in (base_tmp_dir / f"{base_name}.mp4.tmp", base_tmp_dir / f"{base_name}.hls"):
+                    tmp_size = self._existing_temp_size(str(candidate))
+                    if tmp_size > 0:
+                        old = {**old, "temp_path": str(candidate)}
+                        break
+            annotated.append((0 if tmp_size > 0 else 1, idx, old, tmp_size, old_site))
         annotated.sort(key=lambda x: (x[0], x[1]))
 
         original_opt_in = params.get("auto_upload")
         auto_upload = original_opt_in is True or (original_opt_in is None and settings.uploader_enabled)
         quality_option = params.get("quality")
         qualities = _quality_set(settings.preferred_quality if quality_option is None else quality_option)
-        target_qual_by_pair: Dict[Tuple[str, str], Optional[Set[str]]] = {}
-        target_qual_by_user: Dict[str, Optional[Set[str]]] = {}
+        target_qual_by_pair: Dict[Tuple[str, str, str], Optional[Set[str]]] = {}
+        target_qual_by_user: Dict[Tuple[str, str], Optional[Set[str]]] = {}
         if quality_option is None:
             for t in await self.repo.list_targets():
                 q_set = _quality_set(t.get("preferred_quality"))
                 if not q_set:
                     continue
+                s_low = normalize_site(t.get("site"))
                 u_low = str(t.get("username") or "").strip().lower()
                 t_low = str(t.get("target_type") or "model").strip().lower()
                 if t_low == "liked":
-                    target_qual_by_pair[("my_liked", "liked")] = q_set
-                    target_qual_by_pair[("_currentuser_", "liked")] = q_set
+                    target_qual_by_pair[(s_low, "my_liked", "liked")] = q_set
+                    target_qual_by_pair[(s_low, "_currentuser_", "liked")] = q_set
+                elif s_low == "xhamster" and t_low == "favorites":
+                    target_qual_by_pair[(s_low, "my_favorites", "favorites")] = q_set
+                    target_qual_by_pair[(s_low, "_currentuser_", "favorites")] = q_set
                 else:
-                    target_qual_by_pair[(u_low, t_low)] = q_set
-                    if t_low not in {"favorites", "liked"} and u_low not in target_qual_by_user:
-                        target_qual_by_user[u_low] = q_set
+                    target_qual_by_pair[(s_low, u_low, t_low)] = q_set
+                    if t_low not in {"favorites", "liked"} and (s_low, u_low) not in target_qual_by_user:
+                        target_qual_by_user[(s_low, u_low)] = q_set
 
-        def _item_default_qualities(old_item: Dict[str, Any]) -> Optional[Set[str]]:
+        def _item_default_qualities(old_item: Dict[str, Any], item_site: str) -> Optional[Set[str]]:
             if quality_option is not None:
                 return qualities
             u_low = str(old_item.get("uploader") or "").strip().lower()
             t_low = str(old_item.get("target_type") or "model").strip().lower()
-            if (u_low, t_low) in target_qual_by_pair:
-                return target_qual_by_pair[(u_low, t_low)]
-            if t_low not in {"favorites", "liked"} and u_low in target_qual_by_user:
-                return target_qual_by_user[u_low]
+            if (item_site, u_low, t_low) in target_qual_by_pair:
+                return target_qual_by_pair[(item_site, u_low, t_low)]
+            if t_low not in {"favorites", "liked"} and (item_site, u_low) in target_qual_by_user:
+                return target_qual_by_user[(item_site, u_low)]
             return qualities
 
         include_kw = _split_csv_set(params.get("keywords"), lower=True)
         exclude_kw = _split_csv_set(params.get("exclude_keywords"), lower=True)
-        lookup_groups: Dict[Optional[Tuple[str, ...]], List[str]] = defaultdict(list)
+        lookup_groups: Dict[Tuple[str, Optional[Tuple[str, ...]]], List[str]] = defaultdict(list)
         lookup_urls_set: Set[str] = set()
-        for _, _, old, _ in annotated:
+        for _, _, old, _, old_site in annotated:
             if not old.get("download_url") and not old.get("local_path") and old.get("page_url"):
                 purl = old["page_url"]
                 if purl in lookup_urls_set:
                     continue
                 lookup_urls_set.add(purl)
-                q_set = _item_default_qualities(old)
+                q_set = _item_default_qualities(old, old_site)
                 q_key = tuple(sorted(q_set)) if q_set else None
-                lookup_groups[q_key].append(purl)
+                lookup_groups[(old_site, q_key)].append(purl)
         resolved: Dict[str, VideoDetail] = {}
-        for q_key, urls_in_group in lookup_groups.items():
+        for (grp_site, q_key), urls_in_group in lookup_groups.items():
             details = await fetch_video_details_batch(
-                ctx,
+                self._ctx_for_site(ctx, grp_site),
                 [(url, 0, idx + 1) for idx, url in enumerate(urls_in_group)],
                 settings.selectors,
                 concurrency=settings.max_concurrent_video_details,
                 preferred_qualities=set(q_key) if q_key else None,
                 include_keywords=include_kw,
                 exclude_keywords=exclude_kw,
+                xh_preferred_codec=settings.xh_preferred_codec,
                 timeout=settings.request_timeout,
             )
             for detail in details:
@@ -2875,7 +3248,7 @@ class TaskManager:
         retry_qualities: Dict[int, Optional[Set[str]]] = {}
         seen: Set[str] = set()
         new_item_ids: List[int] = []
-        for _, _, old, tmp_size in annotated:
+        for _, _, old, tmp_size, old_site in annotated:
             key = old["viewkey"] or old["page_url"]
             if key in seen:
                 continue
@@ -2905,6 +3278,7 @@ class TaskManager:
                 status, error = "failed", "重新解析视频没有返回结果"
             row = await self.repo.add_job_item(
                 job_id,
+                site=old_site,
                 viewkey=old["viewkey"],
                 title=old["title"],
                 uploader=old["uploader"],
@@ -2925,7 +3299,7 @@ class TaskManager:
             if status == "pending":
                 new_item_ids.append(int(row["id"]))
             previous_quality = normalized_quality(old["quality"])
-            item_q = _item_default_qualities(old)
+            item_q = _item_default_qualities(old, old_site)
             retry_qualities[int(row["id"])] = item_q or ({previous_quality} if previous_quality else None)
             self.events.broadcast("item_updated", row)
 
@@ -2953,7 +3327,7 @@ class TaskManager:
     ) -> None:
         temp_files = self.list_temp_files()
         if not temp_files:
-            self.events.emit_log("INFO", "没有找到可续传的 .mp4.tmp 临时文件。", job_id=job_id)
+            self.events.emit_log("INFO", "没有找到可续传的临时文件。", job_id=job_id)
             return
 
         auto_upload = bool(params.get("auto_upload", settings.uploader_enabled)) and settings.uploader_enabled
@@ -2974,14 +3348,25 @@ class TaskManager:
                     original_opt_in = json.loads(prior.get("params_json") or "{}").get("auto_upload") is True
                 except (ValueError, AttributeError):
                     original_opt_in = False
+            tf_site = normalize_site(prior.get("site") or tf.get("site") or "pornhub")
             folder = tf["folder"]
-            utype = "favorites" if folder.lower().endswith("_favorites") else ("liked" if folder.lower() == "my_liked_videos" else "model")
-            uploader = folder[:-len("_favorites")] if utype == "favorites" else folder
+            if tf_site == "xhamster":
+                utype = "favorites" if folder.lower() == "my_favorites" else "creator"
+                uploader = "My_Favorites" if utype == "favorites" else folder
+            else:
+                utype = "favorites" if folder.lower().endswith("_favorites") else ("liked" if folder.lower() == "my_liked_videos" else "model")
+                uploader = folder[:-len("_favorites")] if utype == "favorites" else folder
             title = prior.get("title") or tf["name"].rsplit("[", 1)[0].strip() or vkey
-            page_url = prior.get("page_url") or f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
+            default_page_url = (
+                f"https://xhamster.com/videos/{vkey}"
+                if tf_site == "xhamster"
+                else f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
+            )
+            page_url = prior.get("page_url") or default_page_url
             quality = tf["quality"] or prior.get("quality") or ""
             row = await self.repo.add_job_item(
                 job_id,
+                site=tf_site,
                 viewkey=vkey,
                 title=title,
                 uploader=prior.get("uploader") or uploader,
@@ -3018,6 +3403,15 @@ class TaskManager:
     # ------------------------------------------------------------------
     # Disk / Residual temp file inspection
     # ------------------------------------------------------------------
+    def _infer_temp_site(self, path: Path) -> str:
+        try:
+            rel_parts = path.resolve().relative_to(self.env.temp_dir.resolve()).parts
+            if rel_parts and rel_parts[0].lower() == "xhamster":
+                return "xhamster"
+        except (OSError, ValueError):
+            pass
+        return "pornhub"
+
     def list_temp_files(self) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         if not self.env.temp_dir.exists():
@@ -3037,6 +3431,7 @@ class TaskManager:
                     checkpoint = None
                 results.append(
                     {
+                        "site": self._infer_temp_site(tmp),
                         "name": tmp.name,
                         "folder": tmp.parent.name,
                         "viewkey": vkey,
@@ -3044,6 +3439,43 @@ class TaskManager:
                         "path": str(tmp),
                         "quality": checkpoint.quality if checkpoint else "",
                         "verified_checkpoint": bool(checkpoint and checkpoint.etag and st.st_size <= checkpoint.total),
+                    }
+                )
+            except OSError:
+                continue
+        for hls_dir in sorted(self.env.temp_dir.rglob("*.hls")):
+            try:
+                if hls_dir.is_symlink() or not hls_dir.is_dir():
+                    continue
+                total_size = self._existing_temp_size(str(hls_dir))
+                if total_size <= 0:
+                    continue
+                vkey = ""
+                quality = ""
+                verified = False
+                manifest = hls_dir / "manifest.json"
+                if manifest.is_file():
+                    try:
+                        meta = json.loads(manifest.read_text(encoding="utf-8"))
+                        if isinstance(meta, dict):
+                            vkey = str(meta.get("viewkey") or "").strip()
+                            raw_q = str(meta.get("quality") or "").strip()
+                            quality = f"{raw_q}p" if raw_q.isdigit() else raw_q
+                            verified = bool(vkey)
+                    except (OSError, ValueError, TypeError):
+                        pass
+                if not vkey and "[" in hls_dir.stem and "]" in hls_dir.stem:
+                    vkey = hls_dir.stem.rsplit("[", 1)[1].split("]", 1)[0]
+                results.append(
+                    {
+                        "site": self._infer_temp_site(hls_dir),
+                        "name": hls_dir.name,
+                        "folder": hls_dir.parent.name,
+                        "viewkey": vkey,
+                        "size_bytes": total_size,
+                        "path": str(hls_dir),
+                        "quality": quality,
+                        "verified_checkpoint": verified,
                     }
                 )
             except OSError:
@@ -3059,4 +3491,9 @@ class TaskManager:
                 tmp.unlink(missing_ok=True)
                 remove_download_checkpoint(tmp)
                 removed += 1
+        for hls_dir in list(self.env.temp_dir.rglob("*.hls")):
+            if hls_dir.is_dir():
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(hls_dir, ignore_errors=True)
+                    removed += 1
         return removed

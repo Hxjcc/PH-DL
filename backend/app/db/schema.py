@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -154,6 +154,42 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE job_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0;",
             "CREATE INDEX IF NOT EXISTS idx_videos_published_sort "
             "ON videos(published_at DESC, COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
+        ],
+    ),
+    (
+        9,
+        [
+            """CREATE TABLE targets_v9 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site TEXT NOT NULL DEFAULT 'pornhub',
+                username TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT 'model',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                preferred_quality TEXT NOT NULL DEFAULT '',
+                avatar_url TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                last_checked_at TEXT,
+                last_new_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(site, username, target_type)
+            );""",
+            """INSERT INTO targets_v9 (
+                id, site, username, target_type, enabled, preferred_quality,
+                avatar_url, display_name, last_checked_at, last_new_count, last_error, created_at
+            )
+            SELECT
+                id, 'pornhub', username, target_type, enabled, preferred_quality,
+                COALESCE(avatar_url, ''), COALESCE(display_name, ''),
+                last_checked_at, last_new_count, last_error, created_at
+            FROM targets;""",
+            "DROP TABLE targets;",
+            "ALTER TABLE targets_v9 RENAME TO targets;",
+            "CREATE INDEX IF NOT EXISTS idx_targets_site ON targets(site);",
+            "ALTER TABLE videos ADD COLUMN site TEXT NOT NULL DEFAULT 'pornhub';",
+            "ALTER TABLE job_items ADD COLUMN site TEXT NOT NULL DEFAULT 'pornhub';",
+            "CREATE INDEX IF NOT EXISTS idx_videos_site_activity "
+            "ON videos(site, COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
         ],
     ),
 ]

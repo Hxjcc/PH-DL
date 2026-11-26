@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { parseVideoLinks } from '../src/utils/videoLinks.js'
 import { buildExportFilename } from '../src/utils/exportFilename.js'
-import { formatBytes, formatPublishedDate, formatSpeed, formatVideoDuration } from '../src/utils/format.js'
+import { formatBytes, formatPublishedDate, formatSpeed, formatVideoDuration, siteMeta, targetTypeMeta } from '../src/utils/format.js'
 import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../src/utils/specificVideos.js'
 import {
   buildItemStatusPills,
@@ -12,7 +12,13 @@ import {
   resolveJobVisual,
 } from '../src/utils/jobMeta.js'
 import { appendLiveLog, mergeLogsSnapshot } from '../src/utils/logBuffer.js'
-import { buildTargetProfileVideosUrl, parseTargetUsernames } from '../src/utils/targetInput.js'
+import {
+  buildTargetProfileVideosUrl,
+  extractTargetFromInput,
+  isXhamsterUrlText,
+  normalizeTargetUsername,
+  parseTargetUsernames,
+} from '../src/utils/targetInput.js'
 import {
   JOB_LIMITS,
   TARGETS_PAGE_SIZES,
@@ -390,4 +396,92 @@ test('listPreferences supports 10-item job limit and target page sizes including
   } finally {
     globalThis.localStorage = prevStorage
   }
+})
+
+test('parseVideoLinks supports xHamster modern/legacy URLs and mixed PornHub deduplication', () => {
+  const input = [
+    'https://www.pornhub.com/view_video.php?viewkey=ph66aa11',
+    'https://xhamster.com/videos/some-video-title-xhOwQIZ',
+    'https://zh.xhamster.com/videos/other-slug-xhOwQIZ?foo=1',
+    'https://xhamster42.desi/movies/old-movie-12345678',
+    'https://xhamster.com/embed/12345678',
+    'https://xhamster.com/embed/xhAbCd99',
+    'https://xhamster.com/creators/webtolove',
+  ].join('\n')
+
+  const res = parseVideoLinks(input)
+  assert.deepEqual(res.urls, [
+    'https://www.pornhub.com/view_video.php?viewkey=ph66aa11',
+    'https://xhamster.com/videos/some-video-title-xhOwQIZ',
+    'https://xhamster42.desi/movies/old-movie-12345678',
+    'https://xhamster.com/embed/xhAbCd99',
+  ])
+  assert.equal(res.duplicates, 2)
+  assert.equal(res.invalid, 1)
+})
+
+test('xHamster targetInput helpers detect site, extract targets, normalize usernames, and build profile URLs', () => {
+  assert.equal(isXhamsterUrlText('https://xhamster.com/creators/luna-star'), true)
+  assert.equal(isXhamsterUrlText('https://zh.xhamster42.desi/users/webtolove/videos'), true)
+  assert.equal(isXhamsterUrlText('https://www.pornhub.com/model/alice'), false)
+
+  assert.deepEqual(extractTargetFromInput('https://xhamster.com/creators/luna-star/newest'), {
+    site: 'xhamster',
+    target_type: 'creator',
+    username: 'luna-star',
+  })
+  assert.deepEqual(extractTargetFromInput('https://xhamster.com/pornstars/eva-elfie'), {
+    site: 'xhamster',
+    target_type: 'pornstar',
+    username: 'eva-elfie',
+  })
+  assert.deepEqual(extractTargetFromInput('https://xhamster.com/channels/brazzers-network/newest'), {
+    site: 'xhamster',
+    target_type: 'channel',
+    username: 'brazzers-network',
+  })
+  assert.deepEqual(extractTargetFromInput('https://xhamster.com/users/webtolove/videos'), {
+    site: 'xhamster',
+    target_type: 'users',
+    username: 'webtolove',
+  })
+  assert.deepEqual(extractTargetFromInput('https://xhamster.com/my/favorites/videos'), {
+    site: 'xhamster',
+    target_type: 'favorites',
+    username: '',
+  })
+
+  assert.equal(normalizeTargetUsername('https://xhamster.com/creators/luna-star/newest'), 'luna-star')
+  assert.equal(normalizeTargetUsername('https://xhamster.com/channels/brazzers-network'), 'brazzers-network')
+  assert.equal(normalizeTargetUsername('https://xhamster.com/users/webtolove/videos'), 'webtolove')
+
+  assert.equal(
+    buildTargetProfileVideosUrl({ site: 'xhamster', username: 'luna-star', target_type: 'creator' }),
+    'https://xhamster.com/creators/luna-star/newest'
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ site: 'xhamster', username: 'eva-elfie', target_type: 'pornstar' }),
+    'https://xhamster.com/pornstars/eva-elfie/newest'
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ site: 'xhamster', username: 'brazzers-network', target_type: 'channel' }),
+    'https://xhamster.com/channels/brazzers-network/newest'
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ site: 'xhamster', username: 'webtolove', target_type: 'users' }),
+    'https://xhamster.com/users/webtolove/videos'
+  )
+  assert.equal(
+    buildTargetProfileVideosUrl({ site: 'xhamster', username: '_currentUser_', target_type: 'favorites' }),
+    'https://xhamster.com/my/favorites/videos'
+  )
+})
+
+test('siteMeta and targetTypeMeta format xHamster and PornHub labels', () => {
+  assert.equal(siteMeta('xhamster').code, 'XH')
+  assert.equal(siteMeta('xhamster').label, 'xHamster')
+  assert.equal(siteMeta('pornhub').code, 'PH')
+  assert.equal(siteMeta('').label, 'PornHub')
+  assert.equal(targetTypeMeta('creator'), 'Creator')
+  assert.equal(targetTypeMeta('channel'), 'Channel')
 })

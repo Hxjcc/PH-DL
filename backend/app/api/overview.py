@@ -7,8 +7,10 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from ..db.repo import normalize_site
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.target import fetch_subscriptions
+from ..parsers.xhamster import fetch_xhamster_subscriptions
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api", tags=["overview"])
@@ -52,6 +54,11 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
             "configured": bool(settings.ph_cookie.strip()),
             **container.tasks.cookie_status,
         },
+        "xh_cookie": {
+            "configured": bool(settings.xh_cookie.strip()),
+            "username": (settings.xh_logged_in_username or "").strip(),
+            **container.tasks.xh_cookie_status,
+        },
         "schedule": {
             "enabled": settings.schedule_enabled,
             "time": settings.schedule_time,
@@ -74,9 +81,41 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
 @router.get("/subscriptions")
 async def get_subscriptions(
     username: Optional[str] = Query(default=None),
+    site: str = Query(default="pornhub"),
     container: AppContainer = Depends(require_auth),
 ):
     settings = await container.repo.get_settings()
+    norm_site = normalize_site(site)
+
+    if norm_site == "xhamster":
+        if not settings.xh_cookie.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="请先在【系统设置 → Cookie 与账号】中配置有效 xHamster Cookie",
+            )
+        async with TaskHttpContext(
+            cookie_str=settings.xh_cookie,
+            proxy_url=settings.normalized_proxy,
+            concurrency=2,
+            timeout=settings.request_timeout,
+            max_retries=settings.max_retries_page_fetch,
+        ) as ctx:
+            subs = await fetch_xhamster_subscriptions(ctx, timeout=settings.request_timeout)
+        return {
+            "site": "xhamster",
+            "username": settings.xh_logged_in_username.strip(),
+            "subscriptions": [
+                {
+                    "site": "xhamster",
+                    "type": t,
+                    "username": u,
+                    "display_name": display_name,
+                    "avatar_url": avatar_url,
+                }
+                for t, u, display_name, avatar_url in subs
+            ],
+        }
+
     source_user = (username or "").strip() or settings.ph_logged_in_username.strip()
     if not source_user:
         raise HTTPException(
@@ -101,9 +140,15 @@ async def get_subscriptions(
         )
 
     return {
+        "site": "pornhub",
         "username": source_user,
         "subscriptions": [
-            {"type": t, "username": u, "display_name": display_name, "avatar_url": avatar_url}
+            {
+                "type": t,
+                "username": u,
+                "display_name": display_name,
+                "avatar_url": avatar_url,
+            }
             for t, u, display_name, avatar_url in subs
         ],
     }

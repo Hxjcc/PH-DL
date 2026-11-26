@@ -90,6 +90,11 @@ const UPDATE_SCAN_MODE_OPTIONS = [
   { label: '全量翻页（全 · 扫完所有分页不漏老片）', value: 'full' },
 ]
 
+const XH_CODEC_OPTIONS = [
+  { label: 'H.264（默认 · 兼容性最好）', value: 'h264' },
+  { label: 'AV1（同画质体积更小，需播放器支持）', value: 'av1' },
+]
+
 function cloneSettings(src) {
   if (!src) return null
   return {
@@ -105,6 +110,7 @@ const saving = ref(false)
 const busyTool = ref('')
 const form = ref(cloneSettings(store.settingsCache))
 const pasteCookie = ref('')
+const pasteXhCookie = ref('')
 const avatarInputRef = ref(null)
 const avatarLoadError = ref(false)
 const rcloneRemotes = ref([])
@@ -339,6 +345,35 @@ async function handleRefreshCookie() {
   }
 }
 
+async function handleTestXhCookie() {
+  busyTool.value = 'xh_cookie_test'
+  try {
+    const res = await api.testXhCookie()
+    store.notify(res.message, res.valid ? 'success' : 'warning')
+    await Promise.all([loadSettings(), store.refreshOverview()])
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    busyTool.value = ''
+  }
+}
+
+async function handleImportXhCookie() {
+  if (!pasteXhCookie.value.trim()) return
+  busyTool.value = 'xh_cookie_import'
+  try {
+    const res = await api.importXhCookie(pasteXhCookie.value.trim())
+    store.clearSubscriptionsCache()
+    pasteXhCookie.value = ''
+    store.notify(`xHamster Cookie 已保存：${res.message}`, res.valid ? 'success' : 'warning')
+    await Promise.all([loadSettings(), store.refreshOverview()])
+  } catch (err) {
+    store.notify(err.message, 'error')
+  } finally {
+    busyTool.value = ''
+  }
+}
+
 async function handleTestYescaptcha() {
   busyTool.value = 'yescaptcha'
   try {
@@ -477,6 +512,57 @@ async function handleTestNotify() {
               @click="handleImportCookie"
             >
               保存粘贴的 Cookie 并测活
+            </Button>
+          </div>
+        </div>
+
+        <div class="p-4 sm:p-6 space-y-4">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div class="space-y-1">
+              <div class="flex items-center gap-2">
+                <h3 class="text-sm font-semibold text-foreground">xHamster Cookie（可选）</h3>
+                <Badge
+                  variant="outline"
+                  :dot="
+                    store.overview?.xh_cookie?.valid === true
+                      ? 'bg-emerald-500'
+                      : store.overview?.xh_cookie?.valid === false
+                        ? 'bg-red-500'
+                        : 'bg-zinc-400'
+                  "
+                >
+                  {{ store.overview?.xh_cookie?.message || (form.has_xh_cookie ? '已配置' : '未配置（公开下载无需）') }}
+                </Badge>
+              </div>
+              <p class="text-xs text-muted-foreground">
+                公开博主、频道与单视频下载均无需 Cookie；仅「从 xHamster 订阅导入」与「xHamster 收藏夹」需要粘贴浏览器 Cookie
+              </p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <Button variant="outline" size="xs" :disabled="busyTool !== ''" @click="handleTestXhCookie">
+                <CheckCircle2 class="w-3.5 h-3.5" />
+                检测有效性
+              </Button>
+            </div>
+          </div>
+
+          <Textarea
+            v-model="pasteXhCookie"
+            :rows="2"
+            placeholder="粘贴从 xhamster.com 浏览器请求头复制的 Cookie 字符串..."
+            class="font-mono text-xs"
+          />
+          <div class="flex items-center justify-between gap-3">
+            <span v-if="form.xh_logged_in_username" class="text-xs text-muted-foreground">
+              当前已识别 xHamster 账号：<strong class="text-foreground">{{ form.xh_logged_in_username }}</strong>
+            </span>
+            <span v-else />
+            <Button
+              size="sm"
+              :disabled="!pasteXhCookie.trim() || busyTool !== ''"
+              @click="handleImportXhCookie"
+            >
+              保存 xHamster Cookie 并测活
             </Button>
           </div>
         </div>
@@ -642,6 +728,15 @@ async function handleTestNotify() {
             <Input v-model="form.preferred_quality" placeholder="如 2160,1440,1080" />
           </div>
           <div class="space-y-1.5">
+            <label
+              class="text-xs font-medium text-foreground"
+              title="下载 xHamster 高清/4K 视频时优先选择的视频编码格式；所选编码不存在时会自动回退到另一编码"
+            >
+              xHamster 编码偏好
+            </label>
+            <Select v-model="form.xh_preferred_codec" :options="XH_CODEC_OPTIONS" />
+          </div>
+          <div class="space-y-1.5">
             <label class="text-xs font-medium text-foreground">待上传最大本地堆积数</label>
             <Input v-model="form.max_pending_upload_files" type="number" :min="1" :max="200" />
           </div>
@@ -738,8 +833,12 @@ async function handleTestNotify() {
               <Input v-model="form.rclone_remote" placeholder="pikpak 或 gd" />
             </div>
             <div class="space-y-1">
-              <label class="text-xs font-medium text-foreground">远端基础目录</label>
+              <label class="text-xs font-medium text-foreground">PornHub 远端基础目录</label>
               <Input v-model="form.rclone_remote_base_dir" placeholder="Pornhub" />
+            </div>
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-foreground">xHamster 远端基础目录</label>
+              <Input v-model="form.rclone_xh_remote_base_dir" placeholder="xHamster" />
             </div>
             <div class="space-y-1">
               <label class="text-xs font-medium text-foreground">并行上传 Worker 数</label>

@@ -197,6 +197,8 @@ async def probe_download_size(
     """Read total media size with a one-byte Range request without downloading the file."""
     if not download_url:
         return None
+    if ".m3u8" in download_url.lower():
+        return None
     headers = dict(DOWNLOAD_HEADERS)
     headers["Referer"] = referer_url or "https://www.pornhub.com/"
     headers["Range"] = "bytes=0-0"
@@ -246,6 +248,7 @@ async def download_mp4_with_resume(
     cookie_str: str = "",
     proxy_url: Optional[str] = None,
     preferred_qualities: Optional[Set[str]] = None,
+    xh_preferred_codec: str = "h264",
     max_attempts: int = 3,
     retry_delay_base: float = 2.0,
     retry_delay_max: float = 10.0,
@@ -257,7 +260,7 @@ async def download_mp4_with_resume(
 ) -> DownloadOutcome:
     """Only append ranges proven to belong to the previous HTTP representation."""
     stop = cancel_event if cancel_event is not None else parse_ctx.cancel_event
-    if not re.fullmatch(r"[a-zA-Z0-9]+", viewkey or ""):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", viewkey or ""):
         return DownloadOutcome(success=False, error="缺少或无效的 viewkey")
 
     base_name = video_filename_base(title, viewkey)
@@ -316,11 +319,23 @@ async def download_mp4_with_resume(
         target_page = page_url or referer
         locked = normalized_quality(current_quality) if _size(part) else ""
         filters = {locked} if locked else preferred_qualities
-        detail = await fetch_single_video_detail(parse_ctx, target_page, selectors,
-                                                preferred_qualities=filters, timeout=request_timeout)
+        detail = await fetch_single_video_detail(
+            parse_ctx,
+            target_page,
+            selectors,
+            preferred_qualities=filters,
+            xh_preferred_codec=xh_preferred_codec,
+            timeout=request_timeout,
+        )
         if not detail.download_url and filters != preferred_qualities:
-            detail = await fetch_single_video_detail(parse_ctx, target_page, selectors,
-                                                    preferred_qualities=preferred_qualities, timeout=request_timeout)
+            detail = await fetch_single_video_detail(
+                parse_ctx,
+                target_page,
+                selectors,
+                preferred_qualities=preferred_qualities,
+                xh_preferred_codec=xh_preferred_codec,
+                timeout=request_timeout,
+            )
         if not detail.download_url:
             return False
         url = detail.download_url

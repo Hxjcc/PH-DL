@@ -21,10 +21,11 @@ from starlette.types import Receive, Scope, Send
 from ..config import RuntimeSettings
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.video import MediaSource, extract_viewkey_from_url, fetch_single_video_detail, is_video_url
+from ..parsers.xhamster import is_xhamster_host, is_xhamster_url
 from .downloader import DOWNLOAD_HEADERS
 
-_SITE = ("pornhub.com",)
-_MEDIA = (*_SITE, "phncdn.com", "phprcdn.com")
+_PH_SITE = ("pornhub.com",)
+_MEDIA = ("pornhub.com", "phncdn.com", "phprcdn.com", "xhcdn.com")
 _REDIRECTS = {301, 302, 303, 307, 308}
 _REQUEST_RANGE = re.compile(r"bytes=(?:([0-9]{1,18})-([0-9]{0,18})|-([0-9]{1,18}))")
 _REPLY_RANGE = re.compile(r"bytes ([0-9]{1,18})-([0-9]{1,18})/([0-9]{1,18})")
@@ -32,35 +33,48 @@ _MP4_TYPES = {"video/mp4", "application/mp4", "application/octet-stream", "binar
 NO_CACHE = {"Cache-Control": "private, no-store"}
 
 
-def _allowed(url: str, domains: tuple[str, ...]) -> bool:
+def _allowed(url: str, domains: tuple[str, ...], *, allow_xhamster: bool = False) -> bool:
     if "\\" in url or any(ord(char) <= 32 or ord(char) == 127 for char in url):
         return False
     try:
         parsed = urlsplit(url)
         host = parsed.hostname or ""
+        host_ok = any(host == domain or host.endswith("." + domain) for domain in domains) or (
+            allow_xhamster and is_xhamster_host(host)
+        )
         return (
             parsed.scheme == "https"
             and parsed.username is None
             and parsed.password is None
             and parsed.port in {None, 443}
-            and any(host == domain or host.endswith("." + domain) for domain in domains)
+            and host_ok
         )
     except ValueError:
         return False
 
 
+def _ph_site_url(url: str) -> bool:
+    return _allowed(url, _PH_SITE)
+
+
+def _xh_site_url(url: str) -> bool:
+    return _allowed(url, (), allow_xhamster=True)
+
+
 def _site_url(url: str) -> bool:
-    return _allowed(url, _SITE)
+    return _allowed(url, _PH_SITE, allow_xhamster=True)
 
 
 def _media_url(url: str) -> bool:
-    return _allowed(url, _MEDIA)
+    return _allowed(url, _MEDIA, allow_xhamster=True)
 
 
 def _playback_page(record: dict, viewkey: str) -> str:
     recorded = str(record.get("video_page_url") or "").strip()
     if _site_url(recorded) and is_video_url(recorded) and extract_viewkey_from_url(recorded) == viewkey:
         return recorded
+    if str(record.get("site") or "").strip().lower() == "xhamster":
+        return f"https://xhamster.com/videos/{viewkey}"
     return f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
 
 
@@ -151,24 +165,26 @@ class PlaybackService:
 
     async def resolve(self, record: dict, settings: RuntimeSettings) -> dict:
         viewkey = str(record["viewkey"])
-        if not re.fullmatch(r"[A-Za-z0-9]{1,128}", viewkey):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", viewkey):
             raise HTTPException(422, "这条记录没有可用的视频编号")
         page = _playback_page(record, viewkey)
+        is_xh = str(record.get("site") or "").strip().lower() == "xhamster" or is_xhamster_url(page)
         try:
             # Resolving a clip must not occupy a download worker or retry indefinitely.
             async with asyncio.timeout(35), self._resolve_slots, TaskHttpContext(
-                cookie_str=settings.ph_cookie,
+                cookie_str=settings.xh_cookie if is_xh else settings.ph_cookie,
                 proxy_url=settings.normalized_proxy,
                 concurrency=1,
                 timeout=min(settings.request_timeout, 12),
                 max_retries=1,
                 allow_url=_media_url,
-                allow_cookie_url=_site_url,
+                allow_cookie_url=_xh_site_url if is_xh else _ph_site_url,
             ) as ctx:
                 detail = await fetch_single_video_detail(
                     ctx, page, settings.selectors, timeout=min(settings.request_timeout, 12),
                     skip_dom=True,
                     include_mp4_sources=True,
+                    xh_preferred_codec=settings.xh_preferred_codec,
                 )
                 cookie = ctx.cookie_string()
         except TimeoutError as err:

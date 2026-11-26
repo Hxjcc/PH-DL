@@ -15,6 +15,7 @@ SENSITIVE_RUNTIME_FIELDS = frozenset(
     {
         "ph_password",
         "ph_cookie",
+        "xh_cookie",
         "serverchan_send_key",
         "yescaptcha_client_key",
     }
@@ -166,6 +167,8 @@ class RuntimeSettings(BaseModel):
     ph_password: str = ""
     ph_logged_in_username: str = ""
     ph_cookie: str = ""
+    xh_cookie: str = ""
+    xh_logged_in_username: str = ""
     account_avatar_version: str = ""
 
     # YesCaptcha (reCAPTCHA solver used by auto-login)
@@ -191,6 +194,7 @@ class RuntimeSettings(BaseModel):
     download_attempts: int = Field(default=3, ge=1, le=10)
     min_file_size_bytes: int = Field(default=10240, ge=1)
     preferred_quality: str = ""  # e.g. "2160,1440,1080" or empty for best
+    xh_preferred_codec: Literal["h264", "av1"] = "h264"
     upload_batch_size: int = Field(default=1, ge=1, le=100)
     upload_workers: int = Field(default=3, ge=1, le=8)
     max_pending_upload_files: int = Field(default=20, ge=1, le=200)
@@ -201,6 +205,7 @@ class RuntimeSettings(BaseModel):
     rclone_bin: str = "rclone"
     rclone_remote: str = "pikpak"
     rclone_remote_base_dir: str = "Pornhub"
+    rclone_xh_remote_base_dir: str = "xHamster"
     rclone_transfers: int = Field(default=1, ge=1, le=16)
     rclone_checkers: int = Field(default=2, ge=1, le=32)
     rclone_pikpak_upload_concurrency: int = Field(default=4, ge=1, le=32)
@@ -242,6 +247,7 @@ class RuntimeSettings(BaseModel):
             if data.get(field):
                 data[field] = REDACTED_PLACEHOLDER
         data["has_cookie"] = bool(self.ph_cookie.strip())
+        data["has_xh_cookie"] = bool(self.xh_cookie.strip())
         return data
 
     def merge_update(self, patch: dict[str, Any]) -> "RuntimeSettings":

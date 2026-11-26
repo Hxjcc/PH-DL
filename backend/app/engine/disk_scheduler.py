@@ -27,6 +27,7 @@ class UploadQueuedItem:
     file_size: int = 0
     enqueued_seq: int = 0
     published_at: str = ""
+    site: str = "pornhub"
 
 
 class AdaptiveDiskScheduler:
@@ -389,12 +390,12 @@ class SmartUploadPool:
             self._cond.notify_all()
             return drained
 
-    def _ready_keys(self) -> set[Tuple[str, Path]]:
+    def _ready_keys(self) -> set[Tuple[str, str, Path]]:
         if self._downloads_done or self._flush_requested or self.batch_trigger_size <= 1:
-            return {(it.uploader_folder, it.download_dir) for it in self._items}
-        counts: Dict[Tuple[str, Path], int] = defaultdict(int)
+            return {(it.site, it.uploader_folder, it.download_dir) for it in self._items}
+        counts: Dict[Tuple[str, str, Path], int] = defaultdict(int)
         for it in self._items:
-            counts[(it.uploader_folder, it.download_dir)] += 1
+            counts[(it.site, it.uploader_folder, it.download_dir)] += 1
         return {k for k, c in counts.items() if c >= self.batch_trigger_size}
 
     async def take_next_chunk(self, cancel_event: asyncio.Event) -> Optional[List[UploadQueuedItem]]:
@@ -404,7 +405,7 @@ class SmartUploadPool:
                 if cancel_event.is_set():
                     return None
                 ready_keys = self._ready_keys()
-                candidates = [it for it in self._items if (it.uploader_folder, it.download_dir) in ready_keys]
+                candidates = [it for it in self._items if (it.site, it.uploader_folder, it.download_dir) in ready_keys]
                 if candidates:
                     prefer_largest = self.scheduler.prefer_largest_upload
                     if prefer_largest:
@@ -412,8 +413,8 @@ class SmartUploadPool:
                     else:
                         anchor = min(candidates, key=lambda x: x.enqueued_seq)
 
-                    group_key = (anchor.uploader_folder, anchor.download_dir)
-                    same_group = [it for it in candidates if (it.uploader_folder, it.download_dir) == group_key]
+                    group_key = (anchor.site, anchor.uploader_folder, anchor.download_dir)
+                    same_group = [it for it in candidates if (it.site, it.uploader_folder, it.download_dir) == group_key]
                     if prefer_largest:
                         same_group.sort(key=lambda x: (-x.file_size, x.enqueued_seq))
                     else:

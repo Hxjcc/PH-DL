@@ -14,6 +14,18 @@ from .database import Database
 STATUS_RANK = {"baseline": 1, "downloaded": 2, "uploaded": 3}
 
 
+def normalize_site(site: Optional[str]) -> str:
+    val = str(site or "pornhub").strip().lower()
+    return "xhamster" if val in {"xhamster", "xh"} else "pornhub"
+
+
+def _infer_site_from_url(url: Optional[str]) -> str:
+    low = str(url or "").strip().lower()
+    if "xhamster." in low:
+        return "xhamster"
+    return ""
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -121,9 +133,23 @@ class Repository:
     # ------------------------------------------------------------------
     # Targets (auto-update tracking list)
     # ------------------------------------------------------------------
-    async def list_targets(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
-        where = "WHERE enabled = 1" if enabled_only else ""
-        rows = await self.db.fetch_all(f"SELECT * FROM targets {where} ORDER BY LOWER(username) ASC, id ASC")
+    async def list_targets(
+        self,
+        enabled_only: bool = False,
+        site: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        query_params: List[Any] = []
+        if enabled_only:
+            clauses.append("enabled = 1")
+        if site and str(site).strip():
+            clauses.append("site = ?")
+            query_params.append(normalize_site(site))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = await self.db.fetch_all(
+            f"SELECT * FROM targets {where} ORDER BY LOWER(username) ASC, id ASC",
+            query_params,
+        )
         if not rows:
             return rows
 
@@ -132,7 +158,8 @@ class Repository:
         recent_publish_cutoff = local_date_days_ago(30)
         video_rows = await self.db.fetch_all(
             """
-            SELECT LOWER(uploader) AS uploader_lower,
+            SELECT LOWER(site) AS site_lower,
+                   LOWER(uploader) AS uploader_lower,
                    LOWER(target_type) AS target_type_lower,
                    COUNT(*) AS total_cnt,
                    SUM(CASE WHEN status IN ('downloaded', 'uploaded') THEN 1 ELSE 0 END) AS saved_cnt,
@@ -146,7 +173,7 @@ class Repository:
                        END
                    ) AS today_cnt
             FROM videos
-            GROUP BY LOWER(uploader), LOWER(target_type)
+            GROUP BY LOWER(site), LOWER(uploader), LOWER(target_type)
             """,
             (today_start_iso, recent_publish_cutoff),
         )
@@ -160,43 +187,55 @@ class Repository:
             bucket["baseline"] += base_c
             bucket["today"] += today_c
 
-        counts_by_pair: Dict[Tuple[str, str], Dict[str, int]] = {}
-        non_special_counts_by_uploader: Dict[str, Dict[str, int]] = {}
-        liked_counts = _empty_counts()
+        counts_by_pair: Dict[Tuple[str, str, str], Dict[str, int]] = {}
+        non_special_counts_by_uploader: Dict[Tuple[str, str], Dict[str, int]] = {}
+        liked_counts_by_site: Dict[str, Dict[str, int]] = {}
+        xh_favorites_counts = _empty_counts()
         for item in video_rows:
+            s_low = normalize_site(item.get("site_lower"))
             u_low = str(item.get("uploader_lower") or "").strip()
             t_low = str(item.get("target_type_lower") or "").strip()
             total_c = int(item.get("total_cnt") or 0)
             saved_c = int(item.get("saved_cnt") or 0)
             base_c = int(item.get("baseline_cnt") or 0)
             today_c = int(item.get("today_cnt") or 0)
-            pair_bucket = counts_by_pair.setdefault((u_low, t_low), _empty_counts())
+            pair_bucket = counts_by_pair.setdefault((s_low, u_low, t_low), _empty_counts())
             _add_counts(pair_bucket, total_c, saved_c, base_c, today_c)
             if t_low == "liked" or u_low == "my_liked":
-                _add_counts(liked_counts, total_c, saved_c, base_c, today_c)
+                liked_bucket = liked_counts_by_site.setdefault(s_low, _empty_counts())
+                _add_counts(liked_bucket, total_c, saved_c, base_c, today_c)
+            elif s_low == "xhamster" and (t_low == "favorites" or u_low == "my_favorites"):
+                _add_counts(xh_favorites_counts, total_c, saved_c, base_c, today_c)
             elif t_low != "favorites" and u_low:
-                user_bucket = non_special_counts_by_uploader.setdefault(u_low, _empty_counts())
+                user_bucket = non_special_counts_by_uploader.setdefault((s_low, u_low), _empty_counts())
                 _add_counts(user_bucket, total_c, saved_c, base_c, today_c)
 
-        non_special_targets_per_user: Dict[str, int] = {}
+        non_special_targets_per_user: Dict[Tuple[str, str], int] = {}
         for r in rows:
+            s_low = normalize_site(r.get("site"))
             u_low = str(r.get("username") or "").strip().lower()
             t_low = str(r.get("target_type") or "model").strip().lower()
             if t_low not in ("liked", "favorites") and u_low:
-                non_special_targets_per_user[u_low] = non_special_targets_per_user.get(u_low, 0) + 1
+                key = (s_low, u_low)
+                non_special_targets_per_user[key] = non_special_targets_per_user.get(key, 0) + 1
 
         for r in rows:
             r["enabled"] = bool(r["enabled"])
+            s_low = normalize_site(r.get("site"))
+            r["site"] = s_low
             u_low = str(r.get("username") or "").strip().lower()
             t_low = str(r.get("target_type") or "model").strip().lower()
             if t_low == "liked":
-                matched = liked_counts
+                matched = liked_counts_by_site.get(s_low) or _empty_counts()
             elif t_low == "favorites":
-                matched = counts_by_pair.get((u_low, "favorites")) or _empty_counts()
-            elif non_special_targets_per_user.get(u_low, 0) == 1:
-                matched = non_special_counts_by_uploader.get(u_low) or _empty_counts()
+                if s_low == "xhamster":
+                    matched = xh_favorites_counts
+                else:
+                    matched = counts_by_pair.get((s_low, u_low, "favorites")) or _empty_counts()
+            elif non_special_targets_per_user.get((s_low, u_low), 0) == 1:
+                matched = non_special_counts_by_uploader.get((s_low, u_low)) or _empty_counts()
             else:
-                matched = counts_by_pair.get((u_low, t_low)) or _empty_counts()
+                matched = counts_by_pair.get((s_low, u_low, t_low)) or _empty_counts()
 
             downloaded_today = matched["today"]
             checked_dt = _parse_iso_utc(r.get("last_checked_at"))
@@ -213,6 +252,7 @@ class Repository:
         row = await self.db.fetch_one("SELECT * FROM targets WHERE id = ?", (target_id,))
         if row:
             row["enabled"] = bool(row["enabled"])
+            row["site"] = normalize_site(row.get("site"))
         return row
 
     async def upsert_target(
@@ -223,12 +263,15 @@ class Repository:
         preferred_quality: str = "",
         avatar_url: str = "",
         display_name: str = "",
+        site: str = "pornhub",
     ) -> Dict[str, Any]:
-        norm_type = (target_type or "model").strip().lower()
-        norm_user = "_currentUser_" if norm_type == "liked" else username.strip()
+        norm_site = normalize_site(site)
+        norm_type = (target_type or ("creator" if norm_site == "xhamster" else "model")).strip().lower()
+        is_current_user = norm_type == "liked" or (norm_site == "xhamster" and norm_type == "favorites")
+        norm_user = "_currentUser_" if is_current_user else username.strip()
         existing = await self.db.fetch_one(
-            "SELECT * FROM targets WHERE LOWER(username) = LOWER(?) AND target_type = ?",
-            (norm_user, norm_type),
+            "SELECT * FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ?",
+            (norm_site, norm_user, norm_type),
         )
         if existing:
             await self.db.execute(
@@ -254,12 +297,13 @@ class Repository:
         new_id = await self.db.execute(
             """
             INSERT INTO targets (
-                username, target_type, enabled, preferred_quality, avatar_url,
+                site, username, target_type, enabled, preferred_quality, avatar_url,
                 display_name, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                norm_site,
                 norm_user,
                 norm_type,
                 1 if enabled else 0,
@@ -278,24 +322,37 @@ class Repository:
         *,
         avatar_url: str = "",
         display_name: str = "",
+        site: str = "pornhub",
     ) -> Tuple[Dict[str, Any], bool]:
         """Insert an enabled tracking target if absent; never overwrite existing enabled/quality settings."""
-        norm_type = (target_type or "model").strip().lower()
-        norm_user = "_currentUser_" if norm_type == "liked" else username.strip()
-        if norm_type in ("model", "pornstar"):
+        norm_site = normalize_site(site)
+        norm_type = (target_type or ("creator" if norm_site == "xhamster" else "model")).strip().lower()
+        is_current_user = norm_type == "liked" or (norm_site == "xhamster" and norm_type == "favorites")
+        norm_user = "_currentUser_" if is_current_user else username.strip()
+        if norm_site == "pornhub" and norm_type in ("model", "pornstar"):
             existing = await self.db.fetch_one(
                 """
                 SELECT * FROM targets
-                WHERE LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar')
+                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar')
                 ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
                 LIMIT 1
                 """,
-                (norm_user, norm_type),
+                (norm_site, norm_user, norm_type),
+            )
+        elif norm_site == "xhamster" and norm_type in ("creator", "pornstar"):
+            existing = await self.db.fetch_one(
+                """
+                SELECT * FROM targets
+                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('creator', 'pornstar')
+                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (norm_site, norm_user, norm_type),
             )
         else:
             existing = await self.db.fetch_one(
-                "SELECT * FROM targets WHERE LOWER(username) = LOWER(?) AND target_type = ?",
-                (norm_user, norm_type),
+                "SELECT * FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ?",
+                (norm_site, norm_user, norm_type),
             )
         if existing:
             clean_avatar = avatar_url.strip()
@@ -321,6 +378,7 @@ class Repository:
             preferred_quality="",
             avatar_url=avatar_url,
             display_name=display_name,
+            site=norm_site,
         )
         return created, True
 
@@ -351,6 +409,7 @@ class Repository:
         *,
         avatar_url: str = "",
         display_name: str = "",
+        site: str = "pornhub",
     ) -> None:
         sets: List[str] = []
         params: List[Any] = []
@@ -362,11 +421,12 @@ class Repository:
             params.append(display_name.strip())
         if not sets:
             return
-        params.extend([username.strip(), (target_type or "model").strip().lower()])
+        norm_site = normalize_site(site)
+        params.extend([norm_site, username.strip(), (target_type or "model").strip().lower()])
         await self.db.execute(
             f"""
             UPDATE targets SET {', '.join(sets)}
-            WHERE LOWER(username) = LOWER(?) AND target_type = ?
+            WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ?
             """,
             params,
         )
@@ -379,17 +439,21 @@ class Repository:
         username: str,
         target_type: str,
         avatar_url: str,
+        *,
+        site: str = "pornhub",
     ) -> None:
         await self.update_target_profile_by_username(
             username,
             target_type,
             avatar_url=avatar_url,
+            site=site,
         )
 
     async def update_target(self, target_id: int, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         existing = await self.get_target(target_id)
         if not existing:
             return None
+        site = normalize_site(existing.get("site"))
         old_username = str(existing.get("username") or "").strip()
         old_type = str(existing.get("target_type") or "model").strip().lower()
         allowed = {"enabled", "target_type", "preferred_quality", "username", "display_name"}
@@ -413,19 +477,24 @@ class Repository:
                 sets.append(f"{k} = ?")
                 params.append(val)
         if "username" in patch or "target_type" in patch:
-            if next_type in ("model", "pornstar"):
+            if site == "pornhub" and next_type in ("model", "pornstar"):
                 conflict = await self.db.fetch_one(
-                    "SELECT id FROM targets WHERE LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar') AND id != ?",
-                    (next_username, target_id),
+                    "SELECT id FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar') AND id != ?",
+                    (site, next_username, target_id),
+                )
+            elif site == "xhamster" and next_type in ("creator", "pornstar"):
+                conflict = await self.db.fetch_one(
+                    "SELECT id FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('creator', 'pornstar') AND id != ?",
+                    (site, next_username, target_id),
                 )
             else:
                 conflict = await self.db.fetch_one(
-                    "SELECT id FROM targets WHERE LOWER(username) = LOWER(?) AND target_type = ? AND id != ?",
-                    (next_username, next_type, target_id),
+                    "SELECT id FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ? AND id != ?",
+                    (site, next_username, next_type, target_id),
                 )
             if conflict:
                 raise sqlite3.IntegrityError(
-                    "UNIQUE constraint failed: targets.username, targets.target_type"
+                    "UNIQUE constraint failed: targets.site, targets.username, targets.target_type"
                 )
         if sets:
             params.append(target_id)
@@ -439,20 +508,33 @@ class Repository:
                     """
                     UPDATE videos
                     SET uploader = ?
-                    WHERE LOWER(uploader) = LOWER(?) AND LOWER(target_type) = 'favorites'
+                    WHERE site = ? AND LOWER(uploader) = LOWER(?) AND LOWER(target_type) = 'favorites'
                     """,
-                    (next_username, old_username),
+                    (next_username, site, old_username),
                 )
-            elif old_type in ("model", "pornstar") and next_type in ("model", "pornstar"):
+            elif site == "pornhub" and old_type in ("model", "pornstar") and next_type in ("model", "pornstar"):
                 await self.db.execute(
                     """
                     UPDATE videos
                     SET uploader = ?,
                         target_type = CASE WHEN LOWER(target_type) IN ('model', 'pornstar') THEN ? ELSE target_type END
-                    WHERE LOWER(uploader) = LOWER(?)
+                    WHERE site = ?
+                      AND LOWER(uploader) = LOWER(?)
                       AND LOWER(target_type) NOT IN ('favorites', 'liked')
                     """,
-                    (next_username, next_type, old_username),
+                    (next_username, next_type, site, old_username),
+                )
+            elif site == "xhamster" and old_type not in ("favorites", "liked") and next_type not in ("favorites", "liked"):
+                await self.db.execute(
+                    """
+                    UPDATE videos
+                    SET uploader = ?,
+                        target_type = ?
+                    WHERE site = ?
+                      AND LOWER(uploader) = LOWER(?)
+                      AND LOWER(target_type) = ?
+                    """,
+                    (next_username, next_type, site, old_username, old_type),
                 )
         return await self.get_target(target_id)
 
@@ -498,7 +580,7 @@ class Repository:
     async def list_pending_upload_videos(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Downloaded videos whose local file may still need to be uploaded."""
         sql = """
-            SELECT viewkey, title, uploader, target_type, quality, local_path,
+            SELECT viewkey, site, title, uploader, target_type, quality, local_path,
                    file_size, video_page_url, downloaded_at, published_at, duration_seconds
             FROM videos
             WHERE status = 'downloaded'
@@ -557,7 +639,7 @@ class Repository:
         limit: int = 0,
     ) -> List[Dict[str, Any]]:
         sql = """
-            SELECT viewkey, title, uploader, target_type, quality, file_size, video_page_url
+            SELECT viewkey, site, title, uploader, target_type, quality, file_size, video_page_url
             FROM videos
             WHERE status = 'baseline'
               AND video_page_url != ''
@@ -604,11 +686,12 @@ class Repository:
 
     _UPSERT_VIDEO_SQL = """
         INSERT INTO videos (
-            viewkey, title, uploader, target_type, quality, video_page_url,
+            viewkey, site, title, uploader, target_type, quality, video_page_url,
             status, local_path, remote_path, file_size, downloaded_at, uploaded_at, created_at,
             upload_requested, published_at, duration_seconds
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(viewkey) DO UPDATE SET
+            site = CASE WHEN ? != '' THEN ? ELSE videos.site END,
             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE videos.title END,
             uploader = CASE
                 WHEN excluded.uploader = '' THEN videos.uploader
@@ -665,6 +748,7 @@ class Repository:
     def _build_upsert_video_params(
         viewkey: str,
         *,
+        site: str = "",
         title: str = "",
         uploader: str = "",
         target_type: str = "",
@@ -683,13 +767,21 @@ class Repository:
         now_iso: Optional[str] = None,
     ) -> tuple[Any, ...]:
         now = now_iso or utc_now_iso()
-        explicit_type = (target_type or "").strip().lower()
-        insert_type = explicit_type or "model"
         explicit_url = (video_page_url or "").strip()
-        insert_url = explicit_url or f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
+        explicit_site = normalize_site(site) if str(site or "").strip() else _infer_site_from_url(explicit_url)
+        insert_site = explicit_site or "pornhub"
+        explicit_type = (target_type or "").strip().lower()
+        insert_type = explicit_type or ("creator" if insert_site == "xhamster" else "model")
+        if explicit_url:
+            insert_url = explicit_url
+        elif insert_site == "xhamster":
+            insert_url = f"https://xhamster.com/videos/{viewkey}"
+        else:
+            insert_url = f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
         force_flag = 1 if force_status else 0
         return (
             viewkey,
+            insert_site,
             title or "",
             uploader or "",
             insert_type,
@@ -705,6 +797,8 @@ class Repository:
             int(bool(upload_requested)),
             (published_at or "").strip(),
             max(0, int(duration_seconds or 0)),
+            explicit_site,
+            explicit_site,
             explicit_type,
             force_flag,
             explicit_type,
@@ -724,6 +818,7 @@ class Repository:
         self,
         viewkey: str,
         *,
+        site: str = "",
         title: str = "",
         uploader: str = "",
         target_type: str = "",
@@ -744,6 +839,7 @@ class Repository:
             return
         params = self._build_upsert_video_params(
             viewkey,
+            site=site,
             title=title,
             uploader=uploader,
             target_type=target_type,
@@ -779,6 +875,7 @@ class Repository:
             param_rows.append(
                 self._build_upsert_video_params(
                     vk,
+                    site=str(rec.get("site") or ""),
                     title=rec.get("title", ""),
                     uploader=rec.get("uploader", ""),
                     target_type=rec.get("target_type", ""),
@@ -864,25 +961,27 @@ class Repository:
             )
         return deleted
 
-    async def _get_target_display_map(self) -> Dict[str, str]:
+    async def _get_target_display_map(self) -> Dict[Tuple[str, str], str]:
         rows = await self.db.fetch_all(
             """
-            SELECT LOWER(username) AS uname, display_name
+            SELECT LOWER(site) AS site_low, LOWER(username) AS uname, display_name
             FROM targets
             WHERE display_name != ''
             ORDER BY id ASC
             """
         )
-        mapping: Dict[str, str] = {}
+        mapping: Dict[Tuple[str, str], str] = {}
         for r in rows:
+            s_low = normalize_site(r.get("site_low"))
             uname = r["uname"]
-            if uname and uname not in mapping:
-                mapping[uname] = r["display_name"]
+            if uname and (s_low, uname) not in mapping:
+                mapping[(s_low, uname)] = r["display_name"]
         return mapping
 
     async def query_videos(
         self,
         *,
+        site: str = "",
         search: str = "",
         uploader: str = "",
         status: str = "",
@@ -894,6 +993,9 @@ class Repository:
     ) -> Tuple[List[Dict[str, Any]], int]:
         clauses = []
         params: List[Any] = []
+        if (site or "").strip():
+            clauses.append("v.site = ?")
+            params.append(normalize_site(site))
         search_clean = search.strip()
         if search_clean:
             like = f"%{search_clean}%"
@@ -915,6 +1017,8 @@ class Repository:
             u_clean = uploader.strip()
             if u_clean.lower() == "my_liked":
                 clauses.append("(LOWER(v.uploader) = 'my_liked' OR LOWER(v.target_type) = 'liked')")
+            elif u_clean.lower() == "my_favorites":
+                clauses.append("(LOWER(v.uploader) = 'my_favorites' OR (v.site = 'xhamster' AND LOWER(v.target_type) = 'favorites'))")
             else:
                 clauses.append("LOWER(v.uploader) = LOWER(?)")
                 params.append(u_clean)
@@ -971,47 +1075,76 @@ class Repository:
         )
         display_map = await self._get_target_display_map() if rows else {}
         for row in rows:
+            s_low = normalize_site(row.get("site"))
+            row["site"] = s_low
             uname = str(row.get("uploader") or "").strip().lower()
             t_low = str(row.get("target_type") or "").strip().lower()
             if uname == "my_liked" or (not uname and t_low == "liked"):
                 row["uploader_display_name"] = "Liked Videos"
+            elif s_low == "xhamster" and (uname == "my_favorites" or (not uname and t_low == "favorites")):
+                row["uploader_display_name"] = "xHamster Favorites"
             else:
-                row["uploader_display_name"] = display_map.get(uname, "")
+                row["uploader_display_name"] = display_map.get((s_low, uname), "")
         return rows, total
 
-    async def get_video_filter_facets(self) -> Dict[str, Any]:
+    async def get_video_filter_facets(self, site: str = "") -> Dict[str, Any]:
+        site_filter = normalize_site(site) if (site or "").strip() else ""
+        where_site = " AND site = ?" if site_filter else ""
+        site_params = (site_filter,) if site_filter else ()
         uploader_rows = await self.db.fetch_all(
-            """
-            SELECT DISTINCT uploader
+            f"""
+            SELECT DISTINCT uploader, site
             FROM videos
-            WHERE uploader != ''
+            WHERE uploader != ''{where_site}
             ORDER BY LOWER(uploader) ASC
-            """
+            """,
+            site_params,
         )
         has_liked_row = await self.db.fetch_one(
-            "SELECT 1 AS hit FROM videos WHERE LOWER(target_type) = 'liked' LIMIT 1"
+            f"SELECT 1 AS hit FROM videos WHERE LOWER(target_type) = 'liked'{where_site} LIMIT 1",
+            site_params,
         )
         display_map = await self._get_target_display_map()
         qualities = await self.db.fetch_all(
-            """
+            f"""
             SELECT DISTINCT quality FROM videos
-            WHERE quality != ''
+            WHERE quality != ''{where_site}
             ORDER BY CAST(REPLACE(REPLACE(LOWER(quality), 'p', ''), 'k', '') AS INTEGER) DESC,
                      quality DESC
-            """
+            """,
+            site_params,
         )
-        uploaders = [r["uploader"] for r in uploader_rows]
+        site_rows = await self.db.fetch_all("SELECT DISTINCT site FROM videos WHERE site != '' ORDER BY site ASC")
+        uploaders: List[str] = []
+        seen_up: Set[str] = set()
+        uploader_sites: Dict[str, str] = {}
+        for r in uploader_rows:
+            u = r["uploader"]
+            if u not in seen_up:
+                seen_up.add(u)
+                uploaders.append(u)
+                uploader_sites[u] = normalize_site(r.get("site"))
         if has_liked_row and not any(u.strip().lower() == "my_liked" for u in uploaders):
             uploaders.append("My_Liked")
+            uploader_sites["My_Liked"] = "pornhub"
             uploaders.sort(key=lambda u: u.lower())
         uploader_labels: Dict[str, str] = {}
         for u in uploaders:
             low = u.strip().lower()
             if low == "my_liked":
                 uploader_labels[u] = "Liked Videos"
+            elif low == "my_favorites":
+                uploader_labels[u] = "xHamster Favorites"
             else:
-                uploader_labels[u] = display_map.get(low) or u
+                s_low = site_filter or uploader_sites.get(u, "pornhub")
+                uploader_labels[u] = (
+                    display_map.get((s_low, low))
+                    or display_map.get(("pornhub", low))
+                    or display_map.get(("xhamster", low))
+                    or u
+                )
         return {
+            "sites": [normalize_site(r["site"]) for r in site_rows],
             "uploaders": uploaders,
             "uploader_labels": uploader_labels,
             "qualities": [r["quality"] for r in qualities],
@@ -1207,11 +1340,11 @@ class Repository:
         step = max(1, int(chunk_size))
         sql = """
             INSERT INTO job_items (
-                job_id, viewkey, title, uploader, target_type, page_url,
+                job_id, site, viewkey, title, uploader, target_type, page_url,
                 download_url, referer_url, quality, status, temp_path, local_path,
                 bytes_downloaded, updated_at, upload_requested, error_message,
                 published_at, duration_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
         """
         for start in range(0, len(items), step):
@@ -1219,13 +1352,17 @@ class Repository:
             async with self.db.transaction() as conn:
                 for spec in batch:
                     up_req = spec.get("upload_requested")
+                    page_url = spec.get("page_url", "")
+                    raw_site = str(spec.get("site") or "").strip()
+                    item_site = normalize_site(raw_site) if raw_site else (_infer_site_from_url(page_url) or "pornhub")
                     params = (
                         job_id,
+                        item_site,
                         spec.get("viewkey", ""),
                         spec.get("title", ""),
                         spec.get("uploader", ""),
-                        spec.get("target_type", "model"),
-                        spec.get("page_url", ""),
+                        spec.get("target_type", "creator" if item_site == "xhamster" else "model"),
+                        page_url,
                         spec.get("download_url", ""),
                         spec.get("referer_url", ""),
                         spec.get("quality", ""),
@@ -1254,6 +1391,7 @@ class Repository:
         uploader: str,
         target_type: str,
         page_url: str,
+        site: str = "",
         download_url: str = "",
         referer_url: str = "",
         quality: str = "",
@@ -1266,17 +1404,19 @@ class Repository:
         published_at: str = "",
         duration_seconds: int = 0,
     ) -> Dict[str, Any]:
+        item_site = normalize_site(site) if (site or "").strip() else (_infer_site_from_url(page_url) or "pornhub")
         item_id = await self.db.execute(
             """
             INSERT INTO job_items (
-                job_id, viewkey, title, uploader, target_type, page_url,
+                job_id, site, viewkey, title, uploader, target_type, page_url,
                 download_url, referer_url, quality, status, temp_path, local_path,
                 bytes_downloaded, updated_at, upload_requested, error_message,
                 published_at, duration_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
+                item_site,
                 viewkey,
                 title,
                 uploader,
@@ -1318,6 +1458,7 @@ class Repository:
 
     async def update_job_item(self, item_id: int, **fields: Any) -> Optional[Dict[str, Any]]:
         allowed = {
+            "site",
             "viewkey",
             "title",
             "uploader",
