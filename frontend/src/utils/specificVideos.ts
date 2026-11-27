@@ -1,4 +1,4 @@
-export function normalizePositionPart(part) {
+export function normalizePositionPart(part: string): string | null {
   const m = String(part || '').trim().match(/^(\d{1,5})(?:\s*-\s*(\d{1,5}))?$/)
   if (!m) return null
   const start = Number(m[1])
@@ -7,7 +7,7 @@ export function normalizePositionPart(part) {
   return start === end ? String(start) : `${start}-${end}`
 }
 
-export function parseSpecificVideoDraft(raw, currentTags = [], defaultPage = 1) {
+export function parseSpecificVideoDraft(raw: string, currentTags: readonly string[] = [], defaultPage: string | number = 1) {
   const safeDefaultPage = Math.max(1, Number(defaultPage) || 1)
   const nextTags = [...currentTags]
   const segments = String(raw || '')
@@ -53,8 +53,8 @@ export function parseSpecificVideoDraft(raw, currentTags = [], defaultPage = 1) 
   return { tags: nextTags, invalidFound }
 }
 
-export function serializeSpecificVideoSpecs(tags = [], fallbackPage = 1) {
-  const byPage = new Map()
+export function serializeSpecificVideoSpecs(tags: readonly string[] = [], fallbackPage: string | number = 1): string {
+  const byPage = new Map<number, string[]>()
   const safeFallbackPage = Math.max(1, Number(fallbackPage) || 1)
   for (const rawTag of tags) {
     const text = String(rawTag || '').trim()
@@ -62,13 +62,13 @@ export function serializeSpecificVideoSpecs(tags = [], fallbackPage = 1) {
     const m = text.match(/^(\d{1,5})页:(.+)$/)
     const page = m ? Number(m[1]) : safeFallbackPage
     const expr = m ? m[2] : text
-    const parts = expr.split(',').map(normalizePositionPart).filter(Boolean)
+    const parts = expr.split(',').map(normalizePositionPart).filter((part): part is string => Boolean(part))
     if (!parts.length) continue
-    if (!byPage.has(page)) byPage.set(page, [])
-    const existing = byPage.get(page)
+    const existing = byPage.get(page) ?? []
     for (const p of parts) {
       if (!existing.includes(p)) existing.push(p)
     }
+    byPage.set(page, existing)
   }
   return Array.from(byPage.entries())
     .sort((a, b) => a[0] - b[0])

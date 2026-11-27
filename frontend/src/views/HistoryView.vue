@@ -1,6 +1,7 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, nextTick, onActivated, onDeactivated, onUnmounted, reactive, ref, shallowRef, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type LocationQuery } from 'vue-router'
 import {
   Search,
   Trash2,
@@ -17,6 +18,7 @@ import {
   CalendarDays,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
+import type { SiteKey, VideoFilterFacets, VideoFilters, VideoRecord, VideoStats, VideoStatus } from '../types/api'
 import { useAppStore } from '../stores/app'
 import { formatBytes, formatDateTime, formatPublishedDate, formatVideoDuration, videoStatusMeta } from '../utils/format'
 import Card from '../components/ui/Card.vue'
@@ -39,25 +41,29 @@ const VALID_HISTORY_STATUSES = new Set(['uploaded', 'downloaded', 'baseline'])
 const VALID_HISTORY_TIME_RANGES = new Set(['published_7d', 'published_30d', 'activity_7d'])
 const VALID_HISTORY_SORTS = new Set(['activity', 'published'])
 
-function firstQueryStr(val) {
+type HistoryStats = Omit<VideoStats, 'baseline_missing_metadata'> & Partial<Pick<VideoStats, 'baseline_missing_metadata'>>
+type VideoPage = { items: VideoRecord[]; total: number }
+type Timer = ReturnType<typeof setTimeout>
+
+function firstQueryStr(val: LocationQuery[string] | undefined) {
   const raw = Array.isArray(val) ? val[0] : val
   return typeof raw === 'string' ? raw.trim() : ''
 }
 
-function parseHistoryRouteQuery(query = {}) {
+function parseHistoryRouteQuery(query: LocationQuery = {}): Omit<VideoFilters, 'page_size'> {
   const rawSite = firstQueryStr(query.site).toLowerCase()
   const rawStatus = firstQueryStr(query.status).toLowerCase()
   const rawTime = firstQueryStr(query.time_range)
   const rawSort = firstQueryStr(query.sort)
   const rawPage = Number.parseInt(firstQueryStr(query.page), 10)
   return {
-    site: VALID_HISTORY_SITES.has(rawSite) ? rawSite : '',
+    site: VALID_HISTORY_SITES.has(rawSite) ? rawSite as SiteKey : '',
     search: firstQueryStr(query.q),
     uploader: firstQueryStr(query.uploader),
-    status: VALID_HISTORY_STATUSES.has(rawStatus) ? rawStatus : '',
+    status: VALID_HISTORY_STATUSES.has(rawStatus) ? rawStatus as VideoStatus : '',
     quality: firstQueryStr(query.quality),
-    time_range: VALID_HISTORY_TIME_RANGES.has(rawTime) ? rawTime : '',
-    sort_by: VALID_HISTORY_SORTS.has(rawSort) ? rawSort : 'activity',
+    time_range: VALID_HISTORY_TIME_RANGES.has(rawTime) ? rawTime as VideoFilters['time_range'] : '',
+    sort_by: VALID_HISTORY_SORTS.has(rawSort) ? rawSort as VideoFilters['sort_by'] : 'activity',
     page: Number.isFinite(rawPage) && rawPage > 1 ? rawPage : 1,
   }
 }
@@ -79,16 +85,16 @@ const fetching = ref(false)
 const refreshing = ref(false)
 const enriching = ref(false)
 const batchDeleting = ref(false)
-const playingVideo = shallowRef(null)
-let playbackTrigger = null
-const selectedViewkeys = ref(new Set())
+const playingVideo = shallowRef<VideoRecord | null>(null)
+let playbackTrigger: HTMLElement | null = null
+const selectedViewkeys = ref(new Set<string>())
 const deleteLocalSingle = ref(false)
 const deleteLocalBatch = ref(false)
 const activeDeleteKey = ref('')
 const deletePopoverDefaultOpen = ref(false)
 const items = shallowRef(cached && initialIsDefault ? [...cached.items] : [])
 const total = ref(cached && initialIsDefault ? cached.total : 0)
-const facets = ref(
+const facets = ref<Omit<VideoFilterFacets, 'sites'>>(
   cached
     ? {
         uploaders: [...(cached.facets?.uploaders || [])],
@@ -97,15 +103,15 @@ const facets = ref(
       }
     : { uploaders: [], uploader_labels: {}, qualities: [] }
 )
-const stats = ref(
+const stats = ref<HistoryStats>(
   cached
-    ? { published_7d: 0, ...cached.stats }
+    ? Object.assign({ published_7d: 0 }, cached.stats)
     : store.overview?.videos
-      ? { published_7d: 0, ...store.overview.videos }
+      ? Object.assign({ published_7d: 0 }, store.overview.videos)
       : { total: 0, uploaded: 0, downloaded: 0, baseline: 0, published_7d: 0 }
 )
 
-const filters = reactive({
+const filters = reactive<VideoFilters>({
   ...initialRouteFilters,
   page_size: store.historyPageSize,
 })
@@ -114,19 +120,19 @@ const siteOptions = [
   { label: '全部站点', value: '' },
   { label: 'PornHub', value: 'pornhub' },
   { label: 'xHamster', value: 'xhamster' },
-]
+] as const
 
 const timeRangeOptions = [
   { label: '全部时间', value: '' },
   { label: '近 7 天发布', value: 'published_7d' },
   { label: '近 30 天发布', value: 'published_30d' },
   { label: '近 7 天入库', value: 'activity_7d' },
-]
+] as const
 
 const sortOptions = [
   { label: '按记录时间', value: 'activity' },
   { label: '按发布日期', value: 'published' },
-]
+] as const
 
 const pageSizeOptions = HISTORY_PAGE_SIZES.map((value) => ({ label: `${value} 条`, value }))
 
@@ -148,7 +154,7 @@ const partiallySelected = computed(
   () => selectedViewkeys.value.size > 0 && selectedViewkeys.value.size < items.value.length
 )
 
-function toggleSelectVideo(viewkey) {
+function toggleSelectVideo(viewkey: string) {
   const next = new Set(selectedViewkeys.value)
   if (next.has(viewkey)) next.delete(viewkey)
   else next.add(viewkey)
@@ -221,7 +227,7 @@ const statCards = computed(() => [
     active: filters.time_range === 'published_7d',
     spanClass: 'col-span-2 sm:col-span-1',
   },
-])
+] as const)
 
 const uploaderOptions = computed(() => {
   const list = facets.value.uploaders || []
@@ -249,26 +255,26 @@ const statusOptions = [
   { label: '已上传云端', value: 'uploaded' },
   { label: '本地已下载', value: 'downloaded' },
   { label: '仅基线去重', value: 'baseline' },
-]
+] as const
 
 const qualityOptions = computed(() => [
   { label: '全部画质', value: '' },
   ...(facets.value.qualities || []).map((q) => ({ label: q, value: q })),
 ])
 
-let debounceTimer = null
-let loadingTimer = null
-let fetchingTimer = null
-let prefetchTimer = null
+let debounceTimer: Timer | null = null
+let loadingTimer: Timer | null = null
+let fetchingTimer: Timer | null = null
+let prefetchTimer: Timer | null = null
 let reqSeq = 0
 let activatedOnce = false
 let routeActive = false
-let activeAbortController = null
+let activeAbortController: AbortController | null = null
 
 const QUERY_CACHE_MAX = 48
 const QUERY_CACHE_TTL_MS = 45_000
-const queryCache = new Map()
-const inflightPrefetches = new Map()
+const queryCache = new Map<string, VideoPage & { ts: number }>()
+const inflightPrefetches = new Map<string, { promise: Promise<VideoPage | null>; controller: AbortController }>()
 
 function buildQueryCacheKey(page = filters.page) {
   return [
@@ -284,7 +290,7 @@ function buildQueryCacheKey(page = filters.page) {
   ].join('\x1f')
 }
 
-function readQueryCache(key) {
+function readQueryCache(key: string) {
   const entry = queryCache.get(key)
   if (!entry) return null
   if (Date.now() - entry.ts > QUERY_CACHE_TTL_MS) {
@@ -296,7 +302,7 @@ function readQueryCache(key) {
   return entry
 }
 
-function writeQueryCache(key, itemsList, totalCount) {
+function writeQueryCache(key: string, itemsList: VideoRecord[], totalCount: number) {
   queryCache.delete(key)
   queryCache.set(key, { items: itemsList, total: totalCount, ts: Date.now() })
   if (queryCache.size > QUERY_CACHE_MAX) {
@@ -306,7 +312,7 @@ function writeQueryCache(key, itemsList, totalCount) {
 }
 
 function cancelAllPrefetches() {
-  clearTimeout(prefetchTimer)
+  clearTimeout(prefetchTimer ?? undefined)
   prefetchTimer = null
   for (const entry of inflightPrefetches.values()) {
     entry.controller.abort()
@@ -319,7 +325,7 @@ function invalidateQueryCache() {
   cancelAllPrefetches()
 }
 
-function prefetchPage(targetPage) {
+function prefetchPage(targetPage: number) {
   if (targetPage < 1 || targetPage > totalPages.value || targetPage === filters.page) return
   const key = buildQueryCacheKey(targetPage)
   if (readQueryCache(key) || inflightPrefetches.has(key)) return
@@ -358,7 +364,7 @@ function prefetchPage(targetPage) {
 
 function scheduleAdjacentPrefetch() {
   if (!routeActive) return
-  clearTimeout(prefetchTimer)
+  clearTimeout(prefetchTimer ?? undefined)
   prefetchTimer = setTimeout(() => {
     prefetchTimer = null
     if (filters.page < totalPages.value) {
@@ -374,14 +380,14 @@ function hasLoadedMeta() {
   return (facets.value.uploaders?.length || 0) > 0 || Number(stats.value.total || 0) > 0
 }
 
-function warmDeleteRowPopover(viewkey) {
+function warmDeleteRowPopover(viewkey: string) {
   if (activeDeleteKey.value !== viewkey) {
     deletePopoverDefaultOpen.value = false
     activeDeleteKey.value = viewkey
   }
 }
 
-function openDeleteRowPopoverNow(viewkey) {
+function openDeleteRowPopoverNow(viewkey: string) {
   deleteLocalSingle.value = false
   deletePopoverDefaultOpen.value = true
   activeDeleteKey.value = viewkey
@@ -401,7 +407,7 @@ function isDefaultFilters() {
   )
 }
 
-function applyVideoList(nextItems, nextTotal) {
+function applyVideoList(nextItems: VideoRecord[], nextTotal: number) {
   items.value = nextItems
   total.value = nextTotal
   if (selectedViewkeys.value.size > 0) {
@@ -424,8 +430,8 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
         activeAbortController = null
       }
       ++reqSeq
-      clearTimeout(loadingTimer)
-      clearTimeout(fetchingTimer)
+      clearTimeout(loadingTimer ?? undefined)
+      clearTimeout(fetchingTimer ?? undefined)
       applyVideoList(hit.items, hit.total)
       loading.value = false
       fetching.value = false
@@ -440,8 +446,8 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
         activeAbortController = null
       }
       const seq = ++reqSeq
-      clearTimeout(loadingTimer)
-      clearTimeout(fetchingTimer)
+      clearTimeout(loadingTimer ?? undefined)
+      clearTimeout(fetchingTimer ?? undefined)
       if (!silent) {
         fetchingTimer = setTimeout(() => {
           if (seq === reqSeq) fetching.value = true
@@ -449,8 +455,8 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
       }
       const prefetched = await pending.promise
       if (seq !== reqSeq) return
-      clearTimeout(loadingTimer)
-      clearTimeout(fetchingTimer)
+      clearTimeout(loadingTimer ?? undefined)
+      clearTimeout(fetchingTimer ?? undefined)
       if (prefetched) {
         applyVideoList(prefetched.items, prefetched.total)
         loading.value = false
@@ -469,8 +475,8 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
   activeAbortController = controller
 
   const seq = ++reqSeq
-  clearTimeout(loadingTimer)
-  clearTimeout(fetchingTimer)
+  clearTimeout(loadingTimer ?? undefined)
+  clearTimeout(fetchingTimer ?? undefined)
   if (!silent && items.value.length === 0) {
     loadingTimer = setTimeout(() => {
       if (seq === reqSeq) loading.value = true
@@ -508,26 +514,26 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
       store.setHistoryCache(res)
     }
     scheduleAdjacentPrefetch()
-  } catch (err) {
-    if (err?.name === 'AbortError') return
+  } catch (err: unknown) {
+    if (typeof err === 'object' && err !== null && 'name' in err && err.name === 'AbortError') return
     if (seq === reqSeq) {
-      store.notify(err.message, 'error')
+      store.notify(getErrorMessage(err), 'error')
     }
   } finally {
     if (activeAbortController === controller) {
       activeAbortController = null
     }
     if (seq === reqSeq) {
-      clearTimeout(loadingTimer)
-      clearTimeout(fetchingTimer)
+      clearTimeout(loadingTimer ?? undefined)
+      clearTimeout(fetchingTimer ?? undefined)
       loading.value = false
       fetching.value = false
     }
   }
 }
 
-function buildHistoryRouteQuery() {
-  const q = {}
+function buildHistoryRouteQuery(): Record<string, string> {
+  const q: Record<string, string> = {}
   if (filters.site) q.site = filters.site
   if (filters.uploader) q.uploader = filters.uploader
   if (filters.status) q.status = filters.status
@@ -539,7 +545,7 @@ function buildHistoryRouteQuery() {
   return q
 }
 
-function historyQueriesEqual(a, b) {
+function historyQueriesEqual(a: Record<string, string>, b: Record<string, string>) {
   const keysA = Object.keys(a)
   const keysB = Object.keys(b)
   if (keysA.length !== keysB.length) return false
@@ -549,7 +555,7 @@ function historyQueriesEqual(a, b) {
 function syncHistoryQueryToUrl() {
   if (route.name !== 'history') return
   const nextQuery = buildHistoryRouteQuery()
-  const currentRaw = {}
+  const currentRaw: Record<string, string> = {}
   for (const [k, v] of Object.entries(route.query || {})) {
     const s = firstQueryStr(v)
     if (s) currentRaw[k] = s
@@ -561,7 +567,7 @@ function syncHistoryQueryToUrl() {
 function triggerSearch() {
   filters.page = 1
   cancelAllPrefetches()
-  clearTimeout(debounceTimer)
+  clearTimeout(debounceTimer ?? undefined)
   debounceTimer = setTimeout(() => {
     syncHistoryQueryToUrl()
     loadVideos({ includeMeta: false, useCache: true })
@@ -571,7 +577,7 @@ function triggerSearch() {
 function changeFilter() {
   filters.page = 1
   cancelAllPrefetches()
-  clearTimeout(debounceTimer)
+  clearTimeout(debounceTimer ?? undefined)
   syncHistoryQueryToUrl()
   loadVideos({ includeMeta: false, useCache: true })
 }
@@ -580,23 +586,23 @@ function changeSiteFilter() {
   filters.uploader = ''
   filters.page = 1
   cancelAllPrefetches()
-  clearTimeout(debounceTimer)
+  clearTimeout(debounceTimer ?? undefined)
   syncHistoryQueryToUrl()
   loadVideos({ includeMeta: true, useCache: false })
 }
 
-function changePageSize(value) {
+function changePageSize(value: string) {
   if (Number(value) === filters.page_size || !store.setHistoryPageSize(value)) return
   filters.page_size = store.historyPageSize
   filters.page = 1
   clearSelection()
   cancelAllPrefetches()
-  clearTimeout(debounceTimer)
+  clearTimeout(debounceTimer ?? undefined)
   syncHistoryQueryToUrl()
   loadVideos({ includeMeta: false, useCache: true })
 }
 
-let sortBeforeTimeRange = null
+let sortBeforeTimeRange: VideoFilters['sort_by'] | null = null
 
 function changeSortBy() {
   sortBeforeTimeRange = null
@@ -617,7 +623,7 @@ function changeTimeRange() {
   changeFilter()
 }
 
-function selectStatCard(card) {
+function selectStatCard(card: typeof statCards.value[number]) {
   if (card.kind === 'all') {
     if (filters.status === '' && filters.time_range === '') return
     filters.status = ''
@@ -642,7 +648,7 @@ function selectStatCard(card) {
   changeFilter()
 }
 
-function goPage(p) {
+function goPage(p: number) {
   if (p < 1 || p > totalPages.value || p === filters.page) return
   activeDeleteKey.value = ''
   deletePopoverDefaultOpen.value = false
@@ -651,8 +657,8 @@ function goPage(p) {
   loadVideos({ includeMeta: false, useCache: true })
 }
 
-function openPlayback(video, event) {
-  playbackTrigger = event.currentTarget
+function openPlayback(video: VideoRecord, event: MouseEvent) {
+  playbackTrigger = event.currentTarget as HTMLElement | null
   playingVideo.value = video
 }
 
@@ -664,18 +670,18 @@ async function closePlayback() {
   if (trigger?.isConnected) trigger.focus({ preventScroll: true })
 }
 
-async function handleRedownload(v) {
+async function handleRedownload(v: VideoRecord) {
   try {
     const res = await api.redownloadVideo(v.viewkey)
     store.notify(`已创建重下任务 #${res.job.id}`, 'success')
     await store.refreshJobs()
     router.push({ name: 'jobs' })
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   }
 }
 
-async function handleDelete(v) {
+async function handleDelete(v: VideoRecord) {
   try {
     const res = await api.deleteVideo(v.viewkey, deleteLocalSingle.value)
     deleteLocalSingle.value = false
@@ -689,8 +695,8 @@ async function handleDelete(v) {
       filters.page -= 1
       await loadVideos({ silent: true, includeMeta: false })
     }
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   }
 }
 
@@ -710,8 +716,8 @@ async function handleBatchDelete() {
       filters.page -= 1
       await loadVideos({ silent: true, includeMeta: false })
     }
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     batchDeleting.value = false
   }
@@ -736,8 +742,8 @@ async function handleEnrichMetadata() {
     store.notify(`已创建元数据补全任务 #${res.job.id}，共 ${res.count} 条`, 'success')
     await store.refreshJobs()
     router.push({ name: 'jobs' })
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     enriching.value = false
   }
@@ -755,10 +761,10 @@ watch(
       uploader_labels: { ...(val.facets?.uploader_labels || {}) },
       qualities: [...(val.facets?.qualities || [])],
     }
-    stats.value = {
-      published_7d: 0,
-      ...(val.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0 }),
-    }
+    stats.value = Object.assign(
+      { published_7d: 0 },
+      val.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0 }
+    )
   }
 )
 
@@ -799,7 +805,7 @@ watch(
     if (name !== 'history' || !activatedOnce || !routeActive) return
     const { changed, siteChanged } = applyRouteQueryFilters()
     if (!changed) return
-    clearTimeout(debounceTimer)
+    clearTimeout(debounceTimer ?? undefined)
     cancelAllPrefetches()
     loadVideos({ silent: false, includeMeta: siteChanged, useCache: !siteChanged })
   }
@@ -840,9 +846,9 @@ onActivated(() => {
 function stopHistoryRequests() {
   routeActive = false
   ++reqSeq
-  clearTimeout(debounceTimer)
-  clearTimeout(loadingTimer)
-  clearTimeout(fetchingTimer)
+  clearTimeout(debounceTimer ?? undefined)
+  clearTimeout(loadingTimer ?? undefined)
+  clearTimeout(fetchingTimer ?? undefined)
   cancelAllPrefetches()
   activeAbortController?.abort()
   activeAbortController = null

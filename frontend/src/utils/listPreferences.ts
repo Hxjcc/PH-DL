@@ -8,7 +8,7 @@ const storageKeys = {
   targets: 'phdl-targets-page-size',
 }
 
-export function readListPreference(kind, choices, fallback = 30) {
+export function readListPreference(kind: keyof typeof storageKeys, choices: readonly number[], fallback = 30): number {
   try {
     const raw = localStorage.getItem(storageKeys[kind])
     if (raw === null || raw === '') return fallback
@@ -19,7 +19,7 @@ export function readListPreference(kind, choices, fallback = 30) {
   }
 }
 
-export function saveListPreference(kind, value) {
+export function saveListPreference(kind: keyof typeof storageKeys, value: number): void {
   try {
     localStorage.setItem(storageKeys[kind], String(value))
   } catch {}

@@ -1,14 +1,19 @@
-<script setup>
+<script setup lang="ts">
 import { SwitchRoot, SwitchThumb } from 'reka-ui'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 
-const props = defineProps({
-  modelValue: { type: Boolean, default: false },
-  disabled: { type: Boolean, default: false },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  modelValue?: boolean
+  disabled?: boolean
+  class?: ClassValue
+}>(), {
+  modelValue: false,
+  disabled: false,
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 </script>
 
 <template>

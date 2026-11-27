@@ -1,4 +1,5 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import {
   Download,
@@ -30,6 +31,7 @@ import {
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
+import type { CreateJobRequest, SiteKey, SubscriptionItem, TargetRecord, TargetType, TargetTypeInput } from '../types/api'
 import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta } from '../utils/format'
 import { computeJobLiveMetrics, resolveJobVisual } from '../utils/jobMeta'
 import { parseVideoLinks } from '../utils/videoLinks'
@@ -52,23 +54,47 @@ import SegmentedControl from '../components/ui/SegmentedControl.vue'
 
 const store = useAppStore()
 
-const sourceTab = ref('target')
+type SourceMode = NonNullable<CreateJobRequest['source_mode']>
+type PageMode = 'all' | 'range'
+type DownloadScope = PageMode | 'specific'
+type JobAvatar = ReturnType<typeof resolveJobVisual>['avatars'][number]
+
+interface DownloadForm {
+  site: SiteKey
+  usernames: string
+  target_type: TargetTypeInput
+  urlsText: string
+  group_by_uploader: boolean
+  batch_name: string
+  quality: string
+  pages: string
+  videos: string
+  keywords: string[]
+  exclude_keywords: string[]
+  redownload: boolean
+  auto_upload: boolean
+  export_only: boolean
+  add_to_auto_track: boolean
+  subscribe_creator: boolean
+}
+
+const sourceTab = ref<SourceMode>('target')
 const showAdvanced = ref(true)
 const subsModalOpen = ref(false)
 const submitting = ref(false)
 const triggeringAuto = ref(false)
 const tempAction = ref('')
-const txtInputRef = ref(null)
+const txtInputRef = ref<HTMLInputElement | null>(null)
 
 const sourceTabs = [
   { value: 'target', label: '按用户名' },
   { value: 'urls', label: '视频链接 / TXT' },
-]
+] as const
 
 const SITE_OPTIONS = [
   { label: 'PornHub', value: 'pornhub', dot: 'bg-[#ff9000]' },
   { label: 'xHamster', value: 'xhamster', dot: 'bg-red-500' },
-]
+] as const
 
 const PH_TARGET_TYPE_OPTIONS = [
   { label: '自动识别', value: 'auto' },
@@ -76,7 +102,7 @@ const PH_TARGET_TYPE_OPTIONS = [
   { label: 'Pornstar / 明星', value: 'pornstar' },
   { label: '收藏夹 (Favorites)', value: 'favorites' },
   { label: '我的点赞 (Liked)', value: 'liked' },
-]
+] as const
 
 const XH_TARGET_TYPE_OPTIONS = [
   { label: '自动识别', value: 'auto' },
@@ -85,31 +111,31 @@ const XH_TARGET_TYPE_OPTIONS = [
   { label: 'User / 普通用户', value: 'users' },
   { label: 'Channel / 频道', value: 'channel' },
   { label: '我的收藏 (Favorites)', value: 'favorites' },
-]
+] as const
 
 const targetTypeOptions = computed(() =>
   form.site === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS
 )
 
 const qualityChoices = ['2160', '1440', '1080', '720', '480']
-const pageMode = ref('all')
-const pageStart = ref(1)
-const pageEnd = ref(1)
-const videoMode = ref('scan')
+const pageMode = ref<PageMode>('all')
+const pageStart = ref<number | ''>(1)
+const pageEnd = ref<number | ''>(1)
+const videoMode = ref<'scan' | 'specific'>('scan')
 const scopeOptions = [
   { label: '全部页', value: 'all' },
   { label: '页码范围', value: 'range' },
   { label: '指定视频', value: 'specific' },
-]
-const downloadScope = computed({
+] as const
+const downloadScope = computed<DownloadScope>({
   get: () => (videoMode.value === 'specific' ? 'specific' : pageMode.value),
   set: (value) => {
     videoMode.value = value === 'specific' ? 'specific' : 'scan'
     if (value !== 'specific') pageMode.value = value
   },
 })
-const specificPage = ref(1)
-const specificPositions = ref([])
+const specificPage = ref<number | ''>(1)
+const specificPositions = ref<string[]>([])
 const urlDropping = ref(false)
 
 const parsedLinks = computed(() => parseVideoLinks(form.urlsText))
@@ -134,7 +160,7 @@ const selectedQualities = computed(() =>
   )
 )
 
-function toggleQuality(quality) {
+function toggleQuality(quality: string) {
   const selected = new Set(selectedQualities.value)
   if (selected.has(quality)) selected.delete(quality)
   else selected.add(quality)
@@ -159,7 +185,7 @@ watch([pageMode, pageStart, pageEnd], () => {
   form.pages = start === end ? String(start) : `${start}-${end}`
 })
 
-function parseSpecificDraft(raw, currentTags) {
+function parseSpecificDraft(raw: string, currentTags: readonly string[]) {
   const { tags, invalidFound } = parseSpecificVideoDraft(raw, currentTags, specificPage.value)
   if (invalidFound) {
     store.notify('序号格式应为 1,3-5', 'warning')
@@ -186,7 +212,7 @@ watch([videoMode, specificPage, specificPositions], () => {
   form.videos = serializeSpecificVideoSpecs(specificPositions.value, page)
 })
 
-const form = reactive({
+const form = reactive<DownloadForm>({
   site: 'pornhub',
   usernames: '',
   target_type: 'auto',
@@ -221,7 +247,7 @@ const subscribeCreatorDisabled = computed(() => creatorActionsDisabled.value)
 watch(
   () => form.site,
   (nextSite) => {
-    const validValues = new Set(
+    const validValues = new Set<TargetTypeInput>(
       (nextSite === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS).map((o) => o.value)
     )
     if (!validValues.has(form.target_type)) {
@@ -277,7 +303,7 @@ const legacyTempCount = computed(() => store.tempFiles.filter((file) => !file.ve
 
 const recentJobs = computed(() => store.jobs.slice(0, 6))
 const isRouteActive = ref(true)
-const brokenRecentAvatars = ref(new Set())
+const brokenRecentAvatars = ref(new Set<string>())
 const RECENT_CATEGORY_ICONS = {
   download: Download,
   link: Link2,
@@ -290,11 +316,11 @@ const RECENT_CATEGORY_ICONS = {
   sparkles: Sparkles,
 }
 
-function isRecentAvatarValid(entry) {
-  return Boolean(entry?.avatarUrl) && !brokenRecentAvatars.value.has(entry.avatarUrl)
+function isRecentAvatarValid(entry: JobAvatar | undefined) {
+  return Boolean(entry?.avatarUrl && !brokenRecentAvatars.value.has(entry.avatarUrl))
 }
 
-function markRecentAvatarBroken(url) {
+function markRecentAvatarBroken(url: string | undefined) {
   if (!url || brokenRecentAvatars.value.has(url)) return
   const next = new Set(brokenRecentAvatars.value)
   next.add(url)
@@ -325,7 +351,7 @@ const quickTargets = computed(() =>
   (store.targetsCache || []).filter((target) => target.enabled)
 )
 const quickTargetsByName = computed(() => {
-  const map = new Map()
+  const map = new Map<string, TargetRecord>()
   for (const t of quickTargets.value) {
     const tSite = t.site || 'pornhub'
     const isSelf = t.target_type === 'liked' || (tSite === 'xhamster' && t.target_type === 'favorites')
@@ -338,7 +364,7 @@ const quickTargetsByName = computed(() => {
 const selectedUsernameList = computed(() => parseTargetUsernames(form.usernames))
 const selectedUsernameSet = computed(() => new Set(selectedUsernameList.value.map((u) => u.toLowerCase())))
 
-function targetName(target) {
+function targetName(target: TargetRecord) {
   if (target.target_type === 'liked') return 'Liked Videos'
   if (target.site === 'xhamster' && target.target_type === 'favorites') {
     return (target.display_name || '').trim() || 'xHamster Favorites'
@@ -346,7 +372,7 @@ function targetName(target) {
   return (target.display_name || '').trim() || target.username
 }
 
-function isQuickTargetSelected(target) {
+function isQuickTargetSelected(target: TargetRecord) {
   const tSite = target.site || 'pornhub'
   if (tSite !== form.site) return false
   if (target.target_type === 'liked') return form.target_type === 'liked'
@@ -354,12 +380,12 @@ function isQuickTargetSelected(target) {
   return !isSelfCollectionTarget.value && selectedUsernameSet.value.has(target.username.toLowerCase())
 }
 
-function syncTargetTypeForNames(names) {
+function syncTargetTypeForNames(names: string[]) {
   if (names.length === 0) {
     form.target_type = 'auto'
     return
   }
-  const types = new Set()
+  const types = new Set<TargetType>()
   for (const name of names) {
     const matched = quickTargetsByName.value.get(`${form.site}:${name.toLowerCase()}`)
     if (!matched) {
@@ -371,7 +397,7 @@ function syncTargetTypeForNames(names) {
   form.target_type = types.size === 1 ? Array.from(types)[0] : 'auto'
 }
 
-function fillQuickTarget(target) {
+function fillQuickTarget(target: TargetRecord) {
   sourceTab.value = 'target'
   const tSite = target.site || 'pornhub'
   const siteChanged = tSite !== form.site
@@ -408,7 +434,7 @@ function clearTargetUsernames() {
   if (!isSelfCollectionTarget.value) form.target_type = 'auto'
 }
 
-const quickRailRef = ref(null)
+const quickRailRef = ref<HTMLElement | null>(null)
 const quickCanScrollLeft = ref(false)
 const quickCanScrollRight = ref(false)
 const quickHoverDir = ref(0) // -1 left, 0 idle, 1 right
@@ -416,7 +442,7 @@ const quickHoverDir = ref(0) // -1 left, 0 idle, 1 right
 let quickGlideRaf = 0
 let quickGlideLastTs = 0
 let quickGlideVelocity = 0
-let quickResizeObserver = null
+let quickResizeObserver: ResizeObserver | null = null
 const QUICK_GLIDE_MAX_SPEED = 240 // px/sec — smooth and easy to read while gliding
 
 function updateQuickScrollState() {
@@ -446,7 +472,7 @@ function stopQuickGlide({ immediate = false } = {}) {
   }
 }
 
-function stepQuickGlide(ts) {
+function stepQuickGlide(ts: number) {
   const el = quickRailRef.value
   if (!el) {
     stopQuickGlide({ immediate: true })
@@ -483,7 +509,7 @@ function stepQuickGlide(ts) {
   quickGlideRaf = requestAnimationFrame(stepQuickGlide)
 }
 
-function startQuickGlide(dir) {
+function startQuickGlide(dir: -1 | 1) {
   if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches) {
     return
   }
@@ -495,7 +521,7 @@ function startQuickGlide(dir) {
   }
 }
 
-function nudgeQuickRail(dir) {
+function nudgeQuickRail(dir: -1 | 1) {
   const el = quickRailRef.value
   if (!el) return
   stopQuickGlide({ immediate: true })
@@ -503,8 +529,8 @@ function nudgeQuickRail(dir) {
   el.scrollBy({ left: dir * step, behavior: 'smooth' })
 }
 
-function handleQuickTargetsWheel(event) {
-  const el = event.currentTarget
+function handleQuickTargetsWheel(event: WheelEvent) {
+  const el = event.currentTarget as HTMLElement | null
   if (!el || el.scrollWidth <= el.clientWidth) return
   if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
     event.preventDefault()
@@ -593,7 +619,7 @@ onActivated(async () => {
   store.refreshTempFiles()
 })
 
-function importTxtFile(file) {
+function importTxtFile(file: File | undefined) {
   if (!file) return
   if (!file.name.toLowerCase().endsWith('.txt')) {
     store.notify('请选择 .txt 文件', 'warning')
@@ -612,12 +638,13 @@ function importTxtFile(file) {
   reader.readAsText(file, 'utf-8')
 }
 
-function handleTxtFileChange(evt) {
-  importTxtFile(evt.target.files?.[0])
-  evt.target.value = ''
+function handleTxtFileChange(evt: Event) {
+  const input = evt.target as HTMLInputElement
+  importTxtFile(input.files?.[0])
+  input.value = ''
 }
 
-function handleTxtDrop(evt) {
+function handleTxtDrop(evt: DragEvent) {
   urlDropping.value = false
   importTxtFile(evt.dataTransfer?.files?.[0])
 }
@@ -626,7 +653,7 @@ function clearUrls() {
   form.urlsText = ''
 }
 
-function handleSubsPicked(picked, opts = {}) {
+function handleSubsPicked(picked: SubscriptionItem[], opts: { site?: SiteKey } = {}) {
   const nextSite = opts?.site || picked?.[0]?.site || form.site
   const switchedSite = nextSite !== form.site
   if (switchedSite) {
@@ -659,7 +686,7 @@ async function submitDownload() {
   }
   submitting.value = true
   try {
-    const payload = {
+    const payload: CreateJobRequest = {
       source_mode: sourceTab.value,
       quality: form.quality.trim(),
       keywords: form.keywords.join(','),
@@ -685,8 +712,8 @@ async function submitDownload() {
     const res = await api.createJob(payload)
     store.notify(`任务 #${res.job.id} 已加入队列`, 'success')
     await store.refreshJobs()
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     submitting.value = false
   }
@@ -701,8 +728,8 @@ async function triggerQuickAutoUpdate() {
     ])
     store.notify(`已启动全量追更任务 #${res.job.id}`, 'success')
     await store.refreshJobs()
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     triggeringAuto.value = false
   }
@@ -715,8 +742,8 @@ async function handleResumeTemp() {
     const res = await api.resumeTempFiles()
     store.notify(`已创建断点续传任务 #${res.job.id}`, 'success')
     await Promise.all([store.refreshJobs(), store.refreshTempFiles()])
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     tempAction.value = ''
   }
@@ -729,8 +756,8 @@ async function handleClearTemp() {
     const res = await api.clearTempFiles()
     store.notify(`已清理 ${res.removed} 个临时文件`, 'info')
     await store.refreshTempFiles()
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     tempAction.value = ''
   }

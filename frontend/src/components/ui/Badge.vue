@@ -1,6 +1,7 @@
-<script setup>
+<script setup lang="ts">
 import { computed } from 'vue'
 import { cva } from 'class-variance-authority'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 
 const badgeVariants = cva(
@@ -20,10 +21,14 @@ const badgeVariants = cva(
   }
 )
 
-const props = defineProps({
-  variant: { type: String, default: 'outline' },
-  dot: { type: String, default: '' },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  variant?: 'default' | 'secondary' | 'outline' | 'destructive'
+  dot?: string
+  class?: ClassValue
+}>(), {
+  variant: 'outline',
+  dot: '',
+  class: '',
 })
 
 const classes = computed(() => cn(badgeVariants({ variant: props.variant }), props.class))

@@ -1,9 +1,17 @@
+import type { SiteKey, TargetType } from '../types/api'
+
+interface TargetInput {
+  site: SiteKey
+  target_type: TargetType
+  username: string
+}
+
 const PH_PROFILE_PATH_RE = /\/(?:model|pornstar|users|user)\/([^/?#]+)/i
 const XH_PROFILE_PATH_RE = /\/(creators|pornstars|users|channels)\/([^/?#]+)/i
 const XH_HOST_RE = /(?:^|\.)xhamster\d*\.(?:com|desi|one|tv|xxx|live)$/i
 const INVALID_USERNAME_RE = /[/\\:?#\s]/
 
-export function isXhamsterUrlText(raw) {
+export function isXhamsterUrlText(raw: string): boolean {
   const text = String(raw || '').trim()
   if (!text) return false
   if (/^https?:\/\//i.test(text)) {
@@ -17,7 +25,7 @@ export function isXhamsterUrlText(raw) {
   return /\bxhamster\d*\.(?:com|desi|one|tv|xxx|live)\b/i.test(text)
 }
 
-export function extractTargetFromInput(raw) {
+export function extractTargetFromInput(raw: string): TargetInput | null {
   const text = String(raw || '').trim()
   if (!text) return null
 
@@ -33,7 +41,7 @@ export function extractTargetFromInput(raw) {
       slug = decodeURIComponent(slug).trim()
     } catch {}
     if (!slug || INVALID_USERNAME_RE.test(slug)) return null
-    const typeMap = {
+    const typeMap: Partial<Record<string, TargetType>> = {
       creators: 'creator',
       pornstars: 'pornstar',
       users: 'users',
@@ -67,7 +75,7 @@ export function extractTargetFromInput(raw) {
         slug = decodeURIComponent(slug).trim()
       } catch {}
       if (slug && !INVALID_USERNAME_RE.test(slug)) {
-        return { site: 'pornhub', target_type: phMatch[1].toLowerCase(), username: slug }
+        return { site: 'pornhub', target_type: phMatch[1].toLowerCase() as 'model' | 'pornstar', username: slug }
       }
     }
   }
@@ -75,7 +83,7 @@ export function extractTargetFromInput(raw) {
   return null
 }
 
-export function normalizeTargetUsername(token) {
+export function normalizeTargetUsername(token: string): string {
   const raw = String(token || '').trim()
   if (!raw) return ''
   if (
@@ -102,12 +110,12 @@ export function normalizeTargetUsername(token) {
   return cleaned && !INVALID_USERNAME_RE.test(cleaned) ? cleaned : ''
 }
 
-export function parseTargetUsernames(raw) {
+export function parseTargetUsernames(raw: string): string[] {
   const tokens = String(raw || '')
     .split(/[\s,，;；]+/)
     .map(normalizeTargetUsername)
     .filter(Boolean)
-  const seen = new Set()
+  const seen = new Set<string>()
   const unique = []
   for (const name of tokens) {
     const key = name.toLowerCase()
@@ -118,7 +126,7 @@ export function parseTargetUsernames(raw) {
   return unique
 }
 
-export function buildTargetProfileVideosUrl(target) {
+export function buildTargetProfileVideosUrl(target: { site?: string; target_type?: string; username?: string } | null): string {
   const site = String(target?.site || 'pornhub').trim().toLowerCase()
   const type = String(target?.target_type || (site === 'xhamster' ? 'creator' : 'model')).trim().toLowerCase()
 

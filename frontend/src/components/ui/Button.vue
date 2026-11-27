@@ -1,6 +1,7 @@
-<script setup>
+<script setup lang="ts">
 import { computed } from 'vue'
 import { cva } from 'class-variance-authority'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 import { useRipple } from '../../composables/useRipple'
 
@@ -33,13 +34,20 @@ const buttonVariants = cva(
   }
 )
 
-const props = defineProps({
-  variant: { type: String, default: 'default' },
-  size: { type: String, default: 'default' },
-  type: { type: String, default: 'button' },
-  as: { type: String, default: 'button' },
-  class: { type: String, default: '' },
-  disabled: { type: Boolean, default: false },
+const props = withDefaults(defineProps<{
+  variant?: 'default' | 'destructive' | 'outline' | 'secondary' | 'ghost' | 'link'
+  size?: 'default' | 'sm' | 'xs' | 'lg' | 'icon'
+  type?: 'button' | 'submit' | 'reset'
+  as?: string
+  class?: ClassValue
+  disabled?: boolean
+}>(), {
+  variant: 'default',
+  size: 'default',
+  type: 'button',
+  as: 'button',
+  class: '',
+  disabled: false,
 })
 
 const { ripples, handlePointerDown } = useRipple(() => props.disabled || props.variant === 'link')

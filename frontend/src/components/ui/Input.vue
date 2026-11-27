@@ -1,31 +1,41 @@
-<script setup>
+<script setup lang="ts" generic="T extends string = 'text'">
 import { cn } from '../../lib/utils'
 import { ref } from 'vue'
+import type { ClassValue } from 'clsx'
 
-const inputElement = ref(null)
-defineExpose({ focus: (options) => inputElement.value?.focus(options) })
+type InputValue = T extends 'number' ? number | '' : 'number' extends T ? string | number : string
 
-const props = defineProps({
-  modelValue: { type: [String, Number], default: '' },
-  type: { type: String, default: 'text' },
-  placeholder: { type: String, default: '' },
-  disabled: { type: Boolean, default: false },
-  autofocus: { type: Boolean, default: false },
-  min: { type: [String, Number], default: undefined },
-  max: { type: [String, Number], default: undefined },
-  step: { type: [String, Number], default: undefined },
-  class: { type: String, default: '' },
+const inputElement = ref<HTMLInputElement | null>(null)
+defineExpose({ focus: (options?: FocusOptions) => inputElement.value?.focus(options) })
+
+const props = withDefaults(defineProps<{
+  modelValue?: string | number
+  type?: T & string
+  placeholder?: string
+  disabled?: boolean
+  autofocus?: boolean
+  min?: string | number
+  max?: string | number
+  step?: string | number
+  class?: ClassValue
+}>(), {
+  modelValue: '',
+  type: () => 'text' as T,
+  placeholder: '',
+  disabled: false,
+  autofocus: false,
+  min: undefined,
+  max: undefined,
+  step: undefined,
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits<{ 'update:modelValue': [value: InputValue] }>()
 
-function onInput(e) {
-  if (props.type === 'number') {
-    const val = e.target.value
-    emit('update:modelValue', val === '' ? '' : Number(val))
-  } else {
-    emit('update:modelValue', e.target.value)
-  }
+function onInput(e: Event) {
+  const value = (e.target as HTMLInputElement).value
+  const next = props.type === 'number' && value !== '' ? Number(value) : value
+  emit('update:modelValue', next as InputValue)
 }
 </script>
 

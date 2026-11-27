@@ -1,16 +1,23 @@
-<script setup>
+<script setup lang="ts">
 import { Check, Minus } from 'lucide-vue-next'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 
-const props = defineProps({
-  modelValue: { type: Boolean, default: false },
-  indeterminate: { type: Boolean, default: false },
-  disabled: { type: Boolean, default: false },
-  title: { type: String, default: undefined },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  modelValue?: boolean
+  indeterminate?: boolean
+  disabled?: boolean
+  title?: string
+  class?: ClassValue
+}>(), {
+  modelValue: false,
+  indeterminate: false,
+  disabled: false,
+  title: undefined,
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 
 function toggle() {
   if (props.disabled) return

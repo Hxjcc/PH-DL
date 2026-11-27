@@ -1,17 +1,22 @@
-<script setup>
+<script setup lang="ts">
 import { ref, watch } from 'vue'
 import { PopoverRoot, PopoverTrigger, PopoverPortal, PopoverContent } from 'reka-ui'
 import Button from './Button.vue'
 
-const props = defineProps({
-  title: { type: String, required: true },
-  description: { type: String, default: '' },
-  confirmText: { type: String, default: '确认' },
-  destructive: { type: Boolean, default: true },
-  defaultOpen: { type: Boolean, default: false },
+const props = withDefaults(defineProps<{
+  title: string
+  description?: string
+  confirmText?: string
+  destructive?: boolean
+  defaultOpen?: boolean
+}>(), {
+  description: '',
+  confirmText: '确认',
+  destructive: true,
+  defaultOpen: false,
 })
 
-const emit = defineEmits(['confirm', 'open-change'])
+const emit = defineEmits<{ confirm: []; 'open-change': [open: boolean] }>()
 const open = ref(props.defaultOpen)
 
 watch(open, (val) => {

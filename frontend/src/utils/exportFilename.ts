@@ -1,4 +1,6 @@
-function safeFilePart(value, maxLength = 150) {
+import type { JobRecord } from '../types/api'
+
+function safeFilePart(value: string, maxLength = 150): string {
   return String(value || '')
     .replace(/[\\/:*?"<>|\x00-\x1f]/g, '')
     .replace(/\s+/g, ' ')
@@ -7,7 +9,7 @@ function safeFilePart(value, maxLength = 150) {
     .slice(0, maxLength)
 }
 
-export function buildExportFilename(job) {
+export function buildExportFilename(job: Partial<Pick<JobRecord, 'id' | 'kind' | 'params'>> | null): string {
   const params = job?.params || {}
   const usernames = Array.isArray(params.usernames)
     ? params.usernames.map((name) => String(name || '').trim()).filter(Boolean)

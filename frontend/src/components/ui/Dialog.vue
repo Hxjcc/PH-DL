@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import {
   DialogRoot,
   DialogPortal,
@@ -9,18 +9,24 @@ import {
   DialogClose,
 } from 'reka-ui'
 import { X } from 'lucide-vue-next'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 
-const props = defineProps({
-  open: { type: Boolean, default: false },
-  title: { type: String, default: '' },
-  description: { type: String, default: '' },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  open?: boolean
+  title?: string
+  description?: string
+  class?: ClassValue
+}>(), {
+  open: false,
+  title: '',
+  description: '',
+  class: '',
 })
 
-const emit = defineEmits(['update:open', 'close', 'open-auto-focus'])
+const emit = defineEmits<{ 'update:open': [open: boolean]; close: []; 'open-auto-focus': [event: Event] }>()
 
-function onOpenChange(val) {
+function onOpenChange(val: boolean) {
   emit('update:open', val)
   if (!val) emit('close')
 }

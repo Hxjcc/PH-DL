@@ -1,4 +1,5 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, ref, watch } from 'vue'
 import {
   ChevronDown,
@@ -23,6 +24,7 @@ import {
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { api } from '../api/client'
+import type { JobItemRecord, JobItemStatus, JobRecord } from '../types/api'
 import {
   avatarGradient,
   formatBytes,
@@ -58,16 +60,37 @@ const CATEGORY_ICONS = {
   sparkles: Sparkles,
 }
 
-const props = defineProps({
-  job: { type: Object, required: true },
-  defaultExpanded: { type: Boolean, default: false },
-  selectable: { type: Boolean, default: false },
-  selected: { type: Boolean, default: false },
-  focused: { type: Boolean, default: false },
-  routeActive: { type: Boolean, default: true },
+const props = withDefaults(defineProps<{
+  job: JobRecord
+  defaultExpanded?: boolean
+  selectable?: boolean
+  selected?: boolean
+  focused?: boolean
+  routeActive?: boolean
+}>(), {
+  defaultExpanded: false,
+  selectable: false,
+  selected: false,
+  focused: false,
+  routeActive: true,
 })
 
-const emit = defineEmits(['toggle-select', 'deleted', 'activate'])
+const emit = defineEmits<{
+  'toggle-select': [jobId: number]
+  deleted: [jobId: number]
+  activate: [jobId: number, expanded: boolean]
+}>()
+
+type JobVisual = ReturnType<typeof resolveJobVisual>
+interface TransferProgress {
+  phase: string
+  doneText: string
+  totalText: string
+  isEstimatedTotal: boolean
+  speedText: string
+  pct: number
+  hasProgress: boolean
+}
 
 const store = useAppStore()
 const expanded = ref(props.defaultExpanded)
@@ -81,8 +104,8 @@ const deletePopoverDefaultOpen = ref(false)
 const itemStatusFilter = ref('all')
 const ITEMS_PER_PAGE = 50
 const itemPage = ref(1)
-const itemListScrollRef = ref(null)
-const brokenAvatars = ref(new Set())
+const itemListScrollRef = ref<HTMLElement | null>(null)
+const brokenAvatars = ref(new Set<string>())
 
 const isActive = computed(() => ['queued', 'scanning', 'running'].includes(props.job.status))
 const tracksLiveProgress = computed(() => props.routeActive && ['scanning', 'running'].includes(props.job.status))
@@ -107,22 +130,22 @@ const showItemUploader = computed(() => {
   return items.value.some((it) => it.uploader && it.uploader.toLowerCase() !== singleUser)
 })
 
-function itemUploaderMeta(item) {
+function itemUploaderMeta(item: JobItemRecord) {
   return resolveItemUploaderLabel(item, store.targetsCache || [], props.job.params?.profile_names || {})
 }
 
-function isAvatarValid(entry) {
-  return Boolean(entry?.avatarUrl) && !brokenAvatars.value.has(entry.avatarUrl)
+function isAvatarValid(entry: JobVisual['avatars'][number] | undefined) {
+  return Boolean(entry?.avatarUrl && !brokenAvatars.value.has(entry.avatarUrl))
 }
 
-function markAvatarBroken(url) {
+function markAvatarBroken(url: string | undefined) {
   if (!url || brokenAvatars.value.has(url)) return
   const next = new Set(brokenAvatars.value)
   next.add(url)
   brokenAvatars.value = next
 }
 
-function capsuleClass(cap) {
+function capsuleClass(cap: JobVisual['capsules'][number]) {
   if (cap.tone === 'emerald') {
     return 'border-emerald-500/25 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300'
   }
@@ -135,7 +158,7 @@ function capsuleClass(cap) {
   return 'border-border/80 bg-surface-subtle text-muted-foreground'
 }
 
-function qualityBadgeClass(q) {
+function qualityBadgeClass(q: string | undefined) {
   const num = parseInt(String(q || ''), 10)
   if (num >= 2160) return 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
   if (num >= 1440) return 'border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300'
@@ -165,7 +188,7 @@ const detailsContentKey = computed(() => {
   return `ready:${itemStatusFilter.value}:${heightBucket}:${totalItemPages.value > 1 ? 1 : 0}`
 })
 
-function statusPillClass(variant) {
+function statusPillClass(variant: ReturnType<typeof jobStatusMeta>['variant']) {
   if (variant === 'destructive') return 'border-red-500/25 bg-red-500/10 text-red-600 dark:text-red-400'
   if (variant === 'secondary') return 'border-transparent bg-secondary text-secondary-foreground'
   return 'border-border bg-card/90 text-foreground'
@@ -228,9 +251,9 @@ watch(totalItemPages, (maxPage) => {
   }
 })
 
-const transferProgressMap = computed(() => {
+const transferProgressMap = computed<Partial<Record<number, TransferProgress>>>(() => {
   if (!detailsMounted.value || !tracksLiveProgress.value) return {}
-  const map = Object.create(null)
+  const map: Partial<Record<number, TransferProgress>> = Object.create(null)
   for (const item of visibleItems.value) {
     if (item.status !== 'downloading' && item.status !== 'uploading') continue
     const live = store.liveProgress[item.id]
@@ -302,14 +325,14 @@ const schedulerChip = computed(() => {
   }
 })
 
-function selectItemFilter(val) {
+function selectItemFilter(val: string) {
   if (itemStatusFilter.value === val) return
   itemStatusFilter.value = val
   itemPage.value = 1
   if (itemListScrollRef.value) itemListScrollRef.value.scrollTop = 0
 }
 
-function goItemPage(nextPage) {
+function goItemPage(nextPage: number) {
   const clamped = Math.min(Math.max(1, nextPage), totalItemPages.value)
   if (clamped === itemPage.value) return
   itemPage.value = clamped
@@ -318,19 +341,20 @@ function goItemPage(nextPage) {
 
 const exportFilename = computed(() => buildExportFilename(props.job))
 
-function itemStatusLabel(item) {
+function itemStatusLabel(item: JobItemRecord) {
   if (isMetadataJob.value) {
-    return {
+    const labels: Partial<Record<JobItemStatus, string>> = {
       pending: '等待补全',
       done: '已补全',
       failed: '失败',
       cancelled: '已取消',
-    }[item.status] || itemStatusMeta(item.status).label
+    }
+    return labels[item.status] || itemStatusMeta(item.status).label
   }
   return itemStatusMeta(item.status).label
 }
 
-function visibleItemError(item) {
+function visibleItemError(item: JobItemRecord) {
   const msg = String(item?.error_message || '').trim()
   if (!msg) return ''
   if (item?.status === 'cancelled' && msg === '已取消') return ''
@@ -350,8 +374,8 @@ async function ensureItemsLoaded(force = false) {
   try {
     const detail = await store.loadJobDetail(props.job.id)
     itemsLoaded.value = !['queued', 'scanning', 'running'].includes(detail?.job?.status || props.job.status)
-  } catch (err) {
-    itemsLoadError.value = err.message || '读取视频明细失败，请重试。'
+  } catch (err: unknown) {
+    itemsLoadError.value = getErrorMessage(err, '读取视频明细失败，请重试。')
   } finally {
     loadingItems.value = false
   }
@@ -413,8 +437,8 @@ async function handleCancel() {
   try {
     await api.cancelJob(props.job.id)
     store.notify(`已发送停止信号给任务 #${props.job.id}`, 'warning')
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyAction.value = false
   }
@@ -434,8 +458,8 @@ async function handleRetry() {
       reloadItems ? store.loadJobDetail(jobId).catch(() => {}) : null,
       store.refreshJobs(),
     ])
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyAction.value = false
   }
@@ -448,8 +472,8 @@ async function handleDelete() {
     store.removeJobs([props.job.id])
     store.notify(`已删除任务 #${props.job.id}`, 'info')
     emit('deleted', props.job.id)
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyAction.value = false
   }
@@ -959,7 +983,7 @@ function downloadExportTxt() {
                         v-if="transferProgressMap[item.id]?.totalText || transferProgressMap[item.id]?.doneText"
                         class="text-muted-foreground font-mono text-[10px] sm:text-[11px]"
                       >
-                        {{ transferProgressMap[item.id].totalText || transferProgressMap[item.id].doneText }}
+                        {{ transferProgressMap[item.id]?.totalText || transferProgressMap[item.id]?.doneText }}
                       </span>
                       <span class="rounded-full bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-600 dark:text-violet-400">
                         封装 MP4
@@ -974,13 +998,13 @@ function downloadExportTxt() {
                         :title="transferProgressMap[item.id]?.isEstimatedTotal ? 'HLS 分片流无固定文件头大小，总大小为按已下载分片码率动态估算' : undefined"
                       >
                         {{ transferProgressMap[item.id]?.doneText || '0 B' }}
-                        <template v-if="transferProgressMap[item.id]?.totalText"> / {{ transferProgressMap[item.id].totalText }}</template>
+                        <template v-if="transferProgressMap[item.id]?.totalText"> / {{ transferProgressMap[item.id]?.totalText }}</template>
                       </span>
                       <span
                         v-if="transferProgressMap[item.id]?.speedText"
                         class="rounded-full bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400"
                       >
-                        ↓ {{ transferProgressMap[item.id].speedText }}
+                        ↓ {{ transferProgressMap[item.id]?.speedText }}
                       </span>
                       <span class="font-mono font-semibold text-foreground sm:w-11 text-right">
                         {{ transferProgressMap[item.id]?.pct || 0 }}%
@@ -992,7 +1016,7 @@ function downloadExportTxt() {
                       v-if="transferProgressMap[item.id]?.hasProgress && transferProgressMap[item.id]?.totalText"
                       class="text-muted-foreground font-mono text-[10px] sm:text-[11px]"
                     >
-                      {{ transferProgressMap[item.id].doneText }} / {{ transferProgressMap[item.id].totalText }}
+                      {{ transferProgressMap[item.id]?.doneText }} / {{ transferProgressMap[item.id]?.totalText }}
                     </span>
                     <span v-else-if="item.bytes_total > 0" class="text-muted-foreground font-mono text-[10px] sm:text-[11px]">
                       {{ formatBytes(item.bytes_total) }}
@@ -1007,13 +1031,13 @@ function downloadExportTxt() {
                       v-else-if="transferProgressMap[item.id]?.speedText"
                       class="rounded-full bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-amber-700 dark:text-amber-300"
                     >
-                      ↑ {{ transferProgressMap[item.id].speedText }}
+                      ↑ {{ transferProgressMap[item.id]?.speedText }}
                     </span>
                     <span
                       v-if="transferProgressMap[item.id]?.hasProgress"
                       class="font-mono font-semibold text-foreground sm:w-11 text-right"
                     >
-                      {{ transferProgressMap[item.id].pct }}%
+                      {{ transferProgressMap[item.id]?.pct }}%
                     </span>
                   </template>
                   <span v-else-if="item.bytes_total > 0" class="text-muted-foreground font-mono text-[11px] sm:min-w-[54px] sm:text-right">

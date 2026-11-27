@@ -1,8 +1,12 @@
-function entryBootId(entry) {
+import type { LogEntry } from '../types/api'
+
+type LogIdentity = Pick<LogEntry, 'id' | 'boot_id' | 'ts'>
+
+function entryBootId(entry: LogIdentity | undefined) {
   return String(entry?.boot_id || '')
 }
 
-function latestBootId(list) {
+function latestBootId(list: readonly LogIdentity[]) {
   for (let i = list.length - 1; i >= 0; i -= 1) {
     const boot = entryBootId(list[i])
     if (boot) return boot
@@ -10,7 +14,7 @@ function latestBootId(list) {
   return ''
 }
 
-function maxIdOf(list) {
+function maxIdOf(list: readonly LogIdentity[]) {
   let maxId = 0
   for (const item of list) {
     const n = Number(item?.id || 0)
@@ -19,7 +23,7 @@ function maxIdOf(list) {
   return maxId
 }
 
-function maxTsOf(list) {
+function maxTsOf(list: readonly LogIdentity[]) {
   let maxTs = 0
   for (const item of list) {
     const t = Date.parse(item?.ts || '') || 0
@@ -28,7 +32,7 @@ function maxTsOf(list) {
   return maxTs
 }
 
-function isNewBackendBoot(existing, incoming) {
+function isNewBackendBoot(existing: readonly LogIdentity[], incoming: readonly LogIdentity[]) {
   if (!existing.length || !incoming.length) return false
   const inBoot = latestBootId(incoming)
   const exBoot = latestBootId(existing)
@@ -39,7 +43,7 @@ function isNewBackendBoot(existing, incoming) {
   return false
 }
 
-export function mergeLogsSnapshot(existing, incoming, maxLogs = 500) {
+export function mergeLogsSnapshot<T extends LogIdentity>(existing: T[], incoming: T[], maxLogs = 500): T[] {
   const prev = Array.isArray(existing) ? existing : []
   if (!Array.isArray(incoming)) return prev
   if (incoming.length === 0) return []
@@ -56,7 +60,7 @@ export function mergeLogsSnapshot(existing, incoming, maxLogs = 500) {
     return prev
   }
 
-  const map = new Map()
+  const map = new Map<number, T>()
   for (const item of incoming) {
     if (item && item.id != null) map.set(item.id, item)
   }
@@ -79,7 +83,7 @@ export function mergeLogsSnapshot(existing, incoming, maxLogs = 500) {
     .slice(-maxLogs)
 }
 
-export function appendLiveLog(existing, entry, maxLogs = 500) {
+export function appendLiveLog<T extends LogIdentity>(existing: T[], entry: T, maxLogs = 500): T[] {
   const prev = Array.isArray(existing) ? existing : []
   if (!entry) return prev
 

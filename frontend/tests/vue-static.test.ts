@@ -1,10 +1,12 @@
-import test from 'node:test'
+import { test } from 'vitest'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parse as parseSfc, compileScript } from '@vue/compiler-sfc'
+import { parse as parseSfc, compileScript } from 'vue/compiler-sfc'
 import { parse as parseJs } from '@babel/parser'
+import { isNode, VISITOR_KEYS, type File, type Node } from '@babel/types'
+import { ModuleKind, ScriptTarget, transpileModule } from 'typescript'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SRC_DIR = path.resolve(__dirname, '../src')
@@ -28,8 +30,8 @@ const GLOBALS = new Set([
   'getComputedStyle', 'matchMedia', 'CSS', 'MediaSource',
 ])
 
-function listVueFiles(dir) {
-  const out = []
+function listVueFiles(dir: string): string[] {
+  const out: string[] = []
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name)
     if (entry.isDirectory()) out.push(...listVueFiles(full))
@@ -38,7 +40,7 @@ function listVueFiles(dir) {
   return out
 }
 
-function collectPatternNames(pattern, targetSet) {
+function collectPatternNames(pattern: Node | null | undefined, targetSet: Set<string>) {
   if (!pattern) return
   switch (pattern.type) {
     case 'Identifier':
@@ -62,7 +64,7 @@ function collectPatternNames(pattern, targetSet) {
   }
 }
 
-function hoistDeclarations(body, blockScope, fnScope) {
+function hoistDeclarations(body: readonly Node[], blockScope: Set<string>, fnScope: Set<string>) {
   for (const stmt of body) {
     if (!stmt) continue
     if (stmt.type === 'ImportDeclaration') {
@@ -86,23 +88,23 @@ function hoistDeclarations(body, blockScope, fnScope) {
   }
 }
 
-function findUndeclaredIdentifiers(ast) {
-  const undeclared = []
+function findUndeclaredIdentifiers(ast: File) {
+  const undeclared: { name: string; line: number; column: number }[] = []
   const scopes = [new Set(GLOBALS)]
 
-  function isDeclared(name) {
+  function isDeclared(name: string) {
     for (let i = scopes.length - 1; i >= 0; i--) {
       if (scopes[i].has(name)) return true
     }
     return false
   }
 
-  function visit(node, fnScope) {
-    if (!node || typeof node !== 'object') return
+  function visit(node: Node | null | undefined, fnScope: Set<string>) {
+    if (!node) return
 
     switch (node.type) {
       case 'Program': {
-        const modScope = new Set()
+        const modScope = new Set<string>()
         scopes.push(modScope)
         hoistDeclarations(node.body, modScope, modScope)
         for (const stmt of node.body) visit(stmt, modScope)
@@ -110,7 +112,7 @@ function findUndeclaredIdentifiers(ast) {
         return
       }
       case 'BlockStatement': {
-        const blockScope = new Set()
+        const blockScope = new Set<string>()
         scopes.push(blockScope)
         hoistDeclarations(node.body, blockScope, fnScope)
         for (const stmt of node.body) visit(stmt, fnScope)
@@ -120,9 +122,9 @@ function findUndeclaredIdentifiers(ast) {
       case 'FunctionDeclaration':
       case 'FunctionExpression':
       case 'ArrowFunctionExpression': {
-        const localScope = new Set()
+        const localScope = new Set<string>()
         scopes.push(localScope)
-        if (node.id?.name) localScope.add(node.id.name)
+        if ('id' in node && node.id?.name) localScope.add(node.id.name)
         for (const param of node.params) {
           collectPatternNames(param, localScope)
           visitPatternDefaults(param, localScope)
@@ -140,7 +142,7 @@ function findUndeclaredIdentifiers(ast) {
       case 'ClassMethod':
       case 'ClassPrivateMethod': {
         if (node.computed) visit(node.key, fnScope)
-        const localScope = new Set()
+        const localScope = new Set<string>()
         scopes.push(localScope)
         for (const param of node.params) {
           collectPatternNames(param, localScope)
@@ -152,7 +154,7 @@ function findUndeclaredIdentifiers(ast) {
         return
       }
       case 'CatchClause': {
-        const catchScope = new Set()
+        const catchScope = new Set<string>()
         scopes.push(catchScope)
         if (node.param) collectPatternNames(node.param, catchScope)
         hoistDeclarations(node.body.body, catchScope, fnScope)
@@ -163,9 +165,9 @@ function findUndeclaredIdentifiers(ast) {
       case 'ForStatement':
       case 'ForInStatement':
       case 'ForOfStatement': {
-        const loopScope = new Set()
+        const loopScope = new Set<string>()
         scopes.push(loopScope)
-        const initNode = node.init || node.left
+        const initNode = node.type === 'ForStatement' ? node.init : node.left
         if (initNode?.type === 'VariableDeclaration') {
           const target = initNode.kind === 'var' ? fnScope : loopScope
           for (const decl of initNode.declarations) collectPatternNames(decl.id, target)
@@ -176,16 +178,19 @@ function findUndeclaredIdentifiers(ast) {
         } else if (initNode) {
           visit(initNode, fnScope)
         }
-        if (node.test) visit(node.test, fnScope)
-        if (node.update) visit(node.update, fnScope)
-        if (node.right) visit(node.right, fnScope)
+        if (node.type === 'ForStatement') {
+          visit(node.test, fnScope)
+          visit(node.update, fnScope)
+        } else {
+          visit(node.right, fnScope)
+        }
         visit(node.body, fnScope)
         scopes.pop()
         return
       }
       case 'SwitchStatement': {
         visit(node.discriminant, fnScope)
-        const swScope = new Set()
+        const swScope = new Set<string>()
         scopes.push(swScope)
         for (const c of node.cases) hoistDeclarations(c.consequent, swScope, fnScope)
         for (const c of node.cases) {
@@ -204,7 +209,7 @@ function findUndeclaredIdentifiers(ast) {
       }
       case 'ClassDeclaration':
       case 'ClassExpression': {
-        const clsScope = new Set()
+        const clsScope = new Set<string>()
         scopes.push(clsScope)
         if (node.id?.name) clsScope.add(node.id.name)
         if (node.superClass) visit(node.superClass, fnScope)
@@ -214,7 +219,7 @@ function findUndeclaredIdentifiers(ast) {
       }
       case 'ClassProperty':
       case 'ClassPrivateProperty': {
-        if (node.computed) visit(node.key, fnScope)
+        if ('computed' in node && node.computed) visit(node.key, fnScope)
         if (node.value) visit(node.value, fnScope)
         return
       }
@@ -259,19 +264,21 @@ function findUndeclaredIdentifiers(ast) {
         return
       }
       default: {
-        for (const [key, val] of Object.entries(node)) {
-          if (key === 'loc' || key === 'start' || key === 'end' || key === 'type') continue
-          if (Array.isArray(val)) {
-            for (const child of val) visit(child, fnScope)
-          } else if (val && typeof val === 'object' && typeof val.type === 'string') {
-            visit(val, fnScope)
+        for (const key of VISITOR_KEYS[node.type] ?? []) {
+          const value: unknown = Reflect.get(node, key)
+          if (Array.isArray(value)) {
+            for (const child of value) {
+              if (isNode(child)) visit(child, fnScope)
+            }
+          } else if (isNode(value)) {
+            visit(value, fnScope)
           }
         }
       }
     }
   }
 
-  function visitPatternDefaults(pattern, fnScope) {
+  function visitPatternDefaults(pattern: Node | null | undefined, fnScope: Set<string>) {
     if (!pattern) return
     switch (pattern.type) {
       case 'AssignmentPattern':
@@ -296,8 +303,19 @@ function findUndeclaredIdentifiers(ast) {
     }
   }
 
-  visit(ast.program, null)
+  visit(ast.program, scopes[0])
   return undeclared
+}
+
+function parseRuntimeScript(content: string, filename: string) {
+  // Erase type syntax and type-only imports before checking runtime bindings.
+  const { outputText, diagnostics = [] } = transpileModule(content, {
+    fileName: filename,
+    compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022, verbatimModuleSyntax: true },
+    reportDiagnostics: true,
+  })
+  assert.deepEqual(diagnostics, [], `${filename} failed TypeScript transpilation`)
+  return parseJs(outputText, { sourceType: 'module' })
 }
 
 test('all Vue SFC scripts compile cleanly with zero undeclared identifier references', () => {
@@ -309,11 +327,12 @@ test('all Vue SFC scripts compile cleanly with zero undeclared identifier refere
     const rel = path.relative(SRC_DIR, file)
     const source = fs.readFileSync(file, 'utf8')
     const { descriptor, errors } = parseSfc(source, { filename: file })
-    assert.equal(errors.length, 0, `${rel} failed SFC parse: ${errors.map((e) => e.message).join('; ')}`)
-    if (!descriptor.script && !descriptor.scriptSetup) continue
+    assert.equal(errors.length, 0, `${rel} failed SFC parse: ${errors.map((e) => typeof e === 'string' ? e : e.message).join('; ')}`)
+    assert.equal(descriptor.scriptSetup?.lang, 'ts', `${rel} must use TypeScript script setup`)
+    if (descriptor.script) assert.equal(descriptor.script.lang, 'ts', `${rel} must use TypeScript for its script block`)
 
     const compiled = compileScript(descriptor, { id: rel })
-    const ast = parseJs(compiled.content, { sourceType: 'module' })
+    const ast = parseRuntimeScript(compiled.content, `${rel}.ts`)
     const undefs = findUndeclaredIdentifiers(ast)
     for (const u of undefs) {
       issues.push(`${rel}: undeclared identifier '${u.name}' (compiled line ${u.line})`)
@@ -321,4 +340,14 @@ test('all Vue SFC scripts compile cleanly with zero undeclared identifier refere
   }
 
   assert.deepEqual(issues, [], `Found undeclared identifiers in Vue SFCs:\n${issues.join('\n')}`)
+})
+
+test('the SFC script check ignores types and still checks runtime expressions inside casts', () => {
+  const ast = parseRuntimeScript(`
+    import type { Payload } from './payload'
+    type Wrapped = { value: Payload }
+    const packet: Wrapped = missingPacket as Wrapped
+    console.log(packet, Payload)
+  `, 'cast.ts')
+  assert.deepEqual(findUndeclaredIdentifiers(ast).map(({ name }) => name), ['missingPacket', 'Payload'])
 })

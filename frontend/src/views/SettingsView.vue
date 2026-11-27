@@ -1,6 +1,7 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, onActivated, onDeactivated, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type LocationQuery } from 'vue-router'
 import {
   Save,
   Cookie,
@@ -22,6 +23,7 @@ import {
   KeyRound,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
+import type { LoginOpStatus, RuntimeSettings, SelectorSettings, SettingsInput, SiteKey } from '../types/api'
 import { useAppStore } from '../stores/app'
 import { prepareAvatarDataUrl } from '../utils/avatarImage'
 import Card from '../components/ui/Card.vue'
@@ -35,7 +37,7 @@ import Select from '../components/ui/Select.vue'
 import SiteBadge from '../components/SiteBadge.vue'
 import SegmentedControl from '../components/ui/SegmentedControl.vue'
 
-const DEFAULT_SELECTORS = Object.freeze({
+const DEFAULT_SELECTORS = Object.freeze<SelectorSettings>({
   list_page_main_containers:
     'ul.videos#videoSearchResult, div#videoCategory ul.videos, ul#searchResults.videos.video-listing.clear, ul.videos[data-type="pornstar"], ul.videos.row-5-thumbs#mostRecentVideosSection, ul#mostRecentVideosSection, ul.videos.section-listing, ul#showAllChanelVideos, ul.videos.video-listing.clear.profileContent, ul.videos.video-listing.clear.playlistContent, div.container > ul.videos, ul#moreData.videos, ul#likedVideosSection.videos',
   list_page_li_in_container:
@@ -59,7 +61,7 @@ const DEFAULT_SELECTORS = Object.freeze({
   pornstar_page_video_container_check: 'div.profileVids',
 })
 
-const SELECTOR_FIELDS = [
+const SELECTOR_FIELDS: { key: keyof SelectorSettings; label: string }[] = [
   { key: 'list_page_main_containers', label: '列表页主视频容器' },
   { key: 'list_page_li_in_container', label: '容器内视频卡片元素 (li)' },
   { key: 'list_page_li_fallback', label: '列表页兜底视频卡片元素' },
@@ -80,12 +82,12 @@ const SELECTOR_FIELDS = [
 const YESCAPTCHA_SITE_OPTIONS = [
   { label: 'PornHub', value: 'pornhub', dot: 'bg-[#ff9000]' },
   { label: 'xHamster', value: 'xhamster', dot: 'bg-red-500' },
-]
+] as const
 
 const RCLONE_DIR_SITE_OPTIONS = [
   { label: 'PH', value: 'pornhub', dot: 'bg-[#ff9000]', title: 'PornHub 远端基础目录' },
   { label: 'xH', value: 'xhamster', dot: 'bg-red-500', title: 'xHamster 远端基础目录' },
-]
+] as const
 
 const YESCAPTCHA_TASK_TYPES = {
   pornhub: [
@@ -102,19 +104,19 @@ const YESCAPTCHA_TASK_TYPES = {
 const UPDATE_SCAN_MODE_OPTIONS = [
   { label: '智能衔接（快 · 衔接已知视频即止）', value: 'catch_up' },
   { label: '全量翻页（全 · 扫完所有分页不漏老片）', value: 'full' },
-]
+] as const
 
 const XH_CODEC_OPTIONS = [
   { label: 'H.264（默认 · 兼容性最好）', value: 'h264' },
   { label: 'AV1（同画质体积更小，需播放器支持）', value: 'av1' },
-]
+] as const
 
 const RCLONE_STRATEGY_OPTIONS = [
   { label: '顺序主备（用满自动切换下一个）', value: 'failover' },
   { label: '多盘轮询（均摊每日额度 + 限额切换）', value: 'round_robin' },
-]
+] as const
 
-function cloneSettings(src) {
+function cloneSettings(src: RuntimeSettings | null): SettingsInput | null {
   if (!src) return null
   return {
     ...src,
@@ -135,13 +137,16 @@ const AUTH_MODES = [
 const LOGIN_POLL_INTERVAL_MS = 2500
 const LOGIN_POLL_TIMEOUT_MS = 15 * 60 * 1000
 const LOGIN_POLL_MAX_ERRORS = 5
-let loginPoll = null
+let loginPoll: AbortController | null = null
 
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function waitForLoginResult(fetchStatus, signal) {
+async function waitForLoginResult(
+  fetchStatus: (signal: AbortSignal) => Promise<LoginOpStatus>,
+  signal: AbortSignal,
+): Promise<LoginOpStatus> {
   const deadline = Date.now() + LOGIN_POLL_TIMEOUT_MS
   let consecutiveErrors = 0
   while (Date.now() < deadline) {
@@ -151,7 +156,7 @@ async function waitForLoginResult(fetchStatus, signal) {
     try {
       status = await fetchStatus(signal)
       consecutiveErrors = 0
-    } catch (err) {
+    } catch (err: unknown) {
       signal.throwIfAborted()
       consecutiveErrors += 1
       if (consecutiveErrors >= LOGIN_POLL_MAX_ERRORS) throw err
@@ -168,9 +173,11 @@ async function waitForLoginResult(fetchStatus, signal) {
 }
 
 const VALID_SETTINGS_TABS = new Set(['cookie', 'download', 'rclone', 'notify', 'selectors'])
-function resolveSettingsTab(raw) {
+type SettingsTab = typeof tabs[number]['value']
+
+function resolveSettingsTab(raw: LocationQuery[string] | undefined): SettingsTab {
   const val = Array.isArray(raw) ? raw[0] : raw
-  return VALID_SETTINGS_TABS.has(val) ? val : 'cookie'
+  return typeof val === 'string' && VALID_SETTINGS_TABS.has(val) ? val as SettingsTab : 'cookie'
 }
 
 const route = useRoute()
@@ -193,7 +200,7 @@ const xhAuthMode = ref(
     ? 'cookie'
     : 'account'
 )
-const yescaptchaTaskSite = ref('pornhub')
+const yescaptchaTaskSite = ref<SiteKey>('pornhub')
 const yescaptchaTaskTypeOptions = computed(
   () => YESCAPTCHA_TASK_TYPES[yescaptchaTaskSite.value] || []
 )
@@ -211,7 +218,7 @@ const currentYescaptchaTaskType = computed({
   },
 })
 let authModesSynced = Boolean(store.settingsCache)
-const avatarInputRef = ref(null)
+const avatarInputRef = ref<HTMLInputElement | null>(null)
 const avatarLoadError = ref(false)
 const rcloneRemotes = computed(() => store.rcloneRemotesCache || [])
 const loadingRemotes = ref(false)
@@ -225,7 +232,7 @@ watch(
 const providerTab = ref('pikpak')
 const manualPrimaryRemote = ref(false)
 const MANUAL_REMOTE_SENTINEL = '__PHDL_MANUAL_REMOTE__'
-const rcloneDirSite = ref('pornhub')
+const rcloneDirSite = ref<SiteKey>('pornhub')
 const currentRcloneBaseDir = computed({
   get: () => {
     if (!form.value) return ''
@@ -240,7 +247,7 @@ const currentRcloneBaseDir = computed({
   },
 })
 
-const REMOTE_TYPE_LABELS = {
+const REMOTE_TYPE_LABELS: Partial<Record<string, string>> = {
   pikpak: 'PikPak',
   drive: 'Google Drive',
   onedrive: 'OneDrive',
@@ -264,7 +271,7 @@ const DRIVE_CHUNK_PRESETS = [
   { label: '256Mi', value: '256Mi' },
 ]
 
-function formatRemoteType(type) {
+function formatRemoteType(type: string) {
   const key = String(type || '').trim().toLowerCase()
   return REMOTE_TYPE_LABELS[key] || (key ? key.toUpperCase() : '未知类型')
 }
@@ -334,7 +341,7 @@ const backupRemotePlaceholder = computed(() => {
   return '留空单盘；如 gd2, gd3'
 })
 
-function buildChunkOptions(presets, currentValue) {
+function buildChunkOptions(presets: { label: string; value: string }[], currentValue: string | undefined) {
   const cur = String(currentValue || '').trim()
   if (!cur || presets.some((p) => p.value === cur)) return presets
   return [{ label: `${cur}（当前）`, value: cur }, ...presets]
@@ -347,7 +354,7 @@ const driveChunkOptions = computed(() =>
   buildChunkOptions(DRIVE_CHUNK_PRESETS, form.value?.rclone_drive_chunk_size)
 )
 
-function syncProviderTabFromType(rtype) {
+function syncProviderTabFromType(rtype: string) {
   if (rtype === 'pikpak') providerTab.value = 'pikpak'
   else if (rtype === 'drive') providerTab.value = 'drive'
   else if (rtype) providerTab.value = 'custom'
@@ -370,7 +377,7 @@ async function loadRcloneRemotes({ force = false } = {}) {
   }
 }
 
-function parseBackupRemoteList(raw, primaryName = '') {
+function parseBackupRemoteList(raw: string | undefined, primaryName = '') {
   const primaryLower = String(primaryName || '').trim().replace(/:+$/, '').toLowerCase()
   const parts = String(raw || '')
     .replace(/[，;\n]+/g, ',')
@@ -398,7 +405,7 @@ const activeRemoteChain = computed(() => {
   return primary ? [primary, ...backupRemoteList.value] : [...backupRemoteList.value]
 })
 
-function handlePrimaryRemoteSelect(val) {
+function handlePrimaryRemoteSelect(val: string) {
   if (!form.value) return
   if (val === MANUAL_REMOTE_SENTINEL) {
     manualPrimaryRemote.value = true
@@ -431,7 +438,7 @@ watch(activeTab, (tab) => {
 })
 
 watch(
-  () => [route.name, route.query.tab],
+  () => [route.name, route.query.tab] as const,
   ([name, tab]) => {
     if (name !== 'settings') return
     const resolved = resolveSettingsTab(tab)
@@ -455,7 +462,7 @@ const tabs = [
   { value: 'rclone', label: 'rclone 上传', icon: CloudUpload },
   { value: 'notify', label: '追更与通知', icon: Bell },
   { value: 'selectors', label: '解析选择器', icon: Code2 },
-]
+] as const
 
 function resetSelectorsToDefault() {
   if (!form.value) return
@@ -465,7 +472,7 @@ function resetSelectorsToDefault() {
 
 let activatedOnce = false
 
-function syncInitialAuthModes(settings) {
+function syncInitialAuthModes(settings: RuntimeSettings) {
   if (authModesSynced || !settings) return
   authModesSynced = true
   phAuthMode.value = settings.has_cookie && !String(settings.ph_username || '').trim() ? 'cookie' : 'account'
@@ -480,8 +487,8 @@ async function loadSettings() {
       form.value = cloneSettings(settings)
       syncInitialAuthModes(settings)
     }
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     loading.value = false
   }
@@ -517,7 +524,7 @@ onDeactivated(() => {
   pasteCookie.value = ''
   pasteXhCookie.value = ''
   if (form.value) {
-    for (const key of ['ph_password', 'xh_password', 'serverchan_send_key', 'yescaptcha_client_key', 'proxy_url', 'rclone_extra_flags']) {
+    for (const key of ['ph_password', 'xh_password', 'serverchan_send_key', 'yescaptcha_client_key', 'proxy_url', 'rclone_extra_flags'] as const) {
       form.value[key] = store.settingsCache?.[key] || ''
     }
   }
@@ -554,16 +561,17 @@ async function saveAll() {
     store.setSettingsCache(res.settings)
     store.notify('系统设置已保存', 'success')
     await store.refreshOverview()
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     saving.value = false
   }
 }
 
-async function handleAvatarChange(event) {
-  const file = event.target.files?.[0]
-  event.target.value = ''
+async function handleAvatarChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
   if (!file || busyTool.value !== '') return
   busyTool.value = 'avatar_upload'
   try {
@@ -574,8 +582,8 @@ async function handleAvatarChange(event) {
     }
     avatarLoadError.value = false
     store.notify('本地账号头像已更新', 'success')
-  } catch (err) {
-    store.notify(err.message || '头像上传失败', 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err, '头像上传失败'), 'error')
   } finally {
     busyTool.value = ''
   }
@@ -591,8 +599,8 @@ async function handleRemoveAvatar() {
     }
     avatarLoadError.value = false
     store.notify('已恢复默认头像', 'info')
-  } catch (err) {
-    store.notify(err.message || '移除头像失败', 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err, '移除头像失败'), 'error')
   } finally {
     busyTool.value = ''
   }
@@ -604,8 +612,8 @@ async function handleTestCookie() {
     const res = await api.testCookie()
     store.notify(`PornHub ${res.message}`, res.valid ? 'success' : 'warning')
     await Promise.all([loadSettings(), store.refreshOverview()])
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyTool.value = ''
   }
@@ -623,8 +631,8 @@ async function handleImportCookie() {
     pasteCookie.value = ''
     store.notify(`PornHub Cookie 已保存：${res.message}`, res.valid ? 'success' : 'warning')
     await Promise.all([loadSettings(), store.refreshOverview()])
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyTool.value = ''
   }
@@ -651,8 +659,8 @@ async function handleRefreshCookie() {
     if (res.success) store.clearSubscriptionsCache()
     store.notify(res.message, res.success ? 'success' : 'error')
     await Promise.all([loadSettings(), store.refreshOverview()])
-  } catch (err) {
-    if (!request.signal.aborted) store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    if (!request.signal.aborted) store.notify(getErrorMessage(err), 'error')
   } finally {
     if (loginPoll === request) loginPoll = null
     busyTool.value = ''
@@ -665,8 +673,8 @@ async function handleTestXhCookie() {
     const res = await api.testXhCookie()
     store.notify(`xHamster ${res.message}`, res.valid ? 'success' : 'warning')
     await Promise.all([loadSettings(), store.refreshOverview()])
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyTool.value = ''
   }
@@ -681,8 +689,8 @@ async function handleImportXhCookie() {
     pasteXhCookie.value = ''
     store.notify(`xHamster Cookie 已保存：${res.message}`, res.valid ? 'success' : 'warning')
     await Promise.all([loadSettings(), store.refreshOverview()])
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyTool.value = ''
   }
@@ -709,8 +717,8 @@ async function handleRefreshXhCookie() {
     if (res.success) store.clearSubscriptionsCache()
     store.notify(res.message, res.success ? 'success' : 'error')
     await Promise.all([loadSettings(), store.refreshOverview()])
-  } catch (err) {
-    if (!request.signal.aborted) store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    if (!request.signal.aborted) store.notify(getErrorMessage(err), 'error')
   } finally {
     if (loginPoll === request) loginPoll = null
     busyTool.value = ''
@@ -718,6 +726,7 @@ async function handleRefreshXhCookie() {
 }
 
 async function handleTestYescaptcha() {
+  if (!form.value) return
   busyTool.value = 'yescaptcha'
   try {
     const saved = await api.saveSettings(form.value)
@@ -727,14 +736,15 @@ async function handleTestYescaptcha() {
     }
     const res = await api.testYescaptcha()
     store.notify(res.message, res.ok ? 'success' : 'error')
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyTool.value = ''
   }
 }
 
 async function handleTestRclone() {
+  if (!form.value) return
   busyTool.value = 'rclone'
   try {
     const saved = await api.saveSettings(form.value)
@@ -745,14 +755,15 @@ async function handleTestRclone() {
     const res = await api.testRclone()
     store.notify(res.message, res.ok ? 'success' : 'error')
     loadRcloneRemotes({ force: true })
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyTool.value = ''
   }
 }
 
 async function handleTestNotify() {
+  if (!form.value) return
   busyTool.value = 'notify'
   try {
     const saved = await api.saveSettings(form.value)
@@ -762,8 +773,8 @@ async function handleTestNotify() {
     }
     const res = await api.testNotify()
     store.notify(res.message, res.ok ? 'success' : 'error')
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     busyTool.value = ''
   }

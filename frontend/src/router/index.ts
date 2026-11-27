@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory, type RouteLocationNormalized, type RouteLocationRaw, type RouteRecordRaw } from 'vue-router'
 import { useAppStore } from '../stores/app'
 
 import LoginView from '../views/LoginView.vue'
@@ -9,7 +9,13 @@ import HistoryView from '../views/HistoryView.vue'
 import LogsView from '../views/LogsView.vue'
 import SettingsView from '../views/SettingsView.vue'
 
-const routes = [
+declare module 'vue-router' {
+  interface RouteMeta {
+    public?: boolean
+  }
+}
+
+const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: LoginView, meta: { public: true } },
   { path: '/', name: 'download', component: DownloadView },
   { path: '/jobs', name: 'jobs', component: JobsView },
@@ -25,7 +31,10 @@ const router = createRouter({
   routes,
 })
 
-async function resolveAsyncGuard(store, to) {
+async function resolveAsyncGuard(
+  store: ReturnType<typeof useAppStore>,
+  to: RouteLocationNormalized,
+): Promise<true | RouteLocationRaw> {
   if (!store.authChecked) {
     await store.checkAuth(to.meta.public ? null : to.name)
   }

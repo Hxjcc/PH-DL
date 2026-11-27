@@ -1,21 +1,26 @@
-<script setup>
+<script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-const props = defineProps({
-  open: { type: Boolean, default: false },
-  contentKey: { type: [String, Number, Boolean], default: '' },
+const props = withDefaults(defineProps<{
+  open?: boolean
+  contentKey?: string | number | boolean
+}>(), {
+  open: false,
+  contentKey: '',
 })
 
-const emit = defineEmits(['after-enter', 'after-leave'])
+const emit = defineEmits<{ 'after-enter': []; 'after-leave': [] }>()
 
-const wrapper = ref(null)
-const content = ref(null)
+type Phase = 'enter' | 'leave' | 'resize'
 
-let fallbackTimer = null
-let rafId1 = null
-let rafId2 = null
+const wrapper = ref<HTMLElement | null>(null)
+const content = ref<HTMLElement | null>(null)
+
+let fallbackTimer: ReturnType<typeof setTimeout> | null = null
+let rafId1: number | null = null
+let rafId2: number | null = null
 let animToken = 0
-let activePhase = null // 'enter' | 'leave' | 'resize' | null
+let activePhase: Phase | null = null
 
 function prefersReducedMotion() {
   return typeof window !== 'undefined' && Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches)
@@ -49,7 +54,7 @@ function clearPending() {
   clearRafs()
 }
 
-function applySettledState(isOpen) {
+function applySettledState(isOpen: boolean) {
   const el = wrapper.value
   if (!el) return
   el.style.transition = 'none'
@@ -64,7 +69,7 @@ function measureContentHeight() {
   return Math.ceil(Math.max(rectH, inner.scrollHeight || 0))
 }
 
-function finishTransition(token, phase) {
+function finishTransition(token: number, phase: Phase) {
   if (token !== animToken) return
   clearPending()
   activePhase = null
@@ -79,7 +84,7 @@ function finishTransition(token, phase) {
   }
 }
 
-function animateHeight(fromPx, toPx, phase, fromOpacity, toOpacity) {
+function animateHeight(fromPx: number, toPx: number, phase: Phase, fromOpacity: number, toOpacity: number) {
   const el = wrapper.value
   if (!el) return
   clearPending()
@@ -129,7 +134,7 @@ function animateHeight(fromPx, toPx, phase, fromOpacity, toOpacity) {
   }
 }
 
-function onTransitionEnd(e) {
+function onTransitionEnd(e: TransitionEvent) {
   if (e.target !== wrapper.value || e.propertyName !== 'height' || !activePhase) return
   finishTransition(animToken, activePhase)
 }

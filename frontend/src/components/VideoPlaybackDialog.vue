@@ -1,21 +1,26 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import { CircleAlert, ExternalLink, RefreshCw } from 'lucide-vue-next'
+import type Artplayer from 'artplayer'
+import type { Option as ArtplayerOptions } from 'artplayer'
+import type Hls from 'hls.js'
 import { api } from '../api/client'
+import type { PlaybackResolution, VideoRecord } from '../types/api'
 import Button from './ui/Button.vue'
 import Dialog from './ui/Dialog.vue'
 import Select from './ui/Select.vue'
 import Spinner from './ui/Spinner.vue'
 
-const props = defineProps({ video: { type: Object, required: true } })
-const emit = defineEmits(['close'])
+const props = defineProps<{ video: VideoRecord }>()
+const emit = defineEmits<{ close: [] }>()
 
-const mountPoint = ref(null)
-const fullscreenTarget = shallowRef(null)
-const sources = shallowRef([])
-const sourceFormat = ref('mp4')
+const mountPoint = ref<HTMLDivElement | null>(null)
+const fullscreenTarget = shallowRef<Element | null>(null)
+const sources = shallowRef<PlaybackResolution['sources']>([])
+const sourceFormat = ref<PlaybackResolution['format']>('mp4')
 const activeIndex = ref(0)
-const phase = ref('resolving')
+const phase = ref<'resolving' | 'connecting' | 'ready' | 'error'>('resolving')
 const error = ref('')
 const busy = computed(() => phase.value === 'resolving' || phase.value === 'connecting')
 const buffering = ref(false)
@@ -33,13 +38,13 @@ const pageUrl = computed(() => {
   }
 })
 
-let player = null
-let Player = null
-let HlsCtor = null
-let hlsClient = null
-let controller = null
-let timer = null
-let bufferTimer = null
+let player: Artplayer | null = null
+let Player: typeof Artplayer | null = null
+let HlsCtor: typeof Hls | null = null
+let hlsClient: Hls | null = null
+let controller: AbortController | null = null
+let timer: ReturnType<typeof setTimeout> | null = null
+let bufferTimer: ReturnType<typeof setTimeout> | null = null
 let attempt = 0
 let closed = false
 let resume = { time: 0, playing: true, rate: 1, muted: false, volume: 0.8 }
@@ -57,7 +62,7 @@ function snapshot() {
 }
 
 function releasePlayer() {
-  clearTimeout(timer)
+  if (timer !== null) clearTimeout(timer)
   timer = null
   stopBuffering()
   fullscreenTarget.value = null
@@ -79,19 +84,19 @@ function releasePlayer() {
 }
 
 function stopBuffering() {
-  clearTimeout(bufferTimer)
+  if (bufferTimer !== null) clearTimeout(bufferTimer)
   bufferTimer = null
   buffering.value = false
 }
 
-function showError(message) {
+function showError(message: string) {
   attempt++
   releasePlayer()
   error.value = message
   phase.value = 'error'
 }
 
-function connect(index, previous) {
+function connect(index: number, previous: typeof resume) {
   const source = sources.value[index]
   if (!source || !mountPoint.value) return
 
@@ -113,7 +118,12 @@ function connect(index, previous) {
   try {
     const isHls = sourceFormat.value === 'hls'
     let usedHlsJs = false
-    const playerOptions = {
+    const videoAttributes = {
+      playsInline: true,
+      preload: 'auto' as const,
+      'aria-label': props.video.title || '视频播放器',
+    }
+    const playerOptions: ArtplayerOptions = {
       container: mountPoint.value,
       url: source.relay_url,
       type: isHls ? 'm3u8' : 'mp4',
@@ -127,16 +137,17 @@ function connect(index, previous) {
       pip: true,
       hotkey: false,
       cssVar: { '--art-progress-height': '5px', '--art-control-height': '42px' },
-      moreVideoAttr: { playsInline: true, preload: 'auto', 'aria-label': props.video.title || '视频播放器' },
+      moreVideoAttr: videoAttributes,
     }
     if (isHls) {
       playerOptions.customType = {
         m3u8(video, url) {
           if (!isCurrent()) return
-          if (HlsCtor && HlsCtor.isSupported()) {
+          const Hls = HlsCtor
+          if (Hls && Hls.isSupported()) {
             usedHlsJs = true
             let mediaRecoveryTries = 0
-            const hls = new HlsCtor({
+            const hls = new Hls({
               enableWorker: true,
               lowLatencyMode: false,
               maxBufferLength: 30,
@@ -146,9 +157,9 @@ function connect(index, previous) {
             hlsClient = hls
             hls.loadSource(url)
             hls.attachMedia(video)
-            hls.on(HlsCtor.Events.ERROR, (_evt, data) => {
+            hls.on(Hls.Events.ERROR, (_evt, data) => {
               if (!isCurrent() || !data?.fatal) return
-              if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR && mediaRecoveryTries < 2) {
+              if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryTries < 2) {
                 mediaRecoveryTries += 1
                 hls.recoverMediaError()
                 return
@@ -165,7 +176,7 @@ function connect(index, previous) {
         },
       }
     }
-    const instance = new Player(playerOptions)
+    const instance = new Player!(playerOptions)
     player = instance
     const media = instance.video
     function onBuffering() {
@@ -189,7 +200,7 @@ function connect(index, previous) {
     })
     instance.once('video:canplay', () => {
       if (!isCurrent()) return
-      clearTimeout(timer)
+      if (timer !== null) clearTimeout(timer)
       timer = null
       phase.value = 'ready'
       // The browser may require another gesture after the source lookup.
@@ -207,7 +218,8 @@ function connect(index, previous) {
 }
 
 function syncFullscreen() {
-  const element = document.fullscreenElement || document.webkitFullscreenElement
+  const fullscreenDocument: Document & { webkitFullscreenElement?: Element | null } = document
+  const element = fullscreenDocument.fullscreenElement || fullscreenDocument.webkitFullscreenElement
   fullscreenTarget.value = element && mountPoint.value?.contains(element) && element.tagName !== 'VIDEO' ? element : null
 }
 
@@ -246,20 +258,20 @@ async function loadSources() {
     const selected = sources.value.findIndex((source) => source.quality === previousQuality)
     await nextTick()
     if (!closed && !request.signal.aborted) connect(Math.max(0, selected), previous)
-  } catch (err) {
-    if (!closed && !request.signal.aborted) showError(err.message || '获取播放地址失败，请重试。')
+  } catch (err: unknown) {
+    if (!closed && !request.signal.aborted) showError(getErrorMessage(err, '获取播放地址失败，请重试。'))
   } finally {
     request.abort()
     if (controller === request) controller = null
   }
 }
 
-function changeQuality(value) {
+function changeQuality(value: string) {
   const index = Number(value)
   if (index !== activeIndex.value) connect(index, snapshot())
 }
 
-function handlePlayerKey(event) {
+function handlePlayerKey(event: KeyboardEvent) {
   const instance = player
   if (phase.value !== 'ready' || !instance || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
 

@@ -1,19 +1,26 @@
-<script setup>
+<script setup lang="ts">
 import { ref } from 'vue'
 import { X } from 'lucide-vue-next'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 
-const props = defineProps({
-  modelValue: { type: Array, default: () => [] },
-  placeholder: { type: String, default: '输入后按回车添加' },
-  commitKeys: { type: Array, default: () => ['Enter', ',', '，'] },
-  parseDraft: { type: Function, default: null },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  modelValue?: string[]
+  placeholder?: string
+  commitKeys?: string[]
+  parseDraft?: ((draft: string, tags: string[]) => string[] | false) | null
+  class?: ClassValue
+}>(), {
+  modelValue: () => [],
+  placeholder: '输入后按回车添加',
+  commitKeys: () => ['Enter', ',', '，'],
+  parseDraft: null,
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits<{ 'update:modelValue': [value: string[]] }>()
 const draft = ref('')
-const inputRef = ref(null)
+const inputRef = ref<HTMLInputElement | null>(null)
 
 function focusInput() {
   inputRef.value?.focus()
@@ -40,11 +47,11 @@ function commit() {
   draft.value = ''
 }
 
-function removeTag(tag) {
+function removeTag(tag: string) {
   emit('update:modelValue', props.modelValue.filter((item) => item !== tag))
 }
 
-function handleKeydown(event) {
+function handleKeydown(event: KeyboardEvent) {
   if (event.key === 'Enter') {
     event.preventDefault()
     if (event.isComposing || event.keyCode === 229) return

@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { useId } from 'vue'
 
 const bgId = `phdl-bg-${useId()}`

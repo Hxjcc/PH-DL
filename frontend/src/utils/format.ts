@@ -1,4 +1,10 @@
-export function formatBytes(bytes) {
+import type { SiteKey } from '../types/api'
+
+type NumericValue = string | number | null | undefined
+type DateValue = string | number | Date | null | undefined
+type StatusMeta = { label: string; dot: string }
+
+export function formatBytes(bytes: NumericValue): string {
   const n = Number(bytes || 0)
   if (n <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -11,56 +17,56 @@ export function formatBytes(bytes) {
   return `${val >= 100 ? val.toFixed(0) : val.toFixed(1)} ${units[idx]}`
 }
 
-export function formatSpeed(bps) {
+export function formatSpeed(bps: NumericValue): string {
   const n = Number(bps || 0)
   if (n <= 0) return ''
   return `${formatBytes(n)}/s`
 }
 
-export function formatLogTime(iso) {
+export function formatLogTime(iso: DateValue): string {
   if (!iso) return '--:--:--'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return String(iso).slice(11, 19)
-  const pad = (v) => String(v).padStart(2, '0')
+  const pad = (v: number) => String(v).padStart(2, '0')
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-export function formatLogTimestamp(iso) {
+export function formatLogTimestamp(iso: DateValue): string {
   if (!iso) return ''
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return String(iso).replace('T', ' ').slice(0, 19)
-  const pad = (v) => String(v).padStart(2, '0')
+  const pad = (v: number) => String(v).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${formatLogTime(iso)}`
 }
 
-export function formatDateTime(iso) {
+export function formatDateTime(iso: DateValue): string {
   if (!iso) return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return String(iso).replace('T', ' ').slice(0, 19)
-  const pad = (v) => String(v).padStart(2, '0')
+  const pad = (v: number) => String(v).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-export function formatPublishedDate(raw) {
+export function formatPublishedDate(raw: string | null | undefined): string {
   const text = String(raw || '').trim()
   if (!text) return ''
   const match = text.match(/^(\d{4}-\d{2}-\d{2})/)
   return match ? match[1] : ''
 }
 
-export function formatVideoDuration(seconds) {
+export function formatVideoDuration(seconds: NumericValue): string {
   const total = Math.floor(Number(seconds || 0))
   if (!Number.isFinite(total) || total <= 0) return ''
   const hrs = Math.floor(total / 3600)
   const mins = Math.floor((total % 3600) / 60)
   const secs = total % 60
-  const pad = (v) => String(v).padStart(2, '0')
+  const pad = (v: number) => String(v).padStart(2, '0')
   if (hrs > 0) return `${hrs}:${pad(mins)}:${pad(secs)}`
   return `${mins}:${pad(secs)}`
 }
 
-export function jobStatusMeta(status) {
-  const map = {
+export function jobStatusMeta(status: string): StatusMeta & { variant: 'outline' | 'secondary' | 'destructive' } {
+  const map: Partial<Record<string, StatusMeta & { variant: 'outline' | 'secondary' | 'destructive' }>> = {
     queued: { label: '排队中', dot: 'bg-amber-400', variant: 'outline' },
     scanning: { label: '扫描解析中', dot: 'bg-brand status-dot-glow-brand animate-pulse', variant: 'secondary' },
     running: { label: '执行中', dot: 'bg-brand status-dot-glow-brand animate-pulse', variant: 'secondary' },
@@ -72,8 +78,8 @@ export function jobStatusMeta(status) {
   return map[status] || { label: status || '未知', dot: 'bg-zinc-400', variant: 'outline' }
 }
 
-export function itemStatusMeta(status) {
-  const map = {
+export function itemStatusMeta(status: string): StatusMeta {
+  const map: Partial<Record<string, StatusMeta>> = {
     pending: { label: '等待', dot: 'bg-zinc-400' },
     downloading: { label: '下载中', dot: 'bg-brand status-dot-glow-brand animate-pulse' },
     downloaded: { label: '已落盘', dot: 'bg-sky-500' },
@@ -86,8 +92,8 @@ export function itemStatusMeta(status) {
   return map[status] || { label: status || '未知', dot: 'bg-zinc-400' }
 }
 
-export function videoStatusMeta(status) {
-  const map = {
+export function videoStatusMeta(status: string): StatusMeta {
+  const map: Partial<Record<string, StatusMeta>> = {
     uploaded: { label: '已上传云端', dot: 'bg-emerald-500' },
     downloaded: { label: '本地已下载', dot: 'bg-sky-500' },
     baseline: { label: '仅基线去重', dot: 'bg-zinc-400' },
@@ -95,8 +101,8 @@ export function videoStatusMeta(status) {
   return map[status] || { label: status || '未知', dot: 'bg-zinc-400' }
 }
 
-export function targetTypeMeta(targetType) {
-  const map = {
+export function targetTypeMeta(targetType: string): string {
+  const map: Partial<Record<string, string>> = {
     model: 'Model',
     creator: 'Creator',
     pornstar: 'Pornstar',
@@ -109,7 +115,9 @@ export function targetTypeMeta(targetType) {
   return map[targetType] || targetType || '未知'
 }
 
-export function siteMeta(site) {
+export function siteMeta(site: string | null | undefined): {
+  key: SiteKey; code: 'PH' | 'XH'; label: string; pillClass: string
+} {
   const norm = String(site || 'pornhub').trim().toLowerCase()
   if (norm === 'xhamster' || norm === 'xh') {
     return {
@@ -134,7 +142,7 @@ const AVATAR_PALETTES = [
   'from-slate-700 to-zinc-900 dark:from-slate-700 dark:to-zinc-800',
 ]
 
-export function avatarGradient(seed) {
+export function avatarGradient(seed: NumericValue): string {
   const s = String(seed || 'phdl')
   let hash = 0
   for (let i = 0; i < s.length; i += 1) {

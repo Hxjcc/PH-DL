@@ -5,15 +5,17 @@ const THEME_COLORS = {
   light: '#f8f8fa',
   dark: '#09090b',
 }
+type Theme = keyof typeof THEME_COLORS
+type ColorScheme = Theme | 'light dark'
 
-function getSystemTheme() {
+function getSystemTheme(): Theme {
   if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches) {
     return 'dark'
   }
   return 'light'
 }
 
-function readStoredOverride() {
+function readStoredOverride(): Theme | '' {
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
     if (saved === 'dark' || saved === 'light') return saved
@@ -21,7 +23,7 @@ function readStoredOverride() {
   return ''
 }
 
-function detectInitialTheme() {
+function detectInitialTheme(): Theme {
   const override = readStoredOverride()
   if (override) return override
   if (typeof document !== 'undefined' && document.documentElement.classList.contains('dark')) {
@@ -31,27 +33,27 @@ function detectInitialTheme() {
 }
 
 const theme = ref(detectInitialTheme())
-let activeTransition = null
-let fallbackTimer = null
+let activeTransition: ViewTransition | null = null
+let fallbackTimer: ReturnType<typeof setTimeout> | null = null
 
-function syncThemeDocumentMeta(rendered, metaScheme) {
+function syncThemeDocumentMeta(rendered: Theme, metaScheme: ColorScheme) {
   if (typeof document === 'undefined') return
   document.documentElement.classList.toggle('dark', rendered === 'dark')
-  const schemeMeta = document.querySelector('meta[name="color-scheme"]')
+  const schemeMeta = document.querySelector<HTMLMetaElement>('meta[name="color-scheme"]')
   if (schemeMeta) {
     schemeMeta.content = metaScheme
   }
-  const themeMeta = document.querySelector('meta[name="theme-color"]')
+  const themeMeta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
   if (themeMeta) {
     themeMeta.content = THEME_COLORS[rendered] || THEME_COLORS.light
   }
 }
 
-function applyTheme(next, { persist = true } = {}) {
+function applyTheme(next: Theme, { persist = true } = {}) {
   const normalized = next === 'dark' ? 'dark' : 'light'
   theme.value = normalized
 
-  let metaScheme = normalized
+  let metaScheme: ColorScheme = normalized
   if (persist) {
     const systemPref = getSystemTheme()
     if (normalized === systemPref) {
@@ -90,9 +92,9 @@ if (typeof window !== 'undefined') {
   })
 }
 
-function resolveOrigin(event) {
+function resolveOrigin(event?: MouseEvent) {
   if (typeof window === 'undefined') return { x: 0, y: 0 }
-  const target = event?.currentTarget
+  const target = event?.currentTarget as Element | null | undefined
   if (target && typeof target.getBoundingClientRect === 'function') {
     const rect = target.getBoundingClientRect()
     if (rect.width > 0 || rect.height > 0) {
@@ -108,7 +110,7 @@ function resolveOrigin(event) {
   return { x: window.innerWidth - 40, y: 28 }
 }
 
-function transitionTheme(next, event) {
+function transitionTheme(next: Theme, event?: MouseEvent) {
   const normalized = next === 'dark' ? 'dark' : 'light'
   if (normalized === theme.value) return
 
@@ -127,7 +129,7 @@ function transitionTheme(next, event) {
     const root = document.documentElement
     root.classList.add('theme-fallback-transition')
     applyTheme(normalized)
-    clearTimeout(fallbackTimer)
+    if (fallbackTimer !== null) clearTimeout(fallbackTimer)
     fallbackTimer = setTimeout(() => {
       root.classList.remove('theme-fallback-transition')
       fallbackTimer = null
@@ -200,11 +202,11 @@ function transitionTheme(next, event) {
 export function useTheme() {
   const isDark = computed(() => theme.value === 'dark')
 
-  function setTheme(next, event) {
+  function setTheme(next: Theme, event?: MouseEvent) {
     transitionTheme(next, event)
   }
 
-  function toggleTheme(event) {
+  function toggleTheme(event?: MouseEvent) {
     transitionTheme(theme.value === 'dark' ? 'light' : 'dark', event)
   }
 

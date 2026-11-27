@@ -1,9 +1,8 @@
-<script setup>
+<script setup lang="ts">
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 
-const props = defineProps({
-  class: { type: String, default: '' },
-})
+const props = withDefaults(defineProps<{ class?: ClassValue }>(), { class: '' })
 </script>
 
 <template>

@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -102,7 +102,7 @@ const cookieMeta = computed(() => {
   const configured = [
     ph?.configured ? { name: 'PH', ...ph } : null,
     xh?.configured ? { name: 'xH', ...xh } : null,
-  ].filter(Boolean)
+  ].filter((cookie) => cookie !== null)
   if (configured.length === 0) {
     return { text: 'Cookie 未配置', dot: 'bg-amber-500 status-dot-glow-amber' }
   }

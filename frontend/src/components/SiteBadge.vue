@@ -1,11 +1,11 @@
-<script setup>
+<script setup lang="ts">
 import { computed } from 'vue'
 import { siteMeta } from '../utils/format'
 
-const props = defineProps({
-  site: { type: String, default: 'pornhub' },
-  size: { type: String, default: 'xs' }, // 'xs' | 'sm'
-  full: { type: Boolean, default: false },
+const props = withDefaults(defineProps<{ site?: string; size?: 'xs' | 'sm'; full?: boolean }>(), {
+  site: 'pornhub',
+  size: 'xs',
+  full: false,
 })
 
 const meta = computed(() => siteMeta(props.site))

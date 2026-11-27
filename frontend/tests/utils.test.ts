@@ -1,34 +1,72 @@
-import test from 'node:test'
+import { afterEach, test, vi } from 'vitest'
 import assert from 'node:assert/strict'
 import { createPinia } from 'pinia'
 
-import { api } from '../src/api/client.js'
-import { useAppStore } from '../src/stores/app.js'
-import { parseVideoLinks } from '../src/utils/videoLinks.js'
-import { buildExportFilename } from '../src/utils/exportFilename.js'
-import { formatBytes, formatPublishedDate, formatSpeed, formatVideoDuration, siteMeta, targetTypeMeta } from '../src/utils/format.js'
-import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../src/utils/specificVideos.js'
+import { api } from '../src/api/client'
+import { useAppStore } from '../src/stores/app'
+import type { JobItemRecord, JobRecord, JobStatus, LogEntry, VideoListResponse } from '../src/types/api'
+import { parseVideoLinks } from '../src/utils/videoLinks'
+import { buildExportFilename } from '../src/utils/exportFilename'
+import { formatBytes, formatPublishedDate, formatSpeed, formatVideoDuration, siteMeta, targetTypeMeta } from '../src/utils/format'
+import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../src/utils/specificVideos'
 import {
   buildItemStatusPills,
   computeJobLiveMetrics,
   filterJobItemsByStatus,
   resolveItemUploaderLabel,
   resolveJobVisual,
-} from '../src/utils/jobMeta.js'
-import { appendLiveLog, mergeLogsSnapshot } from '../src/utils/logBuffer.js'
+} from '../src/utils/jobMeta'
+import { appendLiveLog, mergeLogsSnapshot } from '../src/utils/logBuffer'
 import {
   buildTargetProfileVideosUrl,
   extractTargetFromInput,
   isXhamsterUrlText,
   normalizeTargetUsername,
   parseTargetUsernames,
-} from '../src/utils/targetInput.js'
+} from '../src/utils/targetInput'
 import {
   JOB_LIMITS,
   TARGETS_PAGE_SIZES,
   readListPreference,
   saveListPreference,
-} from '../src/utils/listPreferences.js'
+} from '../src/utils/listPreferences'
+import { makeJob, makeJobItem } from './fixtures'
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
+
+type JobTargetFixtures = NonNullable<Parameters<typeof resolveJobVisual>[1]>
+type ItemFixture = Pick<JobItemRecord, 'id' | 'status' | 'progress_phase'>
+
+test('the typed API client preserves JSON bodies, query filters and request options', async () => {
+  const videoPage: VideoListResponse = { items: [], total: 0, page: 2, page_size: 30, facets: null, stats: null }
+  const job = makeJob(1, 'queued', {})
+  const fetchMock = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(Response.json(videoPage))
+    .mockResolvedValueOnce(Response.json({ job }))
+  vi.stubGlobal('fetch', fetchMock)
+
+  const { signal } = new AbortController()
+  const result: VideoListResponse = await api.listVideos({ site: 'xhamster', page: 2, include_meta: false }, { signal })
+  assert.deepEqual(result, videoPage)
+  assert.deepEqual(fetchMock.mock.calls[0], [
+    '/api/videos?site=xhamster&page=2&include_meta=false',
+    { credentials: 'include', headers: { 'Content-Type': 'application/json' }, signal },
+  ])
+
+  assert.deepEqual(await api.createJob({ source_mode: 'target', auto_upload: false }), { job })
+  assert.deepEqual(fetchMock.mock.calls[1], [
+    '/api/jobs',
+    {
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      body: '{"source_mode":"target","auto_upload":false}',
+    },
+  ])
+})
 
 test('parseVideoLinks deduplicates by viewkey and counts invalid rows', () => {
   const input = [
@@ -98,7 +136,7 @@ test('resolveJobVisual extracts category, display title, avatars, and capsules',
       avatar_url: 'https://cdn.example/kkfox.jpg',
       enabled: true,
     },
-  ]
+  ] satisfies JobTargetFixtures
 
   const dlVisual = resolveJobVisual(
     {
@@ -183,7 +221,7 @@ test('resolveJobVisual keeps the original category and profile on in-place resum
       profile_avatars: { alice: 'https://cdn.example/alice.jpg' },
       resume_count: 1,
     },
-  }
+  } satisfies Partial<JobRecord>
   const visual = resolveJobVisual(job)
   assert.equal(visual.category.key, 'target_download')
   assert.equal(visual.title, 'Alice')
@@ -193,23 +231,28 @@ test('resolveJobVisual keeps the original category and profile on in-place resum
   assert.ok(resolveJobVisual(job).capsules.every(({ text }) => !text.startsWith('已续传')))
 })
 
-test('app store caps inactive job details and preserves active jobs and recent accesses', async (t) => {
+test('app store caps inactive job details and preserves active jobs and recent accesses', async () => {
   const store = useAppStore(createPinia())
-  const job = (id, status = 'completed', resumeCount = 0) => ({
-    id,
-    status,
-    params: { resume_count: resumeCount },
+  const job = (id: number, status: JobStatus = 'completed', resumeCount = 0) => ({
+    ...makeJob(id, status, { resume_count: resumeCount }),
     params_json: JSON.stringify({ resume_count: resumeCount }),
   })
-  t.mock.method(api, 'getJob', async (id) => ({
+  vi.spyOn(api, 'getJob').mockImplementation(async (id) => ({
     job: job(id, id === 1 ? 'running' : id === 2 ? 'queued' : 'completed'),
-    items: [{ id: 100 + id, job_id: id }],
+    items: [makeJobItem(100 + id, id)],
   }))
 
   try {
     for (let id = 1; id <= 10; id++) await store.loadJobDetail(id)
     store.touchJobDetail(3)
-    store.liveProgress[104] = { job_id: 4 }
+    store.liveProgress[104] = {
+      job_id: 4,
+      item_id: 104,
+      bytes_downloaded: 0,
+      bytes_total: 0,
+      speed_bps: 0,
+      phase: 'downloading',
+    }
     await store.loadJobDetail(11)
     assert.deepEqual(Object.keys(store.jobItems).map(Number), [1, 2, 3, 5, 6, 7, 8, 9, 10, 11])
     assert.equal(store.liveProgress[104], undefined)
@@ -227,7 +270,7 @@ test('app store caps inactive job details and preserves active jobs and recent a
 })
 
 test('computeJobLiveMetrics includes fractional byte progress and speed while done_items is 0', () => {
-  const job = { id: 18, kind: 'manual_target', status: 'running', total_items: 9, done_items: 0 }
+  const job = { id: 18, kind: 'manual_target', status: 'running', total_items: 9, done_items: 0 } satisfies Partial<JobRecord>
   const liveProgress = {
     101: { job_id: 18, item_id: 101, bytes_downloaded: 50 * 1024 * 1024, bytes_total: 100 * 1024 * 1024, speed_bps: 12 * 1024 * 1024 },
     102: { job_id: 18, item_id: 102, bytes_downloaded: 40 * 1024 * 1024, bytes_total: 100 * 1024 * 1024, speed_bps: 8 * 1024 * 1024 },
@@ -249,7 +292,7 @@ test('buildItemStatusPills groups items by fine-grained status in workflow order
     { id: 7, status: 'skipped' },
     { id: 8, status: 'pending' },
     { id: 9, status: 'cancelled' },
-  ]
+  ] satisfies ItemFixture[]
 
   const pills = buildItemStatusPills(items)
   assert.deepEqual(
@@ -281,7 +324,7 @@ test('buildItemStatusPills supports metadata labels and retains selected zero-co
   const items = [
     { id: 1, status: 'done' },
     { id: 2, status: 'pending' },
-  ]
+  ] satisfies ItemFixture[]
   const metaPills = buildItemStatusPills(items, { isMetadataJob: true, activeFilter: 'failed' })
   assert.deepEqual(
     metaPills.map((p) => [p.value, p.label, p.count]),
@@ -300,9 +343,9 @@ test('resolveJobVisual target lookup cache reflects refreshed target arrays', ()
     kind: 'manual_target',
     label: '下载目标: alice',
     params: { usernames: ['alice'], target_type: 'model' },
-  }
-  const targetsV1 = [{ id: 1, username: 'alice', display_name: 'Alice V1', target_type: 'model', avatar_url: '' }]
-  const targetsV2 = [{ id: 1, username: 'alice', display_name: 'Alice V2', target_type: 'model', avatar_url: '' }]
+  } satisfies Partial<JobRecord>
+  const targetsV1 = [{ id: 1, username: 'alice', display_name: 'Alice V1', target_type: 'model', avatar_url: '' }] satisfies JobTargetFixtures
+  const targetsV2 = [{ id: 1, username: 'alice', display_name: 'Alice V2', target_type: 'model', avatar_url: '' }] satisfies JobTargetFixtures
 
   assert.equal(resolveJobVisual(job, targetsV1).title, 'Alice V1')
   assert.equal(resolveJobVisual(job, targetsV1).title, 'Alice V1')
@@ -310,7 +353,7 @@ test('resolveJobVisual target lookup cache reflects refreshed target arrays', ()
 })
 
 test('computeJobLiveMetrics separates download and upload speeds by progress phase', () => {
-  const job = { id: 42, kind: 'manual_target', status: 'running', total_items: 10, done_items: 2 }
+  const job = { id: 42, kind: 'manual_target', status: 'running', total_items: 10, done_items: 2 } satisfies Partial<JobRecord>
   const liveProgress = {
     201: { job_id: 42, item_id: 201, bytes_downloaded: 50, bytes_total: 100, speed_bps: 60 * 1024 * 1024, phase: 'downloading' },
     202: { job_id: 42, item_id: 202, bytes_downloaded: 70, bytes_total: 100, speed_bps: 95 * 1024 * 1024, phase: 'uploading' },
@@ -363,7 +406,7 @@ test('logBuffer discards stale pre-restart logs when backend boot_id resets log 
   )
 
   // Legacy cached logs without boot_id are cleanly replaced by new boot_id snapshot
-  const legacyCached = [
+  const legacyCached: Pick<LogEntry, 'id' | 'ts' | 'message' | 'boot_id'>[] = [
     { id: 1, ts: '2026-11-25T07:40:00+00:00', message: 'legacy 1' },
     { id: 50, ts: '2026-11-25T07:40:47+00:00', message: 'legacy 50' },
   ]
@@ -375,7 +418,7 @@ test('logBuffer discards stale pre-restart logs when backend boot_id resets log 
 })
 
 test('computeJobLiveMetrics renders determinate scan bar for target updates and page text for single-target scans', () => {
-  const updateJob = { id: 77, kind: 'check_updates', status: 'scanning', total_items: 0, done_items: 0 }
+  const updateJob = { id: 77, kind: 'check_updates', status: 'scanning', total_items: 0, done_items: 0 } satisfies Partial<JobRecord>
   const targetScan = computeJobLiveMetrics(updateJob, {}, [], {
     77: { mode: 'targets', scanned: 17, total: 34, current_target: 'Kuporovaa Krupa', found_new: 2 },
   })
@@ -386,7 +429,7 @@ test('computeJobLiveMetrics renders determinate scan bar for target updates and 
   assert.match(targetScan.phaseText, /Kuporovaa Krupa/)
   assert.match(targetScan.phaseText, /已发现 2 新/)
 
-  const manualJob = { id: 78, kind: 'manual_target', status: 'scanning', total_items: 0, done_items: 0 }
+  const manualJob = { id: 78, kind: 'manual_target', status: 'scanning', total_items: 0, done_items: 0 } satisfies Partial<JobRecord>
   const pageScan = computeJobLiveMetrics(manualJob, {}, [], {
     78: { mode: 'pages', target_index: 1, total_targets: 1, current_target: 'alice', page: 3, found_videos: 42 },
   })
@@ -452,22 +495,17 @@ test('formatPublishedDate, formatVideoDuration, and enrich_metadata phase text',
 test('listPreferences supports 10-item job limit and target page sizes including 0 (all)', () => {
   assert.ok(JOB_LIMITS.includes(10))
   assert.ok(TARGETS_PAGE_SIZES.includes(0))
-  const backing = new Map()
-  const prevStorage = globalThis.localStorage
-  globalThis.localStorage = {
-    getItem: (k) => (backing.has(k) ? backing.get(k) : null),
-    setItem: (k, v) => backing.set(k, String(v)),
-  }
-  try {
-    // Missing key must return fallback (24), not 0 via Number(null)
-    assert.equal(readListPreference('targets', TARGETS_PAGE_SIZES, 24), 24)
-    saveListPreference('targets', 0)
-    assert.equal(readListPreference('targets', TARGETS_PAGE_SIZES, 24), 0)
-    saveListPreference('jobs', 10)
-    assert.equal(readListPreference('jobs', JOB_LIMITS, 30), 10)
-  } finally {
-    globalThis.localStorage = prevStorage
-  }
+  const backing = new Map<string, string>()
+  vi.stubGlobal('localStorage', {
+    getItem: (key: string) => backing.get(key) ?? null,
+    setItem: (key: string, value: string) => backing.set(key, String(value)),
+  })
+  // Missing key must return fallback (24), not 0 via Number(null)
+  assert.equal(readListPreference('targets', TARGETS_PAGE_SIZES, 24), 24)
+  saveListPreference('targets', 0)
+  assert.equal(readListPreference('targets', TARGETS_PAGE_SIZES, 24), 0)
+  saveListPreference('jobs', 10)
+  assert.equal(readListPreference('jobs', JOB_LIMITS, 30), 10)
 })
 
 test('parseVideoLinks supports xHamster modern/legacy URLs and mixed PornHub deduplication', () => {
@@ -563,7 +601,7 @@ test('resolveJobVisual distinguishes xHamster favorites, site-scoped same userna
     { id: 1, site: 'pornhub', username: 'alice', display_name: 'PH Alice', target_type: 'model', avatar_url: '' },
     { id: 2, site: 'xhamster', username: 'alice', display_name: 'XH Alice', target_type: 'creator', avatar_url: '' },
     { id: 3, site: 'xhamster', username: '_currentUser_', display_name: 'xHamster Favorites', target_type: 'favorites', avatar_url: '' },
-  ]
+  ] satisfies JobTargetFixtures
 
   const xhFav = resolveJobVisual(
     { id: 90, kind: 'manual_target', params: { site: 'xhamster', target_type: 'favorites', usernames: [] } },
@@ -614,8 +652,8 @@ test('resolveJobVisual distinguishes xHamster favorites, site-scoped same userna
 
 test('computeJobLiveMetrics handles HLS remuxing phase without stalling overall job bar at 98%', () => {
   // Single-video job entering remuxing switches to indeterminate pulsing bar with explicit phase text
-  const singleJob = { id: 100, kind: 'manual_target', status: 'running', total_items: 1, done_items: 0 }
-  const singleItems = [{ id: 501, status: 'downloading', progress_phase: 'remuxing' }]
+  const singleJob = { id: 100, kind: 'manual_target', status: 'running', total_items: 1, done_items: 0 } satisfies Partial<JobRecord>
+  const singleItems = [{ id: 501, status: 'downloading', progress_phase: 'remuxing' }] satisfies ItemFixture[]
   const singleLive = {
     501: { job_id: 100, item_id: 501, bytes_downloaded: 500_000_000, bytes_total: 500_000_000, speed_bps: 0, phase: 'remuxing' },
   }
@@ -626,13 +664,13 @@ test('computeJobLiveMetrics handles HLS remuxing phase without stalling overall 
   assert.equal(singleMetrics.phaseText, '正在封装 MP4 (1 个视频)...')
 
   // Multi-video job with downloading + remuxing + uploading shows composite phase and determinate progress
-  const multiJob = { id: 101, kind: 'manual_target', status: 'running', total_items: 4, done_items: 1 }
+  const multiJob = { id: 101, kind: 'manual_target', status: 'running', total_items: 4, done_items: 1 } satisfies Partial<JobRecord>
   const multiItems = [
     { id: 601, status: 'uploading' },
     { id: 602, status: 'downloading' },
     { id: 603, status: 'downloading' },
     { id: 604, status: 'pending' },
-  ]
+  ] satisfies ItemFixture[]
   const multiLive = {
     601: { job_id: 101, item_id: 601, bytes_downloaded: 50, bytes_total: 100, speed_bps: 80_000_000, phase: 'uploading' },
     602: { job_id: 101, item_id: 602, bytes_downloaded: 100, bytes_total: 100, speed_bps: 0, phase: 'remuxing' },
@@ -648,7 +686,7 @@ test('computeJobLiveMetrics handles HLS remuxing phase without stalling overall 
   assert.equal(multiMetrics.uploadSpeedBps, 80_000_000)
 
   // Last remaining item of a multi-video job enters remuxing -> switches to indeterminate remuxing bar
-  const lastRemuxJob = { id: 102, kind: 'manual_target', status: 'running', total_items: 5, done_items: 4 }
+  const lastRemuxJob = { id: 102, kind: 'manual_target', status: 'running', total_items: 5, done_items: 4 } satisfies Partial<JobRecord>
   const lastRemuxLive = {
     701: { job_id: 102, item_id: 701, bytes_downloaded: 300_000_000, bytes_total: 300_000_000, speed_bps: 0, phase: 'remuxing' },
   }
@@ -670,7 +708,7 @@ test('resolveJobVisual and resolveItemUploaderLabel resolve profile names and av
       profile_names: { YourSelena: 'Your Selena' },
       profile_avatars: { YourSelena: 'https://ic-tt-nss.xhcdn.com/a/yourselena/avatar.jpg' },
     },
-  }
+  } satisfies Partial<JobRecord>
   const visual = resolveJobVisual(job, [])
   assert.equal(visual.title, 'Your Selena')
   assert.equal(visual.avatars.length, 1)

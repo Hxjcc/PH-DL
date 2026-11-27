@@ -1,19 +1,28 @@
-<script setup>
-import { TabsRoot, TabsList, TabsTrigger } from 'reka-ui'
+<script setup lang="ts" generic="T extends string">
+import type { Component } from 'vue'
+import type { ClassValue } from 'clsx'
+import { TabsRoot, TabsList, TabsTrigger, type AcceptableValue } from 'reka-ui'
 import { cn } from '../../lib/utils'
 import Button from './Button.vue'
 
-const props = defineProps({
-  modelValue: { type: String, required: true },
-  items: { type: Array, default: () => [] }, // [{ value, label, icon? }]
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  modelValue: T & string
+  items?: readonly { value: T; label: string; icon?: Component }[]
+  class?: ClassValue
+}>(), {
+  items: () => [],
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits<{ 'update:modelValue': [value: T] }>()
+
+function onUpdate(value: AcceptableValue) {
+  emit('update:modelValue', value as T)
+}
 </script>
 
 <template>
-  <TabsRoot :model-value="modelValue" @update:model-value="emit('update:modelValue', $event)">
+  <TabsRoot :model-value="modelValue" @update:model-value="onUpdate">
     <TabsList
       :class="
         cn(

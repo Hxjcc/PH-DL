@@ -1,7 +1,9 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, nextTick, ref, watch } from 'vue'
 import { Search, Check, RefreshCw, UserRound, Camera } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
+import type { SiteKey, SubscriptionItem, TargetRecord } from '../types/api'
 import { targetTypeMeta } from '../utils/format'
 import { prepareAvatarDataUrl } from '../utils/avatarImage'
 import Dialog from './ui/Dialog.vue'
@@ -14,38 +16,46 @@ import Spinner from './ui/Spinner.vue'
 import SegmentedControl from './ui/SegmentedControl.vue'
 import BaselineScopeFields from './BaselineScopeFields.vue'
 
-const props = defineProps({
-  open: { type: Boolean, default: false },
-  site: { type: String, default: 'pornhub' },
-  confirmLabel: { type: String, default: '确认选择' },
-  showBaselineOption: { type: Boolean, default: false },
+const props = withDefaults(defineProps<{
+  open?: boolean
+  site?: SiteKey
+  confirmLabel?: string
+  showBaselineOption?: boolean
+}>(), {
+  open: false,
+  site: 'pornhub',
+  confirmLabel: '确认选择',
+  showBaselineOption: false,
 })
-const emit = defineEmits(['close', 'confirm'])
+const emit = defineEmits<{
+  close: []
+  confirm: [items: SubscriptionItem[], options: { site: SiteKey; initBaseline: boolean; baselinePages: string }]
+}>()
 const store = useAppStore()
-const activeSite = ref('pornhub')
+const activeSite = ref<SiteKey>('pornhub')
 const loading = ref(false)
 const error = ref('')
 const sourceUser = ref('')
-const searchInput = ref(null)
-const avatarInput = ref(null)
+const searchInput = ref<{ focus: (options?: FocusOptions) => void } | null>(null)
+const avatarInput = ref<HTMLInputElement | null>(null)
 const uploadingAvatar = ref(false)
-const items = ref([])
+const items = ref<SubscriptionItem[]>([])
 const query = ref('')
 const typeFilter = ref('all')
 const trackFilter = ref('all')
-const selected = ref(new Set())
+const selected = ref(new Set<string>())
 const initBaseline = ref(true)
 const baselinePages = ref('all')
 const baselinePagesValid = ref(true)
 const fetchedAt = ref(0)
 const fromCache = ref(false)
-const failedAvatarUrls = ref(new Set())
+const failedAvatarUrls = ref(new Set<string>())
 let requestVersion = 0
 
 const SITE_OPTIONS = [
   { value: 'pornhub', label: 'PornHub', dot: 'bg-[#ff9000]' },
   { value: 'xhamster', label: 'xHamster', dot: 'bg-red-500' },
-]
+] as const
 
 const defaultSource = computed(() =>
   activeSite.value === 'xhamster'
@@ -89,8 +99,8 @@ const typeOptions = computed(() =>
       ]
 )
 const trackedTargetsMap = computed(() => {
-  const byPair = new Map()
-  const byUser = new Map()
+  const byPair = new Map<string, TargetRecord>()
+  const byUser = new Map<string, TargetRecord>()
   for (const target of store.targetsCache || []) {
     if (String(target?.site || 'pornhub') !== activeSite.value) continue
     const tType = String(target?.target_type || '').toLowerCase()
@@ -101,7 +111,7 @@ const trackedTargetsMap = computed(() => {
   }
   return { byPair, byUser }
 })
-function trackedTargetFor(sub) {
+function trackedTargetFor(sub: SubscriptionItem) {
   const uLow = String(sub?.username || '').trim().toLowerCase()
   const tType = String(sub?.type || '').toLowerCase()
   const boundLow = String(sub?.bound_username || '').trim().toLowerCase()
@@ -114,13 +124,13 @@ function trackedTargetFor(sub) {
   }
   return null
 }
-function isSubTracked(sub) {
+function isSubTracked(sub: SubscriptionItem) {
   return Boolean(trackedTargetFor(sub))
 }
-function boundUserLabel(sub) {
+function boundUserLabel(sub: SubscriptionItem) {
   return String(sub?.bound_display_name || sub?.bound_username || '').trim()
 }
-function matchedBoundUserLabel(sub) {
+function matchedBoundUserLabel(sub: SubscriptionItem) {
   const q = query.value.trim().toLowerCase()
   const boundLabel = boundUserLabel(sub)
   if (!q || !boundLabel) return ''
@@ -161,7 +171,7 @@ async function focusSearch() {
   if (props.open) searchInput.value?.focus({ preventScroll: true })
 }
 
-function handleOpenAutoFocus(event) {
+function handleOpenAutoFocus(event: Event) {
   event.preventDefault()
   focusSearch()
 }
@@ -192,14 +202,14 @@ async function loadSubs(force = false) {
     fromCache.value = res.fromCache
     failedAvatarUrls.value.clear()
     await focusSearch()
-  } catch (err) {
-    if (version === requestVersion) error.value = err.message || '获取订阅列表失败'
+  } catch (err: unknown) {
+    if (version === requestVersion) error.value = getErrorMessage(err, '获取订阅列表失败')
   } finally {
     if (version === requestVersion) loading.value = false
   }
 }
 
-function switchSite(nextSite) {
+function switchSite(nextSite: SiteKey) {
   if (activeSite.value === nextSite) return
   activeSite.value = nextSite
   items.value = []
@@ -233,9 +243,10 @@ watch(() => props.open, (isOpen) => {
   }
 })
 
-async function handleAvatarPicked(event) {
-  const file = event.target.files?.[0]
-  event.target.value = ''
+async function handleAvatarPicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
   if (!file || uploadingAvatar.value) return
   uploadingAvatar.value = true
   try {
@@ -243,26 +254,26 @@ async function handleAvatarPicked(event) {
     await store.uploadAccountAvatar(dataUrl)
     failedAvatarUrls.value.clear()
     store.notify('本地账号头像已更新', 'success')
-  } catch (err) {
-    store.notify(err.message || '头像更新失败', 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err, '头像更新失败'), 'error')
   } finally {
     uploadingAvatar.value = false
   }
 }
 
-function subKey(sub) { return sub.type + ':' + sub.username }
-function avatarKey(type, username) { return `${type}:${username.toLowerCase()}` }
-function canShowAvatar(url) { return url && !failedAvatarUrls.value.has(url) }
-function avatarFor(sub) {
+function subKey(sub: SubscriptionItem) { return sub.type + ':' + sub.username }
+function avatarKey(type: string, username: string) { return `${type}:${username.toLowerCase()}` }
+function canShowAvatar(url: string | undefined): url is string { return Boolean(url && !failedAvatarUrls.value.has(url)) }
+function avatarFor(sub: SubscriptionItem) {
   if (canShowAvatar(sub.avatar_url)) return sub.avatar_url
   const trackedUrl = trackedAvatars.value.get(avatarKey(sub.type, sub.username))
   return canShowAvatar(trackedUrl) ? trackedUrl : ''
 }
-function markAvatarFailed(event) {
-  const url = event.currentTarget.getAttribute('src')
+function markAvatarFailed(event: Event) {
+  const url = (event.currentTarget as HTMLImageElement).getAttribute('src')
   if (url) failedAvatarUrls.value.add(url)
 }
-function toggle(sub) {
+function toggle(sub: SubscriptionItem) {
   const next = new Set(selected.value)
   const key = subKey(sub)
   if (next.has(key)) next.delete(key)
@@ -442,7 +453,7 @@ function confirm() {
                 v-if="trackedTargetFor(sub)"
                 :class="[
                   'inline-flex items-center gap-1 rounded-full border px-1.5 sm:px-2 py-0.5 text-[10px] font-medium whitespace-nowrap',
-                  trackedTargetFor(sub).enabled
+                  trackedTargetFor(sub)?.enabled
                     ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
                     : 'border-border bg-secondary text-muted-foreground',
                 ]"
@@ -450,10 +461,10 @@ function confirm() {
                 <span
                   :class="[
                     'h-1.5 w-1.5 rounded-full',
-                    trackedTargetFor(sub).enabled ? 'bg-emerald-500' : 'bg-zinc-400',
+                    trackedTargetFor(sub)?.enabled ? 'bg-emerald-500' : 'bg-zinc-400',
                   ]"
                 />
-                {{ trackedTargetFor(sub).enabled ? '已追更' : '已暂停' }}
+                {{ trackedTargetFor(sub)?.enabled ? '已追更' : '已暂停' }}
               </span>
               <Badge
                 variant="outline"

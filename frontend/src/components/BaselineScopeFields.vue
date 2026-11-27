@@ -1,17 +1,17 @@
-<script setup>
+<script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import Input from './ui/Input.vue'
 import Select from './ui/Select.vue'
 
-const props = defineProps({
-  modelValue: { type: String, default: 'all' },
-  disabled: { type: Boolean, default: false },
+const props = withDefaults(defineProps<{ modelValue?: string; disabled?: boolean }>(), {
+  modelValue: 'all',
+  disabled: false,
 })
-const emit = defineEmits(['update:modelValue', 'validity-change'])
+const emit = defineEmits<{ 'update:modelValue': [pages: string]; 'validity-change': [valid: boolean] }>()
 
 const mode = ref('all')
-const startPage = ref(1)
-const endPage = ref(3)
+const startPage = ref<number | ''>(1)
+const endPage = ref<number | ''>(3)
 const options = [
   { label: '全部视频', value: 'all' },
   { label: '仅第 1 页', value: 'first' },
@@ -25,10 +25,12 @@ const pages = computed(() => {
 })
 const rangeError = computed(() => {
   if (mode.value !== 'range') return ''
-  if (!Number.isInteger(startPage.value) || !Number.isInteger(endPage.value) || startPage.value < 1 || endPage.value < 1) {
+  const start = startPage.value
+  const end = endPage.value
+  if (start === '' || end === '' || !Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < 1) {
     return '起止页码必须为大于 0 的整数。'
   }
-  return endPage.value < startPage.value ? '结束页不能小于起始页。' : ''
+  return end < start ? '结束页不能小于起始页。' : ''
 })
 
 watch(() => props.modelValue, (value) => {

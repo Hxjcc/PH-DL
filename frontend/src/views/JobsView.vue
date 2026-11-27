@@ -1,4 +1,5 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -28,8 +29,8 @@ const router = useRouter()
 
 const refreshing = ref(false)
 const batchDeleting = ref(false)
-const selectedJobIds = ref(new Set())
-const focusedJobId = ref(null)
+const selectedJobIds = ref(new Set<number>())
+const focusedJobId = ref<number | null>(null)
 const changingLimit = ref(false)
 const categoryFilter = ref('all')
 const isRouteActive = ref(true)
@@ -47,7 +48,9 @@ const categoryCounts = computed(() => {
 
 const categoryPills = computed(() => {
   const c = categoryCounts.value
-  const pills = [{ value: 'all', label: '全部', count: c.all, icon: null }]
+  const pills: { value: string; label: string; count: number; icon: typeof Download | null }[] = [
+    { value: 'all', label: '全部', count: c.all, icon: null },
+  ]
   pills.push({ value: 'download', label: '下载任务', count: c.download, icon: Download })
   pills.push({ value: 'update', label: '自动追更', count: c.update, icon: RefreshCw })
   if (c.maintenance > 0) {
@@ -62,7 +65,7 @@ const visibleJobs = computed(() => {
 })
 
 let suppressQueryScroll = false
-let syncQueryTimer = null
+let syncQueryTimer: ReturnType<typeof setTimeout> | null = null
 
 function clearPendingQuerySync() {
   if (syncQueryTimer) {
@@ -76,7 +79,7 @@ function readFocusedJob() {
   focusedJobId.value = Number.isInteger(raw) && raw > 0 ? raw : null
 }
 
-function syncJobQuery(nextId, { immediate = false } = {}) {
+function syncJobQuery(nextId: number | null, { immediate = false } = {}) {
   clearPendingQuerySync()
   const apply = () => {
     syncQueryTimer = null
@@ -99,7 +102,7 @@ function syncJobQuery(nextId, { immediate = false } = {}) {
   }
 }
 
-function handleJobActivate(jobId, isExpanded) {
+function handleJobActivate(jobId: number, isExpanded: boolean) {
   if (isExpanded) {
     if (focusedJobId.value === jobId) return
     focusedJobId.value = jobId
@@ -154,7 +157,7 @@ const partiallySelected = computed(
   () => validSelectedIds.value.length > 0 && validSelectedIds.value.length < deletableJobs.value.length
 )
 
-function toggleSelectJob(jobId) {
+function toggleSelectJob(jobId: number) {
   const next = new Set(selectedJobIds.value)
   if (next.has(jobId)) next.delete(jobId)
   else next.add(jobId)
@@ -171,7 +174,7 @@ function clearSelectedJobs() {
   selectedJobIds.value = new Set()
 }
 
-async function changeJobsLimit(value) {
+async function changeJobsLimit(value: string) {
   if (Number(value) === store.jobsLimit || !store.setJobsLimit(value)) return
   clearSelectedJobs()
   changingLimit.value = true
@@ -182,7 +185,7 @@ async function changeJobsLimit(value) {
   }
 }
 
-function handleJobDeleted(jobId) {
+function handleJobDeleted(jobId: number) {
   if (focusedJobId.value === jobId) {
     focusedJobId.value = null
     syncJobQuery(null, { immediate: true })
@@ -229,8 +232,8 @@ async function handleBatchDeleteJobs() {
     } else {
       store.notify(`已批量删除 ${deletedIds.length} 条任务记录`, 'success')
     }
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     batchDeleting.value = false
   }

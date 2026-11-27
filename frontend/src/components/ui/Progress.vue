@@ -1,11 +1,16 @@
-<script setup>
+<script setup lang="ts">
 import { ProgressRoot, ProgressIndicator } from 'reka-ui'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 
-const props = defineProps({
-  modelValue: { type: Number, default: 0 },
-  indeterminate: { type: Boolean, default: false },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  modelValue?: number
+  indeterminate?: boolean
+  class?: ClassValue
+}>(), {
+  modelValue: 0,
+  indeterminate: false,
+  class: '',
 })
 </script>
 

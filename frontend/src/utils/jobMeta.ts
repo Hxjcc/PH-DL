@@ -1,5 +1,19 @@
-import { targetTypeMeta } from './format.js'
-import { isXhamsterUrlText } from './targetInput.js'
+import { targetTypeMeta } from './format'
+import { isXhamsterUrlText } from './targetInput'
+import type { JobItemRecord, JobRecord, LiveProgressEntry, ScanProgress, SiteKey, TargetRecord } from '../types/api'
+
+type VisualJob = Partial<Pick<JobRecord, 'id' | 'kind' | 'params' | 'export_text' | 'label' | 'trigger'>>
+type VisualTarget = Partial<Pick<TargetRecord, 'id' | 'username' | 'site' | 'target_type' | 'display_name' | 'avatar_url' | 'enabled'>>
+type TargetLookup = {
+  byId: Map<number, VisualTarget>
+  byName: Map<string, VisualTarget>
+  bySiteName: Map<string, VisualTarget>
+}
+type Capsule = { text: string; handle?: boolean; mono?: boolean; tone?: 'emerald' | 'amber' | 'brand' }
+type JobMetricInput = Partial<Pick<JobRecord, 'id' | 'kind' | 'status' | 'total_items' | 'done_items' | 'uploaded_items' |
+  'skipped_items' | 'failed_items' | 'started_at' | 'finished_at'>>
+type ItemMetricInput = Pick<JobItemRecord, 'id' | 'status' | 'progress_phase'>
+type ProgressMetricInput = Pick<LiveProgressEntry, 'job_id'> & Partial<LiveProgressEntry>
 
 const CATEGORY_MAP = {
   target_download: {
@@ -82,7 +96,7 @@ const CATEGORY_MAP = {
     pillClass: 'border-purple-500/25 bg-purple-500/10 text-purple-700 dark:text-purple-300',
     iconClass: 'bg-purple-500/12 text-purple-600 dark:text-purple-400 ring-1 ring-purple-500/20',
   },
-}
+} as const
 
 function stripKnownPrefix(rawLabel = '') {
   let text = String(rawLabel || '').trim()
@@ -96,26 +110,26 @@ function stripKnownPrefix(rawLabel = '') {
   return text.trim()
 }
 
-const targetLookupCache = new WeakMap()
-const EMPTY_TARGET_LOOKUP = Object.freeze({ byId: new Map(), byName: new Map(), bySiteName: new Map() })
+const targetLookupCache = new WeakMap<readonly VisualTarget[], TargetLookup>()
+const EMPTY_TARGET_LOOKUP = Object.freeze<TargetLookup>({ byId: new Map(), byName: new Map(), bySiteName: new Map() })
 
-function normalizeSiteKey(site) {
+function normalizeSiteKey(site: string | undefined): SiteKey | '' {
   const s = String(site || '').trim().toLowerCase()
   if (s === 'xhamster' || s === 'xh') return 'xhamster'
   if (s === 'pornhub' || s === 'ph') return 'pornhub'
   return ''
 }
 
-function buildTargetLookup(targetsList = []) {
+function buildTargetLookup(targetsList: readonly VisualTarget[] = []): TargetLookup {
   if (!Array.isArray(targetsList) || targetsList.length === 0) {
     return EMPTY_TARGET_LOOKUP
   }
   const cached = targetLookupCache.get(targetsList)
   if (cached) return cached
 
-  const byId = new Map()
-  const byName = new Map()
-  const bySiteName = new Map()
+  const byId = new Map<number, VisualTarget>()
+  const byName = new Map<string, VisualTarget>()
+  const bySiteName = new Map<string, VisualTarget>()
   for (const t of targetsList) {
     if (!t) continue
     if (t.id != null) byId.set(Number(t.id), t)
@@ -138,7 +152,7 @@ function buildTargetLookup(targetsList = []) {
   return lookup
 }
 
-function lookupProfileField(map, ...keys) {
+function lookupProfileField(map: Record<string, string>, ...keys: (string | undefined)[]) {
   if (!map || typeof map !== 'object') return ''
   for (const rawKey of keys) {
     const key = String(rawKey || '').trim()
@@ -159,7 +173,13 @@ function lookupProfileField(map, ...keys) {
   return ''
 }
 
-function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames = {}, hint = {}) {
+function makeAvatarEntry(
+  target: VisualTarget | null | undefined,
+  fallbackName: string | undefined,
+  profileAvatars: Record<string, string> = {},
+  profileNames: Record<string, string> = {},
+  hint: { site?: SiteKey | ''; targetType?: string } = {},
+) {
   if (target) {
     const site = normalizeSiteKey(target.site || hint.site) || 'pornhub'
     const tType = String(target.target_type || hint.targetType || '').trim().toLowerCase()
@@ -215,7 +235,11 @@ function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames
   }
 }
 
-export function resolveItemUploaderLabel(item, targetsList = [], profileNames = {}) {
+export function resolveItemUploaderLabel(
+  item: Partial<Pick<JobItemRecord, 'site' | 'uploader'>>,
+  targetsList: readonly VisualTarget[] = [],
+  profileNames: Record<string, string> = {},
+) {
   const raw = String(item?.uploader || '').trim()
   if (!raw) return { label: '', isHandle: false }
   const low = raw.toLowerCase()
@@ -233,7 +257,7 @@ export function resolveItemUploaderLabel(item, targetsList = [], profileNames = 
   return { label: raw, isHandle: true }
 }
 
-export function resolveJobCategory(job) {
+export function resolveJobCategory(job: VisualJob | null | undefined) {
   const kind = job?.kind || ''
   const params = job?.params || {}
   const isExport = Boolean(params.export_only || job?.export_text)
@@ -256,19 +280,19 @@ export function resolveJobCategory(job) {
   return CATEGORY_MAP.target_download
 }
 
-export function resolveJobVisual(job, targetsList = []) {
+export function resolveJobVisual(job: VisualJob | null | undefined, targetsList: readonly VisualTarget[] = []) {
   const category = resolveJobCategory(job)
   const params = job?.params || {}
   const profileAvatars = params.profile_avatars || {}
   const profileNames = params.profile_names || {}
   const { byId, byName, bySiteName } = buildTargetLookup(targetsList)
 
-  const avatars = []
-  const capsules = []
+  const avatars: ReturnType<typeof makeAvatarEntry>[] = []
+  const capsules: Capsule[] = []
   let title = ''
   let site = normalizeSiteKey(params.site)
 
-  const lookupByName = (name, preferredSite = '') => {
+  const lookupByName = (name: string, preferredSite: SiteKey | '' = '') => {
     const key = String(name || '').trim().toLowerCase()
     if (!key) return null
     const norm = normalizeSiteKey(preferredSite)
@@ -276,7 +300,7 @@ export function resolveJobVisual(job, targetsList = []) {
     return byName.get(key) || null
   }
 
-  const pushUniqueAvatar = (entry) => {
+  const pushUniqueAvatar = (entry: ReturnType<typeof makeAvatarEntry>) => {
     if (!entry || !entry.name) return
     if (avatars.some((x) => x.name.toLowerCase() === entry.name.toLowerCase())) return
     avatars.push(entry)
@@ -348,7 +372,7 @@ export function resolveJobVisual(job, targetsList = []) {
   } else if (kind === 'auto_update' || kind === 'check_updates') {
     const targetIds = Array.isArray(params.target_ids) ? params.target_ids : []
     if (targetIds.length > 0) {
-      const matchedSites = new Set()
+      const matchedSites = new Set<SiteKey>()
       for (const tid of targetIds) {
         const matched = byId.get(Number(tid))
         if (matched) {
@@ -455,7 +479,7 @@ export function resolveJobVisual(job, targetsList = []) {
   }
 }
 
-export function formatDurationCompact(startedAt, finishedAt) {
+export function formatDurationCompact(startedAt: string | null | undefined, finishedAt: string | null | undefined): string {
   if (!startedAt || !finishedAt) return ''
   const s = new Date(startedAt).getTime()
   const e = new Date(finishedAt).getTime()
@@ -469,7 +493,12 @@ export function formatDurationCompact(startedAt, finishedAt) {
   return `${hr}h ${min % 60}m`
 }
 
-export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = null, scanStatusMap = null) {
+export function computeJobLiveMetrics(
+  job: JobMetricInput | null | undefined,
+  liveProgressMap: Partial<Record<number, ProgressMetricInput>> | null = {},
+  jobItemsList: ItemMetricInput[] | null | undefined = null,
+  scanStatusMap: Partial<Record<number, ScanProgress>> | null = null,
+) {
   let total = Number(job?.total_items || 0)
   let done = Number(job?.done_items || 0)
   let uploaded = Number(job?.uploaded_items || 0)
@@ -552,13 +581,13 @@ export function computeJobLiveMetrics(job, liveProgressMap = {}, jobItemsList = 
   const speedBps = downloadSpeedBps
 
   const finishedCount = done + skipped + failed
-  const isActive = ['queued', 'scanning', 'running'].includes(job?.status)
+  const isActive = job?.status === 'queued' || job?.status === 'scanning' || job?.status === 'running'
   const scanState =
     isActive && scanStatusMap && jobIdNum > 0 && typeof scanStatusMap === 'object'
       ? scanStatusMap[jobIdNum] || null
       : null
   const useScanOverlay =
-    Boolean(scanState) &&
+    scanState !== null &&
     (job?.status === 'scanning' || (total === 0 && downloadingCount === 0 && remuxingCount === 0 && uploadingCount === 0))
 
   let percent = 0
@@ -686,7 +715,7 @@ const ITEM_STATUS_ORDER = [
   'cancelled',
 ]
 
-const ITEM_STATUS_PILL_META = {
+const ITEM_STATUS_PILL_META: Partial<Record<string, { label: string; dot: string }>> = {
   downloading: { label: '下载中', dot: 'bg-brand' },
   uploading: { label: '上传中', dot: 'bg-amber-500' },
   downloaded: { label: '已落盘', dot: 'bg-sky-500' },
@@ -697,36 +726,41 @@ const ITEM_STATUS_PILL_META = {
   cancelled: { label: '已取消', dot: 'bg-zinc-400' },
 }
 
-const METADATA_ITEM_STATUS_LABELS = {
+const METADATA_ITEM_STATUS_LABELS: Partial<Record<string, string>> = {
   pending: '等待补全',
   done: '已补全',
   failed: '失败',
   cancelled: '已取消',
 }
 
-function getItemStatusPillMeta(status, isMetadataJob = false) {
+function getItemStatusPillMeta(status: string, isMetadataJob = false) {
   const base = ITEM_STATUS_PILL_META[status] || { label: status || '未知', dot: 'bg-zinc-400' }
-  if (isMetadataJob && METADATA_ITEM_STATUS_LABELS[status]) {
-    return { label: METADATA_ITEM_STATUS_LABELS[status], dot: base.dot }
+  const metadataLabel = METADATA_ITEM_STATUS_LABELS[status]
+  if (isMetadataJob && metadataLabel) {
+    return { label: metadataLabel, dot: base.dot }
   }
   return base
 }
 
-export function buildItemStatusPills(items = [], { isMetadataJob = false, activeFilter = 'all' } = {}) {
+export function buildItemStatusPills(
+  items: Pick<JobItemRecord, 'status'>[] = [],
+  { isMetadataJob = false, activeFilter = 'all' } = {},
+) {
   const list = Array.isArray(items) ? items : []
-  const counts = Object.create(null)
-  const extraStatuses = []
+  const counts: Partial<Record<string, number>> = Object.create(null)
+  const extraStatuses: string[] = []
 
   for (const it of list) {
     const status = String(it?.status || '').trim()
     if (!status) continue
-    if (counts[status] == null) {
+    const count = counts[status]
+    if (count == null) {
       counts[status] = 0
       if (!ITEM_STATUS_ORDER.includes(status)) {
         extraStatuses.push(status)
       }
     }
-    counts[status] += 1
+    counts[status] = (count ?? 0) + 1
   }
 
   const pills = [{ value: 'all', label: '全部', count: list.length, dot: '' }]
@@ -752,7 +786,7 @@ export function buildItemStatusPills(items = [], { isMetadataJob = false, active
   return pills
 }
 
-export function filterJobItemsByStatus(items = [], filter = 'all') {
+export function filterJobItemsByStatus<T extends Pick<JobItemRecord, 'status'>>(items: T[] = [], filter = 'all'): T[] {
   const list = Array.isArray(items) ? items : []
   if (!filter || filter === 'all') return list
   return list.filter((it) => it?.status === filter)

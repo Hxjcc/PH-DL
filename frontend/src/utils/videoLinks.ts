@@ -1,7 +1,7 @@
 const phVideoKeyPattern = /(?:viewkey=|\/embed\/|\/shorties\/)([a-zA-Z0-9]+)/
 const xhHostPattern = /^(?:[a-z0-9-]+\.)*xhamster\d*\.(?:com|desi|one|tv|xxx|live)$/i
 
-function extractXhamsterVideoKey(pathname) {
+function extractXhamsterVideoKey(pathname: string): string {
   const parts = String(pathname || '')
     .split('/')
     .filter(Boolean)
@@ -22,8 +22,8 @@ function extractXhamsterVideoKey(pathname) {
   return ''
 }
 
-export function parseVideoLinks(text) {
-  const videos = new Map()
+export function parseVideoLinks(text: string): { urls: string[]; invalid: number; duplicates: number } {
+  const videos = new Map<string, string>()
   let invalid = 0
   let duplicates = 0
   for (const row of String(text || '').split(/\r?\n/)) {

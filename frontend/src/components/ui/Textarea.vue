@@ -1,15 +1,26 @@
-<script setup>
+<script setup lang="ts">
 import { cn } from '../../lib/utils'
+import type { ClassValue } from 'clsx'
 
-const props = defineProps({
-  modelValue: { type: String, default: '' },
-  rows: { type: [String, Number], default: 4 },
-  placeholder: { type: String, default: '' },
-  disabled: { type: Boolean, default: false },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  modelValue?: string
+  rows?: string | number
+  placeholder?: string
+  disabled?: boolean
+  class?: ClassValue
+}>(), {
+  modelValue: '',
+  rows: 4,
+  placeholder: '',
+  disabled: false,
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
+
+function onInput(event: Event) {
+  emit('update:modelValue', (event.target as HTMLTextAreaElement).value)
+}
 </script>
 
 <template>
@@ -24,6 +35,6 @@ const emit = defineEmits(['update:modelValue'])
         props.class
       )
     "
-    @input="emit('update:modelValue', $event.target.value)"
+    @input="onInput"
   />
 </template>

@@ -1,4 +1,5 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Eye, EyeOff, Loader2 } from 'lucide-vue-next'
@@ -20,7 +21,7 @@ const password = ref('')
 const showPassword = ref(false)
 const loading = ref(false)
 const error = ref('')
-const passwordInput = ref(null)
+const passwordInput = ref<{ focus: (options?: FocusOptions) => void } | null>(null)
 
 async function focusPassword() {
   await nextTick()
@@ -41,8 +42,8 @@ async function submit() {
         ? route.query.next
         : '/'
     await runAuthTransition('login', () => router.replace(next))
-  } catch (err) {
-    error.value = err.message || '密码错误，请重试'
+  } catch (err: unknown) {
+    error.value = getErrorMessage(err, '密码错误，请重试')
   } finally {
     loading.value = false
   }

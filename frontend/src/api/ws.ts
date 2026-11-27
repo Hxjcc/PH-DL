@@ -1,5 +1,21 @@
+import type { WsMessage } from '../types/api'
+
+interface EventStreamOptions {
+  onEvent?: (message: Exclude<WsMessage, { type: 'ping' }>) => void
+  onStatusChange?: (connected: boolean) => void
+  onUnauthorized?: () => void
+}
+
 export class EventStreamClient {
-  constructor({ onEvent, onStatusChange, onUnauthorized }) {
+  declare ws: WebSocket | null
+  private declare onEvent: EventStreamOptions['onEvent']
+  private declare onStatusChange: EventStreamOptions['onStatusChange']
+  private declare onUnauthorized: EventStreamOptions['onUnauthorized']
+  private declare stopped: boolean
+  private declare retryMs: number
+  private declare timer: ReturnType<typeof setTimeout> | null
+
+  constructor({ onEvent, onStatusChange, onUnauthorized }: EventStreamOptions) {
     this.onEvent = onEvent
     this.onStatusChange = onStatusChange
     this.onUnauthorized = onUnauthorized
@@ -30,7 +46,7 @@ export class EventStreamClient {
     this.onStatusChange?.(false)
   }
 
-  _open() {
+  private _open() {
     if (this.stopped) return
     this.timer = null
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -44,10 +60,10 @@ export class EventStreamClient {
       this.onStatusChange?.(true)
     }
 
-    ws.onmessage = (evt) => {
+    ws.onmessage = (evt: MessageEvent<string>) => {
       if (this.ws !== ws || this.stopped) return
       try {
-        const msg = JSON.parse(evt.data)
+        const msg = JSON.parse(evt.data) as WsMessage
         if (msg.type !== 'ping') {
           this.onEvent?.(msg)
         }

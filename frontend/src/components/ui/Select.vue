@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts" generic="T extends string | number | null | undefined">
 import { computed } from 'vue'
 import {
   SelectRoot,
@@ -10,7 +10,9 @@ import {
   SelectItem,
   SelectItemIndicator,
   SelectItemText,
+  type AcceptableValue,
 } from 'reka-ui'
+import type { ClassValue } from 'clsx'
 import { Check, ChevronsUpDown } from 'lucide-vue-next'
 import { cn } from '../../lib/utils'
 import { useRipple } from '../../composables/useRipple'
@@ -19,15 +21,23 @@ defineOptions({ inheritAttrs: false })
 
 const EMPTY_SENTINEL = '__SHADCN_EMPTY__'
 
-const props = defineProps({
-  modelValue: { type: [String, Number], default: '' },
-  options: { type: Array, default: () => [] }, // [{ label, value }]
-  placeholder: { type: String, default: '请选择' },
-  disabled: { type: Boolean, default: false },
-  class: { type: String, default: '' },
+type EncodedValue = T extends string | number ? `${T}` : ''
+
+const props = withDefaults(defineProps<{
+  modelValue?: string | number | null
+  options?: readonly { label: string; value: T }[]
+  placeholder?: string
+  disabled?: boolean
+  class?: ClassValue
+}>(), {
+  modelValue: '',
+  options: () => [],
+  placeholder: '请选择',
+  disabled: false,
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue', 'change'])
+const emit = defineEmits<{ 'update:modelValue': [value: EncodedValue]; change: [value: EncodedValue] }>()
 const { ripples, handlePointerDown } = useRipple(() => props.disabled)
 
 const normalizedOptions = computed(() =>
@@ -55,8 +65,9 @@ const selectedLabel = computed(() =>
   normalizedOptions.value.find((option) => option.encoded === encodedValue.value)?.label ?? props.placeholder
 )
 
-function handleUpdate(value) {
-  const next = value === EMPTY_SENTINEL ? '' : value
+function handleUpdate(value: AcceptableValue) {
+  // Reka receives only the encoded values above, including for numeric options.
+  const next = (value === EMPTY_SENTINEL ? '' : value) as EncodedValue
   emit('update:modelValue', next)
   emit('change', next)
 }

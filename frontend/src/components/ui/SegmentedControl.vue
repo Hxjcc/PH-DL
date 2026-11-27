@@ -1,18 +1,25 @@
-<script setup>
+<script setup lang="ts" generic="T extends string | number">
+import type { Component } from 'vue'
+import type { ClassValue } from 'clsx'
 import { cn } from '../../lib/utils'
 import Button from './Button.vue'
 
-const props = defineProps({
-  modelValue: { type: [String, Number], required: true },
-  options: { type: Array, default: () => [] }, // [{ value, label, dot?, icon?, count?, title? }]
-  ariaLabel: { type: String, default: '' },
-  size: { type: String, default: 'md' }, // 'xs' | 'sm' | 'md'
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{
+  modelValue: string | number
+  options?: readonly { value: T; label: string; dot?: string; icon?: Component; count?: number | null; title?: string }[]
+  ariaLabel?: string
+  size?: 'xs' | 'sm' | 'md'
+  class?: ClassValue
+}>(), {
+  options: () => [],
+  ariaLabel: '',
+  size: 'md',
+  class: '',
 })
 
-const emit = defineEmits(['update:modelValue', 'change'])
+const emit = defineEmits<{ 'update:modelValue': [value: T]; change: [value: T] }>()
 
-function select(value) {
+function select(value: T) {
   if (value === props.modelValue) return
   emit('update:modelValue', value)
   emit('change', value)

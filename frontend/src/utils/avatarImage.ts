@@ -2,7 +2,7 @@ const MAX_SOURCE_BYTES = 10 * 1024 * 1024
 const MAX_GIF_PASSTHROUGH_BYTES = 1.5 * 1024 * 1024
 const AVATAR_SIZE = 256
 
-function readAsDataUrl(file) {
+function readAsDataUrl(file: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => resolve(String(reader.result || ''))
@@ -11,7 +11,7 @@ function readAsDataUrl(file) {
   })
 }
 
-export async function prepareAvatarDataUrl(file) {
+export async function prepareAvatarDataUrl(file: File | null | undefined): Promise<string> {
   if (!file) throw new Error('请选择图片文件')
   if (!String(file.type || '').startsWith('image/')) {
     throw new Error('请选择 PNG、JPG、WebP 或 GIF 图片')
@@ -25,7 +25,7 @@ export async function prepareAvatarDataUrl(file) {
 
   const objectUrl = URL.createObjectURL(file)
   try {
-    const img = await new Promise((resolve, reject) => {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
       const el = new Image()
       el.onload = () => resolve(el)
       el.onerror = () => reject(new Error('图片解码失败，请换一张 PNG/JPG/WebP 图片'))

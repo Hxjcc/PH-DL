@@ -1,13 +1,21 @@
 import { onBeforeUnmount, ref } from 'vue'
 
-export function useRipple(isDisabled = () => false) {
-  const ripples = ref([])
-  const timers = new Set()
+interface Ripple {
+  id: number
+  x: number
+  y: number
+  size: number
+}
+
+export function useRipple(isDisabled: () => boolean = () => false) {
+  const ripples = ref<Ripple[]>([])
+  const timers = new Set<ReturnType<typeof setTimeout>>()
   let sequence = 0
 
-  function handlePointerDown(event) {
-    if (isDisabled() || event.button > 0 || !event.currentTarget) return
-    const rect = event.currentTarget.getBoundingClientRect()
+  function handlePointerDown(event: PointerEvent) {
+    const target = event.currentTarget as Element | null
+    if (isDisabled() || event.button > 0 || !target) return
+    const rect = target.getBoundingClientRect()
     const id = ++sequence
     ripples.value.push({
       id,

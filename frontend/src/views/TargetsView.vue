@@ -1,6 +1,7 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, onActivated, onDeactivated, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type LocationQuery } from 'vue-router'
 import {
   Plus,
   RefreshCw,
@@ -27,6 +28,7 @@ import {
   Film,
 } from 'lucide-vue-next'
 import { api } from '../api/client'
+import type { CreateTargetRequest, RuntimeSettings, SiteKey, SubscriptionItem, TargetRecord, TargetType, TargetTypeInput, UpdateTargetRequest } from '../types/api'
 import { useAppStore } from '../stores/app'
 import { avatarGradient, formatDateTime, siteMeta, targetTypeMeta } from '../utils/format'
 import { buildTargetProfileVideosUrl, extractTargetFromInput, parseTargetUsernames } from '../utils/targetInput'
@@ -53,19 +55,20 @@ const store = useAppStore()
 const route = useRoute()
 const router = useRouter()
 
-const VALID_TARGET_SITES = new Set(['all', 'pornhub', 'xhamster'])
-function parseTargetsRouteQuery(query = {}) {
+type TargetSiteFilter = SiteKey | 'all'
+
+function parseTargetsRouteQuery(query: LocationQuery = {}): { site: TargetSiteFilter; page: number } {
   const rawSite = Array.isArray(query.site) ? query.site[0] : query.site
   const normSite = typeof rawSite === 'string' ? rawSite.trim().toLowerCase() : ''
   const rawPage = Array.isArray(query.page) ? query.page[0] : query.page
   const parsedPage = Number.parseInt(typeof rawPage === 'string' ? rawPage : '', 10)
   return {
-    site: VALID_TARGET_SITES.has(normSite) ? normSite : 'all',
+    site: normSite === 'pornhub' || normSite === 'xhamster' ? normSite : 'all',
     page: Number.isFinite(parsedPage) && parsedPage > 1 ? parsedPage : 1,
   }
 }
 
-const initialTargetsQuery =
+const initialTargetsQuery: ReturnType<typeof parseTargetsRouteQuery> =
   route.name === 'targets' ? parseTargetsRouteQuery(route.query) : { site: 'all', page: 1 }
 
 const VIEW_MODE_KEY = 'phdl-targets-view'
@@ -75,7 +78,8 @@ const TARGET_SORT_OPTIONS = [
   { label: '最新加入', value: 'created_desc' },
   { label: '最早加入', value: 'created_asc' },
   { label: '视频最多', value: 'videos_desc' },
-]
+] as const
+type TargetSort = typeof TARGET_SORT_OPTIONS[number]['value']
 const targetPageSizeOptions = TARGETS_PAGE_SIZES.map((value) => ({
   label: value === 0 ? '全部显示' : `每页 ${value} 个`,
   value,
@@ -89,10 +93,11 @@ function loadInitialViewMode() {
   return 'grid'
 }
 
-function loadInitialSortBy() {
+function loadInitialSortBy(): TargetSort {
   try {
     const saved = localStorage.getItem(SORT_BY_KEY)
-    if (TARGET_SORT_OPTIONS.some((opt) => opt.value === saved)) return saved
+    const option = TARGET_SORT_OPTIONS.find((opt) => opt.value === saved)
+    if (option) return option.value
   } catch {}
   return 'name_asc'
 }
@@ -109,16 +114,25 @@ const viewMode = ref(loadInitialViewMode())
 const subsModalOpen = ref(false)
 const addModalOpen = ref(false)
 const adding = ref(false)
-const updatingTargetId = ref(null)
+const updatingTargetId = ref<number | null>(null)
 const newBaselineValid = ref(true)
 const baselineModalOpen = ref(false)
-const baselineTarget = ref(null)
+const baselineTarget = ref<TargetRecord | null>(null)
 const baselinePages = ref('all')
 const baselinePagesValid = ref(true)
 const baselineSubmitting = ref(false)
 const editModalOpen = ref(false)
 const editingSubmitting = ref(false)
-const editForm = reactive({
+const editForm = reactive<{
+  id: number | null
+  site: SiteKey
+  username: string
+  original_username: string
+  original_type: TargetType
+  display_name: string
+  target_type: TargetType
+  preferred_quality: string
+}>({
   id: null,
   site: 'pornhub',
   username: '',
@@ -131,18 +145,18 @@ const editForm = reactive({
 const SITE_CHOICES = [
   { label: 'PornHub', value: 'pornhub', dot: 'bg-[#ff9000]' },
   { label: 'xHamster', value: 'xhamster', dot: 'bg-red-500' },
-]
+] as const
 const PH_EDIT_TYPE_OPTIONS = [
   { label: 'Model', value: 'model' },
   { label: 'Pornstar', value: 'pornstar' },
   { label: 'Favorites (收藏夹)', value: 'favorites' },
-]
+] as const
 const XH_EDIT_TYPE_OPTIONS = [
   { label: 'Creator', value: 'creator' },
   { label: 'Pornstar', value: 'pornstar' },
   { label: 'User', value: 'users' },
   { label: 'Channel', value: 'channel' },
-]
+] as const
 const editTargetTypeOptions = computed(() =>
   editForm.site === 'xhamster' ? XH_EDIT_TYPE_OPTIONS : PH_EDIT_TYPE_OPTIONS
 )
@@ -151,7 +165,7 @@ const isEditLockedCollection = computed(
 )
 const qualityPresetChoices = ['2160', '1440', '1080', '720', '480']
 
-const schedule = reactive({
+const schedule = reactive<{ enabled: boolean; time: string; scan_mode: RuntimeSettings['update_scan_mode'] }>({
   enabled:
     store.settingsCache !== null
       ? Boolean(store.settingsCache.schedule_enabled)
@@ -169,9 +183,11 @@ const schedule = reactive({
 const UPDATE_SCAN_MODES = [
   { value: 'catch_up', label: '智能衔接', title: '从首页开始，衔接已知视频后停止（速度快，适合高频追更）' },
   { value: 'full', label: '全量翻页', title: '每次翻完目标全部列表页，不错过重新公开或补漏的旧视频（已知视频直接跳过，不重复解析详情）' },
-]
+] as const
 
-const newTarget = reactive({
+const newTarget = reactive<Required<Pick<CreateTargetRequest,
+  'site' | 'username' | 'target_type' | 'preferred_quality' | 'init_baseline' | 'baseline_pages'
+>>>({
   site: 'pornhub',
   username: '',
   target_type: 'auto',
@@ -186,7 +202,7 @@ const PH_TARGET_TYPE_OPTIONS = [
   { label: 'Pornstar', value: 'pornstar' },
   { label: 'Favorites (收藏夹)', value: 'favorites' },
   { label: 'Liked (我的点赞)', value: 'liked' },
-]
+] as const
 
 const XH_TARGET_TYPE_OPTIONS = [
   { label: '自动识别', value: 'auto' },
@@ -195,7 +211,7 @@ const XH_TARGET_TYPE_OPTIONS = [
   { label: 'User (普通用户)', value: 'users' },
   { label: 'Channel (频道)', value: 'channel' },
   { label: 'Favorites (我的收藏)', value: 'favorites' },
-]
+] as const
 
 const targetTypeOptions = computed(() =>
   newTarget.site === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS
@@ -208,7 +224,7 @@ const isNewSelfCollection = computed(
 watch(
   () => newTarget.site,
   (nextSite) => {
-    const valid = new Set((nextSite === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS).map((o) => o.value))
+    const valid = new Set<TargetTypeInput>((nextSite === 'xhamster' ? XH_TARGET_TYPE_OPTIONS : PH_TARGET_TYPE_OPTIONS).map((o) => o.value))
     if (!valid.has(newTarget.target_type)) {
       newTarget.target_type = 'auto'
     }
@@ -234,7 +250,7 @@ watch(
   }
 )
 
-function isLocalToday(iso) {
+function isLocalToday(iso: string | null | undefined) {
   if (!iso) return false
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return false
@@ -246,7 +262,7 @@ function isLocalToday(iso) {
   )
 }
 
-function targetTodayNewCount(t) {
+function targetTodayNewCount(t: TargetRecord) {
   if (typeof t?.today_new_count === 'number') {
     return Math.max(0, t.today_new_count)
   }
@@ -255,11 +271,11 @@ function targetTodayNewCount(t) {
     : 0
 }
 
-function isUpdatedToday(t) {
+function isUpdatedToday(t: TargetRecord) {
   return targetTodayNewCount(t) > 0
 }
 
-function targetNewBadgeTitle(t) {
+function targetNewBadgeTitle(t: TargetRecord) {
   const today = targetTodayNewCount(t)
   const lastNew = Number(t?.last_new_count || 0)
   const parts = [`今日扫描新增 ${today} 个视频（仅统计当天追更/检查更新发现，次日自动清零）`]
@@ -281,7 +297,7 @@ const siteFilterTabs = computed(() => [
   { value: 'all', label: '全站', title: '显示全部站点目标' },
   { value: 'pornhub', label: 'PH', dot: 'bg-[#ff9000]', count: phTargetCount.value, title: '仅显示 PornHub 目标' },
   { value: 'xhamster', label: 'XH', dot: 'bg-red-500', count: xhTargetCount.value, title: '仅显示 xHamster 目标' },
-])
+] as const)
 
 const enabledCount = computed(() => siteScopedTargets.value.filter((t) => t.enabled).length)
 const disabledCount = computed(() => siteScopedTargets.value.filter((t) => !t.enabled).length)
@@ -298,11 +314,11 @@ const statusPills = computed(() => [
     : []),
 ])
 
-function targetVideoCount(t) {
+function targetVideoCount(t: TargetRecord) {
   return Math.max(0, Number(t?.video_total_count || 0))
 }
 
-function targetVideoCountTitle(t) {
+function targetVideoCountTitle(t: TargetRecord) {
   const total = targetVideoCount(t)
   const saved = Math.max(0, Number(t?.video_saved_count || 0))
   const baseline = Math.max(0, Number(t?.video_baseline_count || 0))
@@ -310,7 +326,7 @@ function targetVideoCountTitle(t) {
   return `共索引 ${total} 个视频（已入库 ${saved} · 仅基线 ${baseline}），点击前往历史记录查看`
 }
 
-function openTargetHistory(t) {
+function openTargetHistory(t: TargetRecord) {
   const site = t.site || 'pornhub'
   const uploader =
     t.target_type === 'liked'
@@ -322,7 +338,7 @@ function openTargetHistory(t) {
   router.push({ name: 'history', query: { uploader, site } })
 }
 
-function parseCreatedTs(iso) {
+function parseCreatedTs(iso: string | null | undefined) {
   if (!iso) return 0
   const ts = Date.parse(iso)
   return Number.isNaN(ts) ? 0 : ts
@@ -397,7 +413,7 @@ let applyingRouteQuery = false
 
 function syncTargetsQueryToUrl() {
   if (route.name !== 'targets' || applyingRouteQuery) return
-  const nextQuery = {}
+  const nextQuery: LocationQuery = {}
   if (siteFilter.value !== 'all') nextQuery.site = siteFilter.value
   if (currentPage.value > 1) nextQuery.page = String(currentPage.value)
   const curSite = Array.isArray(route.query.site) ? route.query.site[0] : route.query.site
@@ -438,33 +454,33 @@ watch(totalPages, (maxPage) => {
   }
 })
 
-function setSortBy(value) {
+function setSortBy(value: TargetSort) {
   sortBy.value = value
   try {
     localStorage.setItem(SORT_BY_KEY, value)
   } catch {}
 }
 
-function setPageSize(value) {
+function setPageSize(value: string) {
   const num = Number(value)
   pageSize.value = TARGETS_PAGE_SIZES.includes(num) ? num : 24
   saveListPreference('targets', pageSize.value)
 }
 
-function goTargetPage(nextPage) {
+function goTargetPage(nextPage: number) {
   const clamped = Math.min(Math.max(1, nextPage), totalPages.value)
   if (clamped === currentPage.value) return
   currentPage.value = clamped
 }
 
-function setViewMode(mode) {
+function setViewMode(mode: 'table' | 'grid') {
   viewMode.value = mode
   try {
     localStorage.setItem(VIEW_MODE_KEY, mode)
   } catch {}
 }
 
-function targetDisplayName(t) {
+function targetDisplayName(t: TargetRecord) {
   if (t.target_type === 'liked') return 'Liked Videos'
   if (t.site === 'xhamster' && t.target_type === 'favorites') {
     return (t.display_name || '').trim() || 'xHamster Favorites'
@@ -472,20 +488,20 @@ function targetDisplayName(t) {
   return (t.display_name || '').trim() || t.username
 }
 
-function targetInitial(t) {
+function targetInitial(t: TargetRecord) {
   const name = targetDisplayName(t).trim()
   return (name[0] || 'P').toUpperCase()
 }
 
-function handleAvatarError(t) {
+function handleAvatarError(t: TargetRecord) {
   t.avatar_url = ''
 }
 
-let loadingTimer = null
+let loadingTimer: ReturnType<typeof setTimeout> | null = null
 let activatedOnce = false
 
 async function loadData({ silent = false } = {}) {
-  clearTimeout(loadingTimer)
+  if (loadingTimer !== null) clearTimeout(loadingTimer)
   if (!silent && store.targetsCache === null && targets.value.length === 0) {
     loadingTimer = setTimeout(() => {
       loading.value = true
@@ -499,10 +515,10 @@ async function loadData({ silent = false } = {}) {
       schedule.time = settings.schedule_time || '04:00'
       schedule.scan_mode = settings.update_scan_mode === 'full' ? 'full' : 'catch_up'
     }
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
-    clearTimeout(loadingTimer)
+    if (loadingTimer !== null) clearTimeout(loadingTimer)
     loading.value = false
   }
 }
@@ -542,7 +558,7 @@ onActivated(() => {
 })
 
 function clearLoadingTimer() {
-  clearTimeout(loadingTimer)
+  if (loadingTimer !== null) clearTimeout(loadingTimer)
   loading.value = false
 }
 
@@ -563,13 +579,13 @@ async function saveSchedule() {
     store.notify('追更策略已保存', 'success')
     await store.refreshOverview()
     return true
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
     return false
   }
 }
 
-async function setScanMode(mode) {
+async function setScanMode(mode: RuntimeSettings['update_scan_mode']) {
   if (schedule.scan_mode === mode) return
   const prev = schedule.scan_mode
   schedule.scan_mode = mode
@@ -630,14 +646,17 @@ async function handleAddTarget() {
     newTarget.username = ''
     newTarget.preferred_quality = ''
     await loadData({ silent: true })
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     adding.value = false
   }
 }
 
-async function handleImportSubs(picked, opts = {}) {
+async function handleImportSubs(
+  picked: SubscriptionItem[],
+  opts: { site?: SiteKey; initBaseline?: boolean; baselinePages?: string } = {},
+) {
   const initBaseline = Boolean(opts?.initBaseline)
   try {
     const res = await api.batchCreateTargets({
@@ -659,25 +678,25 @@ async function handleImportSubs(picked, opts = {}) {
       'success'
     )
     await Promise.all([loadData({ silent: true }), store.refreshJobs()])
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   }
 }
 
-async function toggleEnabled(t, val) {
+async function toggleEnabled(t: TargetRecord, val: boolean) {
   const prev = t.enabled
   t.enabled = val
   try {
     const res = await api.updateTarget(t.id, { enabled: val })
     t.enabled = res.target.enabled
     store.setTargetsCache(targets.value)
-  } catch (err) {
+  } catch (err: unknown) {
     t.enabled = prev
-    store.notify(err.message, 'error')
+    store.notify(getErrorMessage(err), 'error')
   }
 }
 
-async function triggerUpdate(targetIds, autoDownload) {
+async function triggerUpdate(targetIds: number[] | null, autoDownload: boolean) {
   if (Array.isArray(targetIds) && targetIds.length === 1) {
     updatingTargetId.value = targetIds[0]
   }
@@ -686,21 +705,21 @@ async function triggerUpdate(targetIds, autoDownload) {
     store.notify(`已创建任务 #${res.job.id}`, 'success')
     await store.refreshJobs()
     router.push({ name: 'jobs' })
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     updatingTargetId.value = null
   }
 }
 
-function openBaselineDialog(target) {
+function openBaselineDialog(target: TargetRecord) {
   baselineTarget.value = target
   baselinePages.value = 'all'
   baselinePagesValid.value = true
   baselineModalOpen.value = true
 }
 
-function openEditDialog(target) {
+function openEditDialog(target: TargetRecord) {
   editForm.id = target.id
   editForm.site = target.site || 'pornhub'
   editForm.username = target.username
@@ -712,7 +731,7 @@ function openEditDialog(target) {
   editModalOpen.value = true
 }
 
-function toggleEditQuality(q) {
+function toggleEditQuality(q: string) {
   const parts = new Set(
     String(editForm.preferred_quality || '')
       .split(',')
@@ -726,7 +745,7 @@ function toggleEditQuality(q) {
     .join(',')
 }
 
-function isEditQualitySelected(q) {
+function isEditQualitySelected(q: string) {
   return String(editForm.preferred_quality || '')
     .split(',')
     .map((s) => s.trim().replace(/p$/i, ''))
@@ -735,7 +754,7 @@ function isEditQualitySelected(q) {
 
 async function handleSaveTargetEdit() {
   if (!editForm.id || editingSubmitting.value) return
-  const payload = {
+  const payload: UpdateTargetRequest = {
     display_name: editForm.display_name.trim(),
     preferred_quality: editForm.preferred_quality.trim(),
   }
@@ -770,8 +789,8 @@ async function handleSaveTargetEdit() {
     }
     editModalOpen.value = false
     store.notify(identityChanged ? '监控目标标识与历史归属已更新' : '监控目标配置已更新', 'success')
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     editingSubmitting.value = false
   }
@@ -785,21 +804,21 @@ async function handleSyncBaseline() {
     store.notify(`已启动基线同步任务 #${res.job.id}`, 'success')
     baselineModalOpen.value = false
     await store.refreshJobs()
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   } finally {
     baselineSubmitting.value = false
   }
 }
 
-async function handleDelete(t) {
+async function handleDelete(t: TargetRecord) {
   try {
     await api.deleteTarget(t.id)
     targets.value = targets.value.filter((x) => x.id !== t.id)
     store.setTargetsCache(targets.value)
     store.notify(`已移除 '${targetDisplayName(t)}'`, 'info')
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   }
 }
 </script>

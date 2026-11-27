@@ -1,4 +1,5 @@
-<script setup>
+<script setup lang="ts">
+import { getErrorMessage } from '../utils/errors'
 import { computed, nextTick, onActivated, onDeactivated, ref, watch } from 'vue'
 import { Trash2, Search, Copy, Terminal, Activity } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
@@ -13,7 +14,7 @@ const store = useAppStore()
 const levelFilter = ref('ALL')
 const search = ref('')
 const autoScroll = ref(true)
-const boxRef = ref(null)
+const boxRef = ref<HTMLElement | null>(null)
 let routeActive = false
 
 const levelPills = [
@@ -63,7 +64,7 @@ onActivated(() => {
 })
 onDeactivated(() => { routeActive = false })
 
-function levelStyle(level) {
+function levelStyle(level: string) {
   if (level === 'ERROR' || level === 'CRITICAL') return 'text-red-500 dark:text-red-400'
   if (level === 'WARNING') return 'text-amber-600 dark:text-amber-400'
   return 'text-emerald-600 dark:text-emerald-400'
@@ -88,8 +89,8 @@ async function handleClear() {
   try {
     await store.clearLogs()
     store.notify('日志缓冲区已清空', 'info')
-  } catch (err) {
-    store.notify(err.message, 'error')
+  } catch (err: unknown) {
+    store.notify(getErrorMessage(err), 'error')
   }
 }
 </script>

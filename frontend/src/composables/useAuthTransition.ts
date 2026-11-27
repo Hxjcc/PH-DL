@@ -1,13 +1,20 @@
 import { nextTick, reactive, readonly } from 'vue'
 
-const state = reactive({ visible: false, kind: 'login', phase: 'cover' })
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+type AuthTransitionKind = 'entry' | 'login' | 'logout'
+type AuthTransitionPhase = 'cover' | 'covered' | 'reveal'
+
+const state = reactive<{ visible: boolean; kind: AuthTransitionKind; phase: AuthTransitionPhase }>({
+  visible: false,
+  kind: 'login',
+  phase: 'cover',
+})
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 const COVER_MS = 280
 const ENTRY_HOLD_MS = 120
 const REVEAL_MS = 360
 
 export function useAuthTransition() {
-  async function run(kind, action) {
+  async function run(kind: AuthTransitionKind, action?: () => unknown): Promise<void> {
     if (state.visible) return
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     if (reduced) {

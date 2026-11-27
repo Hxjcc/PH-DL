@@ -1,13 +1,14 @@
-<script setup>
+<script setup lang="ts">
 import { Sun, Moon } from 'lucide-vue-next'
+import type { ClassValue } from 'clsx'
 import { useTheme } from '../composables/useTheme'
 import { cn } from '../lib/utils'
 import Button from './ui/Button.vue'
 
-const props = defineProps({
-  sizeClass: { type: String, default: 'h-7 w-7' },
-  iconClass: { type: String, default: 'w-3.5 h-3.5' },
-  class: { type: String, default: '' },
+const props = withDefaults(defineProps<{ sizeClass?: string; iconClass?: string; class?: ClassValue }>(), {
+  sizeClass: 'h-7 w-7',
+  iconClass: 'w-3.5 h-3.5',
+  class: '',
 })
 
 const { isDark, toggleTheme } = useTheme()
