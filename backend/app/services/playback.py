@@ -22,7 +22,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..config import RuntimeSettings
 from ..parsers.http_session import TaskHttpContext
-from ..parsers.video import MediaSource, extract_viewkey_from_url, fetch_single_video_detail, is_video_url
+from ..parsers.video import MediaSource, fetch_single_video_detail, safe_video_page_url
 from ..parsers.urls import is_cookie_origin, is_media_url, is_site_url
 from ..parsers.xhamster import is_xhamster_url
 from .downloader import DOWNLOAD_HEADERS
@@ -56,11 +56,15 @@ def _media_url(url: str) -> bool:
 def _playback_page(record: dict, viewkey: str) -> str:
     recorded = str(record.get("video_page_url") or "").strip()
     site = "xhamster" if str(record.get("site") or "").strip().lower() == "xhamster" or is_xhamster_url(recorded) else "pornhub"
-    if is_site_url(recorded, site) and is_video_url(recorded) and extract_viewkey_from_url(recorded) == viewkey:
-        return recorded
-    if site == "xhamster":
-        return f"https://xhamster.com/videos/{viewkey}"
-    return f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
+    return safe_video_page_url(recorded, site, viewkey)
+
+
+def _playlist_response(body: str) -> Response:
+    return Response(
+        content=body,
+        media_type="application/vnd.apple.mpegurl",
+        headers={**NO_CACHE, "X-Accel-Buffering": "no", "Cross-Origin-Resource-Policy": "same-origin"},
+    )
 
 
 def _parse_range(value: Optional[str]) -> Optional[re.Match[str]]:
@@ -248,7 +252,7 @@ class PlaybackService:
         def _collect_allowed(candidates: tuple[MediaSource, ...]) -> dict[str, MediaSource]:
             collected: dict[str, MediaSource] = {}
             for source in candidates:
-                if _media_url(source.url):
+                if _media_url(source.url) and (not source.audio_url or _media_url(source.audio_url)):
                     collected.setdefault(source.quality, source)
             return collected
 
@@ -321,12 +325,20 @@ class PlaybackService:
         entry = self._session(viewkey, ticket)
         if entry.format != "hls" or not 0 <= index < len(entry.sources):
             raise HTTPException(404, "没有找到该画质")
-        upstream_url = entry.sources[index].url
+        source = entry.sources[index]
+        if source.audio_url:
+            video = entry.register_hls_asset(index, source.url)
+            audio = entry.register_hls_asset(index, source.audio_url)
+            return _playlist_response(
+                '#EXTM3U\n'
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="seg/{audio}"\n'
+                f'#EXT-X-STREAM-INF:BANDWIDTH={max(1, source.bandwidth)},AUDIO="audio"\nseg/{video}\n'
+            )
         async with AsyncExitStack() as setup:
             upstream, final_url = await self._open_upstream(
                 setup,
                 entry,
-                upstream_url,
+                source.url,
                 byte_range=None,
                 extra_headers={"Accept-Encoding": "identity"},
             )
@@ -387,17 +399,7 @@ class PlaybackService:
             else:
                 rewritten_lines.append(_rewrite_uri(stripped))
 
-        body = "\n".join(rewritten_lines) + "\n"
-        return Response(
-            content=body,
-            status_code=200,
-            media_type="application/vnd.apple.mpegurl",
-            headers={
-                **NO_CACHE,
-                "X-Accel-Buffering": "no",
-                "Cross-Origin-Resource-Policy": "same-origin",
-            },
-        )
+        return _playlist_response("\n".join(rewritten_lines) + "\n")
 
     async def segment(
         self,
@@ -413,6 +415,7 @@ class PlaybackService:
         assets = entry.hls_asset_urls.get(index) or []
         if not 0 <= seg_id < len(assets):
             raise HTTPException(404, "没有找到该播放分片")
+        source = entry.sources[index]
         return await self._relay(
             entry,
             assets[seg_id],
@@ -420,6 +423,7 @@ class PlaybackService:
             allowed_types=_HLS_SEGMENT_TYPES,
             forced_media_type=None,
             playlist_index=index,
+            is_playlist=bool(source.audio_url and assets[seg_id] in {source.url, source.audio_url}),
         )
 
     async def _open_upstream(
@@ -482,6 +486,7 @@ class PlaybackService:
         allowed_types: Optional[set[str]] = None,
         forced_media_type: Optional[str] = "video/mp4",
         playlist_index: Optional[int] = None,
+        is_playlist: bool = False,
     ) -> Response:
         requested = _parse_range(byte_range)
         valid_types = allowed_types if allowed_types is not None else _MP4_TYPES
@@ -495,7 +500,7 @@ class PlaybackService:
                 raise HTTPException(502, "视频源暂时不可用")
             content_type = upstream.headers.get("Content-Type", "").partition(";")[0].strip().lower()
             if playlist_index is not None and (
-                content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl"}
+                is_playlist or content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl"}
                 or urlsplit(final_url).path.lower().endswith(".m3u8")
             ):
                 if upstream.status != 200:

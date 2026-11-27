@@ -62,16 +62,14 @@ def create_app(env_settings: Optional[EnvSettings] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if env.admin_password.strip() in {"", "admin", "change-me-strong-password"} and not env.allow_insecure_default_password:
+            raise RuntimeError("PHDL_ADMIN_PASSWORD 必须设置为非空且非默认的管理员密码。")
         env.ensure_dirs()
         _configure_logging(env)
-        if env.admin_password in {"admin", "change-me-strong-password"}:
-            logging.getLogger("phdl").warning(
-                "检测到默认管理员密码，请立即在环境变量 PHDL_ADMIN_PASSWORD 中设置强密码。"
-            )
 
         db = Database(env.db_path)
         await db.connect()
-        repo = Repository(db)
+        repo = Repository(db, rclone_bin=env.rclone_bin)
         recovered = await repo.recover_interrupted_jobs()
 
         secret_key = env.get_or_create_secret_key()

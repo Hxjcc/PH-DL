@@ -64,8 +64,12 @@ def create_aiohttp_connector(
     """
     cleaned = (proxy_url or "").strip() or None
     if cleaned and is_socks_proxy(cleaned):
+        scheme, netloc = cleaned.split("://", 1)
+        scheme = scheme.lower()
+        remote_dns = {"socks4a": "socks4", "socks5h": "socks5"}
         connector = ProxyConnector.from_url(
-            cleaned,
+            f"{remote_dns.get(scheme, scheme)}://{netloc}",
+            rdns=True if scheme in remote_dns else None,
             limit=limit,
             limit_per_host=limit_per_host,
             keepalive_timeout=keepalive_timeout,

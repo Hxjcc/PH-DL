@@ -286,6 +286,7 @@ async def test_uploader_copies_and_verifies_without_downloading_by_default(tmp_p
         if action == "mkdir":
             return 0, "", ""
         if action == "copy":
+            kwargs["on_stderr_line"](json.dumps({"level": "info", "msg": "Copied (new)", "object": f2.name}))
             return 0, "", ""
         if action == "lsjson":
             target = cmd[5]
@@ -432,6 +433,113 @@ async def test_failed_copy_keeps_source_and_never_trusts_an_old_remote_object(tm
     assert local.read_bytes() == VALID_MP4
 
 
+@pytest.mark.parametrize("mode", ["mismatched_hash", "hashless_skip", "hashless_skip_again", "hashless_copy"])
+async def test_upload_retries_unverified_remote_objects_before_local_cleanup(tmp_path, monkeypatch, mode):
+    path = tmp_path / "source.mp4"
+    path.write_bytes(VALID_MP4)
+    copied = []
+    replacement = False
+
+    def transfer_line(kwargs, message="Copied (new)"):
+        kwargs["on_stderr_line"](json.dumps({
+            "level": "debug" if message == "Unchanged skipping" else "info",
+            "msg": message, "object": path.name,
+        }))
+
+    async def command(cmd, **kwargs):
+        nonlocal replacement
+        if cmd[1] == "listremotes":
+            return 0, "primary: pikpak\n", ""
+        if cmd[1] == "mkdir":
+            return 0, "", ""
+        if cmd[1] == "copy":
+            copied.append(cmd)
+            transfer_line(kwargs, "Copied (new)" if mode == "hashless_copy" else "Unchanged skipping")
+            return 0, "", ""
+        if cmd[1] == "copyto":
+            copied.append(cmd)
+            assert "--ignore-times" in cmd and not any(flag.startswith("--size-only") for flag in cmd)
+            replacement = mode != "hashless_skip_again"
+            transfer_line(kwargs, "Copied (replaced existing)" if replacement else "Unchanged skipping")
+            return 0, "", ""
+        if cmd[1] == "lsjson":
+            meta = {"IsDir": False, "Size": len(VALID_MP4)}
+            if mode == "mismatched_hash":
+                meta["Hashes"] = {"md5": hashlib.md5(VALID_MP4 if replacement else b"corrupt").hexdigest()}
+            return 0, json.dumps(meta), ""
+        pytest.fail(f"Unexpected rclone command {cmd[1]}")
+
+    monkeypatch.setattr(uploader, "_run_cmd", command)
+    result = await uploader.upload_file_batch(tmp_path, "fixture", {"vk1": path}, RuntimeSettings(
+        rclone_remote="primary", min_file_size_bytes=64, rclone_extra_flags="--size-only=true",
+    ))
+    assert len(copied) == (1 if mode == "hashless_copy" else 2)
+    if mode == "hashless_skip_again":
+        assert not result.verified_sources and result.failed_viewkeys == ["vk1"] and path.is_file()
+    else:
+        assert result.uploaded_viewkeys == ["vk1"]
+        assert uploader.delete_verified_source(path, result.verified_sources["vk1"])
+        assert not path.exists()
+
+
+async def test_partial_rclone_batch_reconciles_only_confirmed_primary_copies(tmp_path, monkeypatch):
+    paths = {key: tmp_path / f"{key}.mp4" for key in ["transferred", "matched", "skipped", "missing"]}
+    for path in paths.values():
+        path.write_bytes(VALID_MP4)
+    verified = set()
+
+    async def command(cmd, **kwargs):
+        if cmd[1] == "listremotes":
+            return 0, "primary: drive\n", ""
+        if cmd[1] == "mkdir":
+            return 0, "", ""
+        if cmd[1] == "copy":
+            kwargs["on_stderr_line"](json.dumps({"level": "info", "msg": "Copied (new)", "object": "transferred.mp4"}))
+            return 7, "", "storageQuotaExceeded"
+        if cmd[1] == "lsjson":
+            name = cmd[5].rsplit("/", 1)[-1].removesuffix(".mp4")
+            verified.add(name)
+            if name == "missing":
+                return 3, "", "object not found"
+            meta = {"Size": len(VALID_MP4), "IsDir": False}
+            if name == "matched":
+                meta["Hashes"] = {"sha1": hashlib.sha1(VALID_MP4).hexdigest()}
+            return 0, json.dumps(meta), ""
+        pytest.fail(f"Unexpected rclone command {cmd[1]}")
+
+    monkeypatch.setattr(uploader, "_run_cmd", command)
+    result = await uploader.upload_file_batch(tmp_path, "fixture", paths, RuntimeSettings(
+        rclone_remote="primary", min_file_size_bytes=64,
+    ))
+    assert verified == set(paths)
+    assert set(result.uploaded_viewkeys) == set(result.verified_sources) == set(result.remote_paths) == {"transferred", "matched"}
+    assert set(result.failed_viewkeys) == {"skipped", "missing"} and result.fatal_limit_error
+
+
+async def test_hash_checks_cancel_between_one_mib_reads(tmp_path, monkeypatch):
+    from app.cancel import StopRequested
+
+    path = tmp_path / "large.mp4"
+    stop = asyncio.Event()
+    sizes = []
+
+    class Stream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, size):
+            sizes.append(size)
+            stop.set()
+            return b"media"
+
+    monkeypatch.setattr(Path, "open", lambda *args: Stream())
+    with pytest.raises(StopRequested):
+        await asyncio.to_thread(uploader._hash_file, path, "sha256", stop)
+    assert sizes == [1024 * 1024]
+
 async def test_run_cmd_timeout_terminates_subprocess():
     started = time.monotonic()
     rc, _, stderr = await uploader._run_cmd(
@@ -526,7 +634,7 @@ async def test_uploader_streams_json_progress_and_caches_remote_session(tmp_path
         if action == "copy":
             assert "--use-json-log" in cmd
             assert "--stats=300ms" in cmd
-            assert "--log-level=NOTICE" in cmd
+            assert "--log-level=INFO" in cmd
             assert "--stats-log-level=NOTICE" in cmd
             cb = kwargs.get("on_stderr_line")
             assert cb is not None
@@ -550,6 +658,7 @@ async def test_uploader_streams_json_progress_and_caches_remote_session(tmp_path
                     }
                 )
             )
+            cb(json.dumps({"level": "info", "msg": "Copied (new)", "object": rel_name}))
             return 0, "", ""
         if action == "lsjson":
             return 0, json.dumps({"Size": len(VALID_MP4), "IsDir": False}), ""
@@ -711,6 +820,9 @@ async def test_multi_remote_chain_session_cache_and_connection_test(tmp_path: Pa
         if action == "mkdir":
             return 0, "", ""
         if action == "copy":
+            list_file = Path(cmd[cmd.index("--files-from-raw") + 1])
+            for name in list_file.read_text(encoding="utf-8").splitlines():
+                kwargs["on_stderr_line"](json.dumps({"level": "info", "msg": "Copied (new)", "object": name}))
             return 0, "", ""
         if action == "lsjson":
             return 0, json.dumps({"Size": len(VALID_MP4), "IsDir": False}), ""

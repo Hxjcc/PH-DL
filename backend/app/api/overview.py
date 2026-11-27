@@ -12,7 +12,6 @@ from ..db.repo import normalize_site
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.target import fetch_subscriptions
 from ..parsers.xhamster import fetch_xhamster_subscriptions_detailed
-from ..services.cookie import format_cookie_valid_message, login_xhamster_and_get_cookies
 from .deps import AppContainer, require_auth
 
 router = APIRouter(prefix="/api", tags=["overview"])
@@ -92,35 +91,10 @@ async def get_subscriptions(
 
     if norm_site == "xhamster":
         xh_cookie = settings.xh_cookie.strip()
-        if not xh_cookie and settings.xh_username.strip() and settings.xh_password.strip():
-            login_res = await login_xhamster_and_get_cookies(
-                settings.xh_username,
-                settings.xh_password,
-                proxy_url=settings.normalized_proxy,
-                timeout=settings.request_timeout,
-                yescaptcha_enabled=settings.yescaptcha_enabled,
-                yescaptcha_client_key=settings.yescaptcha_client_key,
-                yescaptcha_task_type=settings.yescaptcha_xh_task_type,
-                yescaptcha_timeout_seconds=settings.yescaptcha_timeout_seconds,
-                on_log=lambda level, message: container.events.emit_log(level, message),
-            )
-            if login_res.success and login_res.cookie_str:
-                refreshed = await container.repo.save_refreshed_cookie(
-                    "xh", settings, login_res.cookie_str, login_res.logged_in_username,
-                )
-                if refreshed is None:
-                    raise HTTPException(409, "登录期间连接配置已变更，请重试")
-                settings = refreshed
-                resolved_user = (login_res.logged_in_username or settings.xh_logged_in_username or "").strip()
-                container.tasks.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
-                xh_cookie = settings.xh_cookie.strip()
-            else:
-                container.tasks.set_xh_cookie_status(False, login_res.message)
-                raise HTTPException(status_code=400, detail=container.repo.redact_diagnostic(login_res.message))
         if not xh_cookie:
             raise HTTPException(
                 status_code=400,
-                detail="请先在【系统设置 → Cookie 与账号】中登录 xHamster 账号或粘贴有效 Cookie",
+                detail="请前往【系统设置 → Cookie 与账号】刷新 xHamster 登录或导入有效 Cookie",
             )
         async with TaskHttpContext(
             site="xhamster",

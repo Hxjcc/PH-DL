@@ -55,6 +55,7 @@ interface SessionCacheSource {
 }
 
 export const SESSION_CACHE_KEY = 'phdl-session-cache-v1'
+export const SESSION_LOGOUT_KEY = 'phdl-session-logout-v1'
 export const SESSION_CACHE_MAX_CHARS = 256 * 1024
 const SESSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const SESSION_CACHE_VERSION = 3
@@ -158,7 +159,7 @@ function cachedOverview(overview: OverviewResponse): OverviewResponse {
 function cachedTarget(target: TargetRecord): TargetRecord {
   return {
     ...pick(target, [
-      'id', 'site', 'username', 'target_type', 'display_name', 'enabled', 'preferred_quality', 'created_at',
+      'id', 'site', 'username', 'target_type', 'display_name', 'enabled', 'baseline_pending', 'preferred_quality', 'created_at',
       'last_checked_at', 'last_new_count', 'today_new_date', 'today_new_count', 'video_total_count',
       'video_saved_count', 'video_baseline_count',
     ]),
@@ -219,10 +220,26 @@ export function readSessionCache(): SessionCache | null {
     if (!raw) return null
     const cached = raw.length < SESSION_CACHE_MAX_CHARS ? JSON.parse(raw) as SessionCache | null : null
     if (cached?.v === SESSION_CACHE_VERSION && cached.authenticated === true &&
-        Number.isFinite(cached.ts) && Date.now() - cached.ts <= SESSION_CACHE_TTL_MS) return cached
+        Number.isFinite(cached.ts) && cached.ts > readLogoutTimestamp() &&
+        Date.now() - cached.ts <= SESSION_CACHE_TTL_MS) return cached
   } catch {}
   try { window.sessionStorage.removeItem(SESSION_CACHE_KEY) } catch {}
   return null
+}
+
+export function readLogoutTimestamp(): number {
+  try {
+    const timestamp = Number(window.localStorage.getItem(SESSION_LOGOUT_KEY))
+    return Number.isSafeInteger(timestamp) && timestamp > 0 ? timestamp : 0
+  } catch {
+    return 0
+  }
+}
+
+export function broadcastSessionLogout(): number {
+  const timestamp = Math.max(Date.now(), readLogoutTimestamp() + 1)
+  try { window.localStorage.setItem(SESSION_LOGOUT_KEY, String(timestamp)) } catch {}
+  return timestamp
 }
 
 export function serializeSessionCache(store: SessionCacheSource, pathname: string) {

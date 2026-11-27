@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Awaitable, Callable, Optional, Tuple
 
 from ..db.repo import Repository
@@ -20,6 +20,14 @@ def parse_hhmm(time_str: str) -> Optional[Tuple[int, int]]:
     if 0 <= hour <= 23 and 0 <= minute <= 59:
         return hour, minute
     return None
+
+
+def _next_schedule(now: datetime, hhmm: Tuple[int, int], last_run: Optional[str]) -> Tuple[datetime, bool]:
+    today = now.date()
+    already_ran = last_run == today.isoformat()
+    day = today + timedelta(days=1) if already_ran else today
+    scheduled = datetime.combine(day, time(*hhmm)).astimezone()
+    return scheduled, not already_ran and scheduled <= now
 
 
 class UpdateScheduler:
@@ -64,13 +72,9 @@ class UpdateScheduler:
         if not parsed:
             return None
         last_run = await self._ensure_last_run_loaded()
-        hour, minute = parsed
-        now = datetime.now()
-        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        today_str = now.strftime("%Y-%m-%d")
-        if candidate <= now or last_run == today_str:
-            candidate += timedelta(days=1)
-        return candidate.isoformat(timespec="seconds")
+        now = datetime.now().astimezone()
+        scheduled, due = _next_schedule(now, parsed, last_run)
+        return (now if due else scheduled).isoformat(timespec="seconds")
 
     async def _loop(self) -> None:
         while not self._stop_event.is_set():
@@ -80,11 +84,10 @@ class UpdateScheduler:
                     parsed = parse_hhmm(settings.schedule_time)
                     if parsed:
                         last_run = await self._ensure_last_run_loaded()
-                        hour, minute = parsed
-                        now = datetime.now()
-                        today_str = now.strftime("%Y-%m-%d")
-                        scheduled_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                        if scheduled_dt <= now and last_run != today_str:
+                        now = datetime.now().astimezone()
+                        _, due = _next_schedule(now, parsed, last_run)
+                        if due:
+                            today_str = now.date().isoformat()
                             job_id = await self._trigger_auto_update(today_str)
                             self._last_run_date = today_str
                             if job_id is not None:

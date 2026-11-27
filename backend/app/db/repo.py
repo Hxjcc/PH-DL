@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import secrets
-import sqlite3
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import aiosqlite
 
 from ..config import RuntimeSettings
+from ..parsers.video import build_video_page_url
 from ..redaction import redact_diagnostic
 from .database import Database
+from .schema import TARGET_IDENTITY_TYPE
 
 STATUS_RANK = {"baseline": 1, "downloaded": 2, "uploaded": 3}
 _SCAN_JOB_KINDS = frozenset({"manual_target", "manual_urls", "auto_update", "check_updates", "baseline_sync", "resume_temp"})
@@ -102,8 +104,9 @@ def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
 
 
 class Repository:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, *, rclone_bin: str = "rclone") -> None:
         self.db = db
+        self._rclone_bin = rclone_bin.strip() or "rclone"
         self._diagnostic_secrets: tuple[str, ...] = ()
         self._previous_diagnostic_secrets: tuple[str, ...] = ()
         self._display_map_cache: Optional[Tuple[int, Dict[Tuple[str, str], str]]] = None
@@ -126,10 +129,11 @@ class Repository:
     async def get_settings(self, *, conn: Optional[aiosqlite.Connection] = None) -> RuntimeSettings:
         row = await self.db.fetch_one("SELECT value_json FROM settings WHERE key = ?", ("runtime",), conn=conn)
         if not row:
-            return RuntimeSettings()
+            return RuntimeSettings(rclone_bin=self._rclone_bin)
         try:
             data = json.loads(row["value_json"])
             if isinstance(data, dict):
+                data["rclone_bin"] = self._rclone_bin
                 # Safely normalize any legacy stored range inversions without dropping settings on upgrade.
                 if "page_delay_min" in data and "page_delay_max" in data:
                     try:
@@ -145,10 +149,11 @@ class Repository:
                         pass
             return self._remember_settings(RuntimeSettings.model_validate(data))
         except Exception:
-            return RuntimeSettings()
+            return RuntimeSettings(rclone_bin=self._rclone_bin)
 
     async def save_settings(self, settings: RuntimeSettings) -> RuntimeSettings:
-        payload = json.dumps(settings.model_dump(), ensure_ascii=False)
+        settings = settings.model_copy(update={"rclone_bin": self._rclone_bin})
+        payload = json.dumps(settings.model_dump(exclude={"rclone_bin"}), ensure_ascii=False)
         await self.db.execute(
             """
             INSERT INTO settings (key, value_json, updated_at)
@@ -160,9 +165,13 @@ class Repository:
         return self._remember_settings(settings)
 
     async def update_settings_patch(self, patch: Dict[str, Any]) -> RuntimeSettings:
-        async with self.db.transaction() as conn:
+        _, updated = await self.patch_settings(patch)
+        return updated
+
+    async def patch_settings(self, patch: Dict[str, Any]) -> Tuple[RuntimeSettings, RuntimeSettings]:
+        async with self.db.transaction(touches_video_meta=False) as conn:
             current = await self.get_settings(conn=conn)
-            return await self._save_runtime_settings(conn, current.merge_update(patch))
+            return current, await self._save_runtime_settings(conn, current.merge_update(patch))
 
     async def _save_runtime_settings(self, conn: aiosqlite.Connection, settings: RuntimeSettings) -> RuntimeSettings:
         async with conn.execute(
@@ -170,15 +179,28 @@ class Repository:
             INSERT INTO settings (key, value_json, updated_at) VALUES ('runtime', ?, ?)
             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
             """,
-            (json.dumps(settings.model_dump(), ensure_ascii=False), utc_now_iso()),
+            (json.dumps(settings.model_dump(exclude={"rclone_bin"}), ensure_ascii=False), utc_now_iso()),
         ):
             return self._remember_settings(settings)
+
+    async def save_cookie_check(
+        self, prefix: str, original: RuntimeSettings, username: str = "",
+    ) -> Optional[RuntimeSettings]:
+        cookie_key = f"{prefix}_cookie"
+        username_key = f"{prefix}_logged_in_username"
+        async with self.db.transaction(touches_video_meta=False) as conn:
+            current = await self.get_settings(conn=conn)
+            if getattr(current, cookie_key) != getattr(original, cookie_key) or current.proxy_url != original.proxy_url:
+                return None
+            if username and username != getattr(current, username_key):
+                return await self._save_runtime_settings(conn, current.merge_update({username_key: username}))
+            return current
 
     async def save_refreshed_cookie(
         self, prefix: str, original: RuntimeSettings, cookie: str, username: str,
     ) -> Optional[RuntimeSettings]:
         key = f"{prefix}_cookie"
-        async with self.db.transaction() as conn:
+        async with self.db.transaction(touches_video_meta=False) as conn:
             current = await self.get_settings(conn=conn)
             if any(getattr(current, attr) != getattr(original, attr) for attr in (
                 f"{prefix}_username", f"{prefix}_password", "proxy_url",
@@ -236,11 +258,15 @@ class Repository:
         self,
         enabled_only: bool = False,
         site: Optional[str] = None,
+        *,
+        exclude_baseline_pending: bool = False,
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
         query_params: List[Any] = []
         if enabled_only:
             clauses.append("enabled = 1")
+        if exclude_baseline_pending:
+            clauses.append("baseline_pending = 0")
         if site and str(site).strip():
             clauses.append("site = ?")
             query_params.append(normalize_site(site))
@@ -308,6 +334,7 @@ class Repository:
 
         for r in rows:
             r["enabled"] = bool(r["enabled"])
+            r["baseline_pending"] = bool(r["baseline_pending"])
             s_low = normalize_site(r.get("site"))
             r["site"] = s_low
             u_low = str(r.get("username") or "").strip().lower()
@@ -345,10 +372,13 @@ class Repository:
         row = await self.db.fetch_one("SELECT COUNT(*) AS total, COUNT(CASE WHEN enabled THEN 1 END) AS enabled FROM targets")
         return int(row["total"]), int(row["enabled"])
 
-    async def get_target(self, target_id: int) -> Optional[Dict[str, Any]]:
-        row = await self.db.fetch_one("SELECT * FROM targets WHERE id = ?", (target_id,))
+    async def get_target(
+        self, target_id: int, *, conn: Optional[aiosqlite.Connection] = None,
+    ) -> Optional[Dict[str, Any]]:
+        row = await self.db.fetch_one("SELECT * FROM targets WHERE id = ?", (target_id,), conn=conn)
         if row:
             row["enabled"] = bool(row["enabled"])
+            row["baseline_pending"] = bool(row["baseline_pending"])
             row["site"] = normalize_site(row.get("site"))
             row["last_error"] = self.redact_diagnostic(row["last_error"])
         return row
@@ -358,32 +388,36 @@ class Repository:
         norm_site: str,
         norm_user: str,
         norm_type: str,
+        *,
+        conn: aiosqlite.Connection,
     ) -> Optional[Dict[str, Any]]:
         """Look up a target while respecting same-creator mutually exclusive types."""
-        if norm_site == "pornhub" and norm_type in ("model", "pornstar"):
-            return await self.db.fetch_one(
-                """
-                SELECT * FROM targets
-                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar')
-                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
-                LIMIT 1
-                """,
-                (norm_site, norm_user, norm_type),
-            )
-        if norm_site == "xhamster" and norm_type in ("creator", "pornstar"):
-            return await self.db.fetch_one(
-                """
-                SELECT * FROM targets
-                WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('creator', 'pornstar')
-                ORDER BY CASE WHEN target_type = ? THEN 0 ELSE 1 END, id ASC
-                LIMIT 1
-                """,
-                (norm_site, norm_user, norm_type),
-            )
+        identity_type = {"pornhub": "model", "xhamster": "creator"}[norm_site] if norm_type == "pornstar" else norm_type
         return await self.db.fetch_one(
-            "SELECT * FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ?",
-            (norm_site, norm_user, norm_type),
+            f"SELECT * FROM targets WHERE site = ? AND LOWER(TRIM(username)) = LOWER(?) AND ({TARGET_IDENTITY_TYPE}) = ?",
+            (norm_site, norm_user, identity_type),
+            conn=conn,
         )
+
+    async def _insert_target(
+        self, conn: aiosqlite.Connection, site: str, username: str, target_type: str,
+        *, enabled: bool = True, preferred_quality: str = "", avatar_url: str = "",
+        display_name: str = "", baseline_pending: bool = False,
+    ) -> Dict[str, Any]:
+        async with conn.execute(
+            """
+            INSERT INTO targets (
+                site, username, target_type, enabled, preferred_quality, avatar_url,
+                display_name, created_at, baseline_pending
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                site, username, target_type, int(enabled), preferred_quality.strip(),
+                avatar_url.strip(), display_name.strip(), utc_now_iso(), int(baseline_pending),
+            ),
+        ) as cursor:
+            return (await self.get_target(cursor.lastrowid, conn=conn)) or {}
 
     async def upsert_target(
         self,
@@ -394,19 +428,29 @@ class Repository:
         avatar_url: str = "",
         display_name: str = "",
         site: str = "pornhub",
+        *,
+        init_baseline: bool = False,
     ) -> Dict[str, Any]:
         norm_site = normalize_site(site)
         norm_type = (target_type or ("creator" if norm_site == "xhamster" else "model")).strip().lower()
         is_current_user = norm_type == "liked" or (norm_site == "xhamster" and norm_type == "favorites")
         norm_user = "_currentUser_" if is_current_user else username.strip()
-        existing = await self._find_target_by_identity(norm_site, norm_user, norm_type)
-        if existing:
-            await self.db.execute(
+        async with self.db.transaction() as conn:
+            existing = await self._find_target_by_identity(norm_site, norm_user, norm_type, conn=conn)
+            if not existing:
+                return await self._insert_target(
+                    conn, norm_site, norm_user, norm_type, enabled=enabled,
+                    preferred_quality=preferred_quality, avatar_url=avatar_url,
+                    display_name=display_name, baseline_pending=init_baseline,
+                )
+            # A rescan of a target that has already been checked does not pause tracking.
+            async with conn.execute(
                 """
                 UPDATE targets
                 SET enabled = ?, preferred_quality = ?,
                     avatar_url = CASE WHEN ? != '' THEN ? ELSE avatar_url END,
-                    display_name = CASE WHEN ? != '' THEN ? ELSE display_name END
+                    display_name = CASE WHEN ? != '' THEN ? ELSE display_name END,
+                    baseline_pending = CASE WHEN ? AND last_checked_at IS NULL THEN 1 ELSE baseline_pending END
                 WHERE id = ?
                 """,
                 (
@@ -416,31 +460,12 @@ class Repository:
                     avatar_url.strip(),
                     display_name.strip(),
                     display_name.strip(),
+                    int(init_baseline),
                     existing["id"],
                 ),
-            )
-            return (await self.get_target(existing["id"])) or existing
-
-        new_id = await self.db.execute(
-            """
-            INSERT INTO targets (
-                site, username, target_type, enabled, preferred_quality, avatar_url,
-                display_name, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                norm_site,
-                norm_user,
-                norm_type,
-                1 if enabled else 0,
-                preferred_quality.strip(),
-                avatar_url.strip(),
-                display_name.strip(),
-                utc_now_iso(),
-            ),
-        )
-        return (await self.get_target(new_id)) or {}
+            ):
+                pass
+            return (await self.get_target(existing["id"], conn=conn)) or existing
 
     async def ensure_target(
         self,
@@ -456,14 +481,19 @@ class Repository:
         norm_type = (target_type or ("creator" if norm_site == "xhamster" else "model")).strip().lower()
         is_current_user = norm_type == "liked" or (norm_site == "xhamster" and norm_type == "favorites")
         norm_user = "_currentUser_" if is_current_user else username.strip()
-        existing = await self._find_target_by_identity(norm_site, norm_user, norm_type)
-        if existing:
+        async with self.db.transaction() as conn:
+            existing = await self._find_target_by_identity(norm_site, norm_user, norm_type, conn=conn)
+            if not existing:
+                created = await self._insert_target(
+                    conn, norm_site, norm_user, norm_type, avatar_url=avatar_url, display_name=display_name,
+                )
+                return created, True
             clean_avatar = avatar_url.strip()
             clean_name = display_name.strip()
             need_avatar = bool(clean_avatar and not str(existing.get("avatar_url") or "").strip())
             need_name = bool(clean_name and not str(existing.get("display_name") or "").strip())
             if need_avatar or need_name:
-                await self.db.execute(
+                async with conn.execute(
                     """
                     UPDATE targets
                     SET avatar_url = CASE WHEN COALESCE(avatar_url, '') = '' AND ? != '' THEN ? ELSE avatar_url END,
@@ -471,19 +501,9 @@ class Repository:
                     WHERE id = ?
                     """,
                     (clean_avatar, clean_avatar, clean_name, clean_name, existing["id"]),
-                )
-            return ((await self.get_target(existing["id"])) or existing), False
-
-        created = await self.upsert_target(
-            norm_user,
-            norm_type,
-            enabled=True,
-            preferred_quality="",
-            avatar_url=avatar_url,
-            display_name=display_name,
-            site=norm_site,
-        )
-        return created, True
+                ):
+                    pass
+            return ((await self.get_target(existing["id"], conn=conn)) or existing), False
 
     async def update_target_profile(
         self,
@@ -504,6 +524,12 @@ class Repository:
             return
         params.append(target_id)
         await self.db.execute(f"UPDATE targets SET {', '.join(sets)} WHERE id = ?", params)
+
+    async def mark_unchecked_target_baseline_pending(self, target_id: int) -> None:
+        await self.db.execute(
+            "UPDATE targets SET baseline_pending = 1 WHERE id = ? AND last_checked_at IS NULL",
+            (target_id,),
+        )
 
     async def update_target_profile_by_username(
         self,
@@ -553,93 +579,51 @@ class Repository:
         )
 
     async def update_target(self, target_id: int, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        existing = await self.get_target(target_id)
-        if not existing:
-            return None
-        site = normalize_site(existing.get("site"))
-        old_username = str(existing.get("username") or "").strip()
-        old_type = str(existing.get("target_type") or "model").strip().lower()
-        allowed = {"enabled", "target_type", "preferred_quality", "username", "display_name"}
-        sets = []
-        params: List[Any] = []
-        next_username = old_username
-        next_type = old_type
-        for k, v in patch.items():
-            if k not in allowed:
-                continue
-            if k == "enabled":
-                sets.append("enabled = ?")
-                params.append(1 if v else 0)
-            else:
-                val = str(v).strip()
-                if k == "target_type":
-                    val = val.lower()
-                    next_type = val
-                elif k == "username":
-                    next_username = val
-                sets.append(f"{k} = ?")
-                params.append(val)
-        if "username" in patch or "target_type" in patch:
-            if site == "pornhub" and next_type in ("model", "pornstar"):
-                conflict = await self.db.fetch_one(
-                    "SELECT id FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('model', 'pornstar') AND id != ?",
-                    (site, next_username, target_id),
-                )
-            elif site == "xhamster" and next_type in ("creator", "pornstar"):
-                conflict = await self.db.fetch_one(
-                    "SELECT id FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type IN ('creator', 'pornstar') AND id != ?",
-                    (site, next_username, target_id),
-                )
-            else:
-                conflict = await self.db.fetch_one(
-                    "SELECT id FROM targets WHERE site = ? AND LOWER(username) = LOWER(?) AND target_type = ? AND id != ?",
-                    (site, next_username, next_type, target_id),
-                )
-            if conflict:
-                raise sqlite3.IntegrityError(
-                    "UNIQUE constraint failed: targets.site, targets.username, targets.target_type"
-                )
-        if sets:
-            params.append(target_id)
-            await self.db.execute(f"UPDATE targets SET {', '.join(sets)} WHERE id = ?", params)
+        async with self.db.transaction() as conn:
+            existing = await self.get_target(target_id, conn=conn)
+            if not existing:
+                return None
+            site = existing["site"]
+            old_username = str(existing.get("username") or "").strip()
+            old_type = str(existing.get("target_type") or "model").strip().lower()
+            fields: Dict[str, Any] = {
+                key: str(patch[key]).strip()
+                for key in ("username", "target_type", "preferred_quality", "display_name") if key in patch
+            }
+            if "target_type" in fields:
+                fields["target_type"] = fields["target_type"].lower()
+            if "enabled" in patch:
+                fields["enabled"] = int(bool(patch["enabled"]))
+            if not fields:
+                return existing
+            sets = ", ".join(f"{key} = ?" for key in fields)
+            async with conn.execute(f"UPDATE targets SET {sets} WHERE id = ?", (*fields.values(), target_id)):
+                pass
 
-        username_changed = bool(old_username and next_username and old_username.lower() != next_username.lower())
-        type_changed = old_type != next_type
-        if old_type != "liked" and next_type != "liked" and (username_changed or type_changed):
-            if old_type == "favorites" and next_type == "favorites" and username_changed:
-                await self.db.execute(
-                    """
-                    UPDATE videos
-                    SET uploader = ?
-                    WHERE site = ? AND LOWER(uploader) = LOWER(?) AND LOWER(target_type) = 'favorites'
-                    """,
-                    (next_username, site, old_username),
-                )
-            elif site == "pornhub" and old_type in ("model", "pornstar") and next_type in ("model", "pornstar"):
-                await self.db.execute(
-                    """
-                    UPDATE videos
-                    SET uploader = ?,
-                        target_type = CASE WHEN LOWER(target_type) IN ('model', 'pornstar') THEN ? ELSE target_type END
-                    WHERE site = ?
-                      AND LOWER(uploader) = LOWER(?)
-                      AND LOWER(target_type) NOT IN ('favorites', 'liked')
-                    """,
-                    (next_username, next_type, site, old_username),
-                )
-            elif site == "xhamster" and old_type not in ("favorites", "liked") and next_type not in ("favorites", "liked"):
-                await self.db.execute(
-                    """
-                    UPDATE videos
-                    SET uploader = ?,
-                        target_type = ?
-                    WHERE site = ?
-                      AND LOWER(uploader) = LOWER(?)
-                      AND LOWER(target_type) = ?
-                    """,
-                    (next_username, next_type, site, old_username, old_type),
-                )
-        return await self.get_target(target_id)
+            next_username = fields.get("username", old_username)
+            next_type = fields.get("target_type", old_type)
+            username_changed = bool(old_username and next_username and old_username.lower() != next_username.lower())
+            if "liked" not in (old_type, next_type) and (username_changed or old_type != next_type):
+                history_set = "uploader = ?"
+                history_where = "site = ? AND LOWER(uploader) = LOWER(?)"
+                history_params = (next_username, site, old_username)
+                if old_type == next_type == "favorites":
+                    history_where += " AND LOWER(target_type) = 'favorites'"
+                elif site == "pornhub" and {old_type, next_type} <= {"model", "pornstar"}:
+                    history_set += ", target_type = CASE WHEN LOWER(target_type) IN ('model', 'pornstar') THEN ? ELSE target_type END"
+                    history_where += " AND LOWER(target_type) NOT IN ('favorites', 'liked')"
+                    history_params = (next_username, next_type, site, old_username)
+                elif site == "xhamster" and "favorites" not in (old_type, next_type):
+                    history_set += ", target_type = ?"
+                    history_where += f" AND ({TARGET_IDENTITY_TYPE}) = ?"
+                    identity_type = "creator" if old_type == "pornstar" else old_type
+                    history_params = (next_username, next_type, site, old_username, identity_type)
+                else:
+                    return await self.get_target(target_id, conn=conn)
+                for table in ("videos", "job_items"):
+                    async with conn.execute(f"UPDATE {table} SET {history_set} WHERE {history_where}", history_params):
+                        pass
+            return await self.get_target(target_id, conn=conn)
 
     async def mark_target_checked(
         self,
@@ -766,14 +750,16 @@ class Repository:
     async def get_video(self, viewkey: str) -> Optional[Dict[str, Any]]:
         return await self.db.fetch_one("SELECT * FROM videos WHERE viewkey = ?", (viewkey,))
 
-    async def get_videos_by_viewkeys(self, viewkeys: Iterable[str]) -> List[Dict[str, Any]]:
+    async def get_videos_by_viewkeys(
+        self, viewkeys: Iterable[str], *, conn: Optional[aiosqlite.Connection] = None,
+    ) -> List[Dict[str, Any]]:
         unique_keys = [k for k in dict.fromkeys(str(v).strip() for v in viewkeys) if k]
         if not unique_keys:
             return []
         placeholders = ",".join("?" for _ in unique_keys)
         return await self.db.fetch_all(
             f"SELECT * FROM videos WHERE viewkey IN ({placeholders})",
-            unique_keys,
+            unique_keys, conn=conn,
         )
 
     async def clear_missing_pending_uploads(self, viewkeys: Iterable[str]) -> int:
@@ -916,15 +902,7 @@ class Repository:
             END,
             local_path = CASE
                 WHEN excluded.local_path != '' THEN excluded.local_path
-                WHEN (
-                    CASE
-                        WHEN ? = 1 THEN excluded.status
-                        WHEN (CASE excluded.status WHEN 'uploaded' THEN 3 WHEN 'downloaded' THEN 2 WHEN 'baseline' THEN 1 ELSE 0 END)
-                             >= (CASE videos.status WHEN 'uploaded' THEN 3 WHEN 'downloaded' THEN 2 WHEN 'baseline' THEN 1 ELSE 0 END)
-                        THEN excluded.status
-                        ELSE videos.status
-                    END
-                ) = 'uploaded' THEN ''
+                WHEN excluded.status = 'uploaded' THEN ''
                 ELSE videos.local_path
             END,
             remote_path = CASE
@@ -972,12 +950,7 @@ class Repository:
         insert_site = explicit_site or "pornhub"
         explicit_type = (target_type or "").strip().lower()
         insert_type = explicit_type or ("creator" if insert_site == "xhamster" else "model")
-        if explicit_url:
-            insert_url = explicit_url
-        elif insert_site == "xhamster":
-            insert_url = f"https://xhamster.com/videos/{viewkey}"
-        else:
-            insert_url = f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
+        insert_url = explicit_url or build_video_page_url(insert_site, viewkey)
         force_flag = 1 if force_status else 0
         return (
             viewkey,
@@ -1010,7 +983,6 @@ class Repository:
             explicit_type,
             explicit_url,
             explicit_url,
-            force_flag,
             force_flag,
             force_flag,
             force_flag,
@@ -1173,31 +1145,43 @@ class Repository:
         )
 
     async def delete_video(self, viewkey: str) -> bool:
-        existing = await self.get_video(viewkey)
-        if not existing:
-            return False
-        await self.db.execute("DELETE FROM videos WHERE viewkey = ?", (viewkey,))
-        return True
+        return bool(await self.delete_videos([viewkey]))
 
-    async def delete_videos(self, viewkeys: List[str]) -> List[str]:
+    async def delete_videos(
+        self, viewkeys: List[str], *, conn: Optional[aiosqlite.Connection] = None,
+    ) -> List[str]:
         unique_keys = list(dict.fromkeys(
             str(key).strip() for key in viewkeys if str(key).strip()
         ))
         if not unique_keys:
             return []
         placeholders = ",".join("?" for _ in unique_keys)
-        rows = await self.db.fetch_all(
-            f"SELECT viewkey FROM videos WHERE viewkey IN ({placeholders})",
-            unique_keys,
-        )
-        deleted = [row["viewkey"] for row in rows]
-        if deleted:
-            del_placeholders = ",".join("?" for _ in deleted)
-            await self.db.execute(
-                f"DELETE FROM videos WHERE viewkey IN ({del_placeholders})",
-                deleted,
+        async with (self.db.transaction() if conn is None else nullcontext(conn)) as write_conn:
+            rows = await self.db.fetch_all(
+                f"DELETE FROM videos WHERE viewkey IN ({placeholders}) RETURNING viewkey",
+                unique_keys, conn=write_conn,
             )
-        return deleted
+        deleted = {row["viewkey"] for row in rows}
+        return [key for key in unique_keys if key in deleted]
+
+    async def video_cleanup_blocked(
+        self, viewkeys: Iterable[str], *, conn: aiosqlite.Connection, include_ledger: bool = True,
+    ) -> Set[str]:
+        keys = tuple(viewkeys)
+        if not keys:
+            return set()
+        placeholders = ",".join("?" for _ in keys)
+        rows = await self.db.fetch_all(
+            f"""
+            SELECT viewkey FROM videos WHERE ? AND viewkey IN ({placeholders})
+            UNION
+            SELECT i.viewkey FROM job_items i JOIN jobs j ON j.id = i.job_id
+            WHERE i.viewkey IN ({placeholders}) AND i.status IN ('downloading', 'uploading')
+              AND j.status IN ('scanning', 'running')
+            """,
+            (include_ledger, *keys, *keys), conn=conn,
+        )
+        return {row["viewkey"] for row in rows}
 
     async def _get_target_display_map(
         self, *, conn: Optional[aiosqlite.Connection] = None,
@@ -1238,6 +1222,7 @@ class Repository:
         page: int = 1,
         page_size: int = 30,
         known_total: Optional[int] = None,
+        conn: Optional[aiosqlite.Connection] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         clauses = []
         params: List[Any] = []
@@ -1247,20 +1232,15 @@ class Repository:
         search_clean = search.strip()
         if search_clean:
             like = f"%{search_clean}%"
-            matched_targets = await self.db.fetch_all(
-                "SELECT DISTINCT LOWER(username) AS uname FROM targets WHERE display_name LIKE ?",
-                (like,),
-            )
-            matched_unames = [r["uname"] for r in matched_targets if r["uname"]]
-            if matched_unames:
-                placeholders = ",".join("?" for _ in matched_unames)
-                clauses.append(
-                    f"(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR v.uploader_display_name LIKE ? OR LOWER(v.uploader) IN ({placeholders}))"
-                )
-                params.extend([like, like, like, like, *matched_unames])
-            else:
-                clauses.append("(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR v.uploader_display_name LIKE ?)")
-                params.extend([like, like, like, like])
+            clauses.append("""
+                (v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR v.uploader_display_name LIKE ?
+                 OR EXISTS (
+                    SELECT 1 FROM targets t
+                    WHERE t.site = v.site AND LOWER(TRIM(t.username)) = LOWER(TRIM(v.uploader))
+                      AND t.display_name LIKE ?
+                 ))
+            """)
+            params.extend([like] * 5)
         if uploader.strip():
             u_clean = uploader.strip()
             if u_clean.lower() == "my_liked":
@@ -1305,47 +1285,54 @@ class Repository:
             )
 
         offset = max(0, (page - 1) * page_size)
-        async with self.db.read() as conn:
+        async with (self.db.read() if conn is None else nullcontext(conn)) as read_conn:
             if known_total is not None:
                 total = int(known_total)
             else:
                 total_row = await self.db.fetch_one(
                     f"SELECT COUNT(*) AS cnt FROM videos v {where_sql}",
                     params,
-                    conn=conn,
+                    conn=read_conn,
                 )
                 total = int(total_row["cnt"]) if total_row else 0
             rows = await self.db.fetch_all(
                 f"""
-                SELECT v.*
+                SELECT v.*, (
+                    SELECT t.display_name FROM targets t
+                    WHERE t.site = v.site AND LOWER(TRIM(t.username)) = LOWER(TRIM(v.uploader))
+                      AND t.display_name != ''
+                    ORDER BY t.id LIMIT 1
+                ) AS target_display_name
                 FROM videos v
                 {where_sql}
                 ORDER BY {order_sql}
                 LIMIT ? OFFSET ?
                 """,
                 [*params, page_size, offset],
-                conn=conn,
+                conn=read_conn,
             )
-        display_map = await self._get_target_display_map() if rows else {}
         for row in rows:
             s_low = normalize_site(row.get("site"))
             row["site"] = s_low
             uname = str(row.get("uploader") or "").strip().lower()
             t_low = str(row.get("target_type") or "").strip().lower()
             stored_dn = str(row.get("uploader_display_name") or "").strip()
+            target_display_name = row.pop("target_display_name")
             if uname == "my_liked" or (not uname and t_low == "liked"):
                 row["uploader_display_name"] = "Liked Videos"
             elif s_low == "xhamster" and (uname == "my_favorites" or (not uname and t_low == "favorites")):
                 row["uploader_display_name"] = "xHamster Favorites"
             else:
-                row["uploader_display_name"] = display_map.get((s_low, uname)) or stored_dn
+                row["uploader_display_name"] = target_display_name or stored_dn
         return rows, total
 
-    async def get_video_filter_facets(self, site: str = "") -> Dict[str, Any]:
+    async def get_video_filter_facets(
+        self, site: str = "", *, conn: Optional[aiosqlite.Connection] = None,
+    ) -> Dict[str, Any]:
         site_filter = normalize_site(site) if (site or "").strip() else ""
         version = self.db.video_meta_version
         cached = self._facets_cache.get(site_filter)
-        if cached is not None and cached[0] == version:
+        if conn is None and cached is not None and cached[0] == version:
             data = cached[1]
             return {
                 "sites": list(data["sites"]),
@@ -1356,7 +1343,7 @@ class Repository:
 
         where_site = " AND site = ?" if site_filter else ""
         site_params = (site_filter,) if site_filter else ()
-        async with self.db.read() as conn:
+        async with (self.db.read() if conn is None else nullcontext(conn)) as read_conn:
             uploader_rows = await self.db.fetch_all(
                 f"""
                 SELECT COALESCE(MIN(CASE WHEN uploader != LOWER(uploader) THEN uploader END), MIN(uploader)) AS uploader,
@@ -1368,12 +1355,12 @@ class Repository:
                 ORDER BY LOWER(uploader) ASC
                 """,
                 site_params,
-                conn=conn,
+                conn=read_conn,
             )
             has_liked_row = await self.db.fetch_one(
                 f"SELECT 1 AS hit FROM videos WHERE LOWER(target_type) = 'liked'{where_site} LIMIT 1",
                 site_params,
-                conn=conn,
+                conn=read_conn,
             )
             qualities = await self.db.fetch_all(
                 f"""
@@ -1383,13 +1370,16 @@ class Repository:
                          quality DESC
                 """,
                 site_params,
-                conn=conn,
+                conn=read_conn,
             )
             site_rows = await self.db.fetch_all(
                 "SELECT DISTINCT site FROM videos WHERE site != '' ORDER BY site ASC",
-                conn=conn,
+                conn=read_conn,
             )
-        display_map = await self._get_target_display_map()
+            if conn is not None:
+                display_map = await self._get_target_display_map(conn=read_conn)
+        if conn is None:
+            display_map = await self._get_target_display_map()
         video_display_map: Dict[Tuple[str, str], str] = {}
         uploaders: List[str] = []
         seen_up: Dict[str, int] = {}
@@ -1441,7 +1431,7 @@ class Repository:
             "uploader_labels": uploader_labels,
             "qualities": [r["quality"] for r in qualities],
         }
-        if version == self.db.video_meta_version:
+        if conn is None and version == self.db.video_meta_version:
             if len(self._facets_cache) >= 4:
                 self._facets_cache.clear()
             self._facets_cache[site_filter] = (version, result)
@@ -1452,12 +1442,14 @@ class Repository:
             "qualities": list(result["qualities"]),
         }
 
-    async def get_video_stats(self, site: str = "") -> Dict[str, int]:
+    async def get_video_stats(
+        self, site: str = "", *, conn: Optional[aiosqlite.Connection] = None,
+    ) -> Dict[str, int]:
         site_filter = normalize_site(site) if (site or "").strip() else ""
         version = self.db.video_meta_version
         today_key = local_today_date()
         cached = self._stats_cache.get(site_filter)
-        if cached is not None and cached[0] == version and cached[1] == today_key:
+        if conn is None and cached is not None and cached[0] == version and cached[1] == today_key:
             return dict(cached[2])
 
         where_site = " WHERE LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
@@ -1476,6 +1468,7 @@ class Repository:
             {where_site}
             """,
             params,
+            conn=conn,
         )
         counts = {
             "total": int(row["total"]) if row else 0,
@@ -1485,7 +1478,7 @@ class Repository:
             "published_7d": int(row["published_7d"]) if row else 0,
             "baseline_missing_metadata": int(row["baseline_missing_metadata"]) if row else 0,
         }
-        if version == self.db.video_meta_version:
+        if conn is None and version == self.db.video_meta_version:
             if len(self._stats_cache) >= 4:
                 self._stats_cache.clear()
             self._stats_cache[site_filter] = (version, today_key, counts)
@@ -1731,9 +1724,9 @@ class Repository:
             INSERT INTO job_items (
                 job_id, site, viewkey, title, uploader, target_type, page_url,
                 download_url, referer_url, quality, status, temp_path, local_path,
-                bytes_downloaded, updated_at, upload_requested, error_message,
+                bytes_downloaded, bytes_total, updated_at, upload_requested, error_message,
                 published_at, duration_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
         """
         for start in range(0, len(items), step):
@@ -1759,6 +1752,7 @@ class Repository:
                         spec.get("temp_path", ""),
                         spec.get("local_path", ""),
                         int(spec.get("bytes_downloaded") or 0),
+                        int(spec.get("bytes_total") or 0),
                         now,
                         None if up_req is None else int(bool(up_req)),
                         self.redact_diagnostic(spec.get("error_message", "")),
@@ -1957,11 +1951,14 @@ class Repository:
 
     async def finish_job(
         self, job_id: int, status: str, error_message: str = "", *, cancel_items: bool = False,
+        cancel_requested: Optional[Callable[[], bool]] = None,
     ) -> Optional[Dict[str, Any]]:
         async with self.db.transaction() as conn:
             job = await self.get_job(job_id, conn=conn)
             if job is None or job["status"] not in {"scanning", "running"}:
                 return None
+            if status == "completed" and cancel_requested is not None and cancel_requested():
+                status, error_message, cancel_items = "cancelled", "已取消", True
             return await self._finish_job(conn, job, status, error_message, cancel_items=cancel_items)
 
     async def _finish_job(
@@ -1989,6 +1986,11 @@ class Repository:
             (status, message, now, json.dumps(job["params"], ensure_ascii=False), job_id),
         ):
             pass
+        if status == "completed" and job["kind"] == "baseline_sync":
+            async with conn.execute(
+                "UPDATE targets SET baseline_pending = 0 WHERE id = ?", (job["params"].get("target_id"),),
+            ):
+                pass
         return await self.get_job(job_id, conn=conn)
 
     async def reconcile_metadata_job_items(self, job_id: int) -> None:

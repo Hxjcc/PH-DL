@@ -16,7 +16,7 @@ from ..config import SelectorSettings
 from ..services.filename import extract_date_from_cdn_url
 from .http_session import TaskHttpContext
 from .target import SubscribeAction, extract_subscribe_action, select_many, select_one
-from .video import parse_duration_seconds
+from .video import parse_duration_seconds, safe_video_page_url
 from .xhamster import build_xhamster_list_url, is_xhamster_url, scan_xhamster_list_pages
 
 PH_BASE_URL = "https://www.pornhub.com"
@@ -416,7 +416,11 @@ def _extract_video_cards(
 
         published_at, duration_seconds = _extract_card_published_and_duration(li)
         seen_vkeys.add(vkey)
-        results.append((vkey, urllib.parse.urljoin(PH_BASE_URL, href), title, published_at, duration_seconds))
+        try:
+            page_url = urllib.parse.urljoin(PH_BASE_URL, href)
+        except ValueError:
+            page_url = ""
+        results.append((vkey, safe_video_page_url(page_url, "pornhub", vkey), title, published_at, duration_seconds))
 
     return results
 
@@ -517,12 +521,20 @@ def _parse_list_page(
     profile_username: Optional[str],
     want_profile: bool,
     want_subscribe: bool,
-) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[SubscribeAction]]:
+) -> Tuple[Optional[List[Tuple[str, str, str, str, int]]], str, str, Optional[SubscribeAction]]:
     if not html:
-        return [], "", "", None
+        return None, "", "", None
     tree = HTMLParser(html)
+    items = _extract_video_cards(tree, selectors, target_type)
+    if not items and select_one(tree, [
+        *selectors.split_list("list_page_main_containers"),
+        *_BUILTIN_MAIN_CONTAINERS, *_EMPTY_LIST_STATE_SELECTORS,
+        "div.profileVids", "#profileContent", "#headerMenuContainer", "#headerMainMenu", "#logo",
+        "img#getAvatar", "[data-subscribe-url]",
+    ]) is None:
+        return None, "", "", None
     return (
-        _extract_video_cards(tree, selectors, target_type),
+        items,
         _extract_target_avatar(tree, profile_username) if want_profile else "",
         _extract_target_display_name(tree, profile_username) if want_profile else "",
         extract_subscribe_action(html) if want_subscribe else None,
@@ -734,6 +746,14 @@ async def scan_list_pages(
             else:
                 raw_items, avatar_url, display_name, subscribe_action = _parse_list_page(*parse_args)
             del parse_args
+
+            if raw_items is None and current_page == 1:
+                report_error(current_page, "页面结构异常或未识别")
+                batch_failed = True
+                if is_natural:
+                    end_reached = True
+                    break
+                continue
 
             if want_profile and (avatar_url or display_name):
                 profile_found = True

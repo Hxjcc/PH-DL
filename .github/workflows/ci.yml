@@ -39,10 +39,11 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci --no-audit --no-fund
-      - name: Run frontend unit tests & production build
+      - name: Run frontend unit tests, type check & production build
         working-directory: frontend
         run: |
           npm test
+          npm run typecheck
           npm run build
 
   compose:

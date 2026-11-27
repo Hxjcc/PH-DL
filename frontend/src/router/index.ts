@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, type RouteLocationNormalized, type RouteLocationRaw, type RouteRecordRaw } from 'vue-router'
 import { useAppStore } from '../stores/app'
+import { SESSION_LOGOUT_KEY } from '../stores/sessionCache'
 
 import LoginView from '../views/LoginView.vue'
 import DownloadView from '../views/DownloadView.vue'
@@ -31,6 +32,8 @@ const router = createRouter({
   routes,
 })
 
+let watchingLogout = false
+
 async function resolveAsyncGuard(
   store: ReturnType<typeof useAppStore>,
   to: RouteLocationNormalized,
@@ -52,6 +55,13 @@ async function resolveAsyncGuard(
 
 router.beforeEach((to) => {
   const store = useAppStore()
+  if (!watchingLogout && typeof window !== 'undefined') {
+    watchingLogout = true
+    window.addEventListener('storage', (event) => {
+      if (event.key !== SESSION_LOGOUT_KEY || !store.handleCrossTabLogout(Number(event.newValue))) return
+      if (router.currentRoute.value.name !== 'login') void router.replace({ name: 'login' })
+    })
+  }
   // A same-tab reload can paint cached data or the route's loading state while auth is checked.
   if (store.hydratedFromCache && !store.authChecked && !to.meta.public) {
     void store.revalidateSession(to.name).then((ok) => {

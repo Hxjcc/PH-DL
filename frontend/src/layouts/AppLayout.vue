@@ -19,6 +19,7 @@ import {
 import { useAppStore } from '../stores/app'
 import { useAuthTransition } from '../composables/useAuthTransition'
 import { formatBytes } from '../utils/format'
+import { getErrorMessage } from '../utils/errors'
 import BrandMark from '../components/BrandMark.vue'
 import ThemeToggleButton from '../components/ThemeToggleButton.vue'
 import Button from '../components/ui/Button.vue'
@@ -33,6 +34,7 @@ const { authTransition, runAuthTransition } = useAuthTransition()
 const collapsed = ref(false)
 const mobileOpen = ref(false)
 const headerAvatarBroken = ref(false)
+const loggingOut = ref(false)
 
 watch(
   () => store.accountAvatarUrl,
@@ -121,11 +123,17 @@ const cookieMeta = computed(() => {
 })
 
 async function handleLogout() {
+  if (loggingOut.value) return
+  loggingOut.value = true
   mobileOpen.value = false
-  await runAuthTransition('logout', async () => {
+  try {
     await store.logout()
-    await router.push({ name: 'login' })
-  })
+    await runAuthTransition('logout', () => router.replace({ name: 'login' }))
+  } catch (err: unknown) {
+    store.notify(`退出登录失败，请重试。 ${getErrorMessage(err)}`, 'error')
+  } finally {
+    loggingOut.value = false
+  }
 }
 
 onMounted(() => {
@@ -264,6 +272,7 @@ onMounted(() => {
           size="sm"
           class="w-full h-9 justify-start px-2.5 gap-2.5 rounded-md text-muted-foreground hover:text-foreground overflow-hidden"
           :title="collapsed ? '退出登录' : undefined"
+          :disabled="loggingOut"
           @click="handleLogout"
         >
           <LogOut class="w-4 h-4 shrink-0" />
@@ -441,7 +450,7 @@ onMounted(() => {
                 <span>{{ diskInfo.totalText }}</span>
               </div>
             </div>
-            <Button variant="outline" size="sm" class="w-full" @click="handleLogout">
+            <Button variant="outline" size="sm" class="w-full" :disabled="loggingOut" @click="handleLogout">
               <LogOut class="w-3.5 h-3.5" />
               退出登录
             </Button>

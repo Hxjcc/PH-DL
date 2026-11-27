@@ -7,7 +7,7 @@ import re
 import secrets
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Tuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,6 +16,8 @@ from .redaction import redact_diagnostic
 
 REDACTED_PLACEHOLDER = "********"
 _SECRET_FLAGS = re.compile(r"--[\w-]*(?:password|pass|token|header|secret|credential|(?:^|-)key)[\w-]*", re.I)
+_EXTRA_FLAG_URL = re.compile(r"""[a-z][a-z\d+.-]*://[^\s"'<>]+""", re.I)
+_EXTRA_FLAG_SECRET = re.compile(r"""\b(?:token|key|pass(?:word)?|secret|auth)=([^&\s"'<>;]+)""", re.I)
 _AUTH_COOKIE_NAME_RE = re.compile(r"(?:^|[_-])(sess|session|sid|token|auth|key|secret|hash|login|uid|ss|il|at|rt|jwt|csrf|xsrf|prs|bs|ua)(?:$|[_-])", re.I)
 _NON_SECRET_COOKIE_VAL_RE = re.compile(r"^[\d._:/-]+$")
 _BENIGN_COOKIE_VALUES = frozenset(
@@ -95,7 +97,9 @@ class EnvSettings(BaseSettings):
     )
 
     data_dir: Path = Field(default_factory=default_data_dir)
-    admin_password: str = Field(default="admin")
+    admin_password: str = Field(default="")
+    allow_insecure_default_password: bool = Field(default=False)
+    rclone_bin: str = Field(default="rclone")
     secret_key: str = Field(default="")
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
@@ -350,7 +354,8 @@ class RuntimeSettings(BaseModel):
         fields = set(SENSITIVE_RUNTIME_FIELDS)
         if "@" in self.proxy_url:
             fields.add("proxy_url")
-        if _SECRET_FLAGS.search(self.rclone_extra_flags):
+        flags = self.rclone_extra_flags
+        if "@" in flags or "?" in flags or _SECRET_FLAGS.search(flags) or _EXTRA_FLAG_SECRET.search(flags):
             fields.add("rclone_extra_flags")
         if "@" in self.serverchan_api_url or "?" in self.serverchan_api_url:
             fields.add("serverchan_api_url")
@@ -378,15 +383,23 @@ class RuntimeSettings(BaseModel):
                 val = raw_val.strip().strip('"')
                 if _is_redactable_cookie_value(name.strip(), val):
                     values.add(val)
-        for url in (self.proxy_url, self.serverchan_api_url):
+        for url in (self.proxy_url, self.serverchan_api_url, *_EXTRA_FLAG_URL.findall(self.rclone_extra_flags)):
             try:
-                password = urlsplit(url).password
+                parsed = urlsplit(url)
+                password = parsed.password
                 if password:
                     for cand in (password, unquote(password)):
                         if len(cand) >= 4:
                             values.add(cand)
+                values.update(value for _, value in parse_qsl(parsed.query) if len(value) >= 4)
+                for pair in parsed.query.split("&"):
+                    raw_value = pair.partition("=")[2]
+                    if len(raw_value) >= 4:
+                        values.add(raw_value)
             except ValueError:
                 pass
+        for secret in _EXTRA_FLAG_SECRET.findall(self.rclone_extra_flags):
+            values.update(value for value in (secret, unquote(secret)) if len(value) >= 4)
         return tuple(sorted(values - {""}, key=len, reverse=True))
 
     def redact_diagnostic(self, text: str) -> str:
@@ -395,7 +408,7 @@ class RuntimeSettings(BaseModel):
     def merge_update(self, patch: dict[str, Any]) -> "RuntimeSettings":
         current = self.model_dump()
         for key, value in patch.items():
-            if key not in current:
+            if key not in current or key == "rclone_bin":
                 continue
             if key in SENSITIVE_RUNTIME_FIELDS | {"proxy_url", "rclone_extra_flags", "serverchan_api_url"} and str(value) == REDACTED_PLACEHOLDER:
                 continue

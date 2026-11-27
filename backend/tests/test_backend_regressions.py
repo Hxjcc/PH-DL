@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app.api.jobs import retry_failed_items
+from app.api.targets import TargetBatchCreateRequest, TargetCreateRequest, batch_create_targets, create_target
+from app.cancel import StopRequested
 from app.config import EnvSettings, SelectorSettings
 from app.db.database import Database
 from app.db.repo import Repository
@@ -84,6 +86,231 @@ async def fixture_download(**args):
     path.write_bytes(mp4_payload(b"b"))
     return DownloadOutcome(True, local_path=path, file_size=path.stat().st_size,
                            quality=args["quality"], download_url=args["download_url"])
+
+
+@pytest.mark.parametrize("batch", [False, True])
+async def test_create_target_commits_pending_baseline_before_enqueue(job_engine, batch):
+    manager, repo, _ = job_engine
+    seen = []
+
+    async def enqueue(**kwargs):
+        target = await repo.get_target(kwargs["params"]["target_id"])
+        seen.append(target)
+        return await repo.create_job(kwargs["kind"], kwargs["label"], kwargs["params"])
+
+    container = SimpleNamespace(repo=repo, tasks=SimpleNamespace(enqueue_job=enqueue), events=manager.events)
+    if batch:
+        await batch_create_targets(TargetBatchCreateRequest(
+            items=[{"username": "initializing", "target_type": "model"}], init_baseline=True,
+        ), container)
+    else:
+        await create_target(TargetCreateRequest(username="initializing", target_type="model", init_baseline=True), container)
+    assert len(seen) == 1 and seen[0]["baseline_pending"]
+    assert await manager._update_check_targets({}) == []
+    assert [target["id"] for target in await manager._update_check_targets({"target_ids": [seen[0]["id"]]})] == [seen[0]["id"]]
+
+
+@pytest.mark.parametrize("first_result", ["failed", "cancelled", "completed"])
+async def test_baseline_releases_pending_target_only_after_success(job_engine, monkeypatch, first_result):
+    manager, repo, _ = job_engine
+    target = await repo.upsert_target("initializing", init_baseline=True)
+    scan_result = first_result
+
+    async def scan(ctx, _list_url, _selectors, **options):
+        if scan_result == "failed":
+            options["on_error"]("[PornHub 扫描] 列表第 1 页: HTTP 503")
+            return []
+        if scan_result == "cancelled":
+            ctx.cancel_event.set()
+            return []
+        return [ListedVideo("baseline", "https://example.org/view_video.php?viewkey=baseline", "Fixture", 1, 1, 1)]
+
+    monkeypatch.setattr(engine, "scan_list_pages", scan)
+    first = await run_job(manager, repo, "baseline_sync", target_id=target["id"])
+    assert first["status"] == ("partial_failed" if first_result == "failed" else first_result)
+    assert (await repo.get_target(target["id"]))["baseline_pending"] == (first_result != "completed")
+    if first_result != "completed":
+        scan_result = "completed"
+        assert (await run_job(manager, repo, "baseline_sync", target_id=target["id"]))["status"] == "completed"
+    assert (await repo.get_target(target["id"]))["baseline_pending"] is False
+    assert (await repo.get_video("baseline"))["video_page_url"] == page("baseline")
+    assert not (await repo.upsert_target("INITIALIZING", init_baseline=True))["baseline_pending"]
+
+
+async def test_skipping_reusable_local_file_preserves_upload_intent(job_engine, monkeypatch):
+    manager, repo, env = job_engine
+    source = env.downloads_dir / "held.mp4"
+    source.write_bytes(mp4_payload())
+    await repo.upsert_video(
+        "held", status="downloaded", quality="1080p", uploader="fixture",
+        local_path=str(source), file_size=source.stat().st_size, upload_requested=True,
+    )
+
+    async def parse(*args, **kwargs):
+        return [detail("held")]
+
+    monkeypatch.setattr(engine, "fetch_video_details_batch", parse)
+    job = await run_job(manager, repo, "manual_urls", urls=[page("held")], auto_upload=False)
+    assert job["status"] == "completed" and job["skipped_items"] == 1
+    assert (await repo.get_video("held"))["upload_requested"] == 1
+
+
+@pytest.mark.parametrize("resume", [False, True])
+async def test_compensation_validates_ledger_size_and_never_uploads_replaced_file(job_engine, monkeypatch, resume):
+    manager, repo, env = job_engine
+    await repo.update_settings_patch({"ph_cookie": ""})
+    source = env.downloads_dir / "replaced.mp4"
+    source.write_bytes(mp4_payload())
+    wrong_size = source.stat().st_size + 2
+    url = "https://xhamster.com/videos/xhClip01"
+    await repo.upsert_video(
+        "xhClip01", site="xhamster", status="downloaded", quality="1080p", video_page_url=url,
+        local_path=str(source), file_size=wrong_size, upload_requested=True,
+    )
+    saw_download = []
+
+    async def no_download(**kwargs):
+        saw_download.append(kwargs["viewkey"])
+        return DownloadOutcome(False, error="写入测试替身")
+
+    async def unexpected_cookie(*args, **kwargs):
+        pytest.fail("Purely local compensation must not validate a PornHub cookie")
+
+    monkeypatch.setattr(engine, "download_mp4_with_resume", no_download)
+    monkeypatch.setattr(engine, "check_cookie_valid", unexpected_cookie)
+    if resume:
+        job = await repo.create_job("auto_update", "fixture", {"resume_mode": "items"})
+        await repo.add_job_items_batch(job["id"], [{
+            "viewkey": "xhClip01", "site": "xhamster", "page_url": url,
+            "local_path": str(source), "quality": "1080p", "upload_requested": True,
+        }])
+        await manager._run_job(job["id"])
+        job = await repo.get_job(job["id"])
+    else:
+        job = await run_job(manager, repo, "auto_update")
+    assert job["status"] == "partial_failed" and not job["uploaded_items"]
+    assert saw_download == ["xhClip01"]
+    item = (await repo.list_job_items(job["id"]))[0]
+    assert item["bytes_total"] == (0 if resume else wrong_size)
+    assert source.exists() and (await repo.get_video("xhClip01"))["status"] == "downloaded"
+
+
+async def test_empty_updates_and_xhamster_local_compensation_need_no_pornhub_cookie(job_engine, monkeypatch):
+    manager, repo, env = job_engine
+    await repo.update_settings_patch({"ph_cookie": ""})
+
+    async def unexpected_cookie(*args, **kwargs):
+        pytest.fail("No remote PornHub scan was requested")
+
+    monkeypatch.setattr(engine, "check_cookie_valid", unexpected_cookie)
+    assert (await run_job(manager, repo, "check_updates"))["status"] == "completed"
+    path = env.downloads_dir / "local.mp4"
+    path.write_bytes(mp4_payload())
+    await repo.upsert_video(
+        "xh_1234", site="xhamster", status="downloaded", local_path=str(path),
+        file_size=path.stat().st_size, upload_requested=True,
+    )
+
+    async def upload(**kwargs):
+        assert kwargs["site"] == "xhamster"
+        return UploadBatchResult(uploaded_viewkeys=["xh_1234"], verified_sources={"xh_1234": file_snapshot(path)})
+
+    monkeypatch.setattr(engine, "upload_file_batch", upload)
+    job = await run_job(manager, repo, "auto_update")
+    assert job["status"] == "completed" and job["uploaded_items"] == 1
+    assert (await repo.list_job_items(job["id"]))[0]["page_url"] == "https://xhamster.com/videos/video-1234"
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_parallel_update_reaps_sibling_scans(job_engine, monkeypatch, cancel):
+    manager, repo, _ = job_engine
+    await repo.upsert_target("alpha")
+    await repo.upsert_target("beta")
+    sibling_started, sibling_stopped = asyncio.Event(), asyncio.Event()
+    ctx = TaskHttpContext()
+    job = await repo.create_job("check_updates", "fixture", {})
+
+    async def scan(_job_id, *, list_url, **kwargs):
+        if "/alpha/" in list_url:
+            await sibling_started.wait()
+            if cancel:
+                ctx.cancel_event.set()
+            return [], []
+        sibling_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            sibling_stopped.set()
+
+    async def fail_write(*args, **kwargs):
+        raise RuntimeError("fixture write failure")
+
+    monkeypatch.setattr(manager, "_scan_target_with_details", scan)
+    if not cancel:
+        monkeypatch.setattr(repo, "mark_target_checked", fail_write)
+    with pytest.raises(StopRequested if cancel else RuntimeError):
+        await asyncio.wait_for(manager._exec_update_check(
+            job["id"], {}, await repo.get_settings(), ctx, auto_download=False,
+        ), 3)
+    assert sibling_stopped.is_set()
+
+
+@pytest.mark.parametrize(("site", "prefix"), [("pornhub", "PornHub"), ("xhamster", "xHamster")])
+async def test_page_one_failure_keeps_catch_up_mode(job_engine, monkeypatch, site, prefix):
+    manager, repo, _ = job_engine
+    target = await repo.upsert_target("fixture", site=site)
+    await repo.mark_target_checked(target["id"], 0, error=f"[{prefix} 扫描] 列表第 1 页: HTTP 503")
+    modes = []
+
+    async def scan(*args, **kwargs):
+        modes.append(kwargs["catch_up"])
+        return [], []
+
+    monkeypatch.setattr(manager, "_scan_target_with_details", scan)
+    assert (await run_job(manager, repo, "check_updates"))["status"] == "completed"
+    await repo.mark_target_checked(target["id"], 0, error=f"[{prefix} 扫描] 列表第 1 页: HTTP 503；2 个视频解析失败")
+    assert (await run_job(manager, repo, "check_updates"))["status"] == "completed"
+    assert modes == [True, False]
+
+
+async def test_enrich_job_only_fetches_candidates_from_requested_site(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    await repo.upsert_video("unscoped", site="pornhub")
+    await repo.upsert_video("xhFixture1", site="xhamster")
+    visited = []
+
+    async def parse(ctx, items, *args, **kwargs):
+        assert ctx.site == "xhamster"
+        [url] = [item[0] for item in items]
+        visited.append(url)
+        return [VideoDetail("xhFixture1", "Fixture", url, url, download_url="https://media.xhcdn.com/a.m3u8", quality="720p")]
+
+    monkeypatch.setattr(engine, "fetch_video_details_batch", parse)
+    assert await manager._job_site_requirements("enrich_metadata", {"site": "xhamster"}) == (False, False, True)
+    job = await run_job(manager, repo, "enrich_metadata", site="xhamster")
+    assert job["status"] == "completed" and visited == ["https://xhamster.com/videos/xhFixture1"]
+    assert (await repo.get_video("xhFixture1"))["quality"] == "720p"
+    assert await repo.count_baseline_metadata_candidates("pornhub") == 1
+
+
+async def test_task_cookie_validation_cannot_publish_after_proxy_changes(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def stale_result(*args, **kwargs):
+        started.set()
+        await finish.wait()
+        return CookieCheckResult(True, "valid", "stale-user")
+
+    monkeypatch.setattr(engine, "check_cookie_valid", stale_result)
+    request = asyncio.create_task(manager._ensure_valid_cookie(await repo.get_settings(), 1))
+    await asyncio.wait_for(started.wait(), 3)
+    await repo.update_settings_patch({"proxy_url": "http://127.0.0.1:5432", "ph_logged_in_username": "current-user"})
+    finish.set()
+    with pytest.raises(RuntimeError, match="代理设置已更新"):
+        await request
+    assert manager.cookie_status["valid"] is None
+    assert (await repo.get_settings()).ph_logged_in_username == "current-user"
 
 
 async def test_future_tracking_retries_only_opted_in_files(job_engine, monkeypatch):

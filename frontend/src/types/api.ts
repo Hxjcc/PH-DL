@@ -72,6 +72,7 @@ export interface JobItemRecord {
   target_type: TargetType | ''
   page_url: string
   download_url: string
+  is_hls?: boolean
   referer_url: string
   quality: string
   temp_path: string
@@ -140,6 +141,7 @@ export interface TargetRecord {
   display_name: string
   avatar_url: string
   enabled: boolean
+  baseline_pending?: boolean
   preferred_quality: string
   created_at: string
   last_checked_at: string | null
@@ -326,7 +328,7 @@ export type SettingsInput = {
   [K in keyof RuntimeSettings]: RuntimeSettings[K] extends number ? number | '' : RuntimeSettings[K]
 }
 
-export type SettingsPatch = Partial<Omit<SettingsInput, 'has_cookie' | 'has_xh_cookie' | 'selectors'>> & {
+export type SettingsPatch = Partial<Omit<SettingsInput, 'has_cookie' | 'has_xh_cookie' | 'account_avatar_version' | 'rclone_bin' | 'selectors'>> & {
   selectors?: Partial<SelectorSettings>
 }
 
@@ -383,6 +385,7 @@ export interface CookieCheckResult {
   valid: boolean
   message: string
   logged_in_username: string
+  superseded?: boolean
 }
 
 export interface LoginOpStatus {
@@ -441,6 +444,7 @@ interface WsEventData {
   job_cancelling: { job_id: number; cancelling: boolean }
   item_updated: JobItemRecord
   job_items_changed: { job_id: number }
+  jobs_deleted: { job_ids: number[] }
   item_progress: LiveProgressEntry
   job_scheduler: SchedulerStatus | { job_id: number; cleared: true }
   job_scan: ScanStatusEntry | { job_id: number; cleared: true }
@@ -453,4 +457,5 @@ type WsEvent = {
   [K in keyof WsEventData]: { type: K; ts: string; data: WsEventData[K] }
 }[keyof WsEventData]
 
-export type WsMessage = WsEvent | { type: 'snapshot'; data: WsSnapshot } | { type: 'ping' }
+export type WsMessage = WsEvent | { type: 'snapshot'; data: WsSnapshot }
+  | { type: 'resync_required'; data: Record<string, never> } | { type: 'ping' }

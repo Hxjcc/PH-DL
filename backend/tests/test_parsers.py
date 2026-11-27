@@ -157,6 +157,74 @@ async def test_concurrent_pow_challenges_use_single_flight_solver(monkeypatch):
     assert ctx.pow_cookies["KEY"] == "2*55:5:424242:1"
 
 
+async def test_stale_pow_response_arriving_after_a_new_generation_reuses_solution(monkeypatch):
+    ctx = TaskHttpContext(concurrency=2, retry_delay_base=0.0)
+    late_started = asyncio.Event()
+    release_late = asyncio.Event()
+    calls = []
+
+    async def fake_get(url, cookies, **kwargs):
+        if "KEY" in cookies:
+            return "ok", url, [], 200
+        if url.endswith("/late"):
+            late_started.set()
+            await release_late.wait()
+        return SAMPLE_POW_HTML, url, [], 200
+
+    def solve(html):
+        calls.append(html)
+        return "fresh-key"
+
+    monkeypatch.setattr(ctx, "_raw_get", fake_get)
+    monkeypatch.setattr(challenge, "solve_challenge", solve)
+    late = asyncio.create_task(ctx.fetch_with_pow("https://www.pornhub.com/late"))
+    await asyncio.wait_for(late_started.wait(), 3)
+    first, error = await ctx.fetch_with_pow("https://www.pornhub.com/first")
+    assert first and not error
+    release_late.set()
+    latest, error = await late
+    assert latest and not error and len(calls) == 1 and ctx.challenge_reuse_count == 1
+
+
+async def test_set_cookie_removals_mask_base_and_pow_until_cookie_is_reissued():
+    ctx = TaskHttpContext(cookie_str="session=base; KEY=base-key; other=keep")
+    ctx.pow_cookies["KEY"] = "old-pow"
+    await ctx._absorb_set_cookies(["session=from-session"])
+    await ctx._absorb_set_cookies([
+        "session=gone; Max-Age=-2",
+        "KEY=gone; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+    ])
+    assert ctx.merged_cookies() == {"other": "keep"}
+    assert ctx.cookie_string(include_pow=False) == "other=keep"
+    assert ctx.deleted_cookies == {"session", "KEY"} and not ctx.pow_cookies and not ctx.session_cookies
+    await ctx._absorb_set_cookies(["session=reissued; Max-Age=100"])
+    assert ctx.merged_cookies() == {"other": "keep", "session": "reissued"}
+    assert ctx.deleted_cookies == {"KEY"}
+
+
+@pytest.mark.parametrize("site", ["pornhub", "xhamster"])
+@pytest.mark.parametrize("recognized", [False, True])
+async def test_scan_distinguishes_unrecognized_200_from_recognized_empty_page(monkeypatch, site, recognized):
+    ctx = TaskHttpContext(site=site, retry_delay_base=0.0)
+    list_url = "https://xhamster.com/creators/user/videos" if site == "xhamster" else "https://www.pornhub.com/model/user/videos"
+    empty_html = '<script>window.initials={"videoThumbs":[]};</script>' if site == "xhamster" else '<header id="headerMainMenu"></header>'
+    html = empty_html if recognized else "<html><body>Scheduled maintenance</body></html>"
+
+    async def fetch(url, **kwargs):
+        return PowFetchResult(html, url, 200, 0, False), None
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fetch)
+    errors = []
+    listed = await scan_list_pages(ctx, list_url, SelectorSettings(), pages_spec="1", on_error=errors.append)
+    assert listed == []
+    assert errors == ([] if recognized else [f"[{'PornHub' if site == 'pornhub' else 'xHamster'} 扫描] 列表第 1 页: 页面结构异常或未识别"])
+
+
+def test_pornhub_list_links_fall_back_to_the_site_page_for_untrusted_urls():
+    html = '<li data-video-vkey="fixture"><a href="https://example.test/view_video.php?viewkey=fixture">Video</a></li>'
+    assert extract_video_links_from_list_page(html, SelectorSettings())[0][1] == "https://www.pornhub.com/view_video.php?viewkey=fixture"
+
+
 async def test_task_http_context_retries_transient_403_and_includes_conn_error_detail(monkeypatch):
     logs = []
     ctx = TaskHttpContext(

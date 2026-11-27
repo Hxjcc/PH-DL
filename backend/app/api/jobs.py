@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..db.repo import normalize_site
+from ..engine.events import public_job_item
 from ..parsers.list_scanner import parse_page_specs, parse_page_video_specs
 from ..parsers.video import collect_video_urls
 from .deps import AppContainer, require_auth
@@ -198,6 +199,7 @@ async def batch_delete_jobs(
     if active_id is not None and active_id in payload.job_ids and active_id not in skipped:
         skipped.append(active_id)
     if res["deleted_ids"]:
+        container.events.broadcast("jobs_deleted", {"job_ids": res["deleted_ids"]})
         container.events.broadcast("overview_changed", {})
     return {
         "deleted_count": len(res["deleted_ids"]),
@@ -227,7 +229,7 @@ async def get_job_detail(job_id: int, container: AppContainer = Depends(require_
                 it["bytes_total"] = prog["bytes_total"]
         else:
             it["speed_bps"] = 0.0
-    return {"job": job, "items": items}
+    return {"job": job, "items": [public_job_item(item) for item in items]}
 
 
 @router.delete("/{job_id}")
@@ -239,6 +241,7 @@ async def delete_job(job_id: int, container: AppContainer = Depends(require_auth
         if reason == "active":
             raise HTTPException(status_code=409, detail="排队或运行中的任务无法删除，请先停止")
         raise HTTPException(status_code=404, detail="任务不存在")
+    container.events.broadcast("jobs_deleted", {"job_ids": [job_id]})
     container.events.broadcast("overview_changed", {})
     return {"deleted": True, "id": job_id}
 

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 import urllib.parse
@@ -26,6 +27,7 @@ from ..config import SelectorSettings
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.urls import is_cookie_origin, is_media_url
 from ..parsers.video import fetch_single_video_detail
+from ..parsers.xhamster import HlsVariant, parse_hls_master_variants
 from .downloader import (
     DOWNLOAD_HEADERS,
     DownloadDiskBudget,
@@ -35,6 +37,7 @@ from .downloader import (
     _DiskSpaceError,
     _await_file_io,
     _disk_write,
+    _media_resource,
     _write_media_chunk,
     write_atomic_json,
 )
@@ -43,23 +46,37 @@ from .http_proxy import MediaPolicyError, effective_request_proxy, open_media_re
 from .subprocesses import run_bounded_process
 
 _EXT_X_MAP_URI_RE = re.compile(r'URI\s*=\s*"([^"]+)"', re.IGNORECASE)
+_EXT_X_MAP_RANGE_RE = re.compile(r"(?:^|,)\s*BYTERANGE\s*=", re.IGNORECASE)
 _EXT_X_KEY_METHOD_RE = re.compile(r"METHOD\s*=\s*([A-Z0-9-]+)", re.IGNORECASE)
 _EXTINF_RE = re.compile(r"#EXTINF:\s*([0-9.]+)", re.IGNORECASE)
 _HTTP_EXPIRED_RE = re.compile(r"(?:HTTP\s+Error|status\s+code)\s*(403|410|472)\b|\b(403|410|472)\b", re.IGNORECASE)
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 _HLS_ENGINE_NAME = "yt-dlp"
-_HLS_MANIFEST_VERSION = 2
+_HLS_MANIFEST_VERSION = 3
 _AIOHTTP_ENGINE_NAME = "aiohttp"
-_AIOHTTP_MANIFEST_VERSION = 4
+_AIOHTTP_MANIFEST_VERSION = 5
 _AIOHTTP_CHUNK_BYTES = 256 * 1024
 _HLS_SPILL_COPY_BYTES = 512 * 1024
 HLS_JOB_BUFFER_BYTES = 48 * 1024 * 1024
 _AIOHTTP_MAX_SEGMENT_BYTES = 64 * 1024 * 1024
 _MAX_PLAYLIST_BYTES = 4 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 16_384
 _AIOHTTP_MANIFEST_FLUSH_SEGMENTS = 16
 _AIOHTTP_MANIFEST_FLUSH_SECONDS = 4.0
 _META_FILENAMES = frozenset({"manifest.json", "manifest.json.tmp"})
+_YTDLP_CANCEL_GRACE_SECONDS = 2.0
+_active_ytdlp_workers: Dict[Path, asyncio.Task] = {}
+
+
+def ytdlp_hls_dir_in_use(hls_dir: Path) -> bool:
+    worker = _active_ytdlp_workers.get(hls_dir.resolve())
+    return worker is not None and not worker.done()
+
+
+def _playlist_resource(url: str) -> str:
+    resource = _media_resource(url)
+    return urllib.parse.urlunsplit(("", "", resource.path, resource.query, ""))
 
 
 def is_hls_url(url: Optional[str]) -> bool:
@@ -131,6 +148,9 @@ class HlsMediaPlaylist:
     is_master: bool = False
     has_byterange: bool = False
     has_separate_media: bool = False
+    has_multiple_maps: bool = False
+    has_map_byterange: bool = False
+    is_endlist: bool = False
 
 
 def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
@@ -144,6 +164,7 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
     is_master = False
     has_byterange = False
     has_separate_media = False
+    has_multiple_maps = has_map_byterange = is_endlist = False
 
     for raw_line in (m3u8_text or "").splitlines():
         line = raw_line.strip()
@@ -159,9 +180,16 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
             has_separate_media = True
             continue
         if line.startswith("#EXT-X-MAP:"):
-            m_uri = _EXT_X_MAP_URI_RE.search(line)
+            attrs = line.partition(":")[2]
+            has_map_byterange |= bool(_EXT_X_MAP_RANGE_RE.search(attrs))
+            m_uri = _EXT_X_MAP_URI_RE.search(attrs)
             if m_uri:
-                init_url = urllib.parse.urljoin(base_url, m_uri.group(1).strip())
+                next_init = urllib.parse.urljoin(base_url, m_uri.group(1).strip())
+                has_multiple_maps |= init_url is not None and init_url != next_init
+                init_url = next_init
+            continue
+        if line == "#EXT-X-ENDLIST":
+            is_endlist = True
             continue
         if line.startswith("#EXT-X-KEY:"):
             m_meth = _EXT_X_KEY_METHOD_RE.search(line)
@@ -198,6 +226,9 @@ def parse_hls_media_playlist(m3u8_text: str, base_url: str) -> HlsMediaPlaylist:
         is_master=is_master,
         has_byterange=has_byterange,
         has_separate_media=has_separate_media,
+        has_multiple_maps=has_multiple_maps,
+        has_map_byterange=has_map_byterange,
+        is_endlist=is_endlist,
     )
 
 
@@ -303,9 +334,9 @@ def _classify_ytdlp_error(exc: Optional[BaseException], logger_errors: List[str]
     return "yt-dlp HLS 下载失败", None, False
 
 
-def _find_downloaded_stream(hls_dir: Path) -> Optional[Path]:
+def _find_downloaded_stream(hls_dir: Path, prefix: str = "stream") -> Optional[Path]:
     """Locate the completed stream file produced by yt-dlp inside ``hls_dir``."""
-    preferred = hls_dir / "stream.mp4"
+    preferred = hls_dir / f"{prefix}.mp4"
     if preferred.is_file() and preferred.stat().st_size > 0:
         return preferred
     candidates: List[Path] = []
@@ -321,7 +352,7 @@ def _find_downloaded_stream(hls_dir: Path) -> Optional[Path]:
                 or ".part-Frag" in name
             ):
                 continue
-            if name.startswith("stream.") and entry.stat().st_size > 0:
+            if name.startswith(f"{prefix}.") and entry.stat().st_size > 0:
                 candidates.append(entry)
     if not candidates:
         return None
@@ -357,74 +388,26 @@ async def _remux_stream_to_mp4(
     output_path: Path,
     is_ts: bool,
     cancel_event: asyncio.Event,
+    audio_path: Optional[Path] = None,
 ) -> Tuple[bool, str]:
     """Losslessly remux yt-dlp's downloaded MPEG-TS or fMP4 HLS stream into a faststart MP4."""
+    inputs = ["-protocol_whitelist", "file,pipe", "-i", str(input_path)]
+    if audio_path is not None:
+        inputs.extend(["-protocol_whitelist", "file,pipe", "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0"])
+    cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", *inputs, "-c", "copy"]
+    output = ["-movflags", "+faststart", str(output_path)]
     if is_ts:
-        cmd_primary = [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-protocol_whitelist", "file,pipe",
-            "-i",
-            str(input_path),
-            "-c",
-            "copy",
-            "-bsf:a",
-            "aac_adtstoasc",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-        rc, stderr = await _run_ffmpeg(cmd_primary, cancel_event=cancel_event)
+        rc, stderr = await _run_ffmpeg([*cmd, "-bsf:a", "aac_adtstoasc", *output], cancel_event=cancel_event)
         if rc == 0 and output_path.is_file():
             return True, ""
         if rc == 130 or cancel_event.is_set():
             return False, "已取消"
-
-        # Fallback without aac_adtstoasc bitstream filter in case audio is non-ADTS
-        cmd_fallback = [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-protocol_whitelist", "file,pipe",
-            "-i",
-            str(input_path),
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-        rc2, stderr2 = await _run_ffmpeg(cmd_fallback, cancel_event=cancel_event)
-        if rc2 == 0 and output_path.is_file():
-            return True, ""
-        return False, stderr2 or stderr or f"ffmpeg TS 封装失败 (exit={rc2})"
-
-    cmd_mp4 = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-protocol_whitelist", "file,pipe",
-        "-i",
-        str(input_path),
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-    rc, stderr = await _run_ffmpeg(cmd_mp4, cancel_event=cancel_event)
+    rc, stderr = await _run_ffmpeg([*cmd, *output], cancel_event=cancel_event)
     if rc == 0 and output_path.is_file():
         return True, ""
     if rc == 130 or cancel_event.is_set():
         return False, "已取消"
-    return False, stderr or f"ffmpeg fMP4 封装失败 (exit={rc})"
+    return False, stderr or f"ffmpeg 封装失败 (exit={rc})"
 
 
 def _run_ytdlp_hls_sync(
@@ -441,6 +424,7 @@ def _run_ytdlp_hls_sync(
     prepare_write: Callable[[int], None],
     on_tick: Callable[[int, int, float], None],
     site: Optional[str] = None,
+    audio_playlist_url: str = "",
 ) -> Tuple[bool, List[str], Optional[BaseException]]:
     """Run yt-dlp's native concurrent HLS downloader in a worker thread."""
     import yt_dlp
@@ -455,6 +439,7 @@ def _run_ytdlp_hls_sync(
     capture = _YtDlpCaptureLogger()
     hook_lock = threading.Lock()
     best_dl_bytes = _media_dir_size(hls_dir)
+    previous_tracks_bytes = 0
     accounted_bytes = best_dl_bytes
     bytes_since_tick = 0
     started_at = time.monotonic()
@@ -478,8 +463,8 @@ def _run_ytdlp_hls_sync(
         if status == "error":
             return
 
-        raw_dl = int(info.get("downloaded_bytes") or 0)
-        raw_tot = int(info.get("total_bytes") or info.get("total_bytes_estimate") or 0)
+        raw_dl = previous_tracks_bytes + int(info.get("downloaded_bytes") or 0)
+        raw_tot = previous_tracks_bytes + int(info.get("total_bytes") or info.get("total_bytes_estimate") or 0)
         frag_idx = int(info.get("fragment_index") or 0)
         frag_cnt = int(info.get("fragment_count") or 0)
         raw_speed = float(info.get("speed") or 0.0)
@@ -542,7 +527,7 @@ def _run_ytdlp_hls_sync(
         "fixup": "never",
         "hls_prefer_native": True,
         "ffmpeg_location": str(Path(ffmpeg_bin).parent),
-        "socket_timeout": max(10.0, float(request_timeout)),
+        "socket_timeout": min(float(request_timeout), 15.0),
         "http_headers": headers,
         "logger": capture,
         "quiet": True,
@@ -557,7 +542,7 @@ def _run_ytdlp_hls_sync(
 
     ydl_class = yt_dlp.YoutubeDL
     if site is not None:
-        if not is_media_url(playlist_url, site):
+        if not is_media_url(playlist_url, site) or (audio_playlist_url and not is_media_url(audio_playlist_url, site)):
             return False, ["HLS 清单地址不在允许范围内"], None
         from yt_dlp.networking import Request
         from yt_dlp.networking._requests import RequestsRH
@@ -604,6 +589,13 @@ def _run_ytdlp_hls_sync(
     try:
         with ydl_class(ydl_opts) as ydl:
             ydl.download([playlist_url])
+        if audio_playlist_url and not _find_downloaded_stream(hls_dir, "audio"):
+            if thread_stop.is_set():
+                raise DownloadCancelled("已取消")
+            video = _find_downloaded_stream(hls_dir)
+            previous_tracks_bytes = video.stat().st_size if video else 0
+            with ydl_class({**ydl_opts, "outtmpl": str(hls_dir / "audio.%(ext)s"), "format": "bestaudio/best"}) as ydl:
+                ydl.download([audio_playlist_url])
         return True, list(capture.errors), None
     except _YtDlpDiskLimitStop as exc:
         caught = exc.disk_error
@@ -636,18 +628,29 @@ class _AiohttpHlsOutcome:
     expired_code: Optional[int] = None
     error: str = ""
     disk_error: Optional[_DiskSpaceError] = None
+    variant: Optional[HlsVariant] = None
 
 
 def _read_hls_manifest(hls_dir: Path) -> Optional[Dict[str, Any]]:
     manifest_path = hls_dir / "manifest.json"
-    if not manifest_path.is_file():
-        return None
     try:
-        if manifest_path.is_symlink() or manifest_path.stat().st_size > 16_384:
+        before = manifest_path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_MANIFEST_BYTES:
             return None
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(manifest_path, flags), "rb") as manifest:
+            opened = os.fstat(manifest.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened)
+                or manifest_path.is_symlink()
+            ):
+                return None
+            raw = manifest.read(_MAX_MANIFEST_BYTES + 1)
+        if len(raw) > _MAX_MANIFEST_BYTES:
+            return None
+        data = json.loads(raw)
         return data if isinstance(data, dict) else None
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, RecursionError):
         return None
 
 
@@ -782,13 +785,24 @@ async def _download_hls_aiohttp(
         return _AiohttpHlsOutcome(fallback_to_ytdlp=True, error="非标准 HLS 媒体清单")
 
     playlist = parse_hls_media_playlist(m3u8_text, effective_url)
+    if playlist.is_master:
+        variants = parse_hls_master_variants(m3u8_text, effective_url)
+        if any(v.has_separate_audio for v in variants):
+            requested = normalized_quality(quality)
+            chosen = next((v for v in variants if not requested or str(v.height) == requested), None)
+            if chosen is None:
+                return _AiohttpHlsOutcome(error="HLS 主清单没有请求的画质")
+            return _AiohttpHlsOutcome(fallback_to_ytdlp=True, variant=chosen)
+        return _AiohttpHlsOutcome(fallback_to_ytdlp=True)
     del m3u8_text, upper_m3u8
     if (
         not playlist.segment_urls
         or playlist.encrypted_method
-        or playlist.is_master
         or playlist.has_byterange
         or playlist.has_separate_media
+        or playlist.has_multiple_maps
+        or playlist.has_map_byterange
+        or not playlist.is_endlist
     ):
         return _AiohttpHlsOutcome(fallback_to_ytdlp=True)
 
@@ -796,19 +810,20 @@ async def _download_hls_aiohttp(
     total_segments = len(playlist.segment_urls)
     # Signatures and CDN hosts can change while the underlying sequence stays intact.
     fingerprint = hashlib.sha256()
-    fingerprint.update(urllib.parse.urlsplit(playlist.init_url or "").path.encode())
+    fingerprint.update(_playlist_resource(playlist.init_url or "").encode())
     for url, duration in zip(playlist.segment_urls, playlist.segment_durations, strict=True):
-        fingerprint.update(f"\n{urllib.parse.urlsplit(url).path}\t{duration}".encode())
+        fingerprint.update(f"\n{_playlist_resource(url)}\t{duration}".encode())
     playlist_id = fingerprint.hexdigest()
     norm_q = normalized_quality(quality)
     stream_part = hls_dir / "stream.part"
+    final_stream = hls_dir / "stream.mp4"
     completed_segments = 0
     stream_bytes = 0
     init_written = False
     reused = False
 
     old_meta = _read_hls_manifest(hls_dir)
-    if (
+    same_playlist = (
         old_meta is not None
         and old_meta.get("engine") == _AIOHTTP_ENGINE_NAME
         and old_meta.get("version") == _AIOHTTP_MANIFEST_VERSION
@@ -817,11 +832,14 @@ async def _download_hls_aiohttp(
         and old_meta.get("segment_count") == total_segments
         and old_meta.get("playlist_id") == playlist_id
         and bool(old_meta.get("is_fmp4")) == playlist.is_fmp4
-        and stream_part.is_file()
-    ):
+    )
+    if same_playlist and old_meta is not None:
         try:
             saved_completed = int(old_meta.get("completed_segments") or 0)
             saved_bytes = int(old_meta.get("stream_bytes") or 0)
+            if saved_completed == total_segments and saved_bytes > 0 and final_stream.is_file():
+                if final_stream.stat().st_size == saved_bytes:
+                    return _AiohttpHlsOutcome(ok=True)
             saved_init = bool(old_meta.get("init_written"))
             actual_size = stream_part.stat().st_size
             if (
@@ -852,6 +870,7 @@ async def _download_hls_aiohttp(
             "quality": norm_q,
             "segment_count": total_segments,
             "playlist_id": playlist_id,
+            "playlist_resource": _playlist_resource(playlist_url),
             "is_fmp4": playlist.is_fmp4,
             "init_written": init_written,
             "completed_segments": completed_segments,
@@ -1283,7 +1302,6 @@ async def _download_hls_aiohttp(
     if stop.is_set():
         return _AiohttpHlsOutcome(cancelled=True)
 
-    final_stream = hls_dir / "stream.mp4"
     os.replace(stream_part, final_stream)
     _record_speed_delta(0, force_tick=True)
     return _AiohttpHlsOutcome(ok=True)
@@ -1348,6 +1366,9 @@ async def download_hls_to_mp4(
         hls_dir = partial_path
     if hls_dir.is_symlink() or (hls_dir.is_dir() and any(entry.is_symlink() for entry in hls_dir.iterdir())):
         return DownloadOutcome(success=False, error="HLS 工作目录含不受信任的文件路径")
+    worker_key = hls_dir.resolve()
+    if ytdlp_hls_dir_in_use(worker_key):
+        return DownloadOutcome(success=False, temp_path=hls_dir, error="上一次 HLS 下载仍在停止，请稍后重试")
 
     url = (playlist_url or "").strip()
     referer = (referer_url or page_url or "https://xhamster.com/").strip()
@@ -1379,7 +1400,7 @@ async def download_hls_to_mp4(
 
     def incomplete(error: str, *, cancelled: bool = False, disk_wait_bytes: int = 0) -> DownloadOutcome:
         size = _media_dir_size(hls_dir)
-        if size <= 0 and hls_dir.is_dir():
+        if size <= 0 and hls_dir.is_dir() and not ytdlp_hls_dir_in_use(worker_key):
             with contextlib.suppress(OSError):
                 shutil.rmtree(hls_dir, ignore_errors=True)
         return DownloadOutcome(
@@ -1422,49 +1443,71 @@ async def download_hls_to_mp4(
         current_quality = detail.quality or current_quality
         return True
 
-    def _find_reusable_completed_stream() -> Optional[Path]:
-        """Reuse an already-downloaded ``stream.mp4`` when resuming right before remux."""
-        old_meta = _read_hls_manifest(hls_dir)
-        if old_meta is None:
-            return None
-        if (
-            old_meta.get("engine") in {_HLS_ENGINE_NAME, _AIOHTTP_ENGINE_NAME}
-            and old_meta.get("viewkey") == viewkey
-            and old_meta.get("quality") == normalized_quality(current_quality)
-        ):
-            return _find_downloaded_stream(hls_dir)
-        return None
-
-    def _has_active_ytdlp_checkpoint() -> bool:
-        old_meta = _read_hls_manifest(hls_dir)
-        return (
-            old_meta is not None
-            and old_meta.get("engine") == _HLS_ENGINE_NAME
-            and old_meta.get("viewkey") == viewkey
-            and old_meta.get("quality") == normalized_quality(current_quality)
-            and (hls_dir / "stream.mp4.ytdl").is_file()
-        )
-
-    def _prepare_ytdlp_hls_dir() -> None:
-        manifest_path = hls_dir / "manifest.json"
+    def _ytdlp_checkpoint(variant: Optional[HlsVariant] = None) -> Dict[str, Any]:
         expected_meta = {
             "engine": _HLS_ENGINE_NAME,
             "version": _HLS_MANIFEST_VERSION,
             "viewkey": viewkey,
             "quality": normalized_quality(current_quality),
+            "playlist_resource": _playlist_resource(url),
         }
-        if hls_dir.is_dir():
-            old_meta = _read_hls_manifest(hls_dir)
-            reuse = (
-                old_meta is not None
-                and old_meta.get("engine") == _HLS_ENGINE_NAME
-                and old_meta.get("viewkey") == expected_meta["viewkey"]
-                and old_meta.get("quality") == expected_meta["quality"]
-            )
-            if not reuse:
-                shutil.rmtree(hls_dir, ignore_errors=True)
+        if variant:
+            expected_meta["track_resources"] = [_playlist_resource(variant.url), _playlist_resource(variant.audio_url)]
+        return expected_meta
+
+    def _matches_ytdlp_checkpoint(meta: Optional[Dict[str, Any]]) -> bool:
+        # Masters must be fetched again to select the current signed track URLs.
+        return meta is not None and meta == _ytdlp_checkpoint()
+
+    def _prepare_ytdlp_hls_dir(variant: Optional[HlsVariant]) -> None:
+        expected_meta = _ytdlp_checkpoint(variant)
+        if hls_dir.is_dir() and _read_hls_manifest(hls_dir) != expected_meta:
+            shutil.rmtree(hls_dir, ignore_errors=True)
         hls_dir.mkdir(parents=True, exist_ok=True)
-        write_atomic_json(manifest_path, expected_meta)
+        _write_hls_manifest_atomic(hls_dir, expected_meta)
+
+    async def _download_with_ytdlp(variant: Optional[HlsVariant]):
+        thread_stop = threading.Event()
+
+        async def _run_worker():
+            async with _reserve_fallback_connections(segment_semaphore, fallback_workers):
+                if thread_stop.is_set():
+                    raise StopRequested
+                with disk.reserve(0) as prepare_write:
+                    return await asyncio.to_thread(
+                        _run_ytdlp_hls_sync,
+                        playlist_url=variant.url if variant else url,
+                        hls_dir=hls_dir,
+                        referer=referer,
+                        cookie_str=cookie_str,
+                        proxy_url=proxy_url,
+                        segment_concurrency=fallback_workers,
+                        request_timeout=req_timeout,
+                        ffmpeg_bin=ffmpeg_bin,
+                        thread_stop=thread_stop,
+                        prepare_write=prepare_write,
+                        on_tick=lambda d, t, s: emit_progress_threadsafe(d, t, s, "downloading"),
+                        **({"site": site} if site else {}),
+                        **({"audio_playlist_url": variant.audio_url} if variant and variant.audio_url else {}),
+                    )
+
+        def _worker_finished(worker: asyncio.Task) -> None:
+            if _active_ytdlp_workers.get(worker_key) is worker:
+                _active_ytdlp_workers.pop(worker_key)
+            if not worker.cancelled():
+                worker.exception()
+
+        worker = asyncio.create_task(_run_worker())
+        _active_ytdlp_workers[worker_key] = worker
+        worker.add_done_callback(_worker_finished)
+        try:
+            return await until_stopped(asyncio.shield(worker), stop)
+        except (StopRequested, asyncio.CancelledError):
+            thread_stop.set()
+            # A blocked socket can outlast the job. Keep its directory and slots reserved
+            # until the worker actually exits so a retry cannot touch its checkpoint.
+            await asyncio.wait({worker}, timeout=_YTDLP_CANCEL_GRACE_SECONDS)
+            raise
 
     attempts = max(1, int(max_attempts))
     last_error = "HLS 下载失败"
@@ -1485,10 +1528,13 @@ async def download_hls_to_mp4(
                     last_error = "无法解析 HLS 播放清单"
                     should_retry = True
                 else:
-                    raw_stream = _find_reusable_completed_stream()
+                    matching_ytdlp = _matches_ytdlp_checkpoint(_read_hls_manifest(hls_dir))
+                    raw_stream = _find_downloaded_stream(hls_dir) if matching_ytdlp else None
+                    audio_stream = None
+                    variant = None
 
                     if raw_stream is None:
-                        use_ytdlp = session is None or _has_active_ytdlp_checkpoint()
+                        use_ytdlp = session is None or (matching_ytdlp and any(hls_dir.glob("stream.*.ytdl")))
 
                         if not use_ytdlp and session is not None:
                             with disk.reserve(0) as prepare_write:
@@ -1518,6 +1564,7 @@ async def download_hls_to_mp4(
                                 raise aio_res.disk_error
                             if aio_res.fallback_to_ytdlp:
                                 use_ytdlp = True
+                                variant = aio_res.variant
                             elif aio_res.ok:
                                 raw_stream = _find_downloaded_stream(hls_dir)
                                 if raw_stream is None:
@@ -1535,53 +1582,20 @@ async def download_hls_to_mp4(
                                 should_retry = True
 
                         if use_ytdlp and not should_retry and raw_stream is None:
-                            _prepare_ytdlp_hls_dir()
+                            if ytdlp_hls_dir_in_use(worker_key):
+                                return incomplete("上一次 HLS 下载仍在停止，请稍后重试")
+                            _prepare_ytdlp_hls_dir(variant)
+                            separate_audio = bool(variant and variant.has_separate_audio)
                             raw_stream = _find_downloaded_stream(hls_dir)
+                            if separate_audio:
+                                audio_stream = _find_downloaded_stream(hls_dir, "audio")
 
-                            if raw_stream is None:
+                            if raw_stream is None or (separate_audio and audio_stream is None):
                                 initial_bytes = _media_dir_size(hls_dir)
                                 if initial_bytes > 0:
                                     emit_progress(initial_bytes, initial_bytes + 1, 0.0, "downloading")
 
-                                thread_stop = threading.Event()
-                                if stop.is_set():
-                                    thread_stop.set()
-
-                                async def _bridge_cancel() -> None:
-                                    await stop.wait()
-                                    thread_stop.set()
-
-                                cancel_bridge = asyncio.create_task(_bridge_cancel())
-                                try:
-                                    async with _reserve_fallback_connections(segment_semaphore, fallback_workers):
-                                        if stop.is_set():
-                                            raise StopRequested
-                                        with disk.reserve(0) as prepare_write:
-                                            worker = asyncio.create_task(asyncio.to_thread(
-                                                _run_ytdlp_hls_sync,
-                                                playlist_url=url,
-                                                hls_dir=hls_dir,
-                                                referer=referer,
-                                                cookie_str=cookie_str,
-                                                proxy_url=proxy_url,
-                                                segment_concurrency=fallback_workers,
-                                                request_timeout=req_timeout,
-                                                ffmpeg_bin=ffmpeg_bin,
-                                                thread_stop=thread_stop,
-                                                prepare_write=prepare_write,
-                                                on_tick=lambda d, t, s: emit_progress_threadsafe(d, t, s, "downloading"),
-                                                **({"site": site} if site else {}),
-                                            ))
-                                            try:
-                                                ok_dl, ydl_errors, ydl_exc = await asyncio.shield(worker)
-                                            except asyncio.CancelledError:
-                                                thread_stop.set()
-                                                await asyncio.gather(worker, return_exceptions=True)
-                                                raise
-                                finally:
-                                    cancel_bridge.cancel()
-                                    with contextlib.suppress(BaseException):
-                                        await cancel_bridge
+                                ok_dl, ydl_errors, ydl_exc = await _download_with_ytdlp(variant)
 
                                 if stop.is_set() or isinstance(ydl_exc, StopRequested):
                                     raise StopRequested
@@ -1604,7 +1618,9 @@ async def download_hls_to_mp4(
                                     should_retry = True
                                 else:
                                     raw_stream = _find_downloaded_stream(hls_dir)
-                                    if raw_stream is None:
+                                    if separate_audio:
+                                        audio_stream = _find_downloaded_stream(hls_dir, "audio")
+                                    if raw_stream is None or (separate_audio and audio_stream is None):
                                         last_error = "yt-dlp 下载完成后未找到视频流文件"
                                         should_retry = True
 
@@ -1613,6 +1629,8 @@ async def download_hls_to_mp4(
                         raise StopRequested
 
                     raw_size = raw_stream.stat().st_size
+                    if audio_stream is not None:
+                        raw_size += audio_stream.stat().st_size
                     emit_progress(raw_size, raw_size, 0.0, "remuxing")
 
                     # Reserve disk space roughly equal to downloaded stream for lossless faststart MP4 remux.
@@ -1627,6 +1645,7 @@ async def download_hls_to_mp4(
                             output_path=remuxed_mp4,
                             is_ts=is_ts,
                             cancel_event=stop,
+                            **({"audio_path": audio_stream} if audio_stream is not None else {}),
                         )
                         if stop.is_set():
                             raise StopRequested

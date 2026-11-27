@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ValidationError
 
+from ..config import RuntimeSettings
 from ..engine.scheduler import parse_hhmm
 from ..parsers.xhamster import check_xhamster_cookie_valid
 from ..services.captcha import CaptchaError, get_yescaptcha_balance
@@ -115,17 +116,21 @@ async def update_settings(
         raise HTTPException(status_code=400, detail="开启定时追更时必须设置有效时间（HH:MM，如 04:00）")
 
     try:
-        updated = await container.repo.update_settings_patch(patch)
+        current, updated = await container.repo.patch_settings(patch)
     except ValidationError as err:
         fields = [".".join(map(str, e["loc"])) or e["msg"] for e in err.errors(include_input=False, include_context=False)]
         raise HTTPException(status_code=400, detail=f"配置校验失败: {', '.join(fields)}") from err
 
-    if updated.ph_cookie != current.ph_cookie:
+    if updated.ph_cookie != current.ph_cookie or updated.proxy_url != current.proxy_url:
         container.tasks.reset_cookie_status()
-    if updated.xh_cookie != current.xh_cookie:
+    if updated.xh_cookie != current.xh_cookie or updated.proxy_url != current.proxy_url:
         container.tasks.reset_xh_cookie_status()
 
-    if any(k in patch for k in ("rclone_remote", "rclone_backup_remotes", "rclone_remote_strategy")):
+    if (
+        updated.rclone_remote != current.rclone_remote
+        or updated.rclone_backup_remotes != current.rclone_backup_remotes
+        or updated.rclone_remote_strategy != current.rclone_remote_strategy
+    ):
         container.tasks.clear_remote_cooldowns()
 
     container.events.broadcast("overview_changed", {})
@@ -136,25 +141,35 @@ async def update_settings(
     }
 
 
+async def _check_saved_cookie(
+    container: AppContainer, prefix: str, settings: RuntimeSettings, *, imported: bool = False,
+) -> Dict[str, Any]:
+    options = {"proxy_url": settings.normalized_proxy, "timeout": settings.request_timeout}
+    if prefix == "xh":
+        valid, message, username = await check_xhamster_cookie_valid(settings.xh_cookie, **options)
+        site_label, set_status = "xHamster", container.tasks.set_xh_cookie_status
+    else:
+        res = await check_cookie_valid(settings.ph_cookie, **options)
+        valid, message, username = res.valid, res.message, res.logged_in_username
+        site_label, set_status = "PornHub", container.tasks.set_cookie_status
+    resolved_user = prefer_cased_username(username, getattr(settings, f"{prefix}_logged_in_username")) if valid else ""
+    if await container.repo.save_cookie_check(prefix, settings, resolved_user) is None:
+        return {
+            "valid": False, "message": "检测结果已被更新的 Cookie 或代理设置替代，请重新检测。",
+            "logged_in_username": "", "superseded": True,
+        }
+    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if valid else message)
+    set_status(valid, status_msg)
+    container.events.emit_log(
+        "INFO" if valid else "WARNING",
+        f"[{site_label} Cookie] {'已导入并测活' if imported else '有效性检测'}: {status_msg}",
+    )
+    return {"valid": valid, "message": status_msg, "logged_in_username": resolved_user}
+
+
 @router.post("/cookie/test")
 async def test_cookie(container: AppContainer = Depends(require_auth)):
-    settings = await container.repo.get_settings()
-    res = await check_cookie_valid(
-        settings.ph_cookie,
-        proxy_url=settings.normalized_proxy,
-        timeout=settings.request_timeout,
-    )
-    resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username) if res.valid else ""
-    if res.valid and resolved_user and resolved_user != settings.ph_logged_in_username:
-        await container.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
-    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if res.valid else res.message)
-    container.tasks.set_cookie_status(res.valid, status_msg)
-    container.events.emit_log(
-        "INFO" if res.valid else "WARNING",
-        f"[PornHub Cookie] 有效性检测: {status_msg}",
-    )
-    container.events.broadcast("overview_changed", {})
-    return {"valid": res.valid, "message": status_msg, "logged_in_username": resolved_user}
+    return await _check_saved_cookie(container, "ph", await container.repo.get_settings())
 
 
 @router.post("/cookie/import")
@@ -166,28 +181,24 @@ async def import_cookie(
     if not raw:
         raise HTTPException(status_code=400, detail="Cookie 内容不能为空")
 
-    settings = await container.repo.update_settings_patch({"ph_cookie": raw})
-    res = await check_cookie_valid(
-        settings.ph_cookie,
-        proxy_url=settings.normalized_proxy,
-        timeout=settings.request_timeout,
-    )
-    resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username) if res.valid else ""
-    if res.valid and resolved_user and resolved_user != settings.ph_logged_in_username:
-        await container.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
-    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if res.valid else res.message)
-    container.tasks.set_cookie_status(res.valid, status_msg)
-    container.events.emit_log(
-        "INFO" if res.valid else "WARNING",
-        f"[PornHub Cookie] 已导入并测活: {status_msg}",
-    )
-    container.events.broadcast("overview_changed", {})
-    return {
-        "saved": True,
-        "valid": res.valid,
-        "message": status_msg,
-        "logged_in_username": resolved_user,
-    }
+    current, settings = await container.repo.patch_settings({"ph_cookie": raw})
+    if current.ph_cookie != settings.ph_cookie:
+        container.tasks.reset_cookie_status()
+    return {"saved": True, **await _check_saved_cookie(container, "ph", settings, imported=True)}
+
+
+async def _cookie_refresh_failure(
+    container: AppContainer, prefix: str, original: RuntimeSettings, message: str,
+) -> Dict[str, Any]:
+    current = await container.repo.save_cookie_check(prefix, original)
+    if current is None or any(
+        getattr(current, f"{prefix}_{field}") != getattr(original, f"{prefix}_{field}")
+        for field in ("username", "password")
+    ):
+        return {"success": False, "message": "登录期间连接配置已变更，请重试"}
+    set_status = container.tasks.set_xh_cookie_status if prefix == "xh" else container.tasks.set_cookie_status
+    set_status(False, message)
+    return {"success": False, "message": container.repo.redact_diagnostic(message)}
 
 
 async def _perform_ph_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
@@ -205,15 +216,10 @@ async def _perform_ph_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
             on_log=lambda level, message: container.events.emit_log(level, message),
         )
     except Exception as err:  # pragma: no cover - defensive
-        message = f"自动登录异常 ({type(err).__name__})"
-        container.tasks.set_cookie_status(False, message)
-        container.events.broadcast("overview_changed", {})
-        return {"success": False, "message": message}
+        return await _cookie_refresh_failure(container, "ph", settings, f"自动登录异常 ({type(err).__name__})")
 
     if not res.success:
-        container.tasks.set_cookie_status(False, res.message)
-        container.events.broadcast("overview_changed", {})
-        return {"success": False, "message": container.repo.redact_diagnostic(res.message)}
+        return await _cookie_refresh_failure(container, "ph", settings, res.message)
 
     resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username)
     if await container.repo.save_refreshed_cookie("ph", settings, res.cookie_str, resolved_user) is None:
@@ -253,23 +259,7 @@ async def cookie_refresh_status(container: AppContainer = Depends(require_auth))
 
 @router.post("/xh-cookie/test")
 async def test_xh_cookie(container: AppContainer = Depends(require_auth)):
-    settings = await container.repo.get_settings()
-    valid, message, username = await check_xhamster_cookie_valid(
-        settings.xh_cookie,
-        proxy_url=settings.normalized_proxy,
-        timeout=settings.request_timeout,
-    )
-    resolved_user = prefer_cased_username(username, settings.xh_logged_in_username) if valid else ""
-    if valid and resolved_user and resolved_user != settings.xh_logged_in_username:
-        await container.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
-    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if valid else message)
-    container.tasks.set_xh_cookie_status(valid, status_msg)
-    container.events.emit_log(
-        "INFO" if valid else "WARNING",
-        f"[xHamster Cookie] 有效性检测: {status_msg}",
-    )
-    container.events.broadcast("overview_changed", {})
-    return {"valid": valid, "message": status_msg, "logged_in_username": resolved_user}
+    return await _check_saved_cookie(container, "xh", await container.repo.get_settings())
 
 
 @router.post("/xh-cookie/import")
@@ -281,28 +271,10 @@ async def import_xh_cookie(
     if not raw:
         raise HTTPException(status_code=400, detail="xHamster Cookie 内容不能为空")
 
-    settings = await container.repo.update_settings_patch({"xh_cookie": raw})
-    valid, message, username = await check_xhamster_cookie_valid(
-        settings.xh_cookie,
-        proxy_url=settings.normalized_proxy,
-        timeout=settings.request_timeout,
-    )
-    resolved_user = prefer_cased_username(username, settings.xh_logged_in_username) if valid else ""
-    if valid and resolved_user and resolved_user != settings.xh_logged_in_username:
-        await container.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
-    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if valid else message)
-    container.tasks.set_xh_cookie_status(valid, status_msg)
-    container.events.emit_log(
-        "INFO" if valid else "WARNING",
-        f"[xHamster Cookie] 已导入并测活: {status_msg}",
-    )
-    container.events.broadcast("overview_changed", {})
-    return {
-        "saved": True,
-        "valid": valid,
-        "message": status_msg,
-        "logged_in_username": resolved_user,
-    }
+    current, settings = await container.repo.patch_settings({"xh_cookie": raw})
+    if current.xh_cookie != settings.xh_cookie:
+        container.tasks.reset_xh_cookie_status()
+    return {"saved": True, **await _check_saved_cookie(container, "xh", settings, imported=True)}
 
 
 async def _perform_xh_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
@@ -320,15 +292,10 @@ async def _perform_xh_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
             on_log=lambda level, message: container.events.emit_log(level, message),
         )
     except Exception as err:  # pragma: no cover - defensive
-        message = f"xHamster 自动登录异常 ({type(err).__name__})"
-        container.tasks.set_xh_cookie_status(False, message)
-        container.events.broadcast("overview_changed", {})
-        return {"success": False, "message": message}
+        return await _cookie_refresh_failure(container, "xh", settings, f"xHamster 自动登录异常 ({type(err).__name__})")
 
     if not res.success:
-        container.tasks.set_xh_cookie_status(False, res.message)
-        container.events.broadcast("overview_changed", {})
-        return {"success": False, "message": container.repo.redact_diagnostic(res.message)}
+        return await _cookie_refresh_failure(container, "xh", settings, res.message)
 
     resolved_user = prefer_cased_username(res.logged_in_username, settings.xh_logged_in_username)
     if await container.repo.save_refreshed_cookie("xh", settings, res.cookie_str, resolved_user) is None:

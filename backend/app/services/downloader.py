@@ -24,6 +24,7 @@ import aiohttp
 from ..cancel import StopRequested, until_stopped
 from ..config import SelectorSettings
 from ..parsers.http_session import TaskHttpContext
+from ..parsers.urls import upstream_host
 from ..parsers.video import fetch_single_video_detail
 from .filename import is_valid_video_file, is_within_directory, normalized_quality, video_filename_base
 from .http_proxy import effective_request_proxy, open_media_response
@@ -222,8 +223,16 @@ def _media_resource(url: str):
     """Compare origins, paths, and non-signing query parameters during explicit URL renewal."""
     parsed = urlsplit(url)
     query = "&".join(part for part in parsed.query.split("&")
-                     if unquote_plus(part.partition("=")[0]).lower() not in _SIGNED_QUERY_KEYS)
+                     if part and unquote_plus(part.partition("=")[0]).lower() not in _SIGNED_QUERY_KEYS)
     return parsed._replace(query=query)
+
+
+def _is_immutable_media_cdn(url: str, site: Optional[str]) -> bool:
+    domain = {"pornhub": "phncdn.com", "xhamster": "xhcdn.com"}.get(site)
+    if not domain:
+        return False
+    host = upstream_host(url)
+    return host == domain or host.endswith(f".{domain}")
 
 
 def _strong_etag(value: str) -> str:
@@ -868,9 +877,10 @@ async def download_mp4_with_resume(
                             checkpoint and (not same_entity or total != checkpoint.total)
                         ) or (end is not None and write_end != min(end, total)):
                             raise mismatch("HTTP 206 返回的字节区间或校验标记与断点不符")
-                        if write_end < total and (rejected_weak_etag or (not etag and total < min_multi_range_bytes)):
-                            # A weak/invalid ETag without Last-Modified cannot be trusted across Range requests,
-                            # and small validator-less files should switch straight to one sequential GET.
+                        unvalidated_cdn = total >= min_multi_range_bytes and _is_immutable_media_cdn(
+                            response_url, getattr(parse_ctx, "site", None),
+                        )
+                        if write_end < total and (rejected_weak_etag or (not etag and not unvalidated_cdn)):
                             raise mismatch("HTTP 206 缺少可用于续接的原文件校验标记")
                         expected = write_end - write_from
                         if sparse or (bounded and write_end < total and total >= min_multi_range_bytes):

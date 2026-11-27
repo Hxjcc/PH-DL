@@ -28,6 +28,7 @@ _XH_RESOLUTION_RE = re.compile(r"RESOLUTION\s*=\s*(\d+)\s*x\s*(\d+)", re.IGNOREC
 _XH_BANDWIDTH_RE = re.compile(r"(?:AVERAGE-)?BANDWIDTH\s*=\s*(\d+)", re.IGNORECASE)
 _XH_CODECS_RE = re.compile(r'CODECS\s*=\s*"([^"]+)"', re.IGNORECASE)
 _XH_QUALITY_IN_URI_RE = re.compile(r"(?:^|[/_.-])(\d{3,4})p(?=[._/-]|$)", re.IGNORECASE)
+_HLS_ATTRIBUTE_RE = re.compile(r'(?:^|,)\s*([A-Z0-9-]+)\s*=\s*(?:"([^"]*)"|([^,]*))')
 _OFFLOAD_HTML_THRESHOLD = 32_768
 
 
@@ -56,6 +57,8 @@ def extract_xhamster_viewkey(url: Optional[str]) -> Optional[str]:
     head = parts[0].lower()
     if head in {"videos", "movies"}:
         slug = parts[1].strip()
+        if legacy := re.fullmatch(r"video-([0-9]+)", slug):
+            return f"xh_{legacy.group(1)}"
         m_hash = re.search(r"(?:^|-)(xh[A-Za-z0-9]{4,})$", slug)
         if m_hash:
             return m_hash.group(1)
@@ -70,6 +73,12 @@ def extract_xhamster_viewkey(url: Optional[str]) -> Optional[str]:
         if re.fullmatch(r"\d{4,}", slug):
             return f"xh_{slug}"
     return None
+
+
+def build_xhamster_video_page_url(viewkey: str) -> str:
+    legacy = re.fullmatch(r"xh_([0-9]+)", viewkey)
+    slug = f"video-{legacy.group(1)}" if legacy else urllib.parse.quote(viewkey, safe="")
+    return f"{XH_ORIGIN}/videos/{slug}"
 
 
 def is_xhamster_video_url(url: Optional[str]) -> bool:
@@ -907,17 +916,17 @@ def _extract_xhamster_page_data(
     html: str,
     target_type: Optional[str] = None,
 ) -> Tuple[
-    List[Tuple[str, str, str, str, int]],
+    Optional[List[Tuple[str, str, str, str, int]]],
     str,
     str,
     Optional[int],
     Optional[Tuple[str, str]],
     Optional[SubscribeAction],
 ]:
-    """Parse list HTML into ``(items, avatar_url, display_name, max_pages, bound_user, subscribe_action)``."""
+    """Return None for the items when the page's list structure is unrecognized."""
     initials = extract_xhamster_initials(html)
     if not initials:
-        return [], "", "", None, None, None
+        return None, "", "", None, None, None
 
     avatar_url, display_name = _extract_profile_meta_from_initials(initials, target_type=target_type)
     raw_thumbs, max_pages = _extract_video_thumb_list_from_initials(initials, target_type=target_type)
@@ -929,7 +938,10 @@ def _extract_xhamster_page_data(
     for item in raw_thumbs:
         page_url = str(item.get("pageURL") or item.get("url") or "").strip()
         if page_url and page_url.startswith("/"):
-            page_url = urllib.parse.urljoin(XH_ORIGIN, page_url)
+            try:
+                page_url = urllib.parse.urljoin(XH_ORIGIN, page_url)
+            except ValueError:
+                page_url = ""
         vkey = extract_xhamster_viewkey(page_url)
         if not vkey:
             id_slug = str(item.get("idHashSlug") or "").strip()
@@ -939,8 +951,8 @@ def _extract_xhamster_page_data(
                 vkey = f"xh_{item['id']}"
         if not vkey or vkey in seen_vkeys:
             continue
-        if not page_url:
-            page_url = f"{XH_ORIGIN}/videos/{vkey}"
+        if not is_site_url(page_url, "xhamster") or extract_xhamster_viewkey(page_url) != vkey:
+            page_url = build_xhamster_video_page_url(vkey)
         title = html_lib.unescape(str(item.get("title") or "").strip()) or f"未知标题_{vkey}"
         published_at = _timestamp_to_ymd(item.get("created"))
         raw_dur = item.get("duration")
@@ -957,7 +969,7 @@ def extract_xhamster_video_cards(
 ) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[int]]:
     """Parse list HTML into ``(items, avatar_url, display_name, max_pages)``."""
     results, avatar_url, display_name, max_pages, _, _ = _extract_xhamster_page_data(html, target_type=target_type)
-    return results, avatar_url, display_name, max_pages
+    return results or [], avatar_url, display_name, max_pages
 
 
 def _is_xhamster_off_target(initial_url: str, final_url: str, target_type: Optional[str]) -> bool:
@@ -1144,6 +1156,13 @@ async def scan_xhamster_list_pages(
                 )
             referer = res.final_url or page_url
             res = None
+            if raw_items is None:
+                report_error(current_page, "页面结构异常或未识别")
+                batch_failed = True
+                if is_natural and current_page == 1:
+                    end_reached = True
+                    break
+                continue
             any_page_succeeded = True
             if bound_user_info is None and page_bound_user is not None:
                 bound_user_info = page_bound_user
@@ -1332,6 +1351,15 @@ class HlsVariant:
     quality: str
     bandwidth: int = 0
     codecs: str = ""
+    audio_url: str = ""
+
+    @property
+    def has_separate_audio(self) -> bool:
+        return bool(self.audio_url)
+
+
+def _hls_attributes(line: str) -> Dict[str, str]:
+    return {key: quoted or unquoted.strip() for key, quoted, unquoted in _HLS_ATTRIBUTE_RE.findall(line)}
 
 
 def parse_hls_master_variants(m3u8_text: str, base_url: str) -> List[HlsVariant]:
@@ -1339,6 +1367,14 @@ def parse_hls_master_variants(m3u8_text: str, base_url: str) -> List[HlsVariant]
     if not m3u8_text or "#EXT-X-STREAM-INF" not in m3u8_text:
         return []
     lines = [line.strip() for line in m3u8_text.splitlines() if line.strip()]
+    audio_groups: Dict[str, str] = {}
+    for line in lines:
+        if not line.startswith("#EXT-X-MEDIA:"):
+            continue
+        attrs = _hls_attributes(line.partition(":")[2])
+        group, uri = attrs.get("GROUP-ID"), attrs.get("URI")
+        if attrs.get("TYPE") == "AUDIO" and group and uri and (group not in audio_groups or attrs.get("DEFAULT") == "YES"):
+            audio_groups[group] = urllib.parse.urljoin(base_url, uri)
     variants: List[HlsVariant] = []
     idx = 0
     while idx < len(lines):
@@ -1378,6 +1414,7 @@ def parse_hls_master_variants(m3u8_text: str, base_url: str) -> List[HlsVariant]
                         quality=f"{height}p" if height > 0 else "",
                         bandwidth=bw,
                         codecs=codecs,
+                        audio_url=audio_groups.get(_hls_attributes(attrs).get("AUDIO", ""), ""),
                     )
                 )
             idx = j + 1
@@ -1404,10 +1441,13 @@ def _extract_standard_mp4_options(sources: Dict[str, Any]) -> List[Dict[str, Any
         q_raw = str(entry.get("quality") or "").strip()
         if q_raw.lower() == "auto":
             continue
-        m_num = re.search(r"\d{3,4}", q_raw)
+        m_num = re.search(r"(\d{3,4})", q_raw)
         if not m_num:
-            m_num = _XH_QUALITY_IN_URI_RE.search(url)
-        quality_str = f"{m_num.group(0)}p" if m_num else q_raw
+            try:
+                m_num = _XH_QUALITY_IN_URI_RE.search(urllib.parse.urlsplit(url).path)
+            except ValueError:
+                continue
+        quality_str = f"{m_num.group(1)}p" if m_num else q_raw
         options.append(
             {
                 "videoUrl": url,
@@ -1714,6 +1754,7 @@ async def fetch_xhamster_video_detail(
     del res, initials, video_model, xplayer, raw_sources, sources
 
     selected_variant: Optional[HlsVariant] = None
+    selected_master_url = ""
     had_any_variants = False
     hls_sources_tuple: Tuple[MediaSource, ...] = ()
 
@@ -1729,7 +1770,8 @@ async def fetch_xhamster_video_detail(
         )
         if m_res is None or m_res.status_code >= 400 or "#EXTM3U" not in (m_res.text or ""):
             continue
-        variants = parse_hls_master_variants(m_res.text, m_res.final_url or master_url)
+        effective_master_url = m_res.final_url or master_url
+        variants = parse_hls_master_variants(m_res.text, effective_master_url)
         if not variants:
             continue
         had_any_variants = True
@@ -1737,7 +1779,7 @@ async def fetch_xhamster_video_detail(
             deduped_hls: Dict[str, MediaSource] = {}
             for variant in variants:
                 q_label = variant.quality or f"{variant.height}p" if variant.height > 0 else "auto"
-                deduped_hls.setdefault(q_label, MediaSource(variant.url, q_label))
+                deduped_hls.setdefault(q_label, MediaSource(variant.url, q_label, variant.audio_url, variant.bandwidth))
             hls_sources_tuple = tuple(deduped_hls.values())
         usable = variants
         if preferred_qualities:
@@ -1747,6 +1789,7 @@ async def fetch_xhamster_video_detail(
                 continue
             usable = filtered
         selected_variant = usable[0]
+        selected_master_url = effective_master_url
         break
 
     if selected_variant is not None:
@@ -1755,7 +1798,7 @@ async def fetch_xhamster_video_detail(
             title=title,
             page_url=page_url,
             referer_url=final_url,
-            download_url=selected_variant.url,
+            download_url=selected_master_url if selected_variant.has_separate_audio else selected_variant.url,
             quality=selected_variant.quality,
             video_format="hls",
             uploader_username=uploader_name,
@@ -1771,30 +1814,8 @@ async def fetch_xhamster_video_detail(
             subscribe_action=subscribe_action,
         )
 
-    # If HLS variants existed but none matched preferred_qualities, report filtered_out
-    if had_any_variants and preferred_qualities:
-        q_str = ",".join(sorted(preferred_qualities, key=lambda x: int(x) if x.isdigit() else 0, reverse=True))
-        return VideoDetail(
-            viewkey=vkey,
-            title=title,
-            page_url=page_url,
-            referer_url=final_url,
-            uploader_username=uploader_name,
-            uploader_type=uploader_type,
-            uploader_display_name=uploader_display_name,
-            uploader_avatar_url=uploader_avatar_url,
-            page_num=page_num,
-            item_num=item_num,
-            error=f"无偏好画质 ({q_str}p)",
-            filtered_out=True,
-            mp4_sources=mp4_sources_tuple,
-            hls_sources=hls_sources_tuple,
-            published_at=published_at,
-            duration_seconds=duration_seconds,
-            subscribe_action=subscribe_action,
-        )
-
-    # Fallback to direct MP4 sources only if HLS master failed
+    # Try MP4 even when the HLS master had no variant at the requested height.
+    sel_err = None
     if mp4_options:
         dl_url, quality, sel_err = select_best_mp4_option(mp4_options, preferred_qualities)
         if dl_url and not sel_err:
@@ -1818,26 +1839,10 @@ async def fetch_xhamster_video_detail(
                 duration_seconds=duration_seconds,
                 subscribe_action=subscribe_action,
             )
-        return VideoDetail(
-            viewkey=vkey,
-            title=title,
-            page_url=page_url,
-            referer_url=final_url,
-            uploader_username=uploader_name,
-            uploader_type=uploader_type,
-            uploader_display_name=uploader_display_name,
-            uploader_avatar_url=uploader_avatar_url,
-            page_num=page_num,
-            item_num=item_num,
-            error=sel_err or "筛选后无可用链接",
-            filtered_out=bool(preferred_qualities),
-            mp4_sources=mp4_sources_tuple,
-            hls_sources=hls_sources_tuple,
-            published_at=published_at,
-            duration_seconds=duration_seconds,
-            subscribe_action=subscribe_action,
-        )
-
+    filtered_out = bool(preferred_qualities and (had_any_variants or mp4_options))
+    if filtered_out and not sel_err:
+        q_str = ",".join(sorted(preferred_qualities or (), key=lambda x: int(x) if x.isdigit() else 0, reverse=True))
+        sel_err = f"无偏好画质 ({q_str}p)"
     return VideoDetail(
         viewkey=vkey,
         title=title,
@@ -1849,7 +1854,8 @@ async def fetch_xhamster_video_detail(
         uploader_avatar_url=uploader_avatar_url,
         page_num=page_num,
         item_num=item_num,
-        error="无可用 HLS/MP4 媒体源",
+        error=sel_err or "无可用 HLS/MP4 媒体源",
+        filtered_out=filtered_out,
         mp4_sources=mp4_sources_tuple,
         hls_sources=hls_sources_tuple,
         published_at=published_at,

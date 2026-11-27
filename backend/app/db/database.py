@@ -5,11 +5,31 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Optional
+from typing import Any, AsyncIterator, Awaitable, Iterable, Optional, TypeVar
 
 import aiosqlite
 
 from .schema import MIGRATIONS, SCHEMA_SQL, SCHEMA_VERSION
+
+T = TypeVar("T")
+
+
+async def _settle_sql(operation: Awaitable[T]) -> T:
+    """Keep the connection locked until SQLite has finished queued work."""
+    task = asyncio.ensure_future(operation)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
 
 
 def _sql_touches_video_meta(sql: str) -> bool:
@@ -26,6 +46,7 @@ class Database:
         self._read_conn: Optional[aiosqlite.Connection] = None
         self._write_lock = asyncio.Lock()
         self._read_lock = asyncio.Lock()
+        self._read_owner: Optional[asyncio.Task] = None
         self._video_meta_version = 0
 
     @property
@@ -148,19 +169,24 @@ class Database:
             return [dict(row) async for row in cursor]
 
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
-        async with self._write_lock:
+        async def write() -> int:
             async with self.conn.execute(sql, tuple(params)) as cursor:
-                lastrowid = int(cursor.lastrowid or 0)
-            if _sql_touches_video_meta(sql):
-                self._video_meta_version += 1
-            return lastrowid
+                return int(cursor.lastrowid or 0)
+
+        async with self._write_lock:
+            try:
+                return await _settle_sql(write())
+            finally:
+                if _sql_touches_video_meta(sql):
+                    self.bump_video_meta_version()
 
     async def execute_returning(self, sql: str, params: Iterable[Any] = ()) -> Optional[dict[str, Any]]:
         async with self._write_lock:
-            result = await self.fetch_one(sql, params, conn=self.conn)
-            if _sql_touches_video_meta(sql):
-                self._video_meta_version += 1
-            return result
+            try:
+                return await _settle_sql(self.fetch_one(sql, params, conn=self.conn))
+            finally:
+                if _sql_touches_video_meta(sql):
+                    self.bump_video_meta_version()
 
     async def executemany(self, sql: str, param_seq: Iterable[Iterable[Any]]) -> None:
         touches_meta = _sql_touches_video_meta(sql)
@@ -170,8 +196,26 @@ class Database:
 
     @asynccontextmanager
     async def read(self) -> AsyncIterator[aiosqlite.Connection]:
-        async with self._read_lock:
+        owner = asyncio.current_task()
+        if owner is not None and self._read_owner is owner:
             yield self.read_conn
+            return
+        async with self._read_lock:
+            conn = self.read_conn
+            self._read_owner = owner
+            try:
+                if conn is self.conn or conn.isolation_level is not None or conn.in_transaction:
+                    yield conn
+                else:
+                    try:
+                        async with conn.execute("BEGIN DEFERRED"):
+                            pass
+                        yield conn
+                    finally:
+                        if conn.in_transaction:
+                            await _settle_sql(conn.rollback())
+            finally:
+                self._read_owner = None
 
     @asynccontextmanager
     async def transaction(self, *, touches_video_meta: bool = True) -> AsyncIterator[aiosqlite.Connection]:
@@ -180,9 +224,10 @@ class Database:
                 async with self.conn.execute("BEGIN IMMEDIATE"):
                     pass
                 yield self.conn
-                await self.conn.commit()
-                if touches_video_meta:
-                    self._video_meta_version += 1
+                await _settle_sql(self.conn.commit())
             except BaseException:
-                await self.conn.rollback()
+                await _settle_sql(self.conn.rollback())
                 raise
+            finally:
+                if touches_video_meta:
+                    self.bump_video_meta_version()

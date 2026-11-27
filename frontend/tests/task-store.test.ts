@@ -4,7 +4,7 @@ import { createPinia } from 'pinia'
 import { api } from '../src/api/client'
 import { EventStreamClient } from '../src/api/ws'
 import { useAppStore } from '../src/stores/app'
-import { SESSION_CACHE_KEY, SESSION_CACHE_MAX_CHARS } from '../src/stores/sessionCache'
+import { SESSION_CACHE_KEY, SESSION_CACHE_MAX_CHARS, SESSION_LOGOUT_KEY } from '../src/stores/sessionCache'
 import { resolveJobVisual } from '../src/utils/jobMeta'
 import type { JobDetailResponse, JobStatus, OverviewResponse, RuntimeSettings, TargetRecord, VideoListResponse, WsMessage } from '../src/types/api'
 import { makeJob, makeJobItem } from './fixtures'
@@ -19,7 +19,7 @@ function job(id: number, status: JobStatus, revision: number, resumeCount = 0) {
   return { ...makeJob(id, status, { resume_count: resumeCount }), revision }
 }
 
-function mockSessionStorage(pathname = '/', initial: string | null = null) {
+function mockSessionStorage(pathname = '/', initial: string | null = null, local = new Map<string, string>()) {
   let raw = initial
   let writes = 0
   const browser = Object.assign(new EventTarget(), {
@@ -33,6 +33,10 @@ function mockSessionStorage(pathname = '/', initial: string | null = null) {
         writes++
       },
     },
+    localStorage: {
+      getItem: (key: string) => local.get(key) ?? null,
+      setItem: (key: string, value: string) => local.set(key, value),
+    },
   })
   const listener = vi.spyOn(browser, 'addEventListener')
   vi.stubGlobal('window', browser)
@@ -41,6 +45,7 @@ function mockSessionStorage(pathname = '/', initial: string | null = null) {
     get writes() { return writes },
     pagehide: () => browser.dispatchEvent(new Event('pagehide')),
     listener,
+    local,
   }
 }
 
@@ -353,6 +358,149 @@ test('pagehide flushes pending writes synchronously and logout cancels the next 
     assert.equal(storage.writes, 1)
   } finally {
     store._resetSessionState()
+  }
+})
+
+test('failed logout clears cached data immediately and preserves the authenticated retry path', async () => {
+  const storage = mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const logout = vi.spyOn(api, 'logout')
+    .mockRejectedValueOnce(new Error('Gateway unavailable'))
+    .mockResolvedValueOnce({ authenticated: false })
+  try {
+    store.persistCache()
+    storage.pagehide()
+    assert.ok(storage.raw)
+    const attempt = store.logout()
+    assert.equal(storage.raw, null)
+    assert.equal(store.authenticated, true)
+    await assert.rejects(attempt, /Gateway unavailable/)
+    assert.equal(store.authenticated, true)
+    store.setTargetsCache([target])
+    storage.pagehide()
+    assert.equal(storage.raw, null)
+    assert.equal(storage.local.get(SESSION_LOGOUT_KEY), undefined)
+
+    await store.logout()
+    assert.equal(store.authenticated, false)
+    assert.ok(storage.local.get(SESSION_LOGOUT_KEY))
+    assert.equal(logout.mock.calls.length, 2)
+  } finally {
+    store._resetSessionState()
+  }
+})
+
+test('logout treats a server 401 as confirmation of an expired session', async () => {
+  const storage = mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 401 })))
+  try {
+    await store.logout()
+    assert.equal(store.authenticated, false)
+    assert.ok(storage.local.get(SESSION_LOGOUT_KEY))
+  } finally {
+    store._resetSessionState()
+  }
+})
+
+test('cross-tab logout invalidates persisted and already hydrated state', () => {
+  const origin = mockSessionStorage('/jobs')
+  const first = seedRouteStore()
+  first.persistCache()
+  origin.pagehide()
+  assert.ok(origin.raw)
+  const other = mockSessionStorage('/jobs', origin.raw, origin.local)
+  const openTab = useAppStore(createPinia())
+  assert.equal(openTab.authenticated, true)
+  const timestamp = Date.now() + 1
+  origin.local.set(SESSION_LOGOUT_KEY, String(timestamp))
+  assert.equal(openTab.handleCrossTabLogout(timestamp), true)
+  assert.equal(openTab.authenticated, false)
+  assert.equal(other.raw, null)
+
+  const sleeping = mockSessionStorage('/jobs', origin.raw, origin.local)
+  const refreshed = useAppStore(createPinia())
+  assert.equal(refreshed.hydratedFromCache, false)
+  assert.equal(refreshed.authChecked, false)
+  assert.equal(sleeping.raw, null)
+  first._resetSessionState()
+})
+
+function startTestEventStream(store: ReturnType<typeof useAppStore>) {
+  vi.stubGlobal('WebSocket', class {
+    get [Symbol.toStringTag]() { return 'WebSocket' }
+    close() {}
+  })
+  store.startRealtime()
+  const socket = (store._wsClient as EventStreamClient).ws!
+  return (msg: WsMessage) => socket.onmessage?.(new MessageEvent('message', { data: JSON.stringify(msg) }))
+}
+
+test('jobs_deleted removes a task across tabs and filters it out of an older REST response', async () => {
+  mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const removed = job(1, 'completed', 1)
+  const preserved = job(2, 'completed', 1)
+  store.jobs = [removed, preserved]
+  let resolveList!: (result: { items: typeof removed[] }) => void
+  const list = vi.spyOn(api, 'listJobs').mockImplementation(() => new Promise((resolve) => { resolveList = resolve }))
+  const send = startTestEventStream(store)
+  try {
+    const pending = store.refreshJobs()
+    await Promise.resolve()
+    send({ type: 'jobs_deleted', ts: '', data: { job_ids: [removed.id] } })
+    assert.deepEqual(store.jobs.map((row) => row.id), [2])
+    resolveList({ items: [removed, preserved] })
+    assert.deepEqual((await pending).map((row) => row.id), [2])
+    assert.deepEqual(store.jobs.map((row) => row.id), [2])
+    assert.equal(list.mock.calls.length, 1)
+  } finally {
+    store.handleUnauthorized()
+  }
+})
+
+test('older REST job detail cannot replace progress received from the WebSocket during the request', async () => {
+  vi.useFakeTimers()
+  mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const running = job(1, 'running', 1)
+  store.jobs = [running]
+  let resolveDetail!: (response: JobDetailResponse) => void
+  vi.spyOn(api, 'getJob').mockImplementation(() => new Promise((resolve) => { resolveDetail = resolve }))
+  const send = startTestEventStream(store)
+  try {
+    const pending = store.loadJobDetail(1)
+    await Promise.resolve()
+    const progress = { job_id: 1, item_id: 4, bytes_downloaded: 48, bytes_total: 64, speed_bps: 32, phase: 'downloading' }
+    send({ type: 'item_progress', ts: '', data: progress })
+    await vi.advanceTimersByTimeAsync(150)
+    resolveDetail({ job: running, items: [makeJobItem(4, 1, { status: 'downloading', bytes_downloaded: 16 })] })
+    await pending
+    assert.deepEqual(store.liveProgress[4], progress)
+  } finally {
+    store.handleUnauthorized()
+  }
+})
+
+test('resync_required reloads the jobs list, overview, and a pinned task detail', async () => {
+  vi.useFakeTimers()
+  mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const task = job(1, 'completed', 1)
+  const listJobs = vi.spyOn(api, 'listJobs').mockResolvedValue({ items: [task] })
+  const overviewApi = vi.spyOn(api, 'overview').mockResolvedValue(overview)
+  const detail = vi.spyOn(api, 'getJob').mockResolvedValue({ job: task, items: [] })
+  const unpin = store.pinJobDetail(1)
+  const send = startTestEventStream(store)
+  try {
+    send({ type: 'resync_required', data: {} })
+    await vi.advanceTimersByTimeAsync(300)
+    assert.equal(listJobs.mock.calls.length, 1)
+    assert.equal(overviewApi.mock.calls.length, 1)
+    assert.deepEqual(detail.mock.calls, [[1]])
+  } finally {
+    unpin()
+    store.handleUnauthorized()
   }
 })
 

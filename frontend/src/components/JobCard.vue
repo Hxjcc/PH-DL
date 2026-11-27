@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { getErrorMessage } from '../utils/errors'
+import { safeExternalVideoUrl } from '../utils/videoLinks'
 import { computed, ref, watch } from 'vue'
 import {
   ChevronDown,
@@ -277,7 +278,7 @@ const transferProgressMap = computed<Partial<Record<number, TransferProgress>>>(
     const isEstimatedTotal =
       !isUploading &&
       phase === 'downloading' &&
-      (Boolean(live?.estimated_total) || String(item.download_url || '').toLowerCase().includes('.m3u8'))
+      (Boolean(live?.estimated_total) || (item.is_hls ?? String(item.download_url || '').toLowerCase().includes('.m3u8')))
     map[item.id] = {
       phase,
       doneText: formatBytes(done),
@@ -1058,8 +1059,8 @@ function downloadExportTxt() {
                   </span>
 
                   <a
-                    v-if="item.page_url"
-                    :href="item.page_url"
+                    v-if="item.page_url || item.viewkey"
+                    :href="safeExternalVideoUrl(item.page_url, item.site, item.viewkey)"
                     target="_blank"
                     rel="noopener noreferrer"
                     class="inline-flex h-6 w-6 ml-auto sm:ml-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"

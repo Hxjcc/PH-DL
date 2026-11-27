@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from pathlib import Path
 from typing import List
@@ -10,31 +11,72 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from .deps import AppContainer, require_auth
+from ..db.repo import normalize_site
+from ..parsers.video import safe_video_page_url
+from ..services.downloader import _await_file_io
 from ..services.playback import NO_CACHE
+from ..services.uploader import FileSnapshot, delete_verified_source, file_snapshot
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
 
-def _safe_unlink_downloaded_video(downloads_dir: Path, raw_path: str) -> bool:
-    cleaned = (raw_path or "").strip()
-    if not cleaned:
-        return False
-    try:
-        candidate = Path(cleaned)
-        if candidate.is_symlink():
-            return False
-        resolved = candidate.resolve(strict=True)
-        root = downloads_dir.resolve()
-        if resolved == root or not resolved.is_relative_to(root) or not resolved.is_file():
-            return False
-        resolved.unlink()
-        parent = resolved.parent
-        if parent != root and parent.is_relative_to(root):
-            with contextlib.suppress(OSError):
-                parent.rmdir()
-        return True
-    except (OSError, ValueError):
-        return False
+def _capture_local_videos(downloads_dir: Path, records: list[dict]) -> dict[str, tuple[Path, FileSnapshot]]:
+    root = downloads_dir.resolve()
+    candidates = {}
+    for record in records:
+        if not record["local_path"]:
+            continue
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            path = Path(record["local_path"])
+            if path.is_symlink():
+                continue
+            path = path.resolve(strict=True)
+            if path != root and path.is_relative_to(root) and (snapshot := file_snapshot(path)):
+                candidates[record["viewkey"]] = (path, snapshot)
+    return candidates
+
+
+async def _remove_deleted_local_videos(
+    container: AppContainer, candidates: dict[str, tuple[Path, FileSnapshot]], deleted: list[str],
+) -> int:
+    keys = candidates.keys() & set(deleted)
+    if not keys:
+        return 0
+
+    def unlink_files(allowed: set[str]) -> int:
+        root = container.env.downloads_dir.resolve()
+        removed = 0
+        for key in allowed:
+            path, snapshot = candidates[key]
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                if path.resolve().is_relative_to(root) and delete_verified_source(path, snapshot):
+                    removed += 1
+                    if path.parent != root:
+                        path.parent.rmdir()
+        return removed
+
+    # A downloader records its active item before publishing the file. Keep SQLite's
+    # writer lock until unlink so neither that marker nor a new ledger row can race us.
+    async with container.repo.db.transaction(touches_video_meta=False) as conn:
+        blocked = await container.repo.video_cleanup_blocked(keys, conn=conn)
+        return await _await_file_io(asyncio.create_task(asyncio.to_thread(unlink_files, keys - blocked)))
+
+
+async def _delete_records_and_local_files(
+    container: AppContainer, viewkeys: list[str],
+) -> tuple[list[str], int]:
+    repo = container.repo
+    async with repo.db.transaction() as conn:
+        records = await repo.get_videos_by_viewkeys(viewkeys, conn=conn)
+        blocked = await repo.video_cleanup_blocked(
+            (record["viewkey"] for record in records), conn=conn, include_ledger=False,
+        )
+        candidates = await asyncio.to_thread(
+            _capture_local_videos, container.env.downloads_dir,
+            [record for record in records if record["viewkey"] not in blocked],
+        )
+        deleted = await repo.delete_videos(viewkeys, conn=conn)
+    return deleted, await _remove_deleted_local_videos(container, candidates, deleted)
 
 
 @router.get("")
@@ -51,9 +93,9 @@ async def list_videos(
     include_meta: bool = Query(default=True),
     container: AppContainer = Depends(require_auth),
 ):
-    stats = await container.repo.get_video_stats(site=site) if include_meta else None
+    repo = container.repo
     unfiltered = not any((search.strip(), uploader.strip(), status.strip(), quality.strip(), time_range.strip()))
-    items, total = await container.repo.query_videos(
+    filters = dict(
         site=site,
         search=search,
         uploader=uploader,
@@ -63,9 +105,17 @@ async def list_videos(
         sort_by=sort_by,
         page=page,
         page_size=page_size,
-        known_total=stats["total"] if (stats is not None and unfiltered) else None,
     )
-    facets = await container.repo.get_video_filter_facets(site=site) if include_meta else None
+    if include_meta:
+        async with repo.db.read() as conn:
+            stats = await repo.get_video_stats(site=site, conn=conn)
+            items, total = await repo.query_videos(
+                **filters, known_total=stats["total"] if unfiltered else None, conn=conn,
+            )
+            facets = await repo.get_video_filter_facets(site=site, conn=conn)
+    else:
+        items, total = await repo.query_videos(**filters)
+        stats = facets = None
     return {
         "items": items,
         "total": total,
@@ -76,15 +126,25 @@ async def list_videos(
     }
 
 
+class EnrichMetadataRequest(BaseModel):
+    site: str = ""
+
+
 @router.post("/metadata/enrich")
-async def enrich_baseline_metadata(container: AppContainer = Depends(require_auth)):
-    count = await container.repo.count_baseline_metadata_candidates()
+async def enrich_baseline_metadata(
+    payload: EnrichMetadataRequest | None = None,
+    site: str | None = Query(default=None),
+    container: AppContainer = Depends(require_auth),
+):
+    raw_site = (site if site is not None else payload.site if payload else "").strip()
+    site_filter = normalize_site(raw_site) if raw_site else ""
+    count = await container.repo.count_baseline_metadata_candidates(site=site_filter)
     if count == 0:
         raise HTTPException(status_code=400, detail="没有需要补全元数据的基线视频")
     job = await container.tasks.enqueue_job(
         kind="enrich_metadata",
         label=f"补全基线元数据 ({count} 条)",
-        params={},
+        params={"site": site_filter} if site_filter else {},
     )
     return {"job": job, "count": count}
 
@@ -101,16 +161,10 @@ async def batch_delete_video_records(
 ):
     if not payload.viewkeys:
         raise HTTPException(status_code=400, detail="请至少选择一条视频记录")
-    records = await container.repo.get_videos_by_viewkeys(payload.viewkeys) if payload.delete_local_files else []
-    deleted = await container.repo.delete_videos(payload.viewkeys)
-    deleted_files = 0
-    if payload.delete_local_files and deleted:
-        deleted_set = set(deleted)
-        for rec in records:
-            if rec.get("viewkey") in deleted_set and _safe_unlink_downloaded_video(
-                container.env.downloads_dir, str(rec.get("local_path") or "")
-            ):
-                deleted_files += 1
+    if payload.delete_local_files:
+        deleted, deleted_files = await _delete_records_and_local_files(container, payload.viewkeys)
+    else:
+        deleted, deleted_files = await container.repo.delete_videos(payload.viewkeys), 0
     if deleted:
         container.events.broadcast("overview_changed", {})
     return {
@@ -161,17 +215,15 @@ async def delete_video_record(
     container: AppContainer = Depends(require_auth),
 ):
     vk = viewkey.strip()
-    record = await container.repo.get_video(vk) if delete_local_file else None
-    ok = await container.repo.delete_video(vk)
+    if delete_local_file:
+        deleted, removed_files = await _delete_records_and_local_files(container, [vk])
+        ok = bool(deleted)
+    else:
+        ok, removed_files = await container.repo.delete_video(vk), 0
     if not ok:
         raise HTTPException(status_code=404, detail="视频记录不存在")
-    removed_file = False
-    if delete_local_file and record:
-        removed_file = _safe_unlink_downloaded_video(
-            container.env.downloads_dir, str(record.get("local_path") or "")
-        )
     container.events.broadcast("overview_changed", {})
-    return {"deleted": True, "deleted_local_file": removed_file}
+    return {"deleted": True, "deleted_local_file": bool(removed_files)}
 
 
 @router.post("/{viewkey}/redownload")
@@ -181,12 +233,7 @@ async def redownload_video(viewkey: str, container: AppContainer = Depends(requi
         raise HTTPException(status_code=404, detail="视频记录不存在")
 
     settings = await container.repo.get_settings()
-    default_url = (
-        f"https://xhamster.com/videos/{viewkey.strip()}"
-        if str(record.get("site") or "").strip().lower() == "xhamster"
-        else f"https://www.pornhub.com/view_video.php?viewkey={viewkey.strip()}"
-    )
-    page_url = record.get("video_page_url") or default_url
+    page_url = safe_video_page_url(record.get("video_page_url"), normalize_site(record.get("site")), viewkey.strip())
     job = await container.tasks.enqueue_job(
         kind="manual_urls",
         label=f"重新下载: {record.get('title') or viewkey}",

@@ -10,13 +10,46 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 from ..redaction import redact_diagnostic
+from ..services.hls_downloader import is_hls_url
 
 logger = logging.getLogger("phdl")
+_TELEMETRY_EVENTS = frozenset({"item_progress", "job_scheduler", "job_scan", "log"})
+
+
+def public_job_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    is_hls = is_hls_url(item.get("download_url")) or str(item.get("temp_path") or "").lower().endswith(".hls")
+    return {**item, "download_url": "", "is_hls": is_hls}
+
+
+class SubscriberQueue(asyncio.Queue[Dict[str, Any]]):
+    def __init__(self) -> None:
+        super().__init__(maxsize=500)
+        self._needs_resync = False
+
+    def publish(self, packet: Dict[str, Any]) -> None:
+        if self.full():
+            if packet["type"] in _TELEMETRY_EVENTS:
+                return
+            for index, queued in enumerate(self._queue):
+                if queued["type"] in _TELEMETRY_EVENTS:
+                    del self._queue[index]
+                    break
+            else:
+                self.get_nowait()
+                self._needs_resync = True
+            self.task_done()
+        self.put_nowait(packet)
+
+    def enqueue_resync_if_needed(self) -> None:
+        if self._needs_resync and not self.full():
+            # Deliver after the remaining backlog so older state cannot overtake the refresh.
+            self.put_nowait({"type": "resync_required", "data": {}})
+            self._needs_resync = False
 
 
 class EventBus:
     def __init__(self, max_logs: int = 500, redact: Callable[[str], str] = redact_diagnostic) -> None:
-        self._subscribers: Set[asyncio.Queue[Dict[str, Any]]] = set()
+        self._subscribers: Set[SubscriberQueue] = set()
         self._logs: Deque[Dict[str, Any]] = deque(maxlen=max_logs)
         self._boot_id: str = secrets.token_hex(4)
         self._log_seq: int = 0
@@ -26,12 +59,12 @@ class EventBus:
         self._scan_status: Dict[int, Dict[str, Any]] = {}
         self._cancelling_jobs: Set[int] = set()
 
-    def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
-        q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=500)
+    def subscribe(self) -> SubscriberQueue:
+        q = SubscriberQueue()
         self._subscribers.add(q)
         return q
 
-    def unsubscribe(self, q: asyncio.Queue[Dict[str, Any]]) -> None:
+    def unsubscribe(self, q: SubscriberQueue) -> None:
         self._subscribers.discard(q)
 
     def broadcast(self, event_type: str, data: Any) -> None:
@@ -41,22 +74,15 @@ class EventBus:
                     return
             if event_type in {"item_updated", "job_items_changed"} and data.get("job_id") in self._cancelling_jobs:
                 return
+        if event_type == "item_updated":
+            data = public_job_item(data)
         packet = {
             "type": event_type,
             "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "data": data,
         }
-        for q in list(self._subscribers):
-            if q.full():
-                try:
-                    q.get_nowait()
-                    q.task_done()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
-                q.put_nowait(packet)
-            except asyncio.QueueFull:
-                pass
+        for q in self._subscribers:
+            q.publish(packet)
 
     def emit_log(self, level: str, message: str, job_id: Optional[int] = None) -> None:
         lvl = (level or "INFO").upper()

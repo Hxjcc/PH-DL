@@ -3,7 +3,7 @@
 import asyncio
 import re
 import threading
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 
 import aiohttp
@@ -51,7 +51,7 @@ async def test_large_hls_segments_spill_while_the_head_stalls_and_resume_cleanly
 
     async def playlist(_request):
         assert not (folder / "seg_999999.tmp").exists()
-        return web.Response(text="#EXTM3U\n" + "".join(f"#EXTINF:2,\n/{i}.ts\n" for i in range(len(segments))))
+        return web.Response(text="#EXTM3U\n" + "".join(f"#EXTINF:2,\n/{i}.ts\n" for i in range(len(segments))) + "#EXT-X-ENDLIST\n")
 
     async def segment(request):
         i = int(request.match_info["index"])
@@ -110,7 +110,7 @@ async def test_hls_one_video_uses_twelve_workers_and_concurrent_videos_share_the
     release = asyncio.Event()
 
     async def playlist(_request):
-        return web.Response(text="#EXTM3U\n" + "".join(f"#EXTINF:1,\n{i}.ts\n" for i in range(14)))
+        return web.Response(text="#EXTM3U\n" + "".join(f"#EXTINF:1,\n{i}.ts\n" for i in range(14)) + "#EXT-X-ENDLIST\n")
 
     async def segment(request):
         nonlocal peak
@@ -154,7 +154,7 @@ async def test_hls_spill_disk_denial_cleans_temporary_files(tmp_path):
     app = web.Application()
 
     async def playlist(_):
-        return web.Response(text="#EXTM3U\n#EXTINF:1,\nsegment.ts\n")
+        return web.Response(text="#EXTM3U\n#EXTINF:1,\nsegment.ts\n#EXT-X-ENDLIST\n")
 
     async def segment(_):
         return web.Response(body=b"x" * (2 * MIB))
@@ -623,7 +623,8 @@ async def test_mp4_multi_range_and_resume_work_with_last_modified_validator_only
     assert not list(state.iterdir())
 
 
-async def test_mp4_multi_range_works_without_etag_or_last_modified_but_does_not_resume_unvalidated(tmp_path):
+@pytest.mark.parametrize(("site", "cdn"), [("pornhub", "phncdn.com"), ("xhamster", "xhcdn.com")])
+async def test_official_cdn_keeps_live_mp4_multi_range_without_validators(tmp_path, monkeypatch, site, cdn):
     """Signed immutable CDN URLs with neither ETag nor Last-Modified still get live multi-range speed."""
     media = large_mp4(12 * MIB)
     active = peak = 0
@@ -653,13 +654,48 @@ async def test_mp4_multi_range_works_without_etag_or_last_modified_but_does_not_
             },
         )
 
-    async with media_server(handler) as url, aiohttp.ClientSession() as session:
+    async with media_server(handler) as loopback, aiohttp.ClientSession() as session:
+        url = f"https://media.{cdn}/video.mp4"
+
+        @asynccontextmanager
+        async def cdn_response(client, candidate, *, site, **kwargs):
+            assert candidate == url
+            async with http_proxy.open_media_response(client, loopback, site=None, **kwargs) as response:
+                yield SimpleNamespace(url=url, headers=response.headers, status=response.status, content=response.content)
+
+        monkeypatch.setattr(downloader, "open_media_response", cdn_response)
         result = await downloader.download_mp4_with_resume(**media_args(
-            tmp_path, session, url, range_connections=4, min_multi_range_bytes=8 * MIB,
+            tmp_path, session, url, parse_ctx=TaskHttpContext(site=site),
+            range_connections=4, min_multi_range_bytes=8 * MIB,
         ))
     assert result.success and result.local_path.read_bytes() == media
     assert peak >= 2 and sorted(requests) == list(downloader._missing_ranges(len(media), []))
     assert not list((tmp_path / "temp").iterdir())
+
+
+async def test_mp4_unknown_source_declines_unvalidated_ranges_when_entity_changes(tmp_path):
+    original = large_mp4(9 * MIB)
+    replacement = original[:1024] + b"r" * (len(original) - 1024)
+    requests = []
+
+    async def handler(request):
+        span = request.headers.get("Range")
+        requests.append(span)
+        if not span:
+            return web.Response(body=replacement)
+        start, end = range_bounds(span, len(original))
+        payload = original if len(requests) == 1 else replacement
+        return web.Response(
+            status=206, body=payload[start:end],
+            headers={"Content-Range": f"bytes {start}-{end - 1}/{len(payload)}"},
+        )
+
+    async with media_server(handler) as url, aiohttp.ClientSession() as session:
+        result = await downloader.download_mp4_with_resume(**media_args(
+            tmp_path, session, url, range_connections=4, min_multi_range_bytes=8 * MIB,
+        ))
+    assert result.success and result.local_path.read_bytes() == replacement
+    assert requests == [f"bytes=0-{RANGE_BYTES - 1}", None]
 
 
 async def test_wal_read_connection_does_not_block_on_write_lock_and_meta_cache_invalidates(tmp_path):

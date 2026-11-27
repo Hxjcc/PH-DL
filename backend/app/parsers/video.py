@@ -19,6 +19,7 @@ from .http_session import TaskHttpContext
 from .target import SubscribeAction, extract_subscribe_action, select_one
 from .urls import is_site_url
 from .xhamster import (
+    build_xhamster_video_page_url,
     extract_xhamster_viewkey,
     fetch_xhamster_video_detail,
     is_xhamster_url,
@@ -119,6 +120,8 @@ def extract_detail_published_and_duration(
 class MediaSource:
     url: str
     quality: str
+    audio_url: str = ""
+    bandwidth: int = 0
 
 
 @dataclass
@@ -152,6 +155,19 @@ def extract_viewkey_from_url(url: Optional[str]) -> Optional[str]:
         return extract_xhamster_viewkey(url)
     m = re.search(r"(?:viewkey=|/embed/|/shorties/)([a-zA-Z0-9]+)", url)
     return m.group(1) if m else None
+
+
+def build_video_page_url(site: str, viewkey: str) -> str:
+    if site == "xhamster":
+        return build_xhamster_video_page_url(viewkey)
+    return "https://www.pornhub.com/view_video.php?" + urllib.parse.urlencode({"viewkey": viewkey})
+
+
+def safe_video_page_url(raw_url: Optional[str], site: str, viewkey: str) -> str:
+    url = (raw_url or "").strip()
+    if is_site_url(url, site) and extract_viewkey_from_url(url) == viewkey:
+        return url
+    return build_video_page_url(site, viewkey)
 
 
 def _video_url_key(url: str) -> Optional[str]:

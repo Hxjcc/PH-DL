@@ -25,7 +25,9 @@ import type {
 } from '../types/api'
 import { appendLiveLog, mergeLogsSnapshot } from '../utils/logBuffer'
 import { JOB_LIMITS, HISTORY_PAGE_SIZES, readListPreference, saveListPreference } from '../utils/listPreferences'
-import { readSessionCache, serializeSessionCache, SESSION_CACHE_KEY, type HistoryCache } from './sessionCache'
+import {
+  broadcastSessionLogout, readLogoutTimestamp, readSessionCache, serializeSessionCache, SESSION_CACHE_KEY, type HistoryCache,
+} from './sessionCache'
 
 type RouteName = RouteRecordName | null | undefined
 type Timer = ReturnType<typeof setTimeout>
@@ -38,6 +40,8 @@ interface AppState {
   authChecked: boolean
   hydratedFromCache: boolean
   authenticated: boolean
+  _cacheSuspended: boolean
+  _logoutTimestamp: number
   wsConnected: boolean
   overview: OverviewResponse | null
   overviewLoaded: boolean
@@ -127,6 +131,10 @@ const jobItemsReloadTimers = new Map<number, Timer>()
 const jobItemAccessOrder = new Map<number, JobStatus | undefined>()
 const jobItemPins = new Map<number, number>()
 const detailUpdates: ItemUpdates = new Map()
+const detailProgressVersions = new Map<number, Map<number, number>>()
+const deletedJobVersions = new Map<number, number>()
+let progressVersion = 0
+let deletionVersion = 0
 
 function isActiveJobStatus(status: JobStatus | undefined) {
   return status !== undefined && JOB_RUN_ORDER[status] !== undefined
@@ -183,6 +191,7 @@ function evictJobItems(store: JobDetailCache, jid: number) {
   jobItemAccessOrder.delete(jid)
   jobItemIndexMap.delete(jid)
   detailUpdates.delete(jid)
+  detailProgressVersions.delete(jid)
   inflight.delete(`jobDetail:${jid}`)
   pendingItemUpdates?.delete(jid)
   clearTimeout(jobItemsReloadTimers.get(jid))
@@ -218,6 +227,7 @@ function clearPendingItemUpdates() {
   }
   pendingItemUpdates = null
   detailUpdates.clear()
+  detailProgressVersions.clear()
   jobItemIndexMap.clear()
   for (const timer of jobItemsReloadTimers.values()) {
     clearTimeout(timer)
@@ -331,6 +341,7 @@ function flushPendingLiveProgress(store: Pick<AppState, 'liveProgress'>) {
 
 function queueLiveProgress(store: Pick<AppState, 'liveProgress'>, payload: LiveProgressEntry) {
   if (!payload || payload.item_id == null) return
+  detailProgressVersions.get(payload.job_id)?.set(payload.item_id, ++progressVersion)
   if (!pendingLiveProgress) pendingLiveProgress = new Map()
   pendingLiveProgress.set(payload.item_id, payload)
   if (liveProgressFlushTimer === null) {
@@ -358,7 +369,11 @@ function clearSessionCache() {
 function flushScheduledPersist() {
   const store = pendingPersist
   cancelScheduledPersist()
-  if (!store?.authenticated || typeof window === 'undefined') return
+  if (!store?.authenticated || store._cacheSuspended || typeof window === 'undefined') return
+  if (readLogoutTimestamp() > store._logoutTimestamp) {
+    clearSessionCache()
+    return
+  }
   try {
     const { raw, payload } = serializeSessionCache(store, window.location?.pathname || '/')
     if (payload === lastSnapshot) return
@@ -368,7 +383,7 @@ function flushScheduledPersist() {
 }
 
 function schedulePersistSessionCache(store: AppState) {
-  if (!store.authenticated || typeof window === 'undefined') return
+  if (!store.authenticated || store._cacheSuspended || typeof window === 'undefined') return
   if (persistWindow !== window && typeof window.addEventListener === 'function') {
     persistWindow?.removeEventListener('pagehide', flushScheduledPersist)
     window.addEventListener('pagehide', flushScheduledPersist)
@@ -421,6 +436,8 @@ export const useAppStore = defineStore('app', {
       authChecked: false,
       hydratedFromCache: hasCache,
       authenticated: hasCache,
+      _cacheSuspended: false,
+      _logoutTimestamp: readLogoutTimestamp(),
       wsConnected: hasCache,
       overview: cached?.overview ?? null,
       overviewLoaded: Boolean(cached?.overview),
@@ -545,15 +562,16 @@ export const useAppStore = defineStore('app', {
     },
 
     async checkAuth(initialRouteName: RouteName = null): Promise<boolean> {
+      const epoch = sessionEpoch
+      let authenticated = false
       try {
         const res = await api.me()
-        this.authenticated = Boolean(res?.authenticated)
-      } catch {
-        this.authenticated = false
-      } finally {
-        this.authChecked = true
-        this.hydratedFromCache = false
-      }
+        authenticated = Boolean(res?.authenticated)
+      } catch {}
+      if (epoch !== sessionEpoch || this.handleCrossTabLogout(readLogoutTimestamp())) return false
+      this.authenticated = authenticated
+      this.authChecked = true
+      this.hydratedFromCache = false
       if (this.authenticated) {
         this.startRealtime()
         if (initialRouteName) {
@@ -580,7 +598,7 @@ export const useAppStore = defineStore('app', {
         } catch {
           ok = false
         }
-        if (!isLatest()) return ok
+        if (!isLatest() || this.handleCrossTabLogout(readLogoutTimestamp())) return false
         this.authChecked = true
         if (!ok) {
           this.handleUnauthorized()
@@ -619,6 +637,8 @@ export const useAppStore = defineStore('app', {
 
     async login(password: string): Promise<void> {
       await api.login(password)
+      this._cacheSuspended = false
+      this._logoutTimestamp = readLogoutTimestamp()
       this.authenticated = true
       this.authChecked = true
       this.hydratedFromCache = false
@@ -637,6 +657,7 @@ export const useAppStore = defineStore('app', {
       clearPendingItemUpdates()
       jobItemAccessOrder.clear()
       jobItemPins.clear()
+      deletedJobVersions.clear()
       clearSessionCache()
       this.hydratedFromCache = false
       this.authenticated = false
@@ -669,20 +690,26 @@ export const useAppStore = defineStore('app', {
     },
 
     async logout() {
-      this.stopRealtime()
-      resetInflight()
-      this._resetSessionState()
-      try {
-        await api.logout()
-      } catch {}
+      this._cacheSuspended = true
+      clearSessionCache()
+      const result = await api.logout()
+      if (result?.authenticated !== false) throw new Error('服务端未确认退出登录')
+      this.handleUnauthorized()
+      this._logoutTimestamp = broadcastSessionLogout()
+    },
+
+    handleCrossTabLogout(timestamp: number): boolean {
+      if (!Number.isSafeInteger(timestamp) || timestamp <= this._logoutTimestamp) return false
+      this._logoutTimestamp = timestamp
+      this.handleUnauthorized()
+      return true
     },
 
     handleUnauthorized() {
-      const wasAuth = this.authenticated
       this.stopRealtime()
       resetInflight()
       this._resetSessionState()
-      if (!wasAuth) return
+      this.authChecked = true
     },
 
     _scheduleOverviewRefresh(delayMs = 350) {
@@ -849,8 +876,9 @@ export const useAppStore = defineStore('app', {
       return runRequest('jobs', async ({ isLatest }) => {
         try {
           const before = new Map(this.jobs.map((job) => [job.id, job]))
+          const version = deletionVersion
           const res = await api.listJobs(limit)
-          const items = res.items || []
+          const items = (res.items || []).filter((job) => (deletedJobVersions.get(job.id) ?? 0) <= version)
           if (isLatest()) {
             const current = new Map(this.jobs.map((job) => [job.id, job]))
             const merged = new Map(items.map((job) => {
@@ -871,6 +899,9 @@ export const useAppStore = defineStore('app', {
             this.jobsLoaded = true
             this.jobsLoadedAt = Date.now()
             this.jobsFetchedLimit = limit
+            for (const [id, deletedAt] of deletedJobVersions) {
+              if (deletedAt <= version) deletedJobVersions.delete(id)
+            }
             this.persistCache()
           }
           return items
@@ -1201,8 +1232,11 @@ export const useAppStore = defineStore('app', {
 
     removeJobs(jobIds: number[]) {
       const idSet = new Set(jobIds.map((x) => Number(x)))
+      if (!idSet.size) return
+      deletionVersion++
       this.jobs = this.jobs.filter((j) => !idSet.has(Number(j.id)))
       for (const jid of idSet) {
+        deletedJobVersions.set(jid, deletionVersion)
         evictJobItems(this, jid)
         inflight.delete(`jobDetail:${jid}`)
         this._clearJobTelemetry(jid)
@@ -1219,13 +1253,17 @@ export const useAppStore = defineStore('app', {
       clearTimeout(jobItemsReloadTimers.get(jid))
       jobItemsReloadTimers.delete(jid)
       return runRequest(key, async ({ isLatest }) => {
+        const version = progressVersion
+        const progressUpdates = new Map<number, number>()
         const updates = new Map<number, JobItemRecord>()
         detailUpdates.set(jid, updates)
+        detailProgressVersions.set(jid, progressUpdates)
         let res
         try {
           res = await api.getJob(jid)
         } finally {
           if (detailUpdates.get(jid) === updates) detailUpdates.delete(jid)
+          if (detailProgressVersions.get(jid) === progressUpdates) detailProgressVersions.delete(jid)
         }
         if (!isLatest()) return res
         const current = this.jobs.find((job) => job.id === jid)
@@ -1249,6 +1287,7 @@ export const useAppStore = defineStore('app', {
           touchJobItems(jid, status)
           for (const it of isActiveJobStatus(status) && !this.isJobCancelling(jid) ? items : []) {
             if (!it.speed_bps && it.status !== 'downloading' && it.status !== 'uploading') continue
+            if ((progressUpdates.get(it.id) ?? 0) > version) continue
             const isUploading = it.status === 'uploading' || it.progress_phase === 'uploading' || it.progress_phase === 'verifying'
             this.liveProgress[it.id] = {
               job_id: jid,
@@ -1293,6 +1332,7 @@ export const useAppStore = defineStore('app', {
     },
 
     _upsertJob(job: JobRecord): false | void {
+      if (deletedJobVersions.has(job.id)) return false
       const idx = this.jobs.findIndex((j) => j.id === job.id)
       let orderChanged = idx < 0
       const previousJob = idx >= 0 ? this.jobs[idx] : undefined
@@ -1418,6 +1458,19 @@ export const useAppStore = defineStore('app', {
             this._upsertItem(msg.data)
           } else if (msg.type === 'job_items_changed') {
             scheduleJobItemsReload(this, msg.data?.job_id)
+          } else if (msg.type === 'jobs_deleted') {
+            this.removeJobs(msg.data.job_ids)
+          } else if (msg.type === 'resync_required') {
+            const epoch = sessionEpoch
+            void Promise.allSettled([getInflight('jobs'), getInflight('overview')]).then(() => {
+              if (this.authenticated && epoch === sessionEpoch) {
+                void this.refreshJobs()
+                void this.refreshOverview()
+              }
+            })
+            for (const jid of new Set([...jobItemPins.keys(), ...jobItemAccessOrder.keys()])) {
+              scheduleJobItemsReload(this, jid)
+            }
           } else if (msg.type === 'item_progress') {
             if (!this.isJobCancelling(msg.data.job_id)) queueLiveProgress(this, msg.data)
           } else if (msg.type === 'job_scheduler') {

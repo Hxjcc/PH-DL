@@ -48,6 +48,7 @@ async def ws_events(websocket: WebSocket):
                         with anyio.move_on_after(25.0):
                             event = await queue.get()
                             queue.task_done()
+                            queue.enqueue_resync_if_needed()
                         if not container.auth.verify_websocket(websocket):
                             break
                         with anyio.fail_after(15):

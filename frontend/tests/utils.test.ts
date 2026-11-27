@@ -4,8 +4,9 @@ import { createPinia } from 'pinia'
 
 import { api } from '../src/api/client'
 import { useAppStore } from '../src/stores/app'
-import type { JobItemRecord, JobRecord, JobStatus, LogEntry, VideoListResponse } from '../src/types/api'
-import { parseVideoLinks } from '../src/utils/videoLinks'
+import type { JobItemRecord, JobRecord, JobStatus, LogEntry, SettingsInput, VideoListResponse } from '../src/types/api'
+import { parseVideoLinks, safeExternalVideoUrl } from '../src/utils/videoLinks'
+import { settingsPatch } from '../src/utils/settingsPatch'
 import { buildExportFilename } from '../src/utils/exportFilename'
 import { formatBytes, formatPublishedDate, formatSpeed, formatVideoDuration, siteMeta, targetTypeMeta } from '../src/utils/format'
 import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../src/utils/specificVideos'
@@ -85,6 +86,44 @@ test('parseVideoLinks deduplicates by viewkey and counts invalid rows', () => {
   ])
   assert.equal(res.duplicates, 1)
   assert.equal(res.invalid, 2)
+})
+
+test('history and job links restrict protocols and sites and fall back to the canonical video page', () => {
+  const fallback = 'https://www.pornhub.com/view_video.php?viewkey=abc123'
+  for (const url of [
+    'javascript:alert(1)', 'data:text/html,test', 'file:///tmp/test',
+    'https://pornhub.com.example.test/view_video.php?viewkey=abc123',
+    'https://xhamster.com/videos/video-1234',
+    'https://account:secret@www.pornhub.com/view_video.php?viewkey=abc123',
+  ]) assert.equal(safeExternalVideoUrl(url, 'pornhub', 'abc123'), fallback)
+  assert.equal(safeExternalVideoUrl('http://www.pornhub.com/embed/abc123', 'pornhub', 'abc123'), 'http://www.pornhub.com/embed/abc123')
+  assert.equal(safeExternalVideoUrl('', 'xhamster', 'xh_1234'), 'https://xhamster.com/videos/video-1234')
+  assert.equal(safeExternalVideoUrl('javascript:alert(1)', 'xhamster', ''), undefined)
+})
+
+test('settings save diffs draft fields and tool saves omit unsaved edits in other sections', () => {
+  const saved = {
+    ph_username: 'account',
+    ph_password: '********',
+    rclone_bin: 'rclone',
+    rclone_remote: 'disk',
+    serverchan_enabled: false,
+    selectors: { list_page_main_containers: 'ul', list_page_li_fallback: 'li' },
+  } as SettingsInput
+  const draft = {
+    ...saved,
+    ph_password: 'new-password',
+    rclone_bin: 'ignore-executable-edit',
+    serverchan_enabled: true,
+    selectors: { ...saved.selectors, list_page_main_containers: 'div' },
+  }
+  assert.deepEqual(settingsPatch(draft, saved), {
+    ph_password: 'new-password',
+    serverchan_enabled: true,
+    selectors: { list_page_main_containers: 'div' },
+  })
+  assert.deepEqual(settingsPatch(draft, saved, (key) => key.startsWith('ph_')), { ph_password: 'new-password' })
+  assert.deepEqual(settingsPatch(draft, saved, (key) => key.startsWith('rclone_')), {})
 })
 
 test('parseSpecificVideoDraft and serializeSpecificVideoSpecs support single and multi-page specs', () => {

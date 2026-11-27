@@ -143,6 +143,7 @@ async def create_target(
         avatar_url=resolved_avatar_url,
         display_name=resolved_display_name or ("xHamster Favorites" if norm_site == "xhamster" and resolved_type == "favorites" else ""),
         site=norm_site,
+        init_baseline=payload.init_baseline,
     )
 
     baseline_job = None
@@ -277,6 +278,7 @@ async def batch_create_targets(
             display_name=(item.display_name or "").strip() or resolved_dn,
             avatar_url=(item.avatar_url or "").strip() or resolved_av,
             site=item_site,
+            init_baseline=payload.init_baseline,
         )
         created.append(t)
         if payload.init_baseline and t.get("id"):
@@ -367,6 +369,7 @@ async def sync_baseline(
     target = await container.repo.get_target(target_id)
     if not target:
         raise HTTPException(status_code=404, detail="目标不存在")
+    await container.repo.mark_unchecked_target_baseline_pending(target_id)
     target_label = target.get("display_name") or target["username"]
     job = await container.tasks.enqueue_job(
         kind="baseline_sync",

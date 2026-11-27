@@ -1,6 +1,14 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
+
+TARGET_IDENTITY_TYPE = """
+    CASE
+        WHEN site = 'pornhub' AND LOWER(TRIM(target_type)) IN ('model', 'pornstar') THEN 'model'
+        WHEN site = 'xhamster' AND LOWER(TRIM(target_type)) IN ('creator', 'pornstar') THEN 'creator'
+        ELSE LOWER(TRIM(target_type))
+    END
+"""
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -245,6 +253,56 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ON videos(site, quality);",
             "CREATE INDEX IF NOT EXISTS idx_videos_target_type_lower "
             "ON videos(LOWER(target_type), site);",
+        ],
+    ),
+    (
+        14,
+        [
+            "ALTER TABLE targets ADD COLUMN baseline_pending INTEGER NOT NULL DEFAULT 0;",
+            # Keep an enabled target when possible, preferring the one with the newest scan.
+            f"""CREATE TEMP TABLE duplicate_targets AS
+                SELECT id, survivor FROM (
+                    SELECT id, FIRST_VALUE(id) OVER (
+                        PARTITION BY site, LOWER(TRIM(username)), {TARGET_IDENTITY_TYPE}
+                        ORDER BY enabled DESC, last_checked_at DESC, id
+                    ) AS survivor
+                    FROM targets
+                ) WHERE id != survivor;""",
+            """UPDATE targets AS t SET
+                display_name = COALESCE(NULLIF(t.display_name, ''), (
+                    SELECT other.display_name FROM targets other JOIN duplicate_targets d ON d.id = other.id
+                    WHERE d.survivor = t.id AND other.display_name != '' ORDER BY other.id LIMIT 1
+                ), ''),
+                avatar_url = COALESCE(NULLIF(t.avatar_url, ''), (
+                    SELECT other.avatar_url FROM targets other JOIN duplicate_targets d ON d.id = other.id
+                    WHERE d.survivor = t.id AND other.avatar_url != '' ORDER BY other.id LIMIT 1
+                ), ''),
+                preferred_quality = COALESCE(NULLIF(t.preferred_quality, ''), (
+                    SELECT other.preferred_quality FROM targets other JOIN duplicate_targets d ON d.id = other.id
+                    WHERE d.survivor = t.id AND other.preferred_quality != '' ORDER BY other.id LIMIT 1
+                ), '')
+                WHERE t.id IN (SELECT survivor FROM duplicate_targets);""",
+            """UPDATE jobs SET params_json = json_set(params_json, '$.target_id', d.survivor)
+                FROM duplicate_targets d
+                WHERE d.id = CASE WHEN json_valid(params_json) THEN json_extract(params_json, '$.target_id') END;""",
+            """UPDATE jobs AS j
+                SET params_json = json_set(params_json, '$.target_ids', (
+                    SELECT json_group_array(target_id) FROM (
+                        SELECT COALESCE(d.survivor, entry.value) AS target_id
+                        FROM json_each(j.params_json, '$.target_ids') entry
+                        LEFT JOIN duplicate_targets d ON d.id = entry.value
+                        GROUP BY target_id ORDER BY MIN(entry.key)
+                    )
+                ))
+                WHERE EXISTS (
+                    SELECT 1 FROM json_each(
+                        CASE WHEN json_valid(j.params_json) THEN j.params_json ELSE '{}' END, '$.target_ids'
+                    ) entry JOIN duplicate_targets d ON d.id = entry.value
+                );""",
+            "DELETE FROM targets WHERE id IN (SELECT id FROM duplicate_targets);",
+            "DROP TABLE duplicate_targets;",
+            f"""CREATE UNIQUE INDEX idx_targets_identity
+                ON targets(site, LOWER(TRIM(username)), {TARGET_IDENTITY_TYPE});""",
         ],
     ),
 ]

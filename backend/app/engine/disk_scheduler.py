@@ -130,32 +130,19 @@ class AdaptiveDiskScheduler:
             "headroom_bytes": max(0, headroom),
             "reserved_bytes": self.disk_budget.reserved_bytes,
             "waiting_for_space": len(self._waiting_large),
-            "prefer_largest_upload": self.prefer_largest_upload,
+            "prefer_largest_upload": bool(self._waiting_large) or level != "green",
         }
-
-    @staticmethod
-    def _status_signature(snap: Dict[str, Any]) -> Tuple[Any, ...]:
-        return (
-            snap["level"],
-            snap["active_downloads"],
-            snap["allowed_downloads"],
-            snap["active_uploads"],
-            snap["pending_uploads"],
-            snap["waiting_for_space"],
-        )
 
     def emit_status(self, *, force: bool = False) -> None:
         if self._on_status is None:
             return
         now = time.monotonic()
-        snap = self.snapshot()
-        sig = self._status_signature(snap)
-        state_changed = sig != self._last_signature
-        if not force and not state_changed and (now - self._last_emit_at) < 0.8:
+        sig = (self.active_downloads, self.active_uploads, self.pending_upload_count, len(self._waiting_large))
+        if not force and sig == self._last_signature and now - self._last_emit_at < 0.8:
             return
         self._last_emit_at = now
         self._last_signature = sig
-        self._on_status(snap)
+        self._on_status(self.snapshot())
 
     async def notify_changed(self, *, force_emit: bool = False) -> None:
         async with self._cond:

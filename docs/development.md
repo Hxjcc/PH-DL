@@ -4,7 +4,7 @@
 
 外部命令行工具（与 Docker 镜像一致）：
 - **FFmpeg**（`ffmpeg` 加入 `PATH`）：下载 xHamster HLS 视频并进行无损 MP4 封装时必需；仅下载 PornHub MP4 时可省略。
-- **rclone**（`rclone` 加入 `PATH`，或在设置中指定 `rclone_bin` 路径）：启用自动云端上传时必需；仅本地下载可省略。
+- **rclone**（`rclone` 加入 `PATH`，或通过 `PHDL_RCLONE_BIN` 指定可执行文件）：启用自动云端上传时必需。
 
 ## 安装依赖（Windows PowerShell）
 
@@ -33,7 +33,7 @@ npm.cmd --prefix frontend ci
 
 打开 `http://127.0.0.1:5173`。开发前端会把 `/api` 和 `/api/ws` 转发到本地 `8000`。
 后端默认不自动重启，以免写代码时中断下载；只在调试空闲实例时可加 `-Reload`。
-本地后端自动读取仓库根目录 `.env`、`backend/.env` 或终端环境变量。使用 `PHDL_ADMIN_PASSWORD` 可以覆盖本地面板密码。
+本地后端自动读取仓库根目录 `.env`、`backend/.env` 或终端环境变量。启动前用 `PHDL_ADMIN_PASSWORD` 设置面板密码。后端会拒绝空密码、`admin` 和 `change-me-strong-password`，受控的本地测试可以显式设置 `PHDL_ALLOW_INSECURE_DEFAULT_PASSWORD=true`。
 
 macOS／Linux 从 `backend/` 创建虚拟环境并安装 `.[dev]` 后，可用
 `.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000` 启动；

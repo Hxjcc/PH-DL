@@ -4,7 +4,7 @@ import re
 from collections.abc import Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-_URL = re.compile(r"\b(?:https?|socks[45]h?)://[^\s<>'\"]+", re.IGNORECASE)
+_URL = re.compile(r"\b(?:https?|socks(?:4a?|5h?))://[^\s<>'\"]+", re.IGNORECASE)
 _USERINFO = re.compile(r"(?<=://)[^/?#]*@")
 _CREDENTIAL_HEADER = re.compile(r"\b(set-cookie|cookie|(?:proxy-)?authorization)(:\s*)[^\r\n]+", re.IGNORECASE)
 _CREDENTIAL_VALUE = re.compile(

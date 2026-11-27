@@ -288,7 +288,7 @@ async def test_hls_bounds_out_of_order_chunks_and_releases_waiters(tmp_path, can
 
     def get(url, **_kwargs):
         if url.endswith(".m3u8"):
-            response = SyntheticResponse(url, data=b"#EXTM3U\n#EXTINF:1,\nhead.ts\n#EXTINF:1,\nlater.ts\n")
+            response = SyntheticResponse(url, data=b"#EXTM3U\n#EXTINF:1,\nhead.ts\n#EXTINF:1,\nlater.ts\n#EXT-X-ENDLIST\n")
         else:
             response = SyntheticResponse(url, chunks=head if url.endswith("head.ts") else later)
         responses.append(response)

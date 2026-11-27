@@ -26,6 +26,7 @@ from app.parsers.video import collect_video_urls, extract_viewkey_from_url, fetc
 from app.parsers.xhamster import (
     _prng_bytes,
     build_xhamster_list_url,
+    build_xhamster_video_page_url,
     check_xhamster_cookie_valid,
     decode_xhamster_hex,
     decode_xhamster_sources,
@@ -273,6 +274,52 @@ async def test_fetch_xhamster_video_detail_respects_codec_and_direct_mp4_optimiz
     assert d_720.quality == "720p"
     assert d_720.video_format == "hls"
     assert d_720.download_url == "https://video-nss.xhcdn.com/tok/720p.h264.mp4.m3u8"
+
+
+async def test_xhamster_keeps_master_audio_and_tries_mp4_if_requested_height_is_missing(monkeypatch):
+    page_url = "https://xhamster.com/videos/fixture-xhClip01"
+    master = "https://media.xhcdn.com/clip/master.m3u8"
+    direct = "https://media.xhcdn.com/clip/720p/video.mp4"
+    html = "<script>window.initials=" + json.dumps({
+        "videoModel": {"title": "Fixture"},
+        "xplayerSettings": {"sources": {
+            "hls": {"h264": {"url": master}},
+            "standard": {"h264": [{"url": direct}]},
+        }},
+    }) + ";</script>"
+    playlist = (
+        '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Other",URI="other.m3u8"\n'
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Default",DEFAULT=YES,URI="audio.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=100,RESOLUTION=1920x1080,AUDIO="a"\n1080p.m3u8\n'
+    )
+    ctx = TaskHttpContext(site="xhamster")
+
+    async def fetch(url, **kwargs):
+        return PowFetchResult(html if url == page_url else playlist, url, 200, 0, False), None
+
+    monkeypatch.setattr(ctx, "fetch_with_pow", fetch)
+    hls = await fetch_xhamster_video_detail(ctx, page_url, preferred_qualities={"1080"}, include_mp4_sources=True)
+    assert hls.quality == "1080p" and hls.download_url == master
+    assert hls.hls_sources[0].audio_url == "https://media.xhcdn.com/clip/audio.m3u8"
+    assert parse_hls_master_variants(playlist, master)[0].has_separate_audio
+    mp4 = await fetch_xhamster_video_detail(ctx, page_url, preferred_qualities={"720"})
+    assert not mp4.filtered_out and mp4.download_url == direct and mp4.quality == "720p"
+    filtered = await fetch_xhamster_video_detail(ctx, page_url, preferred_qualities={"480"})
+    assert filtered.filtered_out and not filtered.download_url
+
+
+@pytest.mark.parametrize("key", ["xh_7", "xh_123456789", "xhClip01"])
+def test_canonical_xhamster_urls_round_trip_modern_and_numeric_ids(key):
+    result = build_xhamster_video_page_url(key)
+    expected_slug = f"video-{key[3:]}" if key.startswith("xh_") else key
+    assert result == f"https://xhamster.com/videos/{expected_slug}"
+    assert extract_xhamster_viewkey(result) == key
+
+
+def test_xhamster_list_replaces_untrusted_page_url_with_numeric_id_page():
+    html = '<script>window.initials={"videoListComponent":{"videos":[{"id":1234,"pageURL":"javascript:void(0)","title":"Fixture"}]}};</script>'
+    items, *_ = extract_xhamster_video_cards(html)
+    assert len(items) == 1 and items[0][:2] == ("xh_1234", "https://xhamster.com/videos/video-1234")
 
 
 async def test_fetch_xhamster_subscriptions_filters_unsubscribed_recommendations(monkeypatch):
@@ -595,7 +642,7 @@ async def test_download_hls_to_mp4_ytdlp_cancel_resume_remux_and_403_refresh(tmp
         assert manifest["engine"] == "yt-dlp" and manifest["viewkey"] == "xhOwQIZ"
         assert (hls_dir / "stream.mp4.ytdl").is_file()
 
-        # 2. Resume against refreshed URL (v2.m3u8) -> skips seg0.ts & seg1.ts, emits downloading & remuxing phases, TS remuxes
+        # 2. A new signature on the same resource preserves the fragment checkpoint.
         hits.clear()
         state["cancel_on_seg2"] = None
         phases_run2: List[str] = []
@@ -605,7 +652,7 @@ async def test_download_hls_to_mp4_ytdlp_cancel_resume_remux_and_403_refresh(tmp
             selectors=SelectorSettings(),
             viewkey="xhOwQIZ",
             title="Demo Clip",
-            playlist_url=f"http://127.0.0.1:{port}/v2.m3u8",
+            playlist_url=f"http://127.0.0.1:{port}/v1.m3u8?token=renewed",
             page_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
             referer_url="https://xhamster.com/videos/demo-clip-xhOwQIZ",
             quality="2160p",
@@ -681,7 +728,10 @@ async def test_download_hls_to_mp4_ytdlp_cancel_resume_remux_and_403_refresh(tmp
         fmp4_hls_dir = tmp_dir / "AV1 Clip [xhAv100].hls"
         fmp4_hls_dir.mkdir(parents=True)
         (fmp4_hls_dir / "manifest.json").write_text(
-            json.dumps({"engine": "yt-dlp", "version": 2, "viewkey": "xhAv100", "quality": "2160"}),
+            json.dumps({
+                "engine": "yt-dlp", "version": hls_mod._HLS_MANIFEST_VERSION,
+                "viewkey": "xhAv100", "quality": "2160", "playlist_resource": "/av1.m3u8",
+            }),
             encoding="utf-8",
         )
         (fmp4_hls_dir / "stream.mp4").write_bytes(fmp4_init + fmp4_seg)

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { getErrorMessage } from '../utils/errors'
-import { computed, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, ref, shallowRef, watch } from 'vue'
 import { useRoute, useRouter, type LocationQuery } from 'vue-router'
 import {
   Save,
@@ -27,6 +27,7 @@ import type { LoginOpStatus, RuntimeSettings, SelectorSettings, SettingsInput, S
 import { useAppStore } from '../stores/app'
 import { prepareAvatarDataUrl } from '../utils/avatarImage'
 import { redactedSettingsFields } from '../utils/settingsRedaction'
+import { settingsPatch } from '../utils/settingsPatch'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
@@ -211,6 +212,7 @@ const loading = ref(false)
 const saving = ref(false)
 const busyTool = ref('')
 const form = ref(cloneSettings(store.settingsCache))
+const savedSnapshot = shallowRef(cloneSettings(store.settingsCache))
 const pasteCookie = ref('')
 const pasteXhCookie = ref('')
 const phAuthMode = ref(
@@ -518,21 +520,36 @@ async function loadSettings() {
 
 watch(
   () => store.settingsCache,
-  (val, previous) => {
-    if (!val || saving.value) return
-    const next = cloneSettings(val)
-    const baseline = cloneSettings(previous)
-    const draft = form.value
-    if (draft && baseline) {
-      const merged = keepDraftEdits(draft, baseline, next)
-      merged.selectors = keepDraftEdits(draft.selectors, baseline.selectors, next.selectors)
-      form.value = merged
-    } else {
-      form.value = next
-    }
-    syncInitialAuthModes(val)
-  }
+  (val) => { if (val) applySavedSettings(val, savedSnapshot.value) }
 )
+
+function applySavedSettings(settings: RuntimeSettings, baseline: SettingsInput | null) {
+  const next = cloneSettings(settings)
+  const draft = form.value
+  if (draft && baseline) {
+    const merged = keepDraftEdits(draft, baseline, next)
+    merged.selectors = keepDraftEdits(draft.selectors, baseline.selectors, next.selectors)
+    form.value = merged
+  } else {
+    form.value = next
+  }
+  savedSnapshot.value = next
+  syncInitialAuthModes(settings)
+}
+
+async function saveChanges(includes?: (key: string) => boolean) {
+  if (!form.value || !savedSnapshot.value) return
+  const patch = settingsPatch(form.value, savedSnapshot.value, includes)
+  if (!Object.keys(patch).length) return
+  const result = await api.saveSettings(patch)
+  const baseline = savedSnapshot.value
+  applySavedSettings(result.settings, {
+    ...baseline,
+    ...patch,
+    selectors: { ...baseline.selectors, ...patch.selectors },
+  })
+  store.setSettingsCache(result.settings)
+}
 
 onActivated(() => {
   if (!activatedOnce) {
@@ -585,9 +602,7 @@ async function saveAll() {
   }
   saving.value = true
   try {
-    const res = await api.saveSettings(form.value)
-    form.value = cloneSettings(res.settings)
-    store.setSettingsCache(res.settings)
+    await saveChanges()
     store.notify('系统设置已保存', 'success')
     await store.refreshOverview()
   } catch (err: unknown) {
@@ -652,9 +667,7 @@ async function handleImportCookie() {
   if (!pasteCookie.value.trim()) return
   busyTool.value = 'cookie_import'
   try {
-    if (form.value && String(form.value.ph_logged_in_username || '').trim()) {
-      await api.saveSettings({ ph_logged_in_username: form.value.ph_logged_in_username.trim() })
-    }
+    await saveChanges((key) => key === 'ph_logged_in_username')
     const res = await api.importCookie(pasteCookie.value.trim())
     store.clearSubscriptionsCache()
     pasteCookie.value = ''
@@ -677,11 +690,7 @@ async function handleRefreshCookie() {
   const request = new AbortController()
   loginPoll = request
   try {
-    const saved = await api.saveSettings(form.value)
-    if (saved?.settings) {
-      form.value = cloneSettings(saved.settings)
-      store.setSettingsCache(saved.settings)
-    }
+    await saveChanges((key) => key.startsWith('ph_') || key === 'proxy_url' || key.startsWith('yescaptcha_'))
     const started = await api.refreshCookie()
     const res = started?.running ? await waitForLoginResult(api.cookieRefreshStatus, request.signal) : started
     request.signal.throwIfAborted()
@@ -735,11 +744,7 @@ async function handleRefreshXhCookie() {
   const request = new AbortController()
   loginPoll = request
   try {
-    const saved = await api.saveSettings(form.value)
-    if (saved?.settings) {
-      form.value = cloneSettings(saved.settings)
-      store.setSettingsCache(saved.settings)
-    }
+    await saveChanges((key) => (key.startsWith('xh_') && key !== 'xh_preferred_codec') || key === 'proxy_url' || key.startsWith('yescaptcha_'))
     const started = await api.refreshXhCookie()
     const res = started?.running ? await waitForLoginResult(api.xhCookieRefreshStatus, request.signal) : started
     request.signal.throwIfAborted()
@@ -758,11 +763,7 @@ async function handleTestYescaptcha() {
   if (!form.value) return
   busyTool.value = 'yescaptcha'
   try {
-    const saved = await api.saveSettings(form.value)
-    if (saved?.settings) {
-      form.value = cloneSettings(saved.settings)
-      store.setSettingsCache(saved.settings)
-    }
+    await saveChanges((key) => key.startsWith('yescaptcha_') || key === 'proxy_url')
     const res = await api.testYescaptcha()
     store.notify(res.message, res.ok ? 'success' : 'error')
   } catch (err: unknown) {
@@ -776,11 +777,7 @@ async function handleTestRclone() {
   if (!form.value) return
   busyTool.value = 'rclone'
   try {
-    const saved = await api.saveSettings(form.value)
-    if (saved?.settings) {
-      form.value = cloneSettings(saved.settings)
-      store.setSettingsCache(saved.settings)
-    }
+    await saveChanges((key) => key.startsWith('rclone_') || key === 'uploader_enabled')
     const res = await api.testRclone()
     store.notify(res.message, res.ok ? 'success' : 'error')
     loadRcloneRemotes({ force: true })
@@ -795,11 +792,7 @@ async function handleTestNotify() {
   if (!form.value) return
   busyTool.value = 'notify'
   try {
-    const saved = await api.saveSettings(form.value)
-    if (saved?.settings) {
-      form.value = cloneSettings(saved.settings)
-      store.setSettingsCache(saved.settings)
-    }
+    await saveChanges((key) => key.startsWith('serverchan_') || key === 'proxy_url' || key === 'notify_if_no_updates')
     const res = await api.testNotify()
     store.notify(res.message, res.ok ? 'success' : 'error')
   } catch (err: unknown) {

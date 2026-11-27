@@ -7,6 +7,8 @@ import random
 import time
 import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
@@ -129,9 +131,10 @@ def extract_set_cookie_headers(headers: Any) -> List[str]:
     return []
 
 
-def parse_set_cookie_headers(set_cookie_headers: List[str]) -> Dict[str, str]:
+def parse_set_cookie_headers(set_cookie_headers: List[str]) -> Dict[str, Optional[str]]:
     """Parse response Set-Cookie headers into a short-lived task cookie jar."""
-    result: Dict[str, str] = {}
+    result: Dict[str, Optional[str]] = {}
+    now = datetime.now(timezone.utc)
     for header in set_cookie_headers:
         cookie = SimpleCookie()
         try:
@@ -140,9 +143,16 @@ def parse_set_cookie_headers(set_cookie_headers: List[str]) -> Dict[str, str]:
             continue
         for name, morsel in cookie.items():
             max_age = str(morsel["max-age"] or "").strip()
-            if max_age.isdigit() and int(max_age) <= 0:
-                continue
-            result[name] = morsel.value
+            expired = False
+            try:
+                expired = int(max_age) <= 0
+            except ValueError:
+                try:
+                    expiry = parsedate_to_datetime(morsel["expires"])
+                    expired = (expiry if expiry.tzinfo else expiry.replace(tzinfo=timezone.utc)) <= now
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            result[name] = None if expired else morsel.value
     return result
 
 
@@ -192,6 +202,7 @@ class TaskHttpContext:
             self.min_request_interval = max(0.0, float(min_request_interval))
         self.session_cookies: Dict[str, str] = {}
         self.pow_cookies: Dict[str, str] = {}
+        self.deleted_cookies: set[str] = set()
         self.cancel_event = cancel_event or asyncio.Event()
         self.on_log = on_log
         self.site = site
@@ -323,26 +334,32 @@ class TaskHttpContext:
             return
         async with self._cookie_lock:
             for name, value in parsed.items():
+                if value is None:
+                    self.session_cookies.pop(name, None)
+                    self.pow_cookies.pop(name, None)
+                    self.deleted_cookies.add(name)
+                    continue
                 if len(name) + len(value) > 4096:
                     continue
+                self.deleted_cookies.discard(name)
                 self.session_cookies.pop(name, None)
                 self.session_cookies[name] = value
             while len(self.session_cookies) > _MAX_SESSION_COOKIES:
                 self.session_cookies.pop(next(iter(self.session_cookies)))
 
-    def merged_cookies(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        merged = dict(self.base_cookies)
+    def merged_cookies(
+        self, extra: Optional[Dict[str, str]] = None, *, include_pow: bool = True,
+    ) -> Dict[str, str]:
+        merged = {name: value for name, value in self.base_cookies.items() if name not in self.deleted_cookies}
         merged.update(self.session_cookies)
-        merged.update(self.pow_cookies)
+        if include_pow:
+            merged.update(self.pow_cookies)
         if extra:
             merged.update(extra)
         return merged
 
     def cookie_string(self, include_pow: bool = True) -> str:
-        cookies = dict(self.base_cookies)
-        cookies.update(self.session_cookies)
-        if include_pow:
-            cookies.update(self.pow_cookies)
+        cookies = self.merged_cookies(include_pow=include_pow)
         return "; ".join(f"{name}={value}" for name, value in cookies.items())
 
     async def _raw_request(
@@ -420,6 +437,8 @@ class TaskHttpContext:
                 location = resp.headers.get("Location")
                 if self._allow_url and verb == "GET" and status in {301, 302, 303, 307, 308} and location:
                     hop_cookies.update(self.session_cookies)
+                    for name in self.deleted_cookies:
+                        hop_cookies.pop(name, None)
                     current_url = urljoin(str(resp.url), location)
                     continue
                 if body:
@@ -496,7 +515,6 @@ class TaskHttpContext:
         retries_left = self.max_retries if max_retries is None else max(0, int(max_retries))
         initial_retries = retries_left
         challenge_solves = 0
-        extra_cookies: Dict[str, str] = {}
         verb = method.upper()
         attempt_http_version: Any = _HTTP_VERSION_AUTO
 
@@ -509,7 +527,8 @@ class TaskHttpContext:
             except StopRequested:
                 return None, "操作已取消"
 
-            merged_cookies = self.merged_cookies(extra_cookies)
+            generation_before_request = self._challenge_generation
+            merged_cookies = self.merged_cookies()
 
             try:
                 raw_kwargs: Dict[str, Any] = {"headers": headers, "timeout": timeout}
@@ -573,43 +592,38 @@ class TaskHttpContext:
                 if challenge_solves >= challenge.MAX_CHALLENGE_SOLVES:
                     self._emit("WARNING", f"{log_label} PoW 质询连续 {challenge_solves} 次未通过")
                     return None, "PoW 质询未通过"
-                generation_before_wait = self._challenge_generation
                 solved_here = False
 
-                # Multiple concurrent workers often receive the same anti-bot challenge.
-                # Only one worker needs to solve it; the others reuse the refreshed cookies.
-                async with self._challenge_lock:
-                    if (
-                        self._challenge_generation > generation_before_wait
-                        and "KEY" in self.pow_cookies
-                    ):
-                        self.challenge_reuse_count += 1
-                        self._emit("INFO", f"{log_label} 复用并发请求刚解开的 PoW Cookie")
-                    else:
-                        solve_started = time.perf_counter()
-                        try:
-                            solved_key = await asyncio.to_thread(challenge.solve_challenge, text)
-                        except Exception as solve_err:
-                            self._emit("WARNING", f"{log_label} PoW 求解失败: {solve_err}")
-                            return None, "PoW 质询解题失败"
-                        solve_elapsed = time.perf_counter() - solve_started
+                def newer_solution() -> bool:
+                    return self._challenge_generation > generation_before_request and "KEY" in self.pow_cookies
 
-                        extra_cookies["KEY"] = solved_key
-                        self.pow_cookies["KEY"] = solved_key
-                        ht_val = challenge.extract_set_cookie(set_cookies, "htjschalref")
-                        if ht_val:
-                            extra_cookies["htjschalref"] = ht_val
-                            self.pow_cookies["htjschalref"] = ht_val
-                        self._challenge_generation += 1
-                        self.challenge_solve_count += 1
-                        self.challenge_solve_seconds += solve_elapsed
-                        solved_here = True
-                        if self.retry_delay_base > 0:
-                            self._pow_ready_at = time.monotonic() + 0.6 + random.uniform(0.0, 0.4)
-                        self._emit(
-                            "INFO",
-                            f"{log_label} PoW 质询求解完成，耗时 {solve_elapsed * 1000:.1f}ms",
-                        )
+                if not newer_solution():
+                    async with self._challenge_lock:
+                        if not newer_solution():
+                            solve_started = time.perf_counter()
+                            try:
+                                solved_key = await asyncio.to_thread(challenge.solve_challenge, text)
+                            except Exception as solve_err:
+                                self._emit("WARNING", f"{log_label} PoW 求解失败: {solve_err}")
+                                return None, "PoW 质询解题失败"
+                            solve_elapsed = time.perf_counter() - solve_started
+
+                            self.deleted_cookies.discard("KEY")
+                            self.pow_cookies["KEY"] = solved_key
+                            ht_val = parse_set_cookie_headers(set_cookies).get("htjschalref")
+                            if ht_val:
+                                self.deleted_cookies.discard("htjschalref")
+                                self.pow_cookies["htjschalref"] = ht_val
+                            self._challenge_generation += 1
+                            self.challenge_solve_count += 1
+                            self.challenge_solve_seconds += solve_elapsed
+                            solved_here = True
+                            if self.retry_delay_base > 0:
+                                self._pow_ready_at = time.monotonic() + 0.6 + random.uniform(0.0, 0.4)
+                            self._emit("INFO", f"{log_label} PoW 质询求解完成，耗时 {solve_elapsed * 1000:.1f}ms")
+                if not solved_here:
+                    self.challenge_reuse_count += 1
+                    self._emit("INFO", f"{log_label} 复用并发请求刚解开的 PoW Cookie")
 
                 challenge_solves += 1
                 # Ensure BOTH the solver and reusing workers wait until the PoW cookie
@@ -638,8 +652,6 @@ class TaskHttpContext:
                 if status_code == 403 and streak >= 2:
                     async with self._cookie_lock:
                         self.pow_cookies.clear()
-                    extra_cookies.pop("KEY", None)
-                    extra_cookies.pop("htjschalref", None)
                 stagger = random.uniform(0.0, min(1.0, base)) if base > 0 else 0.0
                 wait_total = delay + stagger
                 hint = "（触发频控冷却）" if status_code == 403 else ""

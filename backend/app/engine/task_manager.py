@@ -33,9 +33,11 @@ from ..parsers.target import (
 )
 from ..parsers.video import (
     VideoDetail,
+    build_video_page_url,
     collect_video_urls,
     extract_viewkey_from_url,
     fetch_video_details_batch,
+    safe_video_page_url,
 )
 from ..parsers.xhamster import (
     build_xhamster_profile_url,
@@ -61,7 +63,9 @@ from ..services.downloader import (
     remove_download_checkpoint,
 )
 from ..services.http_proxy import create_aiohttp_connector
-from ..services.hls_downloader import HLS_JOB_BUFFER_BYTES, HlsMemoryBudget, download_hls_to_mp4, is_hls_url
+from ..services.hls_downloader import (
+    HLS_JOB_BUFFER_BYTES, HlsMemoryBudget, _read_hls_manifest, download_hls_to_mp4, is_hls_url, ytdlp_hls_dir_in_use,
+)
 from ..services.filename import (
     format_remote_video_filename,
     is_valid_video_file,
@@ -546,6 +550,14 @@ class TaskManager:
             message = f"扫描未完成，{message}"
         return await self.repo.finish_job(job_id, "cancelled", message, cancel_items=True)
 
+    async def _require_cookie_snapshot(
+        self, prefix: str, settings: RuntimeSettings, username: str = "",
+    ) -> RuntimeSettings:
+        current = await self.repo.save_cookie_check(prefix, settings, username)
+        if current is None:
+            raise RuntimeError("Cookie 检测期间凭据或代理设置已更新，请重新运行任务。")
+        return current
+
     async def _ensure_valid_cookie(
         self,
         settings: RuntimeSettings,
@@ -561,10 +573,9 @@ class TaskManager:
                 proxy_url=settings.normalized_proxy,
                 timeout=settings.request_timeout,
             )
+            resolved_user = prefer_cased_username(check.logged_in_username, settings.ph_logged_in_username) if check.valid else ""
+            settings = await self._require_cookie_snapshot("ph", settings, resolved_user)
             if check.valid:
-                resolved_user = prefer_cased_username(check.logged_in_username, settings.ph_logged_in_username)
-                if resolved_user and resolved_user != settings.ph_logged_in_username:
-                    settings = await self.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
                 status_msg = format_cookie_valid_message(resolved_user)
                 self.set_cookie_status(True, status_msg)
                 self.events.emit_log("INFO", f"[PornHub Cookie] {status_msg}。", job_id=job_id)
@@ -614,6 +625,7 @@ class TaskManager:
         else:
             err_msg = "未配置有效 Cookie，且未填写 PornHub 账号密码"
 
+        await self._require_cookie_snapshot("ph", settings)
         self.set_cookie_status(False, err_msg)
         self.events.emit_log("ERROR", f"[PornHub Cookie] 准备失败: {err_msg}", job_id=job_id)
         if notify_on_failure:
@@ -624,12 +636,24 @@ class TaskManager:
             )
         return None
 
+    async def _update_check_targets(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        target_ids = params.get("target_ids")
+        if not target_ids:
+            return await self.repo.list_targets(enabled_only=True, exclude_baseline_pending=True)
+        targets = []
+        for tid in target_ids:
+            target = await self.repo.get_target(int(tid))
+            if target:
+                targets.append(target)
+        return targets
+
     async def _job_site_requirements(
         self,
         kind: str,
         params: Dict[str, Any],
         *,
         job_id: Optional[int] = None,
+        update_targets: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[bool, bool, bool]:
         """Return ``(needs_ph_cookie, needs_xh_cookie, needs_xh_ctx)`` for a job."""
         resume_mode = params.get("resume_mode")
@@ -637,9 +661,13 @@ class TaskManager:
         if job_id is not None and (
             resume_mode == "items" or (resume_mode == "rescan" and kind in {"auto_update", "resume_temp"})
         ):
-            pending_sites = {_item_site(item) for item in await self.repo.list_job_items(job_id, status="pending")}
+            pending_items = await self.repo.list_job_items(job_id, status="pending")
+            pending_sites = {
+                _item_site(item) for item in pending_items
+                if kind not in {"auto_update", "check_updates"} or not item.get("local_path")
+            }
             if resume_mode == "items":
-                return "pornhub" in pending_sites, False, "xhamster" in pending_sites
+                return "pornhub" in pending_sites, False, any(_item_site(item) == "xhamster" for item in pending_items)
 
         if kind == "manual_target":
             site = normalize_site(params.get("site"))
@@ -664,17 +692,7 @@ class TaskManager:
             return True, False, False
 
         if kind in {"auto_update", "check_updates"}:
-            target_ids = params.get("target_ids")
-            if target_ids:
-                targets = []
-                for tid in target_ids:
-                    row = await self.repo.get_target(int(tid))
-                    if row:
-                        targets.append(row)
-            else:
-                targets = await self.repo.list_targets(enabled_only=True)
-            if not targets and not pending_sites:
-                return True, False, False
+            targets = update_targets if update_targets is not None else await self._update_check_targets(params)
             sites = pending_sites | {normalize_site(t.get("site")) for t in targets}
             needs_xh_cookie = any(
                 normalize_site(t.get("site")) == "xhamster"
@@ -713,10 +731,8 @@ class TaskManager:
             limit = int(params.get("limit") or 0)
             resumed = params.get("resume_mode") == "enrich"
             candidates = await self.repo.list_baseline_metadata_candidates(
-                limit=limit, resume_job_id=job_id if resumed else None, site_only=True,
+                limit=limit, site=params.get("site") or "", resume_job_id=job_id if resumed else None, site_only=True,
             )
-            if not candidates:
-                return not resumed, False, False
             has_xh = any(
                 normalize_site(c.get("site")) == "xhamster"
                 for c in candidates
@@ -743,10 +759,9 @@ class TaskManager:
                 proxy_url=settings.normalized_proxy,
                 timeout=settings.request_timeout,
             )
+            resolved_user = prefer_cased_username(username, settings.xh_logged_in_username) if valid else ""
+            settings = await self._require_cookie_snapshot("xh", settings, resolved_user)
             if valid:
-                resolved_user = prefer_cased_username(username, settings.xh_logged_in_username)
-                if resolved_user and resolved_user != settings.xh_logged_in_username:
-                    settings = await self.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
                 status_msg = format_cookie_valid_message(resolved_user)
                 self.set_xh_cookie_status(True, status_msg)
                 self.events.emit_log("INFO", f"[xHamster Cookie] {status_msg}。", job_id=job_id)
@@ -798,6 +813,7 @@ class TaskManager:
         else:
             err_msg = "xHamster 收藏夹需要登录 xHamster 账号或粘贴有效 Cookie，请在【系统设置 → Cookie 与账号】中配置"
 
+        await self._require_cookie_snapshot("xh", settings)
         self.set_xh_cookie_status(False, err_msg)
         self.events.emit_log("ERROR", f"[xHamster Cookie] 准备失败: {err_msg}", job_id=job_id)
         return None
@@ -866,7 +882,12 @@ class TaskManager:
         params = job.get("params") or {}
 
         resume_mode = params.get("resume_mode")
-        needs_ph_cookie, needs_xh_cookie, needs_xh_ctx = await self._job_site_requirements(kind, params, job_id=job_id)
+        update_targets = None
+        if kind in {"auto_update", "check_updates"} and resume_mode != "items":
+            update_targets = await self._update_check_targets(params)
+        needs_ph_cookie, needs_xh_cookie, needs_xh_ctx = await self._job_site_requirements(
+            kind, params, job_id=job_id, update_targets=update_targets,
+        )
         scan_error_prefix = "扫描未完成：" if resume_mode == "rescan" else ""
 
         # Validate required site cookie(s) before network work
@@ -956,6 +977,7 @@ class TaskManager:
                         settings,
                         ctx,
                         auto_download=(kind == "auto_update"),
+                        targets=update_targets,
                     )
                 elif kind == "baseline_sync":
                     await self._exec_baseline_sync(job_id, params, settings, ctx)
@@ -991,7 +1013,10 @@ class TaskManager:
                 final_status = "partial_failed"
             else:
                 final_status = "completed"
-            final_job = await self.repo.finish_job(job_id, final_status, message, cancel_items=cancel_event.is_set())
+            final_job = await self.repo.finish_job(
+                job_id, final_status, message, cancel_items=cancel_event.is_set(),
+                cancel_requested=cancel_event.is_set if kind == "baseline_sync" else None,
+            )
         return final_job
 
     # ------------------------------------------------------------------
@@ -1543,7 +1568,7 @@ class TaskManager:
                                     partial_path.unlink(missing_ok=True)
                                     remove_download_checkpoint(partial_path)
                                     cleaned_stale = True
-                            elif partial_path.name.endswith(".hls") and partial_path.is_dir():
+                            elif partial_path.name.endswith(".hls") and partial_path.is_dir() and not ytdlp_hls_dir_in_use(partial_path):
                                 with contextlib.suppress(OSError):
                                     shutil.rmtree(partial_path, ignore_errors=True)
                                     cleaned_stale = True
@@ -1568,11 +1593,14 @@ class TaskManager:
                     if vkey and item.get("local_path"):
                         local_file = await asyncio.to_thread(
                             self._existing_local_file, item["local_path"], settings.min_file_size_bytes,
-                            item.get("bytes_total") or None,
+                            item.get("bytes_total") or (ledger or {}).get("file_size") or None,
                         )
                     own_local_file = local_file is not None
                     local_quality = item["quality"]
-                    if local_file is None and ledger and ledger["status"] == "downloaded" and ledger["local_path"] and quality_matches:
+                    if (
+                        local_file is None and ledger and ledger["status"] == "downloaded" and quality_matches
+                        and ledger["local_path"] and ledger["local_path"] != item.get("local_path")
+                    ):
                         local_file = await asyncio.to_thread(
                             self._existing_local_file, ledger["local_path"], settings.min_file_size_bytes,
                             ledger["file_size"] or None,
@@ -1583,6 +1611,7 @@ class TaskManager:
                         return
                     if local_file is not None:
                         existing_local, existing_size = local_file
+                        completed_here = will_upload or own_local_file
                         pub_date = str(item.get("published_at") or (ledger or {}).get("published_at") or "").strip()
                         dur_sec = int(item.get("duration_seconds") or (ledger or {}).get("duration_seconds") or 0)
                         local_metadata = {
@@ -1600,12 +1629,11 @@ class TaskManager:
                             local_path=str(existing_local),
                             file_size=existing_size,
                             force_status=own_local_file,
-                            upload_requested=will_upload,
+                            upload_requested=will_upload if completed_here else None,
                             published_at=pub_date,
                             duration_seconds=dur_sec,
                             **local_metadata,
                         )
-                        completed_here = will_upload or own_local_file
                         it = await self.repo.update_job_item(
                             item_id,
                             status="downloaded" if completed_here else "skipped",
@@ -2311,10 +2339,8 @@ class TaskManager:
             if detail.error or not detail.download_url or not detail.viewkey or detail.viewkey in seen_viewkeys:
                 continue
             seen_viewkeys.add(detail.viewkey)
-            urls.append(
-                detail.page_url
-                or f"https://www.pornhub.com/view_video.php?viewkey={detail.viewkey}"
-            )
+            site = detect_site_from_url(detail.page_url or detail.referer_url)
+            urls.append(build_video_page_url(site, detail.viewkey))
         return urls
 
     @staticmethod
@@ -3266,20 +3292,15 @@ class TaskManager:
         ctx: TaskHttpContext,
         *,
         auto_download: bool,
+        targets: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         rescan = params.get("resume_mode") == "rescan"
         auto_upload = _effective_auto_upload(params, settings)
         historical_items = await self.repo.list_job_items(job_id) if auto_download and rescan else []
         existing_keys = {_item_key(item["viewkey"], item["page_url"]) for item in historical_items}
         target_ids = params.get("target_ids")
-        if target_ids:
-            targets = []
-            for tid in target_ids:
-                row = await self.repo.get_target(int(tid))
-                if row:
-                    targets.append(row)
-        else:
-            targets = await self.repo.list_targets(enabled_only=True)
+        if targets is None:
+            targets = await self._update_check_targets(params)
 
         pending_upload_ids: List[int] = []
         if auto_download and auto_upload and not target_ids:
@@ -3317,15 +3338,11 @@ class TaskManager:
                     "title": str(video.get("title") or ""),
                     "uploader": str(video.get("uploader") or ""),
                     "target_type": str(video.get("target_type") or "model"),
-                    "page_url": video.get("video_page_url")
-                    or (
-                        f"https://xhamster.com/videos/{video['viewkey']}"
-                        if normalize_site(video.get("site")) == "xhamster"
-                        else f"https://www.pornhub.com/view_video.php?viewkey={video['viewkey']}"
-                    ),
+                    "page_url": safe_video_page_url(video.get("video_page_url"), normalize_site(video.get("site")), video["viewkey"]),
                     "quality": str(video.get("quality") or ""),
                     "status": "pending",
                     "local_path": str(video.get("local_path") or "").strip(),
+                    "bytes_total": int(video.get("file_size") or 0),
                     "upload_requested": True,
                     "published_at": str(video.get("published_at") or "").strip(),
                     "duration_seconds": int(video.get("duration_seconds") or 0),
@@ -3474,8 +3491,9 @@ class TaskManager:
                 # However, if page 1 itself failed with 0 new videos saved (e.g. a transient
                 # 403), there is no gap behind a saved head — keep catch_up enabled so we
                 # don't trigger a full historical rescan across every affected target.
+                first_error = previous_error.removeprefix("[PornHub 扫描] ").removeprefix("[xHamster 扫描] ")
                 only_page1_failed = (
-                    previous_error.startswith("列表第 1 页:")
+                    first_error.startswith("列表第 1 页:")
                     and "；" not in previous_error
                     and int(target.get("last_new_count") or 0) == 0
                 )
@@ -3580,7 +3598,14 @@ class TaskManager:
                         break
                     await _scan_one_target(target_idx, target)
             else:
-                await asyncio.gather(*(_scan_one_target(idx, t) for idx, t in enumerate(targets)))
+                scans = [asyncio.create_task(_scan_one_target(idx, target)) for idx, target in enumerate(targets)]
+                try:
+                    await until_stopped(asyncio.gather(*scans), ctx.cancel_event)
+                finally:
+                    for scan in scans:
+                        if not scan.done():
+                            scan.cancel()
+                    await asyncio.gather(*scans, return_exceptions=True)
 
         for idx in range(len(ordered_outcomes)):
             outcome = ordered_outcomes[idx]
@@ -3823,7 +3848,7 @@ class TaskManager:
                     "uploader": default_uploader if is_self_col else uname,
                     "uploader_display_name": "" if is_self_col else target_display_name,
                     "target_type": utype,
-                    "video_page_url": lv.url,
+                    "video_page_url": safe_video_page_url(lv.url, tsite, lv.viewkey),
                     "status": "baseline",
                     "published_at": lv.published_at,
                     "duration_seconds": lv.duration_seconds,
@@ -3852,7 +3877,7 @@ class TaskManager:
             item_ids = {item["viewkey"]: int(item["id"]) for item in await self.repo.list_job_items(job_id)}
             self.events.broadcast("job_items_changed", {"job_id": job_id})
         candidates = await self.repo.list_baseline_metadata_candidates(
-            limit=limit, resume_job_id=job_id if resumed else None,
+            limit=limit, site=params.get("site") or "", resume_job_id=job_id if resumed else None,
         )
         if not candidates:
             self.events.emit_log("INFO", "没有需要补全元数据的基线视频。", job_id=job_id)
@@ -4314,12 +4339,7 @@ class TaskManager:
                 utype = "favorites" if folder.lower().endswith("_favorites") else ("liked" if folder.lower() == "my_liked_videos" else "model")
                 uploader = folder[:-len("_favorites")] if utype == "favorites" else folder
             title = prior.get("title") or tf["name"].rsplit("[", 1)[0].strip() or vkey
-            default_page_url = (
-                f"https://xhamster.com/videos/{vkey}"
-                if tf_site == "xhamster"
-                else f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
-            )
-            page_url = prior.get("page_url") or default_page_url
+            page_url = safe_video_page_url(prior.get("page_url"), tf_site, vkey)
             quality = tf["quality"] or prior.get("quality") or ""
             row = await self.repo.add_job_item(
                 job_id,
@@ -4416,17 +4436,12 @@ class TaskManager:
                 vkey = ""
                 quality = ""
                 verified = False
-                manifest = hls_dir / "manifest.json"
-                if manifest.is_file():
-                    try:
-                        meta = json.loads(manifest.read_text(encoding="utf-8"))
-                        if isinstance(meta, dict):
-                            vkey = str(meta.get("viewkey") or "").strip()
-                            raw_q = str(meta.get("quality") or "").strip()
-                            quality = f"{raw_q}p" if raw_q.isdigit() else raw_q
-                            verified = bool(vkey)
-                    except (OSError, ValueError, TypeError):
-                        pass
+                meta = _read_hls_manifest(hls_dir)
+                if meta:
+                    vkey = str(meta.get("viewkey") or "").strip()
+                    raw_q = str(meta.get("quality") or "").strip()
+                    quality = f"{raw_q}p" if raw_q.isdigit() else raw_q
+                    verified = bool(vkey)
                 if not vkey and "[" in hls_dir.stem and "]" in hls_dir.stem:
                     vkey = hls_dir.stem.rsplit("[", 1)[1].split("]", 1)[0]
                 results.append(
@@ -4455,7 +4470,7 @@ class TaskManager:
                 remove_download_checkpoint(tmp)
                 removed += 1
         for hls_dir in list(self.env.temp_dir.rglob("*.hls")):
-            if not hls_dir.is_symlink() and hls_dir.is_dir():
+            if not hls_dir.is_symlink() and hls_dir.is_dir() and not ytdlp_hls_dir_in_use(hls_dir):
                 with contextlib.suppress(OSError):
                     shutil.rmtree(hls_dir)
                     removed += 1

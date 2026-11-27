@@ -31,6 +31,7 @@ import ConfirmPopover from '../components/ui/ConfirmPopover.vue'
 import VideoPlaybackDialog from '../components/VideoPlaybackDialog.vue'
 import SiteBadge from '../components/SiteBadge.vue'
 import { HISTORY_PAGE_SIZES } from '../utils/listPreferences'
+import { safeExternalVideoUrl } from '../utils/videoLinks'
 
 const store = useAppStore()
 const route = useRoute()
@@ -115,6 +116,7 @@ const filters = reactive<VideoFilters>({
   ...initialRouteFilters,
   page_size: store.historyPageSize,
 })
+const statsSite = ref<VideoFilters['site'] | null>(cached || store.overview?.videos ? '' : null)
 const loadingHistory = computed(() => loading.value || (
   store.hydratedFromCache && isDefaultFilters() && !store.hasRouteCache('history')
 ))
@@ -141,8 +143,9 @@ const pageSizeOptions = HISTORY_PAGE_SIZES.map((value) => ({ label: `${value} �
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / filters.page_size)))
 const metadataCandidates = computed(
-  () => stats.value.baseline_missing_metadata ?? stats.value.baseline ?? 0
+  () => statsSite.value === filters.site ? stats.value.baseline_missing_metadata ?? stats.value.baseline ?? 0 : 0
 )
+const metadataScope = computed(() => filters.site === 'pornhub' ? 'PornHub' : filters.site === 'xhamster' ? 'xHamster' : '全站')
 
 const selectedCount = computed(() => selectedViewkeys.value.size)
 const selectedHasLocalFiles = computed(() =>
@@ -380,7 +383,7 @@ function scheduleAdjacentPrefetch() {
 }
 
 function hasLoadedMeta() {
-  return (facets.value.uploaders?.length || 0) > 0 || Number(stats.value.total || 0) > 0
+  return statsSite.value === filters.site
 }
 
 function warmDeleteRowPopover(viewkey: string) {
@@ -512,6 +515,7 @@ async function loadVideos({ silent = false, includeMeta = true, useCache = false
     }
     if (res.stats) {
       stats.value = res.stats
+      statsSite.value = filters.site
     }
     if (isDefaultFilters() && res.facets && res.stats) {
       store.setHistoryCache(res)
@@ -741,7 +745,7 @@ async function handleEnrichMetadata() {
   if (enriching.value || metadataCandidates.value <= 0) return
   enriching.value = true
   try {
-    const res = await api.enrichBaselineMetadata()
+    const res = await api.enrichBaselineMetadata(filters.site)
     store.notify(`已创建元数据补全任务 #${res.job.id}，共 ${res.count} 条`, 'success')
     await store.refreshJobs()
     router.push({ name: 'jobs' })
@@ -767,6 +771,7 @@ watch(
       { published_7d: 0 },
       val.stats || { total: 0, uploaded: 0, downloaded: 0, baseline: 0 }
     )
+    statsSite.value = ''
   }
 )
 
@@ -885,7 +890,7 @@ onDeactivated(() => {
         </div>
       </div>
       <ConfirmPopover
-        :title="`补全 ${metadataCandidates} 条基线视频的画质和大小？`"
+        :title="`补全 ${metadataScope} 的 ${metadataCandidates} 条基线视频的画质和大小？`"
         description="会解析视频详情并用 Range 请求读取媒体大小，不会下载视频文件。记录较多时可能需要数分钟。"
         confirm-text="开始补全"
         @confirm="handleEnrichMetadata"
@@ -1162,8 +1167,7 @@ onDeactivated(() => {
                     </svg>
                   </button>
                   <a
-                    v-if="v.video_page_url"
-                    :href="v.video_page_url"
+                    :href="safeExternalVideoUrl(v.video_page_url, v.site, v.viewkey)"
                     target="_blank"
                     rel="noopener noreferrer"
                     class="inline-flex items-center justify-center h-8 w-8 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
@@ -1356,8 +1360,7 @@ onDeactivated(() => {
                       </svg>
                     </button>
                     <a
-                      v-if="v.video_page_url"
-                      :href="v.video_page_url"
+                      :href="safeExternalVideoUrl(v.video_page_url, v.site, v.viewkey)"
                       target="_blank"
                       rel="noopener noreferrer"
                       class="inline-flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"

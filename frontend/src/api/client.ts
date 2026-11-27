@@ -80,6 +80,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 
   if (resp.status === 401) {
+    if (path === '/api/auth/logout') return { authenticated: false } as T
     if (unauthorizedHandler && !path.startsWith('/api/auth/')) {
       unauthorizedHandler()
     }
@@ -167,8 +168,8 @@ export const api = {
     }),
   redownloadVideo: (viewkey: string): Promise<JobResponse> =>
     request(`/api/videos/${encodeURIComponent(viewkey)}/redownload`, { method: 'POST' }),
-  enrichBaselineMetadata: (): Promise<JobResponse & { count: number }> =>
-    request('/api/videos/metadata/enrich', { method: 'POST' }),
+  enrichBaselineMetadata: (site: SiteKey | '' = ''): Promise<JobResponse & { count: number }> =>
+    request('/api/videos/metadata/enrich', { method: 'POST', body: { site } }),
 
   // Settings & Tools
   getSettings: (): Promise<SettingsResponse> => request('/api/settings'),

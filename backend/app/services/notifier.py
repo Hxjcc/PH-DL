@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import aiohttp
 
 from ..config import RuntimeSettings
+from .http_proxy import create_aiohttp_connector, effective_request_proxy
 
 
 async def send_serverchan(
@@ -27,9 +28,11 @@ async def send_serverchan(
 
     try:
         timeout = aiohttp.ClientTimeout(total=15.0)
-        async with aiohttp.ClientSession(timeout=timeout) as client:
+        connector, _ = create_aiohttp_connector(settings.normalized_proxy)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as client:
+            proxy = effective_request_proxy(client, settings.normalized_proxy)
             if is_turbo:
-                async with client.post(api_url, data=payload, proxy=settings.normalized_proxy, allow_redirects=False) as resp:
+                async with client.post(api_url, data=payload, proxy=proxy, allow_redirects=False) as resp:
                     if resp.status < 200 or resp.status >= 300:
                         return False, f"ServerChan 返回 HTTP {resp.status}"
                     resp.raise_for_status()
@@ -39,7 +42,7 @@ async def send_serverchan(
                 async with client.get(
                     api_url,
                     params={"text": title, "desp": content},
-                    proxy=settings.normalized_proxy,
+                    proxy=proxy,
                     allow_redirects=False,
                 ) as resp:
                     if resp.status < 200 or resp.status >= 300:

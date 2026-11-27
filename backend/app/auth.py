@@ -124,7 +124,7 @@ class AuthManager:
             )
 
     def verify_websocket(self, websocket: WebSocket) -> bool:
-        token = websocket.cookies.get(SESSION_COOKIE_NAME) or websocket.query_params.get("token")
+        token = websocket.cookies.get(SESSION_COOKIE_NAME)
         return self.verify_token(token)
 
     @staticmethod
