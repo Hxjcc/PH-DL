@@ -54,9 +54,22 @@ CHROME_FINGERPRINTS: Tuple[str, ...] = tuple(
     if not _AVAILABLE_BROWSERS or fp in _AVAILABLE_BROWSERS
 ) or ("chrome124", "chrome123", "chrome120")
 
-# Force HTTP/1.1 by default so concurrent requests to www.pornhub.com do not multiplex
+# Force HTTP/1.1 for PornHub so concurrent requests to www.pornhub.com do not multiplex
 # onto a single HTTP/2 TCP socket where one WAF reset or timeout kills every in-flight stream.
+# xHamster negotiates HTTP/2 over TLS (with automatic HTTP/1.1 fallback) to match modern
+# Chrome fingerprints and reduce handshake latency across paginated scans.
 _HTTP_V1_1 = getattr(CurlHttpVersion, "V1_1", None)
+_HTTP_V2_TLS = getattr(CurlHttpVersion, "V2TLS", None) or getattr(CurlHttpVersion, "V2_0", None)
+_HTTP_VERSION_AUTO = object()
+_H2_ERROR_CODES = frozenset({16, 92})
+
+
+def _is_http2_protocol_error(err: BaseException) -> bool:
+    code = getattr(err, "code", None)
+    if isinstance(code, int) and code in _H2_ERROR_CODES:
+        return True
+    msg = str(err).lower()
+    return "http/2" in msg or "http2" in msg or "(16)" in msg or "(92)" in msg
 
 DEFAULT_HEADERS: Dict[str, str] = {
     "Referer": "https://www.pornhub.com/",
@@ -138,7 +151,7 @@ class TaskHttpContext:
 
     - Pins ONE Chrome TLS fingerprint across list pages, detail pages, get_media, and link refreshes.
     - Shares server-issued session cookies and PoW cookies across the entire job.
-    - Caps the lazily created connection pool and defaults to HTTP/1.1.
+    - Caps the lazily created connection pool; defaults to HTTP/2 (V2TLS) for xHamster and HTTP/1.1 for PornHub.
     """
 
     def __init__(
@@ -152,7 +165,7 @@ class TaskHttpContext:
         retry_delay_base: float = 2.0,
         retry_delay_max: float = 10.0,
         impersonate: Optional[str] = None,
-        http_version: Any = _HTTP_V1_1,
+        http_version: Any = _HTTP_VERSION_AUTO,
         min_request_interval: Optional[float] = None,
         cancel_event: Optional[asyncio.Event] = None,
         on_log: Optional[LogCallback] = None,
@@ -168,7 +181,11 @@ class TaskHttpContext:
         self.retry_delay_base = float(retry_delay_base)
         self.retry_delay_max = float(retry_delay_max)
         self.impersonate: str = impersonate or random.choice(CHROME_FINGERPRINTS)
-        self.http_version = http_version
+        norm_site = (site or "").strip().lower()
+        if http_version is _HTTP_VERSION_AUTO:
+            self.http_version = _HTTP_V2_TLS if norm_site in {"xhamster", "xh"} else _HTTP_V1_1
+        else:
+            self.http_version = http_version
         if min_request_interval is None:
             self.min_request_interval = 0.15 if (self.retry_delay_base > 0 and int(concurrency) > 1) else 0.0
         else:
@@ -336,12 +353,16 @@ class TaskHttpContext:
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
         data: Optional[Any] = None,
+        http_version_override: Any = _HTTP_VERSION_AUTO,
     ) -> Tuple[str, str, List[str], int]:
         merged_headers = dict(DEFAULT_HEADERS)
         if headers:
             merged_headers.update(headers)
         req_timeout = float(timeout if timeout is not None else self.timeout)
         verb = method.upper()
+        effective_http_version = (
+            self.http_version if http_version_override is _HTTP_VERSION_AUTO else http_version_override
+        )
 
         async def _do(sess: CffiSession) -> Tuple[str, str, List[str], int]:
             current_url = url
@@ -382,8 +403,8 @@ class TaskHttpContext:
 
                 if self._allow_url:
                     request_kwargs["content_callback"] = receive
-                if self.http_version is not None:
-                    request_kwargs["http_version"] = self.http_version
+                if effective_http_version is not None:
+                    request_kwargs["http_version"] = effective_http_version
                 try:
                     if verb == "POST":
                         resp = await sess.post(current_url, data=data, **request_kwargs)
@@ -429,8 +450,16 @@ class TaskHttpContext:
         cookies: Dict[str, str],
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
+        http_version_override: Any = _HTTP_VERSION_AUTO,
     ) -> Tuple[str, str, List[str], int]:
-        return await self._raw_request("GET", url, cookies, headers=headers, timeout=timeout)
+        return await self._raw_request(
+            "GET",
+            url,
+            cookies,
+            headers=headers,
+            timeout=timeout,
+            http_version_override=http_version_override,
+        )
 
     async def _raw_post(
         self,
@@ -439,6 +468,7 @@ class TaskHttpContext:
         data: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
+        http_version_override: Any = _HTTP_VERSION_AUTO,
     ) -> Tuple[str, str, List[str], int]:
         return await self._raw_request(
             "POST",
@@ -447,6 +477,7 @@ class TaskHttpContext:
             headers=headers,
             timeout=timeout,
             data=data,
+            http_version_override=http_version_override,
         )
 
     async def fetch_with_pow(
@@ -467,6 +498,7 @@ class TaskHttpContext:
         challenge_solves = 0
         extra_cookies: Dict[str, str] = {}
         verb = method.upper()
+        attempt_http_version: Any = _HTTP_VERSION_AUTO
 
         while retries_left >= 0:
             if self.cancel_event.is_set():
@@ -480,20 +512,21 @@ class TaskHttpContext:
             merged_cookies = self.merged_cookies(extra_cookies)
 
             try:
+                raw_kwargs: Dict[str, Any] = {"headers": headers, "timeout": timeout}
+                if attempt_http_version is not _HTTP_VERSION_AUTO:
+                    raw_kwargs["http_version_override"] = attempt_http_version
                 if verb == "POST":
                     request = self._raw_post(
                         url,
                         merged_cookies,
                         data,
-                        headers=headers,
-                        timeout=timeout,
+                        **raw_kwargs,
                     )
                 else:
                     request = self._raw_get(
                         url,
                         merged_cookies,
-                        headers=headers,
-                        timeout=timeout,
+                        **raw_kwargs,
                     )
                 text, final_url, set_cookies, status_code = await until_stopped(request, self.cancel_event)
             except StopRequested:
@@ -505,6 +538,13 @@ class TaskHttpContext:
                 if retries_left == 0:
                     self._emit("WARNING", f"{log_label}多次重试仍失败 ({err_summary}): {url}")
                     return None, f"网络错误 ({err_summary})"
+                if (
+                    _HTTP_V1_1 is not None
+                    and self.http_version != _HTTP_V1_1
+                    and attempt_http_version is _HTTP_VERSION_AUTO
+                    and _is_http2_protocol_error(err)
+                ):
+                    attempt_http_version = _HTTP_V1_1
 
                 retry_num = initial_retries - retries_left
                 base = self.retry_delay_base if retry_delay_base is None else float(retry_delay_base)

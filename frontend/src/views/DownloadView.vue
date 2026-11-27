@@ -896,9 +896,6 @@ async function handleClearTemp() {
                 <div class="site-bar">
                   <span class="site-bar-label">来源站点</span>
                   <SegmentedControl v-model="form.site" :options="SITE_OPTIONS" aria-label="目标站点" />
-                  <span v-if="form.site === 'xhamster'" class="site-bar-hint">
-                    公开主页免 Cookie · 4K HLS 自动封装 MP4
-                  </span>
                 </div>
 
                 <div class="target-source">
@@ -1515,12 +1512,6 @@ async function handleClearTemp() {
   font-size: 12px;
   font-weight: 500;
   color: var(--foreground);
-}
-
-.site-bar-hint {
-  font-size: 11px;
-  line-height: 16px;
-  color: var(--muted-foreground);
 }
 
 .target-source {

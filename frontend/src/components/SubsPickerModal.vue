@@ -26,10 +26,6 @@ const activeSite = ref('pornhub')
 const loading = ref(false)
 const error = ref('')
 const sourceUser = ref('')
-const sourceDraft = ref('')
-const manualSource = ref(false)
-const editingSource = ref(false)
-const sourceInput = ref(null)
 const searchInput = ref(null)
 const avatarInput = ref(null)
 const uploadingAvatar = ref(false)
@@ -56,14 +52,8 @@ const defaultSource = computed(() =>
     ? (store.xhAccountUsername || '')
     : (store.accountUsername || store.subscriptionsLastSource || '')
 )
-const isOwnAccount = computed(() => {
-  if (activeSite.value === 'xhamster') return true
-  const cur = sourceUser.value.trim().toLowerCase()
-  const own = defaultSource.value.trim().toLowerCase()
-  return !cur || (own && cur === own) || !manualSource.value
-})
 const sourceAvatar = computed(() => {
-  if (isOwnAccount.value && canShowAvatar(store.accountAvatarUrl)) {
+  if (canShowAvatar(store.accountAvatarUrl)) {
     return store.accountAvatarUrl
   }
   return store.targetsCache?.find(
@@ -168,7 +158,7 @@ const updatedTime = computed(() => fetchedAt.value
 
 async function focusSearch() {
   await nextTick()
-  if (props.open && !editingSource.value) searchInput.value?.focus({ preventScroll: true })
+  if (props.open) searchInput.value?.focus({ preventScroll: true })
 }
 
 function handleOpenAutoFocus(event) {
@@ -217,40 +207,9 @@ function switchSite(nextSite) {
   query.value = ''
   typeFilter.value = 'all'
   trackFilter.value = 'all'
-  editingSource.value = false
-  manualSource.value = false
   fetchedAt.value = 0
   sourceUser.value = defaultSource.value
   loadSubs()
-}
-
-async function editSource() {
-  if (activeSite.value === 'xhamster') return
-  sourceDraft.value = sourceUser.value || defaultSource.value
-  editingSource.value = true
-  await nextTick()
-  sourceInput.value?.focus({ preventScroll: true })
-}
-
-async function applySource() {
-  const nextSource = sourceDraft.value.trim()
-  if (nextSource.toLowerCase() !== sourceUser.value.toLowerCase()) {
-    items.value = []
-    fetchedAt.value = 0
-    selected.value = new Set()
-  }
-  sourceUser.value = nextSource
-  manualSource.value = Boolean(nextSource)
-  editingSource.value = false
-  query.value = ''
-  await loadSubs()
-}
-
-function handleSourceKeydown(event) {
-  if (event.key !== 'Enter') return
-  event.preventDefault()
-  if (event.isComposing || event.keyCode === 229) return
-  applySource()
 }
 
 watch(() => props.open, (isOpen) => {
@@ -265,8 +224,7 @@ watch(() => props.open, (isOpen) => {
     initBaseline.value = true
     baselinePages.value = 'all'
     baselinePagesValid.value = true
-    editingSource.value = false
-    if (!manualSource.value || activeSite.value === 'xhamster') sourceUser.value = defaultSource.value
+    sourceUser.value = defaultSource.value
     if (store.targetsCache === null) store.ensureTargets()
     loadSubs()
   } else {
@@ -333,7 +291,7 @@ function confirm() {
   <Dialog
     :open="open"
     title="从账号订阅选择"
-    description="选择要导入的订阅，默认使用已登录账号"
+    description="选择要导入的订阅，使用当前已登录账号"
     class="max-w-3xl max-h-[calc(100dvh-2rem)] overflow-y-auto"
     @open-auto-focus="handleOpenAutoFocus"
     @close="emit('close')"
@@ -352,55 +310,39 @@ function confirm() {
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-surface-subtle px-3 py-2.5">
-        <div v-if="editingSource && activeSite === 'pornhub'" class="flex w-full items-center gap-2">
-          <Input ref="sourceInput" v-model="sourceDraft" class="min-w-0 flex-1" placeholder="源账号，留空使用已登录账号" aria-label="订阅源账号" @keydown="handleSourceKeydown" />
-          <Button size="sm" @click="applySource">获取</Button>
-          <Button size="sm" variant="ghost" @click="editingSource = false; focusSearch()">取消</Button>
-        </div>
-        <template v-else>
-          <div class="flex min-w-0 items-center gap-2.5">
-            <button
-              v-if="isOwnAccount"
-              type="button"
-              class="group relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-muted-foreground cursor-pointer transition-colors hover:border-brand/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30"
-              :disabled="uploadingAvatar"
-              title="点击更换本地账号头像（仅本地显示，不修改站点账号信息）"
-              aria-label="更换本地账号头像"
-              @click="avatarInput?.click()"
-            >
-              <img v-if="sourceAvatar" :key="sourceAvatar" :src="sourceAvatar" alt="" class="h-full w-full object-cover" referrerpolicy="no-referrer" @error="markAvatarFailed" />
-              <UserRound v-else class="w-4 h-4" />
-              <span class="absolute inset-0 flex items-center justify-center bg-black/45 text-white opacity-0 transition-opacity group-hover:opacity-100">
-                <Spinner v-if="uploadingAvatar" class="w-3.5 h-3.5" />
-                <Camera v-else class="w-3.5 h-3.5" />
-              </span>
-            </button>
-            <span
-              v-else
-              class="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-muted-foreground"
-            >
-              <img v-if="sourceAvatar" :key="sourceAvatar" :src="sourceAvatar" alt="" class="h-full w-full object-cover" referrerpolicy="no-referrer" @error="markAvatarFailed" />
-              <UserRound v-else class="w-4 h-4" />
+        <div class="flex min-w-0 items-center gap-2.5">
+          <button
+            type="button"
+            class="group relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-muted-foreground cursor-pointer transition-colors hover:border-brand/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30"
+            :disabled="uploadingAvatar"
+            title="点击更换本地账号头像（仅本地显示，不修改站点账号信息）"
+            aria-label="更换本地账号头像"
+            @click="avatarInput?.click()"
+          >
+            <img v-if="sourceAvatar" :key="sourceAvatar" :src="sourceAvatar" alt="" class="h-full w-full object-cover" referrerpolicy="no-referrer" @error="markAvatarFailed" />
+            <UserRound v-else class="w-4 h-4" />
+            <span class="absolute inset-0 flex items-center justify-center bg-black/45 text-white opacity-0 transition-opacity group-hover:opacity-100">
+              <Spinner v-if="uploadingAvatar" class="w-3.5 h-3.5" />
+              <Camera v-else class="w-3.5 h-3.5" />
             </span>
-            <input
-              ref="avatarInput"
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              class="hidden"
-              @change="handleAvatarPicked"
-            />
-            <div class="min-w-0">
-              <div class="text-[10px] text-muted-foreground">{{ activeSite === 'xhamster' ? 'xHamster 订阅账号' : 'PornHub 订阅账号' }}</div>
-              <div class="max-w-44 truncate text-sm font-medium" :title="sourceUser">{{ sourceUser || (activeSite === 'xhamster' ? '当前 xHamster 账号' : '当前 PornHub 账号') }}</div>
-            </div>
-            <Button v-if="activeSite === 'pornhub'" variant="ghost" size="xs" :disabled="loading" class="text-muted-foreground" @click="editSource">更换</Button>
+          </button>
+          <input
+            ref="avatarInput"
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            class="hidden"
+            @change="handleAvatarPicked"
+          />
+          <div class="min-w-0">
+            <div class="text-[10px] text-muted-foreground">{{ activeSite === 'xhamster' ? 'xHamster 订阅账号' : 'PornHub 订阅账号' }}</div>
+            <div class="max-w-44 truncate text-sm font-medium" :title="sourceUser">{{ sourceUser || (activeSite === 'xhamster' ? '当前 xHamster 账号' : '当前 PornHub 账号') }}</div>
           </div>
-          <Button variant="outline" size="sm" :disabled="loading" @click="loadSubs(true)">
-            <Spinner v-if="loading" class="w-4 h-4" />
-            <RefreshCw v-else class="w-3.5 h-3.5" />
-            {{ loading ? '获取中' : '刷新订阅' }}
-          </Button>
-        </template>
+        </div>
+        <Button variant="outline" size="sm" :disabled="loading" @click="loadSubs(true)">
+          <Spinner v-if="loading" class="w-4 h-4" />
+          <RefreshCw v-else class="w-3.5 h-3.5" />
+          {{ loading ? '获取中' : '刷新订阅' }}
+        </Button>
       </div>
 
       <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">

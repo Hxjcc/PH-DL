@@ -2185,3 +2185,42 @@ def test_xhamster_profile_meta_extracts_channel_logo_and_creator_pornstar_top():
 
     assert parse_xhamster_target_from_url("https://xhamster.com/users/profiles/nativepea222") == ("users", "nativepea222")
     assert parse_xhamster_target_from_url("https://xhamster.com/users/profiles") is None
+
+
+async def test_xhamster_http_context_uses_http2_with_http1_retry_fallback(monkeypatch):
+    from types import SimpleNamespace
+    from app.parsers import http_session
+
+    xh_ctx = TaskHttpContext(site="xhamster", retry_delay_base=0, retry_delay_max=0, max_retries=1)
+    ph_ctx = TaskHttpContext(site="pornhub", retry_delay_base=0, retry_delay_max=0, max_retries=1)
+    default_ctx = TaskHttpContext(retry_delay_base=0, retry_delay_max=0, max_retries=1)
+
+    assert xh_ctx.http_version == http_session._HTTP_V2_TLS
+    assert ph_ctx.http_version == http_session._HTTP_V1_1
+    assert default_ctx.http_version == http_session._HTTP_V1_1
+
+    explicit_ctx = TaskHttpContext(site="xhamster", http_version=http_session._HTTP_V1_1)
+    assert explicit_ctx.http_version == http_session._HTTP_V1_1
+
+    seen_versions = []
+
+    class FakeCffiSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            pass
+
+        async def get(self, url, **kwargs):
+            seen_versions.append(kwargs.get("http_version"))
+            if len(seen_versions) == 1:
+                raise ConnectionError("curl: (92) HTTP/2 stream 1 was not closed cleanly")
+            return SimpleNamespace(url=url, status_code=200, text="<html>ok</html>", headers={})
+
+    monkeypatch.setattr(http_session, "CffiSession", FakeCffiSession)
+    res, err = await xh_ctx.fetch_with_pow("https://xhamster.com/creators/yourselena")
+    assert err is None and res is not None and res.status_code == 200 and res.retried is True
+    assert seen_versions == [http_session._HTTP_V2_TLS, http_session._HTTP_V1_1]
