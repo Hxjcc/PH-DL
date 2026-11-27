@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 TARGET_IDENTITY_TYPE = """
     CASE
@@ -303,6 +303,26 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "DROP TABLE duplicate_targets;",
             f"""CREATE UNIQUE INDEX idx_targets_identity
                 ON targets(site, LOWER(TRIM(username)), {TARGET_IDENTITY_TYPE});""",
+        ],
+    ),
+    (
+        15,
+        [
+            "UPDATE videos SET site = LOWER(COALESCE(NULLIF(TRIM(site), ''), 'pornhub')) "
+            "WHERE site IS NULL OR site = '' OR site != LOWER(TRIM(site));",
+            "DROP INDEX IF EXISTS idx_videos_facets_uploader;",
+            "CREATE INDEX IF NOT EXISTS idx_videos_facets_uploader "
+            "ON videos(site, LOWER(uploader), uploader, uploader_display_name);",
+            "CREATE INDEX IF NOT EXISTS idx_videos_target_counts "
+            "ON videos(site, LOWER(uploader), LOWER(target_type), status);",
+            "CREATE INDEX IF NOT EXISTS idx_videos_published_sort "
+            "ON videos(published_at DESC, "
+            "COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_videos_site_published_sort "
+            "ON videos(site, published_at DESC, "
+            "COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_videos_stats_cover "
+            "ON videos(site, status, published_at, quality, file_size, (video_page_url != ''));",
         ],
     ),
 ]

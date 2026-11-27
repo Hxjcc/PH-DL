@@ -182,3 +182,81 @@ async def test_display_name_search_is_site_scoped_and_baseline_keeps_local_uploa
         assert total == 1 and [item["viewkey"] for item in items] == [key]
     await repo.upsert_video("ph", status="uploaded")
     assert (await repo.get_video("ph"))["local_path"] == ""
+
+
+async def test_list_videos_uses_snapshot_safe_caches_and_invalidates_on_write(repo, monkeypatch):
+    await repo.upsert_target("alice", display_name="Alice Display")
+    await repo.upsert_video("v1", uploader="alice", quality="1080p", status="uploaded", published_at="2026-11-20")
+    container = SimpleNamespace(repo=repo)
+
+    # First call populates stats and facets caches.
+    first = await list_videos(
+        site="pornhub", search="", uploader="", status="", quality="", time_range="",
+        sort_by="published", page=1, page_size=30, include_meta=True, container=container,
+    )
+    assert first["total"] == 1 and first["stats"]["total"] == 1 and first["facets"]["qualities"] == ["1080p"]
+
+    # Second call with no writes must serve stats & facets from cache (only 1 SELECT for video rows).
+    seen_sql: list[str] = []
+    original_fetch_one = repo.db.fetch_one
+    original_fetch_all = repo.db.fetch_all
+
+    async def spy_one(sql, params=(), **kwargs):
+        seen_sql.append(sql)
+        return await original_fetch_one(sql, params, **kwargs)
+
+    async def spy_all(sql, params=(), **kwargs):
+        seen_sql.append(sql)
+        return await original_fetch_all(sql, params, **kwargs)
+
+    monkeypatch.setattr(repo.db, "fetch_one", spy_one)
+    monkeypatch.setattr(repo.db, "fetch_all", spy_all)
+
+    second = await list_videos(
+        site="pornhub", search="", uploader="", status="", quality="", time_range="",
+        sort_by="published", page=1, page_size=30, include_meta=True, container=container,
+    )
+    assert second["total"] == 1 and second["stats"]["total"] == 1
+    assert not any("COUNT(*)" in sql for sql in seen_sql)
+    assert not any("GROUP BY" in sql for sql in seen_sql)
+
+    # Writing a new video invalidates both stats/facets and list_targets count caches.
+    targets_before = await repo.list_targets()
+    assert targets_before[0]["video_total_count"] == 1
+    await repo.upsert_video("v2", uploader="alice", quality="720p", status="downloaded", published_at="2026-11-25")
+    third = await list_videos(
+        site="pornhub", search="", uploader="", status="", quality="", time_range="",
+        sort_by="published", page=1, page_size=30, include_meta=True, container=container,
+    )
+    assert [it["viewkey"] for it in third["items"]] == ["v2", "v1"]
+    assert third["total"] == 2 and third["stats"]["total"] == 2 and third["facets"]["qualities"] == ["1080p", "720p"]
+    targets_after = await repo.list_targets()
+    assert targets_after[0]["video_total_count"] == 2
+
+
+async def test_list_videos_recovers_when_write_races_cached_stats_before_snapshot_pin(repo, monkeypatch):
+    await repo.upsert_video("v1", uploader="alice", quality="720p", status="uploaded")
+    container = SimpleNamespace(repo=repo)
+    # Warm stats/facets cache at v1.
+    await list_videos(
+        site="", search="", uploader="", status="", quality="", time_range="",
+        sort_by="activity", page=1, page_size=30, include_meta=True, container=container,
+    )
+
+    original_query = repo.query_videos
+    raced = False
+
+    async def query_after_concurrent_write(**kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            await repo.upsert_video("v2", uploader="bob", quality="1080p", status="uploaded")
+        return await original_query(**kwargs)
+
+    monkeypatch.setattr(repo, "query_videos", query_after_concurrent_write)
+    res = await list_videos(
+        site="", search="", uploader="", status="", quality="", time_range="",
+        sort_by="activity", page=1, page_size=30, include_meta=True, container=container,
+    )
+    assert res["total"] == 2 and len(res["items"]) == 2
+    assert res["stats"]["total"] == 2 and res["facets"]["qualities"] == ["1080p", "720p"]

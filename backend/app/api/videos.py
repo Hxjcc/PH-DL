@@ -108,11 +108,20 @@ async def list_videos(
     )
     if include_meta:
         async with repo.db.read() as conn:
-            stats = await repo.get_video_stats(site=site, conn=conn)
+            snapshot_version = repo.db.video_meta_version
+            stats, stats_cached = await repo.get_video_stats_with_cache_info(
+                site=site, conn=conn, snapshot_version=snapshot_version,
+            )
             items, total = await repo.query_videos(
                 **filters, known_total=stats["total"] if unfiltered else None, conn=conn,
             )
-            facets = await repo.get_video_filter_facets(site=site, conn=conn)
+            if stats_cached and repo.db.video_meta_version != snapshot_version:
+                stats = await repo.get_video_stats(site=site, conn=conn)
+                if unfiltered:
+                    total = stats["total"]
+            facets = await repo.get_video_filter_facets(
+                site=site, conn=conn, snapshot_version=snapshot_version,
+            )
     else:
         items, total = await repo.query_videos(**filters)
         stats = facets = None

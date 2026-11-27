@@ -19,8 +19,8 @@ from .schema import TARGET_IDENTITY_TYPE
 STATUS_RANK = {"baseline": 1, "downloaded": 2, "uploaded": 3}
 _SCAN_JOB_KINDS = frozenset({"manual_target", "manual_urls", "auto_update", "check_updates", "baseline_sync", "resume_temp"})
 _BASELINE_METADATA_FILTER = """
-    status = 'baseline' AND video_page_url != ''
-    AND (quality = '' OR (LOWER(COALESCE(site, 'pornhub')) != 'xhamster' AND file_size <= 0))
+    status = 'baseline' AND (video_page_url != '') = 1
+    AND (quality = '' OR (site != 'xhamster' AND file_size <= 0))
 """
 _RECALCULATE_JOB_COUNTS = """
     UPDATE jobs
@@ -112,6 +112,17 @@ class Repository:
         self._display_map_cache: Optional[Tuple[int, Dict[Tuple[str, str], str]]] = None
         self._facets_cache: Dict[str, Tuple[int, Dict[str, Any]]] = {}
         self._stats_cache: Dict[str, Tuple[int, str, Dict[str, int]]] = {}
+        self._target_counts_cache: Optional[
+            Tuple[
+                int,
+                Tuple[
+                    Dict[Tuple[str, str, str], Dict[str, int]],
+                    Dict[Tuple[str, str], Dict[str, int]],
+                    Dict[str, Dict[str, int]],
+                    Dict[str, int],
+                ],
+            ]
+        ] = None
 
     def redact_diagnostic(self, message: str) -> str:
         return redact_diagnostic(message, (*self._diagnostic_secrets, *self._previous_diagnostic_secrets))
@@ -254,42 +265,27 @@ class Repository:
     # ------------------------------------------------------------------
     # Targets (auto-update tracking list)
     # ------------------------------------------------------------------
-    async def list_targets(
-        self,
-        enabled_only: bool = False,
-        site: Optional[str] = None,
-        *,
-        exclude_baseline_pending: bool = False,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        query_params: List[Any] = []
-        if enabled_only:
-            clauses.append("enabled = 1")
-        if exclude_baseline_pending:
-            clauses.append("baseline_pending = 0")
-        if site and str(site).strip():
-            clauses.append("site = ?")
-            query_params.append(normalize_site(site))
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = await self.db.fetch_all(
-            f"SELECT * FROM targets {where} ORDER BY LOWER(username) ASC, id ASC",
-            query_params,
-        )
-        if not rows:
-            return rows
+    async def _get_target_video_counts(self) -> Tuple[
+        Dict[Tuple[str, str, str], Dict[str, int]],
+        Dict[Tuple[str, str], Dict[str, int]],
+        Dict[str, Dict[str, int]],
+        Dict[str, int],
+    ]:
+        version = self.db.video_meta_version
+        cached = self._target_counts_cache
+        if cached is not None and cached[0] == version:
+            return cached[1]
 
-        today_start_dt = local_day_start_utc()
-        today_str = local_today_date()
         video_rows = await self.db.fetch_all(
             """
-            SELECT LOWER(site) AS site_lower,
+            SELECT site AS site_lower,
                    LOWER(uploader) AS uploader_lower,
                    LOWER(target_type) AS target_type_lower,
                    COUNT(*) AS total_cnt,
                    SUM(CASE WHEN status IN ('downloaded', 'uploaded') THEN 1 ELSE 0 END) AS saved_cnt,
                    SUM(CASE WHEN status = 'baseline' THEN 1 ELSE 0 END) AS baseline_cnt
             FROM videos
-            GROUP BY LOWER(site), LOWER(uploader), LOWER(target_type)
+            GROUP BY site, LOWER(uploader), LOWER(target_type)
             """
         )
 
@@ -322,6 +318,47 @@ class Repository:
             elif t_low != "favorites" and u_low:
                 user_bucket = non_special_counts_by_uploader.setdefault((s_low, u_low), _empty_counts())
                 _add_counts(user_bucket, total_c, saved_c, base_c)
+
+        result = (counts_by_pair, non_special_counts_by_uploader, liked_counts_by_site, xh_favorites_counts)
+        if version == self.db.video_meta_version:
+            self._target_counts_cache = (version, result)
+        return result
+
+    async def list_targets(
+        self,
+        enabled_only: bool = False,
+        site: Optional[str] = None,
+        *,
+        exclude_baseline_pending: bool = False,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        query_params: List[Any] = []
+        if enabled_only:
+            clauses.append("enabled = 1")
+        if exclude_baseline_pending:
+            clauses.append("baseline_pending = 0")
+        if site and str(site).strip():
+            clauses.append("site = ?")
+            query_params.append(normalize_site(site))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = await self.db.fetch_all(
+            f"SELECT * FROM targets {where} ORDER BY LOWER(username) ASC, id ASC",
+            query_params,
+        )
+        if not rows:
+            return rows
+
+        today_start_dt = local_day_start_utc()
+        today_str = local_today_date()
+        (
+            counts_by_pair,
+            non_special_counts_by_uploader,
+            liked_counts_by_site,
+            xh_favorites_counts,
+        ) = await self._get_target_video_counts()
+
+        def _empty_counts() -> Dict[str, int]:
+            return {"total": 0, "saved": 0, "baseline": 0}
 
         non_special_targets_per_user: Dict[Tuple[str, str], int] = {}
         for r in rows:
@@ -1184,11 +1221,17 @@ class Repository:
         return {row["viewkey"] for row in rows}
 
     async def _get_target_display_map(
-        self, *, conn: Optional[aiosqlite.Connection] = None,
+        self,
+        *,
+        conn: Optional[aiosqlite.Connection] = None,
+        snapshot_version: Optional[int] = None,
     ) -> Dict[Tuple[str, str], str]:
-        version = self.db.video_meta_version
+        version = snapshot_version if snapshot_version is not None else self.db.video_meta_version
+        allow_cache = conn is None or (
+            snapshot_version is not None and self.db.video_meta_version == snapshot_version
+        )
         cached = self._display_map_cache
-        if conn is None and cached is not None and cached[0] == version:
+        if allow_cache and cached is not None and cached[0] == version:
             return cached[1]
         rows = await self.db.fetch_all(
             """
@@ -1205,7 +1248,7 @@ class Repository:
             uname = r["uname"]
             if uname and (s_low, uname) not in mapping:
                 mapping[(s_low, uname)] = r["display_name"]
-        if conn is None and version == self.db.video_meta_version:
+        if (conn is None or snapshot_version is not None) and version == self.db.video_meta_version:
             self._display_map_cache = (version, mapping)
         return mapping
 
@@ -1226,21 +1269,11 @@ class Repository:
     ) -> Tuple[List[Dict[str, Any]], int]:
         clauses = []
         params: List[Any] = []
-        if (site or "").strip():
+        site_filter = normalize_site(site) if (site or "").strip() else ""
+        if site_filter:
             clauses.append("v.site = ?")
-            params.append(normalize_site(site))
+            params.append(site_filter)
         search_clean = search.strip()
-        if search_clean:
-            like = f"%{search_clean}%"
-            clauses.append("""
-                (v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR v.uploader_display_name LIKE ?
-                 OR EXISTS (
-                    SELECT 1 FROM targets t
-                    WHERE t.site = v.site AND LOWER(TRIM(t.username)) = LOWER(TRIM(v.uploader))
-                      AND t.display_name LIKE ?
-                 ))
-            """)
-            params.extend([like] * 5)
         if uploader.strip():
             u_clean = uploader.strip()
             if u_clean.lower() == "my_liked":
@@ -1270,10 +1303,8 @@ class Repository:
             )
             params.append(activity_cutoff)
 
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         if (sort_by or "").strip().lower() == "published":
             order_sql = (
-                "(v.published_at = '') ASC, "
                 "v.published_at DESC, "
                 "COALESCE(v.downloaded_at, v.uploaded_at, v.created_at) DESC, "
                 "v.viewkey DESC"
@@ -1286,6 +1317,45 @@ class Repository:
 
         offset = max(0, (page - 1) * page_size)
         async with (self.db.read() if conn is None else nullcontext(conn)) as read_conn:
+            if search_clean:
+                like = f"%{search_clean}%"
+                target_rows = await self.db.fetch_all(
+                    (
+                        "SELECT DISTINCT site, LOWER(TRIM(username)) AS uname FROM targets "
+                        "WHERE display_name LIKE ? AND site = ?"
+                        if site_filter
+                        else "SELECT DISTINCT site, LOWER(TRIM(username)) AS uname FROM targets "
+                        "WHERE display_name LIKE ?"
+                    ),
+                    (like, site_filter) if site_filter else (like,),
+                    conn=read_conn,
+                )
+                matched_by_site: Dict[str, List[str]] = {}
+                for trow in target_rows:
+                    uname = str(trow.get("uname") or "").strip()
+                    if uname:
+                        matched_by_site.setdefault(normalize_site(trow.get("site")), []).append(uname)
+
+                search_parts = [
+                    "v.title LIKE ?",
+                    "v.viewkey LIKE ?",
+                    "v.uploader LIKE ?",
+                    "v.uploader_display_name LIKE ?",
+                ]
+                search_params: List[Any] = [like, like, like, like]
+                for matched_site, unames in matched_by_site.items():
+                    placeholders = ",".join("?" for _ in unames)
+                    if site_filter:
+                        search_parts.append(f"LOWER(TRIM(v.uploader)) IN ({placeholders})")
+                        search_params.extend(unames)
+                    else:
+                        search_parts.append(f"(v.site = ? AND LOWER(TRIM(v.uploader)) IN ({placeholders}))")
+                        search_params.append(matched_site)
+                        search_params.extend(unames)
+                clauses.append(f"({' OR '.join(search_parts)})")
+                params.extend(search_params)
+
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             if known_total is not None:
                 total = int(known_total)
             else:
@@ -1327,12 +1397,19 @@ class Repository:
         return rows, total
 
     async def get_video_filter_facets(
-        self, site: str = "", *, conn: Optional[aiosqlite.Connection] = None,
+        self,
+        site: str = "",
+        *,
+        conn: Optional[aiosqlite.Connection] = None,
+        snapshot_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         site_filter = normalize_site(site) if (site or "").strip() else ""
-        version = self.db.video_meta_version
+        version = snapshot_version if snapshot_version is not None else self.db.video_meta_version
+        allow_cache = conn is None or (
+            snapshot_version is not None and self.db.video_meta_version == snapshot_version
+        )
         cached = self._facets_cache.get(site_filter)
-        if conn is None and cached is not None and cached[0] == version:
+        if allow_cache and cached is not None and cached[0] == version:
             data = cached[1]
             return {
                 "sites": list(data["sites"]),
@@ -1351,7 +1428,7 @@ class Repository:
                        MAX(CASE WHEN uploader_display_name != '' THEN uploader_display_name ELSE '' END) AS video_display_name
                 FROM videos
                 WHERE uploader != ''{where_site}
-                GROUP BY LOWER(site), LOWER(uploader)
+                GROUP BY site, LOWER(uploader)
                 ORDER BY LOWER(uploader) ASC
                 """,
                 site_params,
@@ -1377,7 +1454,7 @@ class Repository:
                 conn=read_conn,
             )
             if conn is not None:
-                display_map = await self._get_target_display_map(conn=read_conn)
+                display_map = await self._get_target_display_map(conn=read_conn, snapshot_version=snapshot_version)
         if conn is None:
             display_map = await self._get_target_display_map()
         video_display_map: Dict[Tuple[str, str], str] = {}
@@ -1431,7 +1508,7 @@ class Repository:
             "uploader_labels": uploader_labels,
             "qualities": [r["quality"] for r in qualities],
         }
-        if conn is None and version == self.db.video_meta_version:
+        if (conn is None or snapshot_version is not None) and version == self.db.video_meta_version:
             if len(self._facets_cache) >= 4:
                 self._facets_cache.clear()
             self._facets_cache[site_filter] = (version, result)
@@ -1442,17 +1519,24 @@ class Repository:
             "qualities": list(result["qualities"]),
         }
 
-    async def get_video_stats(
-        self, site: str = "", *, conn: Optional[aiosqlite.Connection] = None,
-    ) -> Dict[str, int]:
+    async def get_video_stats_with_cache_info(
+        self,
+        site: str = "",
+        *,
+        conn: Optional[aiosqlite.Connection] = None,
+        snapshot_version: Optional[int] = None,
+    ) -> Tuple[Dict[str, int], bool]:
         site_filter = normalize_site(site) if (site or "").strip() else ""
-        version = self.db.video_meta_version
+        version = snapshot_version if snapshot_version is not None else self.db.video_meta_version
         today_key = local_today_date()
+        allow_cache = conn is None or (
+            snapshot_version is not None and self.db.video_meta_version == snapshot_version
+        )
         cached = self._stats_cache.get(site_filter)
-        if conn is None and cached is not None and cached[0] == version and cached[1] == today_key:
-            return dict(cached[2])
+        if allow_cache and cached is not None and cached[0] == version and cached[1] == today_key:
+            return dict(cached[2]), True
 
-        where_site = " WHERE LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
+        where_site = " WHERE site = ?" if site_filter else ""
         cutoff_7d = local_date_days_ago(7)
         params: Tuple[Any, ...] = (cutoff_7d, site_filter) if site_filter else (cutoff_7d,)
         row = await self.db.fetch_one(
@@ -1478,11 +1562,23 @@ class Repository:
             "published_7d": int(row["published_7d"]) if row else 0,
             "baseline_missing_metadata": int(row["baseline_missing_metadata"]) if row else 0,
         }
-        if conn is None and version == self.db.video_meta_version:
+        if (conn is None or snapshot_version is not None) and version == self.db.video_meta_version:
             if len(self._stats_cache) >= 4:
                 self._stats_cache.clear()
             self._stats_cache[site_filter] = (version, today_key, counts)
-        return dict(counts)
+        return dict(counts), False
+
+    async def get_video_stats(
+        self,
+        site: str = "",
+        *,
+        conn: Optional[aiosqlite.Connection] = None,
+        snapshot_version: Optional[int] = None,
+    ) -> Dict[str, int]:
+        counts, _ = await self.get_video_stats_with_cache_info(
+            site=site, conn=conn, snapshot_version=snapshot_version,
+        )
+        return counts
 
     # ------------------------------------------------------------------
     # Jobs & JobItems
