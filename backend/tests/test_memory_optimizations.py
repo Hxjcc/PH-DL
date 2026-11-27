@@ -1,6 +1,7 @@
 """Regression coverage for the HTTP, HLS, and playback memory limits."""
 
 import asyncio
+from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -175,3 +176,10 @@ async def test_reclaim_memory_trims_even_if_sqlite_is_unavailable(monkeypatch):
     monkeypatch.setattr(memory, "trim_process_memory", lambda: calls.append("trim"))
     await memory.reclaim_memory(SimpleNamespace(execute=execute))
     assert calls == ["gc", "PRAGMA shrink_memory", "trim"]
+
+
+def test_dockerfile_avoids_static_malloc_trim_threshold():
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
+    env_lines = [line.strip() for line in dockerfile.splitlines() if line.strip() and not line.strip().startswith("#")]
+    assert any("MALLOC_ARENA_MAX=2" in line for line in env_lines)
+    assert not any("MALLOC_TRIM_THRESHOLD_" in line for line in env_lines)

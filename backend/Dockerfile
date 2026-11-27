@@ -3,11 +3,14 @@ FROM mwader/static-ffmpeg:9.1 AS ffmpeg
 
 FROM python:3.12-slim
 
+# Keep MALLOC_ARENA_MAX=2 to cap glibc arena RSS across worker threads, but do NOT
+# set MALLOC_TRIM_THRESHOLD_ (which disables glibc's dynamic mmap_threshold and pins it
+# at 128 KiB, causing massive mmap/munmap page-fault churn on 256-512 KiB TLS/HTTP buffers).
+# Idle heap memory is reclaimed after jobs via malloc_trim(0) in app/engine/memory.py.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    MALLOC_ARENA_MAX=2 \
-    MALLOC_TRIM_THRESHOLD_=131072
+    MALLOC_ARENA_MAX=2
 
 # Minimal certs & tzdata; copy static rclone and ffmpeg/ffprobe binaries (used with yt-dlp for HLS remuxing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
