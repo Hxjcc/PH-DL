@@ -430,29 +430,105 @@ async def _stream_mp4_body(
     received = 0
     pending: Optional[asyncio.Task[None]] = None
     read_size = chunk_size if chunk_size is not None else (_MIB if overlap else _RANGE_READ_BYTES)
+    buf_cap = min(read_size, expected) if expected is not None and expected > 0 else read_size
+    bufs: list[Optional[bytearray]] = [None, None]
+    cur = 0
+    filled = 0
+    wrote_any = False
+    last_flush = time.monotonic()
 
-    async def write_chunk(chunk: bytes) -> None:
-        await asyncio.to_thread(_write_media_chunk, fp, chunk, prepare_write)
-        advance(len(chunk))
+    async def write_direct(payload: bytes) -> None:
+        await asyncio.to_thread(_write_media_chunk, fp, payload, prepare_write)
+        advance(len(payload))
+
+    async def write_buffered(buf: bytearray, length: int) -> None:
+        def _write_slice() -> None:
+            with memoryview(buf)[:length] as view:
+                _write_media_chunk(fp, view, prepare_write)
+
+        await asyncio.to_thread(_write_slice)
+        advance(length)
+
+    async def flush_buffered(*, wait_current: bool = False) -> None:
+        nonlocal pending, cur, filled, wrote_any, last_flush
+        if not filled:
+            return
+        buf = bufs[cur]
+        assert buf is not None
+        length = filled
+        filled = 0
+        wrote_any = True
+        last_flush = time.monotonic()
+        if pending is not None:
+            previous, pending = pending, None
+            await _await_file_io(previous)
+        pending = asyncio.create_task(write_buffered(buf, length))
+        if wait_current or not overlap:
+            previous, pending = pending, None
+            await _await_file_io(previous)
+        else:
+            cur ^= 1
 
     try:
         async for chunk in response.content.iter_chunked(read_size):
-            if pending is not None:
-                previous, pending = pending, None
-                await _await_file_io(previous)
             if stop.is_set():
                 raise StopRequested
-            if expected is not None and received + len(chunk) > expected:
+            if not chunk:
+                continue
+            n = len(chunk)
+            if expected is not None and received + n > expected:
+                if filled:
+                    await flush_buffered(wait_current=True)
                 raise _RangeMismatch("下载响应超过声明的字节范围")
-            received += len(chunk)
-            pending = asyncio.create_task(write_chunk(chunk))
-            if not overlap:
-                previous, pending = pending, None
-                await _await_file_io(previous)
+            received += n
+            # Flush the first chunk immediately so disk guards and initial progress fire without waiting,
+            # and pass through full-sized chunks directly without copying.
+            if not filled and (not wrote_any or n >= buf_cap):
+                if pending is not None:
+                    previous, pending = pending, None
+                    await _await_file_io(previous)
+                wrote_any = True
+                last_flush = time.monotonic()
+                pending = asyncio.create_task(write_direct(chunk))
+                if not overlap:
+                    previous, pending = pending, None
+                    await _await_file_io(previous)
+                del chunk
+                continue
+            # Coalesce small TLS records (typically ~16 KiB) into reusable read_size buffers so
+            # asyncio.to_thread / unbuffered write() overhead does not saturate a CPU core.
+            if n <= buf_cap - filled:
+                if bufs[cur] is None:
+                    bufs[cur] = bytearray(buf_cap)
+                target = bufs[cur]
+                assert target is not None
+                target[filled:filled + n] = chunk
+                filled += n
+                if filled == buf_cap:
+                    await flush_buffered()
+            else:
+                with memoryview(chunk) as src:
+                    pos = 0
+                    while pos < n:
+                        if bufs[cur] is None:
+                            bufs[cur] = bytearray(buf_cap)
+                        target = bufs[cur]
+                        assert target is not None
+                        take = min(n - pos, buf_cap - filled)
+                        target[filled:filled + take] = src[pos:pos + take]
+                        filled += take
+                        pos += take
+                        if filled == buf_cap:
+                            await flush_buffered()
             del chunk
+            if filled and (time.monotonic() - last_flush) >= 0.25:
+                await flush_buffered()
+        if filled:
+            await flush_buffered(wait_current=True)
     finally:
         if pending is not None:
             await _await_file_io(pending)
+        bufs.clear()
     if expected is not None and received != expected:
         raise aiohttp.ClientPayloadError(f"下载不完整 ({received}/{expected})")
     return received

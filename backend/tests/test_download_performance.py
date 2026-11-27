@@ -696,3 +696,93 @@ async def test_wal_read_connection_does_not_block_on_write_lock_and_meta_cache_i
         assert set(facets2["uploaders"]) == {"alice", "bob"}
     finally:
         await db.close()
+
+
+async def test_mp4_stream_coalesces_small_tls_chunks_into_bounded_disk_writes(tmp_path, monkeypatch):
+    payload = large_mp4(3 * MIB + 17_321)
+    write_sizes = []
+    original_write = downloader._write_media_chunk
+
+    def track_write(fp, chunk, prepare):
+        write_sizes.append(len(chunk))
+        original_write(fp, chunk, prepare)
+
+    async def small_chunks(_size):
+        step = 16 * 1024
+        for offset in range(0, len(payload), step):
+            yield payload[offset:offset + step]
+
+    class Response:
+        status = 200
+        headers = {"Content-Length": str(len(payload)), "ETag": ETAG}
+        content = SimpleNamespace(iter_chunked=small_chunks)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+    monkeypatch.setattr(downloader, "_write_media_chunk", track_write)
+    session = SimpleNamespace(get=lambda *_, **__: Response())
+    result = await downloader.download_mp4_with_resume(**media_args(
+        tmp_path, session, "https://cdn.example/media",
+    ))
+    assert result.success and result.local_path.read_bytes() == payload
+    assert sum(write_sizes) == len(payload)
+    assert max(write_sizes) <= MIB
+    # ~194 16 KiB TLS records should coalesce into ~5 disk writes instead of ~194.
+    assert len(write_sizes) <= 8
+
+
+async def test_hls_disk_spill_coalesces_small_tls_chunks(tmp_path, monkeypatch):
+    segment_data = b"S" * (700 * 1024 + 123)
+    write_sizes = []
+    original_write = hls_downloader._write_media_chunk
+
+    def track_write(fp, chunk, prepare):
+        if getattr(fp, "name", "").endswith(".tmp"):
+            write_sizes.append(len(chunk))
+        original_write(fp, chunk, prepare)
+
+    async def handler(request):
+        if request.path == "/index.m3u8":
+            return web.Response(text="#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n#EXT-X-ENDLIST\n")
+        resp = web.StreamResponse(status=200, headers={"Content-Length": str(len(segment_data))})
+        await resp.prepare(request)
+        step = 16 * 1024
+        for offset in range(0, len(segment_data), step):
+            await resp.write(segment_data[offset:offset + step])
+            await asyncio.sleep(0)
+        await resp.write_eof()
+        return resp
+
+    monkeypatch.setattr(hls_downloader, "_write_media_chunk", track_write)
+    app = web.Application()
+    app.router.add_get("/{name:.*}", handler)
+    async with TestServer(app) as server, aiohttp.ClientSession() as session:
+        # Force immediate disk spill by giving the budget 0 payload allowance.
+        tiny_budget = hls_downloader.HlsMemoryBudget(max_bytes=1, http_slots=1, writers=1)
+        out = await hls_downloader._download_hls_aiohttp(
+            session=session,
+            playlist_url=str(server.make_url("/index.m3u8")),
+            hls_dir=tmp_path,
+            viewkey="vk_spill",
+            quality="1080p",
+            referer="",
+            cookie_str="",
+            proxy_url=None,
+            segment_concurrency=1,
+            request_timeout=10,
+            stop=asyncio.Event(),
+            prepare_write=lambda _: None,
+            on_tick=lambda *_: None,
+            memory_budget=tiny_budget,
+            spill_to_disk=True,
+        )
+    assert out.ok
+    assert (tmp_path / "stream.mp4").read_bytes() == segment_data
+    assert sum(write_sizes) == len(segment_data)
+    assert max(write_sizes) <= hls_downloader._AIOHTTP_CHUNK_BYTES
+    # 44 16 KiB TLS records should coalesce into <= 4 disk writes.
+    assert len(write_sizes) <= 4

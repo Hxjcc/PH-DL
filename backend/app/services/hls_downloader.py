@@ -987,6 +987,22 @@ async def _download_hls_aiohttp(
                                 # sharing the budget never have to lend it unaccounted memory.
                                 spill = hls_dir / f"seg_{seg_idx:06d}.tmp"
                             with spill.open("xb", buffering=0) if spill else contextlib.nullcontext() as spool:
+                                spool_buf = bytearray(_AIOHTTP_CHUNK_BYTES) if spool is not None else None
+                                spool_filled = 0
+
+                                async def _flush_spool() -> None:
+                                    nonlocal spool_filled
+                                    if spool is None or spool_buf is None or not spool_filled:
+                                        return
+                                    length = spool_filled
+                                    spool_filled = 0
+
+                                    def _write_spool() -> None:
+                                        with memoryview(spool_buf)[:length] as view:
+                                            _write_media_chunk(spool, view, prepare_write)
+
+                                    await _write_in_thread(_write_spool)
+
                                 async for chunk in resp.content.iter_chunked(_AIOHTTP_CHUNK_BYTES):
                                     n = len(chunk)
                                     upper_limit = expected if expected is not None else _AIOHTTP_MAX_SEGMENT_BYTES
@@ -994,7 +1010,24 @@ async def _download_hls_aiohttp(
                                         last_err = "HLS 分片超出声明大小或单分片限制"
                                         break
                                     if spool is not None:
-                                        await _write_in_thread(_write_media_chunk, spool, chunk, prepare_write)
+                                        assert spool_buf is not None
+                                        if not spool_filled and n >= _AIOHTTP_CHUNK_BYTES:
+                                            await _write_in_thread(_write_media_chunk, spool, chunk, prepare_write)
+                                        elif n <= _AIOHTTP_CHUNK_BYTES - spool_filled:
+                                            spool_buf[spool_filled:spool_filled + n] = chunk
+                                            spool_filled += n
+                                            if spool_filled == _AIOHTTP_CHUNK_BYTES:
+                                                await _flush_spool()
+                                        else:
+                                            with memoryview(chunk) as src:
+                                                pos = 0
+                                                while pos < n:
+                                                    take = min(n - pos, _AIOHTTP_CHUNK_BYTES - spool_filled)
+                                                    spool_buf[spool_filled:spool_filled + take] = src[pos:pos + take]
+                                                    spool_filled += take
+                                                    pos += take
+                                                    if spool_filled == _AIOHTTP_CHUNK_BYTES:
+                                                        await _flush_spool()
                                     elif budget is not None:
                                         buf[received:received + n] = chunk
                                     else:
@@ -1012,6 +1045,8 @@ async def _download_hls_aiohttp(
                                     _record_speed_delta(n)
                                     del chunk
                                 else:
+                                    if spool_filled:
+                                        await _flush_spool()
                                     if received and (expected is None or received == expected):
                                         result = _HlsSegment(received, buf, spill)
                                     else:
