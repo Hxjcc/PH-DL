@@ -803,9 +803,11 @@ async def test_subscriptions_filter_users_and_build_target_urls(monkeypatch):
 
     ctx = TaskHttpContext()
     requested_urls: list[str] = []
+    requested_headers: list[dict] = []
 
     async def fake_fetch(url, **kwargs):
         requested_urls.append(url)
+        requested_headers.append(kwargs.get("headers") or {})
         if "page=1" in url:
             html = """
             <ul id="moreData" class="userWidgetWrapperGrid">
@@ -821,6 +823,8 @@ async def test_subscriptions_filter_users_and_build_target_urls(monkeypatch):
     monkeypatch.setattr(ctx, "fetch_with_pow", fake_fetch)
     subs = await fetch_subscriptions(ctx, "Hxiay", SelectorSettings())
     assert requested_urls[0] == "https://www.pornhub.com/users/hxiay/subscriptions?page=1"
+    assert requested_headers[0].get("Cache-Control") == "no-cache"
+    assert requested_headers[0].get("Pragma") == "no-cache"
     assert subs == [
         ("model", "aquari", "AquaRi", "https://cdn.example/aquari.jpg"),
         ("pornstar", "eva-elfie", "Eva", ""),

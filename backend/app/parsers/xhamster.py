@@ -1930,6 +1930,7 @@ async def fetch_xhamster_subscriptions_detailed(
     uid_to_creator_idx: Dict[int, int] = {}
     slug_to_creator_idx: Dict[str, int] = {}
     req_timeout = max(5.0, float(timeout))
+    subs_headers = {**_xh_headers(), "Cache-Control": "no-cache", "Pragma": "no-cache"}
 
     def _add_item(
         utype: str,
@@ -1970,7 +1971,7 @@ async def fetch_xhamster_subscriptions_detailed(
         )
         res, _ = await ctx.fetch_with_pow(
             url,
-            headers=_xh_headers(),
+            headers=subs_headers,
             timeout=req_timeout,
             log_label=f"xHamster 创作者订阅第 {page_num} 页",
         )
@@ -2050,7 +2051,7 @@ async def fetch_xhamster_subscriptions_detailed(
         )
         res, _ = await ctx.fetch_with_pow(
             url,
-            headers=_xh_headers(),
+            headers=subs_headers,
             timeout=req_timeout,
             log_label=f"xHamster 频道订阅第 {page_num} 页",
         )
@@ -2104,7 +2105,7 @@ async def fetch_xhamster_subscriptions_detailed(
         )
         res, _ = await ctx.fetch_with_pow(
             url,
-            headers=_xh_headers(),
+            headers=subs_headers,
             timeout=req_timeout,
             log_label=f"xHamster 用户订阅第 {page_num} 页",
         )

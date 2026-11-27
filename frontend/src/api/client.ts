@@ -107,7 +107,7 @@ export const api = {
     if (username) sp.set('username', username)
     if (site && site !== 'pornhub') sp.set('site', site)
     const qs = sp.toString() ? `?${sp.toString()}` : ''
-    return request(`/api/subscriptions${qs}`)
+    return request(`/api/subscriptions${qs}`, { cache: 'no-store' })
   },
 
   // Targets

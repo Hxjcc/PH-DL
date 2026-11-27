@@ -12,9 +12,10 @@ import shutil
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Set
+from typing import Callable, Iterator, Optional, Set, TypeVar
+from urllib.parse import unquote_plus, urlsplit
 
 import aiohttp
 
@@ -36,6 +37,17 @@ DOWNLOAD_HEADERS = {
 
 ProgressCallback = Callable[[int, int, float], None]  # (downloaded_bytes, total_bytes, speed_bps)
 LogCallback = Callable[[str, str], None]
+_T = TypeVar("_T")
+_MIB = 1024 * 1024
+_RANGE_BYTES = 4 * _MIB
+_RANGE_READ_BYTES = 512 * 1024
+_RANGE_READ_BUFSIZE = 256 * 1024
+_MAX_CHECKPOINT_BYTES = 16_384
+_MAX_CHECKPOINT_RANGES = 128
+_MAX_FILE_BYTES = (1 << 63) - 1
+_CHECKPOINT_WRITE_INTERVAL = 3.0
+_EXPIRED_MEDIA_CODES = {403, 410, 472}
+_SIGNED_QUERY_KEYS = frozenset({"token", "sig", "signature", "expires", "validfrom", "validto", "hash", "hdnea"})
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,10 @@ class DownloadOutcome:
 
 class _RangeMismatch(Exception):
     pass
+
+
+class _RetrySingleStream(_RangeMismatch):
+    """A response established that parallel requests cannot be combined safely."""
 
 
 class _DiskSpaceError(Exception):
@@ -97,16 +113,16 @@ class DownloadDiskBudget:
         last_free = initial_free
         written_since_check = 0
         try:
-            def before_write(size: int) -> None:
-                nonlocal last_free, written_since_check
+            @contextlib.contextmanager
+            def writing(size: int) -> Iterator[None]:
+                nonlocal last_free, written_since_check, remaining
                 with self._lock:
                     others = self._reserved - remaining
                     projected_free = last_free - written_since_check - size
-                    need_check = (
+                    if (
                         written_since_check + size >= self._CHECK_INTERVAL_BYTES
                         or projected_free < self.keep_free_bytes + others + self._STRICT_NEAR_FLOOR_BYTES
-                    )
-                    if need_check:
+                    ):
                         last_free = shutil.disk_usage(self.path).free
                         written_since_check = 0
                         if last_free < self.keep_free_bytes + others + size:
@@ -116,19 +132,60 @@ class DownloadDiskBudget:
                                 during_write=True,
                             )
                     written_since_check += size
+                    reserved_for_write = min(size, remaining)
+                    remaining -= reserved_for_write
+                    self._reserved += size - reserved_for_write
+                try:
+                    yield
+                finally:
+                    with self._lock:
+                        self._reserved -= size
 
-            def consume(size: int) -> None:
-                nonlocal remaining
-                before_write(size)
-                with self._lock:
-                    used = min(size, remaining)
-                    remaining -= used
-                    self._reserved -= used
-
-            yield consume
+            yield _DiskWriteGuard(writing)
         finally:
             with self._lock:
                 self._reserved -= remaining
+
+
+@dataclass(frozen=True)
+class _DiskWriteGuard:
+    writing: Callable[[int], contextlib.AbstractContextManager[None]]
+
+    def __call__(self, size: int) -> None:
+        # Legacy observers such as yt-dlp report the bytes after their own write.
+        with self.writing(size):
+            pass
+
+
+def _disk_write(prepare_write: Callable[[int], None], size: int) -> contextlib.AbstractContextManager[None]:
+    if isinstance(prepare_write, _DiskWriteGuard):
+        return prepare_write.writing(size)
+    prepare_write(size)
+    return contextlib.nullcontext()
+
+
+def _write_media_chunk(fp, chunk: bytes, prepare_write: Callable[[int], None]) -> None:
+    with _disk_write(prepare_write, len(chunk)):
+        if fp.write(chunk) != len(chunk):
+            raise OSError("未能写入全部下载数据")
+
+
+async def _await_file_io(task: asyncio.Task[_T]) -> _T:
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancelling an await never stops a running thread. Keep the file open
+        # until that thread has finished, including on repeated cancellation.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+        raise
 
 
 @dataclass(frozen=True)
@@ -139,6 +196,16 @@ class DownloadCheckpoint:
     response_fingerprint: str
     etag: str
     total: int
+    completed_ranges: Optional[list[list[int]]] = None
+
+    def saved_bytes(self, file_size: int) -> int:
+        if file_size > self.total:
+            return 0
+        if self.completed_ranges is None:
+            return file_size
+        if self.completed_ranges and self.completed_ranges[-1][1] > file_size:
+            return 0
+        return sum(end - start for start, end in self.completed_ranges)
 
 
 _SATISFIED_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
@@ -147,6 +214,14 @@ _UNSATISFIED_RANGE = re.compile(r"bytes \*/(\d+)")
 
 def _fingerprint(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def _media_resource(url: str):
+    """Compare origins, paths, and non-signing query parameters during explicit URL renewal."""
+    parsed = urlsplit(url)
+    query = "&".join(part for part in parsed.query.split("&")
+                     if unquote_plus(part.partition("=")[0]).lower() not in _SIGNED_QUERY_KEYS)
+    return parsed._replace(query=query)
 
 
 def _strong_etag(value: str) -> str:
@@ -161,18 +236,28 @@ def _checkpoint_path(path: Path) -> Path:
 def read_download_checkpoint(path: Path) -> Optional[DownloadCheckpoint]:
     try:
         sidecar = _checkpoint_path(path)
-        if sidecar.is_symlink() or sidecar.stat().st_size > 16_384:
+        if sidecar.is_symlink() or sidecar.stat().st_size > _MAX_CHECKPOINT_BYTES:
             return None
         data = json.loads(sidecar.read_text(encoding="utf-8"))
         if data.pop("version") != 1:
             return None
         checkpoint = DownloadCheckpoint(**data)
-        if (
-            type(checkpoint.total) is int
-            and checkpoint.total >= 0
-            and all(isinstance(value, str) for name, value in data.items() if name != "total")
+        if type(checkpoint.total) is not int or not 0 <= checkpoint.total <= _MAX_FILE_BYTES or not all(
+            isinstance(value, str) for name, value in data.items() if name not in {"total", "completed_ranges"}
         ):
-            return checkpoint
+            return None
+        ranges = checkpoint.completed_ranges
+        if ranges is not None:
+            if not isinstance(ranges, list) or len(ranges) > _MAX_CHECKPOINT_RANGES:
+                return None
+            previous_end = -1
+            for interval in ranges:
+                if (not isinstance(interval, list) or len(interval) != 2
+                    or any(type(bound) is not int for bound in interval)
+                    or not previous_end < interval[0] < interval[1] <= checkpoint.total):
+                    return None
+                previous_end = interval[1]
+        return checkpoint
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
     return None
@@ -195,7 +280,12 @@ def write_atomic_json(path: Path, data: dict) -> None:
 
 
 def _write_checkpoint(path: Path, checkpoint: DownloadCheckpoint) -> None:
-    write_atomic_json(_checkpoint_path(path), {"version": 1, **asdict(checkpoint)})
+    data = asdict(checkpoint)
+    if checkpoint.completed_ranges is None:
+        data.pop("completed_ranges")
+    else:
+        data["completed_ranges"] = data["completed_ranges"][:_MAX_CHECKPOINT_RANGES]
+    write_atomic_json(_checkpoint_path(path), {"version": 1, **data})
 
 
 def _size(path: Path) -> int:
@@ -203,6 +293,108 @@ def _size(path: Path) -> int:
         return path.stat().st_size
     except FileNotFoundError:
         return 0
+
+
+def _missing_ranges(total: int, completed: list[list[int]]) -> Iterator[tuple[int, int]]:
+    start = 0
+    for left, right in [*completed, [total, total]]:
+        for offset in range(start, left, _RANGE_BYTES):
+            yield offset, min(offset + _RANGE_BYTES, left)
+        start = right
+
+
+def _add_completed_range(completed: list[list[int]], start: int, end: int) -> None:
+    left = 0
+    while left < len(completed) and completed[left][1] < start:
+        left += 1
+    right = left
+    while right < len(completed) and completed[right][0] <= end:
+        start = min(start, completed[right][0])
+        end = max(end, completed[right][1])
+        right += 1
+    completed[left:right] = [[start, end]]
+
+
+def _content_length(response) -> Optional[int]:
+    length = response.headers.get("Content-Length", "").strip()
+    return int(length) if length.isdigit() else None
+
+
+def _identity_encoding(response) -> bool:
+    return response.headers.get("Content-Encoding", "identity").strip().lower() in {"", "identity"}
+
+
+def _response_range(response) -> tuple[int, int, int]:
+    span = _SATISFIED_RANGE.fullmatch(response.headers.get("Content-Range", "").strip())
+    if not span:
+        raise _RangeMismatch("HTTP 206 缺少有效的字节范围")
+    start, last, total = map(int, span.groups())
+    end = last + 1
+    if not start < end <= total <= _MAX_FILE_BYTES:
+        raise _RangeMismatch("HTTP 206 返回了无效的字节区间")
+    length = _content_length(response)
+    if "Content-Length" in response.headers and length != end - start:
+        raise _RangeMismatch("HTTP 206 响应体长度与字节区间不符")
+    return start, end, total
+
+
+def _progress_tracker(callback: Optional[ProgressCallback], downloaded: int, total: int):
+    last_tick, since_tick = time.monotonic(), 0
+    if callback:
+        callback(downloaded, total, 0.0)
+
+    def advance(count: int) -> None:
+        nonlocal downloaded, last_tick, since_tick
+        downloaded += count
+        if callback:
+            since_tick += count
+            now = time.monotonic()
+            if now - last_tick >= 0.35:
+                callback(downloaded, total, since_tick / (now - last_tick))
+                last_tick, since_tick = now, 0
+
+    return advance
+
+
+async def _stream_mp4_body(
+    response,
+    fp,
+    expected: Optional[int],
+    prepare_write: Callable[[int], None],
+    advance: Callable[[int], None],
+    stop: asyncio.Event,
+    *,
+    overlap: bool,
+) -> int:
+    received = 0
+    pending: Optional[asyncio.Task[None]] = None
+    chunk_size = _MIB if overlap else _RANGE_READ_BYTES
+
+    async def write_chunk(chunk: bytes) -> None:
+        await asyncio.to_thread(_write_media_chunk, fp, chunk, prepare_write)
+        advance(len(chunk))
+
+    try:
+        async for chunk in response.content.iter_chunked(chunk_size):
+            if pending is not None:
+                previous, pending = pending, None
+                await _await_file_io(previous)
+            if stop.is_set():
+                raise StopRequested
+            if expected is not None and received + len(chunk) > expected:
+                raise _RangeMismatch("下载响应超过声明的字节范围")
+            received += len(chunk)
+            pending = asyncio.create_task(write_chunk(chunk))
+            if not overlap:
+                previous, pending = pending, None
+                await _await_file_io(previous)
+            del chunk
+    finally:
+        if pending is not None:
+            await _await_file_io(pending)
+    if expected is not None and received != expected:
+        raise aiohttp.ClientPayloadError(f"下载不完整 ({received}/{expected})")
+    return received
 
 
 async def probe_download_size(
@@ -276,6 +468,9 @@ async def download_mp4_with_resume(
     retry_delay_max: float = 10.0,
     request_timeout: Optional[float] = None,
     min_file_size_bytes: int = 10240,
+    range_connections: int = 1,
+    range_semaphore: Optional[asyncio.Semaphore] = None,
+    min_multi_range_bytes: int = 24 * _MIB,
     cancel_event: Optional[asyncio.Event] = None,
     on_progress: Optional[ProgressCallback] = None,
     on_log: Optional[LogCallback] = None,
@@ -302,6 +497,10 @@ async def download_mp4_with_resume(
     owned_parts: Set[Path] = set()
     superseded_parts: Set[Path] = set()
     force_fresh = False
+    connections = max(1, min(4, int(range_connections)))
+    parallel_enabled = connections > 1
+    validated_response_url = ""
+    renewed_from: Optional[tuple[str, str]] = None
 
     def emit(level: str, message: str) -> None:
         if on_log:
@@ -310,6 +509,9 @@ async def download_mp4_with_resume(
     def incomplete(error: str, *, cancelled: bool = False, disk_wait_bytes: int = 0) -> DownloadOutcome:
         try:
             size = _size(part)
+            checkpoint = read_download_checkpoint(part) if size else None
+            if checkpoint and checkpoint.completed_ranges is not None:
+                size = checkpoint.saved_bytes(size)
         except OSError:
             size = 0
         if not size and part in owned_parts:
@@ -337,7 +539,7 @@ async def download_mp4_with_resume(
         return Path(name)
 
     async def refresh_link() -> bool:
-        nonlocal url, referer, current_quality
+        nonlocal url, referer, current_quality, renewed_from
         target_page = page_url or referer
         locked = normalized_quality(current_quality) if _size(part) else ""
         filters = {locked} if locked else preferred_qualities
@@ -360,129 +562,231 @@ async def download_mp4_with_resume(
             )
         if not detail.download_url:
             return False
+        renewed_from = (url, validated_response_url or url) if (
+            url and locked and detail.viewkey == viewkey
+            and normalized_quality(detail.quality or current_quality) == locked
+        ) else None
         url = detail.download_url
         referer = detail.referer_url or referer
         current_quality = detail.quality or current_quality
         return True
 
-    async def receive() -> int:
+    def fresh_part() -> None:
         nonlocal part, force_fresh
-        offset = 0 if part.is_symlink() else _size(part)
-        checkpoint = read_download_checkpoint(part) if offset else None
-        if not (
-            checkpoint and not force_fresh and checkpoint.viewkey == viewkey
-            and normalized_quality(checkpoint.quality) == normalized_quality(current_quality)
-            and checkpoint.request_fingerprint == _fingerprint(url)
-            and _strong_etag(checkpoint.etag) and 0 < offset <= checkpoint.total
-        ):
-            checkpoint = None
+        if part.is_symlink():
+            part = new_part()
+        elif _size(part):
+            previous = read_download_checkpoint(part)
+            if part not in owned_parts or (previous and previous.completed_ranges is not None):
+                if (previous and previous.viewkey == viewkey
+                    and normalized_quality(previous.quality) == normalized_quality(current_quality)):
+                    superseded_parts.add(part)
+                part = new_part()
+                emit("INFO", f"无法安全续接，保留原断点并重新下载: {title}")
+        owned_parts.add(part)
+        force_fresh = False
 
+    def media_request(start: Optional[int], end: Optional[int], etag: str, *, pooled: bool):
         headers = {**DOWNLOAD_HEADERS, "Referer": referer}
         if cookie_str:
             headers["Cookie"] = cookie_str
-        if checkpoint:
-            headers["Range"] = f"bytes={offset}-"
-            headers["If-Range"] = checkpoint.etag
-
-        async with open_media_response(
+        if start is not None:
+            headers["Range"] = f"bytes={start}-{'' if end is None else end - 1}"
+            if etag:
+                headers["If-Range"] = etag
+        return open_media_response(
             session, url, headers=headers, site=getattr(parse_ctx, "site", None),
             proxy=effective_request_proxy(session, proxy_url), auto_decompress=False,
-        ) as response:
-            if response.status not in {200, 206, 416}:
-                response.raise_for_status()
-                raise _RangeMismatch(f"意外的下载响应 HTTP {response.status}")
-            etag = _strong_etag(response.headers.get("ETag", ""))
-            resolved = _fingerprint(str(getattr(response, "url", url)))
-            same_entity = bool(checkpoint and etag == checkpoint.etag and resolved == checkpoint.response_fingerprint)
-            range_header = response.headers.get("Content-Range", "").strip()
-            if response.status == 416:
-                span = _UNSATISFIED_RANGE.fullmatch(range_header)
-                if same_entity and span and int(span[1]) == offset == checkpoint.total:
-                    return offset
-                raise _RangeMismatch("HTTP 416 无法确认断点对应同一完整文件")
+            **({"read_bufsize": _RANGE_READ_BUFSIZE} if pooled else {}),
+        )
 
-            encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
-            if encoding not in {"", "identity"}:
-                raise _RangeMismatch("媒体响应经过内容编码，不能校验原始字节范围")
-            length = response.headers.get("Content-Length", "").strip()
-            expected = int(length) if length.isdigit() else 0
+    async def receive_remaining_ranges(
+        checkpoint: DownloadCheckpoint,
+        completed: list[list[int]],
+        prepare_write: Callable[[int], None],
+        advance: Callable[[int], None],
+    ) -> None:
+        requests = _missing_ranges(checkpoint.total, completed.copy())
+        last_checkpoint = time.monotonic()
 
-            if response.status == 206:
-                span = _SATISFIED_RANGE.fullmatch(range_header)
-                if not same_entity or not span:
-                    raise _RangeMismatch("HTTP 206 缺少有效的范围或原文件校验标记")
-                start, end, total = map(int, span.groups())
-                if start != offset or not start <= end < total or total != checkpoint.total:
-                    raise _RangeMismatch("HTTP 206 返回的字节区间或总大小与断点不符")
-                span_bytes = end - start + 1
-                if length and expected != span_bytes:
-                    raise _RangeMismatch("HTTP 206 响应体长度与字节区间不符")
-                expected = span_bytes
-                mode = "ab"
-            else:
-                start = 0
-                total = expected
-                mode = "wb"
-
-            with disk.reserve(expected) as prepare_write:
-                if mode == "wb":
-                    if part.is_symlink():
-                        part = new_part()
-                    elif _size(part) and part not in owned_parts:
-                        prev_cp = read_download_checkpoint(part)
-                        if (
-                            prev_cp is not None
-                            and prev_cp.viewkey == viewkey
-                            and normalized_quality(prev_cp.quality) == normalized_quality(current_quality)
-                        ):
-                            # Same video & quality written by an earlier pass/attempt: keep intact
-                            # during retry, then remove automatically once the new file validates.
-                            superseded_parts.add(part)
-                        part = new_part()
-                        emit("INFO", f"无法安全续接，保留原断点并重新下载: {title}")
-                    owned_parts.add(part)
-                    _write_checkpoint(part, DownloadCheckpoint(
-                        viewkey, current_quality, _fingerprint(url), resolved, etag, total,
-                    ))
-                    force_fresh = False
-
-                downloaded = start
-                bytes_since_tick = 0
-                last_tick = time.monotonic()
-                if on_progress:
-                    on_progress(downloaded, total, 0.0)
-                # Unbuffered writes keep the disk free-space check aligned with written bytes;
-                # offload large chunks to a worker thread so 1000 Mbps disk I/O never stalls the loop.
-                with open(part, mode, buffering=0) as fp:
-                    async for chunk in response.content.iter_chunked(512 * 1024):
-                        if stop.is_set():
-                            raise StopRequested
-                        if expected and downloaded - start + len(chunk) > expected:
-                            raise _RangeMismatch("下载响应超过声明的字节范围")
-                        prepare_write(len(chunk))
-                        if len(chunk) >= 256 * 1024:
-                            write_task = asyncio.create_task(asyncio.to_thread(fp.write, chunk))
+        async def worker() -> None:
+            nonlocal last_checkpoint
+            with open(part, "r+b", buffering=0) as fp:
+                for start, end in requests:
+                    async with range_semaphore or contextlib.nullcontext():
+                        async with media_request(start, end, checkpoint.etag, pooled=True) as response:
+                            if response.status not in {200, 206, 412, 416}:
+                                response.raise_for_status()
                             try:
-                                written = await write_task
-                            except BaseException:
-                                with contextlib.suppress(Exception):
-                                    await write_task
-                                raise
-                        else:
-                            written = fp.write(chunk)
-                        if written != len(chunk):
-                            raise OSError("未能写入全部下载数据")
-                        downloaded += len(chunk)
-                        bytes_since_tick += len(chunk)
-                        now = time.monotonic()
-                        if on_progress and now - last_tick >= 0.35:
-                            on_progress(downloaded, total, bytes_since_tick / (now - last_tick))
-                            last_tick, bytes_since_tick = now, 0
-                if on_progress:
-                    on_progress(downloaded, total, 0.0)
-                if total and downloaded != total:
-                    raise aiohttp.ClientPayloadError(f"下载不完整 ({downloaded}/{total})")
-                return downloaded
+                                if (
+                                    response.status != 206
+                                    or not _identity_encoding(response)
+                                    or _strong_etag(response.headers.get("ETag", "")) != checkpoint.etag
+                                    or _fingerprint(str(getattr(response, "url", url))) != checkpoint.response_fingerprint
+                                    or _response_range(response) != (start, end, checkpoint.total)
+                                ):
+                                    raise _RangeMismatch("并行下载的 HTTP 字节区间或校验标记已变化")
+                                fp.seek(start)
+                                await _stream_mp4_body(response, fp, end - start, prepare_write, advance, stop, overlap=False)
+                            except _RangeMismatch as err:
+                                raise _RetrySingleStream(str(err)) from err
+                    _add_completed_range(completed, start, end)
+                    now = time.monotonic()
+                    if now - last_checkpoint >= _CHECKPOINT_WRITE_INTERVAL:
+                        _write_checkpoint(part, checkpoint)
+                        last_checkpoint = now
+
+        if completed == [[0, checkpoint.total]]:
+            return
+        workers = [asyncio.create_task(worker()) for _ in range(connections)]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            _write_checkpoint(part, checkpoint)
+        if completed != [[0, checkpoint.total]]:
+            raise aiohttp.ClientPayloadError("并行下载仍有未完成的字节区间")
+
+    async def receive(*, allow_probe: bool = True) -> int:
+        nonlocal validated_response_url, parallel_enabled
+        offset = 0 if part.is_symlink() else _size(part)
+        checkpoint = read_download_checkpoint(part) if offset and not force_fresh else None
+        request_fingerprint = _fingerprint(url)
+        renewed = bool(
+            renewed_from and checkpoint and checkpoint.completed_ranges is not None
+            and checkpoint.request_fingerprint == _fingerprint(renewed_from[0])
+            and checkpoint.response_fingerprint == _fingerprint(renewed_from[1])
+            and _media_resource(renewed_from[0]) == _media_resource(url)
+        )
+        if not (
+            checkpoint and checkpoint.viewkey == viewkey
+            and normalized_quality(checkpoint.quality) == normalized_quality(current_quality)
+            and (checkpoint.request_fingerprint == request_fingerprint or renewed)
+            and _strong_etag(checkpoint.etag) and 0 < offset <= checkpoint.total
+            and (not checkpoint.completed_ranges or checkpoint.completed_ranges[-1][1] <= offset)
+        ):
+            checkpoint = None
+            offset = 0
+
+        sparse = checkpoint is not None and checkpoint.completed_ranges is not None
+        completed = checkpoint.completed_ranges if sparse else ([[0, offset]] if offset else [])
+        bounded = sparse or (
+            parallel_enabled and allow_probe and not force_fresh
+            and (checkpoint is None or min_multi_range_bytes <= checkpoint.total)
+        )
+        if bounded:
+            first = next(_missing_ranges(checkpoint.total, completed), None) if checkpoint else (0, _RANGE_BYTES)
+            start, end = first if first is not None else (checkpoint.total, None)
+        else:
+            start, end = (offset if checkpoint else None), None
+
+        ranged_checkpoint = None
+        with contextlib.ExitStack() as reservations:
+            async with range_semaphore if bounded and range_semaphore is not None else contextlib.nullcontext():
+                async with media_request(start, end, checkpoint.etag if checkpoint else "", pooled=sparse) as response:
+                    if response.status == 412 and bounded:
+                        raise _RetrySingleStream("媒体服务拒绝了并行续传校验")
+                    if response.status not in {200, 206, 416}:
+                        response.raise_for_status()
+                        raise _RangeMismatch(f"意外的下载响应 HTTP {response.status}")
+
+                    etag = _strong_etag(response.headers.get("ETag", ""))
+                    response_url = str(getattr(response, "url", url))
+                    resolved = _fingerprint(response_url)
+                    same_entity = bool(checkpoint and etag == checkpoint.etag and (
+                        resolved == checkpoint.response_fingerprint
+                        or (renewed and renewed_from and _media_resource(renewed_from[1]) == _media_resource(response_url))
+                    ))
+                    mismatch = _RetrySingleStream if bounded else _RangeMismatch
+                    if response.status == 416:
+                        span = _UNSATISFIED_RANGE.fullmatch(response.headers.get("Content-Range", "").strip())
+                        if same_entity and span and int(span[1]) == checkpoint.total and completed == [[0, checkpoint.total]]:
+                            return checkpoint.total
+                        raise mismatch("HTTP 416 无法确认断点对应同一完整文件")
+
+                    if not _identity_encoding(response):
+                        raise mismatch("媒体响应经过内容编码，不能校验原始字节范围")
+
+                    if response.status == 200:
+                        expected = _content_length(response)
+                        total = expected or 0
+                        write_from = 0
+                        # Use this body directly when a server ignored Range.
+                        if bounded:
+                            parallel_enabled = False
+                    else:
+                        try:
+                            write_from, write_end, total = _response_range(response)
+                        except _RangeMismatch as err:
+                            raise mismatch(str(err)) from err
+                        if start is None or write_from != start or (
+                            checkpoint and (not same_entity or total != checkpoint.total)
+                        ) or (end is not None and write_end != min(end, total)):
+                            raise mismatch("HTTP 206 返回的字节区间或校验标记与断点不符")
+                        if write_end < total and not etag:
+                            # A weak/missing validator can only be used if this response contains the entire file.
+                            raise mismatch("HTTP 206 缺少可用于续接的原文件校验标记")
+                        expected = write_end - write_from
+                        if sparse or (bounded and write_end < total and total >= min_multi_range_bytes):
+                            ranged_checkpoint = DownloadCheckpoint(
+                                viewkey, current_quality, request_fingerprint, resolved, etag, total, completed,
+                            )
+
+                    saved = sum(right - left for left, right in completed) if ranged_checkpoint else write_from
+                    reserve_bytes = total - saved if ranged_checkpoint else expected or 0
+                    prepare_write = reservations.enter_context(disk.reserve(reserve_bytes))
+                    if response.status == 200 or checkpoint is None:
+                        fresh_part()
+                        mode = "wb"
+                    else:
+                        mode = "r+b"
+                    with open(part, mode, buffering=0) as fp:
+                        # Truncate any previous entity before publishing the new validator.
+                        if ranged_checkpoint or mode == "wb" or renewed:
+                            _write_checkpoint(part, ranged_checkpoint or DownloadCheckpoint(
+                                viewkey, current_quality, request_fingerprint, resolved, etag, total,
+                            ))
+                        validated_response_url = response_url
+                        advance = _progress_tracker(on_progress, saved, total)
+                        fp.seek(write_from)
+                        try:
+                            received = await _stream_mp4_body(
+                                response, fp, expected, prepare_write, advance, stop, overlap=ranged_checkpoint is None,
+                            )
+                        except _RangeMismatch as err:
+                            if bounded:
+                                raise _RetrySingleStream(str(err)) from err
+                            raise
+                    size = write_from + received
+                    if ranged_checkpoint:
+                        _add_completed_range(completed, write_from, size)
+                        _write_checkpoint(part, ranged_checkpoint)
+
+            if ranged_checkpoint is not None:
+                await receive_remaining_ranges(ranged_checkpoint, completed, prepare_write, advance)
+                size = total
+
+        if total and size != total:
+            if bounded and allow_probe:
+                # The initial bounded response supplied real bytes for a small file. Continue it sequentially.
+                return await receive(allow_probe=False)
+            raise aiohttp.ClientPayloadError(f"下载不完整 ({size}/{total})")
+        if on_progress:
+            on_progress(size, total, 0.0)
+        return size
+
+    async def receive_with_fallback() -> int:
+        nonlocal force_fresh, parallel_enabled
+        try:
+            return await receive()
+        except _RetrySingleStream as err:
+            emit("INFO", f"{title}: {err}，切换为单连接下载")
+            force_fresh = True
+            parallel_enabled = False
+            return await receive(allow_probe=False)
 
     attempts = max(1, int(max_attempts))
     last_error = "下载失败"
@@ -498,7 +802,7 @@ async def download_mp4_with_resume(
                 if not url and not await until_stopped(refresh_link(), stop):
                     last_error = "无法解析视频直链"
                 else:
-                    size = await until_stopped(receive(), stop)
+                    size = await until_stopped(receive_with_fallback(), stop)
                     if await asyncio.to_thread(is_valid_video_file, part, min_file_size_bytes, size):
                         if stop.is_set():
                             raise StopRequested
@@ -531,7 +835,7 @@ async def download_mp4_with_resume(
                 force_fresh = True
             except aiohttp.ClientResponseError as err:
                 last_error = f"HTTP {err.status}"
-                if attempt < attempts - 1 and err.status in {403, 410, 472}:
+                if attempt < attempts - 1 and err.status in _EXPIRED_MEDIA_CODES:
                     emit("INFO", f"{title}: 直链疑似过期，重新解析直链")
                     await until_stopped(refresh_link(), stop)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:

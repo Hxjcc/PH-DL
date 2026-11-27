@@ -61,7 +61,7 @@ from ..services.downloader import (
     remove_download_checkpoint,
 )
 from ..services.http_proxy import create_aiohttp_connector
-from ..services.hls_downloader import download_hls_to_mp4, is_hls_url
+from ..services.hls_downloader import HLS_JOB_BUFFER_BYTES, HlsMemoryBudget, download_hls_to_mp4, is_hls_url
 from ..services.filename import (
     format_remote_video_filename,
     is_valid_video_file,
@@ -1029,6 +1029,16 @@ class TaskManager:
             self.events.broadcast("job_updated", running_job)
 
         disk_budget = DownloadDiskBudget(self.env.temp_dir, int(settings.min_free_disk_gb * 1024 ** 3))
+        dl_slots = max(1, int(settings.max_concurrent_downloads))
+        total_hls_slots = min(32, max(16, dl_slots * 6))
+        total_mp4_range_slots = min(16, max(4, dl_slots * 3))
+        hls_segment_semaphore = asyncio.Semaphore(total_hls_slots)
+        mp4_range_semaphore = asyncio.Semaphore(total_mp4_range_slots)
+        hls_memory_budget = HlsMemoryBudget(HLS_JOB_BUFFER_BYTES, http_slots=total_hls_slots, writers=dl_slots)
+        per_video_hls_workers = min(12, total_hls_slots)
+        fallback_hls_workers = min({1: 8, 2: 6}.get(dl_slots, 4), total_hls_slots // dl_slots)
+        conn_per_host = max(24, min(64, max(total_hls_slots, total_mp4_range_slots) + dl_slots * 2 + 4))
+        conn_total = max(48, conn_per_host * 2)
         upload_worker_count = max(1, int(getattr(settings, "upload_workers", 2))) if auto_upload else 0
         scheduler = AdaptiveDiskScheduler(
             self.env.resolved_data_dir,
@@ -1453,29 +1463,20 @@ class TaskManager:
                         self.events.broadcast("job_updated", refreshed)
 
             timeout = aiohttp.ClientTimeout(total=None, connect=20.0, sock_connect=20.0, sock_read=45.0)
-            dl_slots = max(1, int(settings.max_concurrent_downloads))
-            if dl_slots == 1:
-                hls_seg_concurrency, hls_max_buffer_bytes = 8, 24 * 1024 * 1024
-            elif dl_slots == 2:
-                hls_seg_concurrency, hls_max_buffer_bytes = 6, 16 * 1024 * 1024
-            else:
-                hls_seg_concurrency, hls_max_buffer_bytes = 4, 12 * 1024 * 1024
-            conn_per_host = max(12, min(48, dl_slots * hls_seg_concurrency + 4))
-            conn_total = max(24, conn_per_host * 2)
             if not pass_parse_specs:
                 await self._release_idle_http_sessions(ctx)
             connector, _ = create_aiohttp_connector(
                 settings.normalized_proxy,
                 limit=conn_total,
                 limit_per_host=conn_per_host,
-                keepalive_timeout=20.0,
+                keepalive_timeout=45.0,
                 ttl_dns_cache=300,
             )
 
             async with aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
-                read_bufsize=256 * 1024,
+                read_bufsize=1024 * 1024,
                 cookie_jar=aiohttp.DummyCookieJar(),
             ) as dl_session:
                 async def _dl_one(item_id: int) -> None:
@@ -1701,8 +1702,12 @@ class TaskManager:
                                     preferred_qualities=requested,
                                     xh_preferred_codec=settings.xh_preferred_codec,
                                     max_attempts=settings.download_attempts,
-                                    segment_concurrency=hls_seg_concurrency,
-                                    max_buffer_bytes=hls_max_buffer_bytes,
+                                    segment_concurrency=per_video_hls_workers,
+                                    max_buffer_bytes=HLS_JOB_BUFFER_BYTES,
+                                    segment_semaphore=hls_segment_semaphore,
+                                    memory_budget=hls_memory_budget,
+                                    spill_to_disk=True,
+                                    fallback_segment_concurrency=fallback_hls_workers,
                                     retry_delay_base=settings.retry_delay_base,
                                     retry_delay_max=settings.retry_delay_max,
                                     request_timeout=settings.request_timeout,
@@ -1732,6 +1737,8 @@ class TaskManager:
                                     preferred_qualities=requested,
                                     xh_preferred_codec=settings.xh_preferred_codec,
                                     max_attempts=settings.download_attempts,
+                                    range_connections=4,
+                                    range_semaphore=mp4_range_semaphore,
                                     retry_delay_base=settings.retry_delay_base,
                                     retry_delay_max=settings.retry_delay_max,
                                     request_timeout=settings.request_timeout,
@@ -4013,10 +4020,16 @@ class TaskManager:
             if p.is_symlink() or not is_within_directory(p, self.env.temp_dir):
                 return 0
             if p.is_file():
-                return p.stat().st_size
+                size = p.stat().st_size
+                checkpoint = read_download_checkpoint(p) if p.name.endswith(".mp4.tmp") else None
+                if checkpoint and checkpoint.completed_ranges is not None:
+                    return checkpoint.saved_bytes(size)
+                return size
             if p.is_dir():
                 total = 0
                 for child in p.iterdir():
+                    if child.name.startswith("seg_") and child.suffix == ".tmp":
+                        continue
                     if not child.is_symlink() and child.is_file() and child.name not in {"manifest.json", "manifest.json.tmp"} and not child.name.endswith(".ytdl"):
                         with contextlib.suppress(OSError):
                             total += child.stat().st_size
@@ -4336,13 +4349,18 @@ class TaskManager:
                 checkpoint = read_download_checkpoint(tmp)
                 if checkpoint and checkpoint.viewkey != vkey:
                     checkpoint = None
+                saved_size = st.st_size
+                if checkpoint and checkpoint.completed_ranges is not None:
+                    saved_size = checkpoint.saved_bytes(saved_size)
+                    if not saved_size:
+                        continue
                 results.append(
                     {
                         "site": self._infer_temp_site(tmp),
                         "name": tmp.name,
                         "folder": tmp.parent.name,
                         "viewkey": vkey,
-                        "size_bytes": st.st_size,
+                        "size_bytes": saved_size,
                         "path": str(tmp),
                         "quality": checkpoint.quality if checkpoint else "",
                         "verified_checkpoint": bool(checkpoint and checkpoint.etag and st.st_size <= checkpoint.total),

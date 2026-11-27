@@ -249,12 +249,18 @@ async def fetch_subscriptions(
     main_sels = selectors.split_list("subs_page_main_container")
     link_sels = selectors.split_list("subs_page_user_link_in_container")
 
+    no_cache_headers = {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
     while page_num <= 50:
         if ctx.cancel_event.is_set():
             break
         current_url = f"{subs_url}?page={page_num}"
         res, _ = await ctx.fetch_with_pow(
             current_url,
+            headers=no_cache_headers,
             timeout=max(5.0, float(timeout)),
             log_label=f"订阅第 {page_num} 页",
         )

@@ -239,10 +239,10 @@ const visibleItems = computed(() =>
   filteredItems.value.slice(itemPageStart.value, itemPageStart.value + ITEMS_PER_PAGE)
 )
 const itemIndexWidthClass = computed(() => {
-  const len = filteredItems.value.length
-  if (len >= 1000) return 'w-9 sm:w-10'
-  if (len >= 100) return 'w-7 sm:w-8'
-  return 'w-5 sm:w-6'
+  const maxIndex = itemPageStart.value + visibleItems.value.length
+  if (maxIndex >= 1000) return 'w-7 sm:w-8 text-right'
+  if (maxIndex >= 100) return 'w-6 text-right'
+  return 'w-[18px] text-left'
 })
 
 watch(totalItemPages, (maxPage) => {
@@ -941,13 +941,13 @@ function downloadExportTxt() {
                 <div class="min-w-0 flex-1 flex items-center gap-1.5 sm:gap-2">
                   <span
                     :class="[
-                      'shrink-0 text-right text-[11px] font-mono text-muted-foreground/65 tabular-nums',
+                      'shrink-0 text-[11px] font-mono text-muted-foreground/65 tabular-nums',
                       itemIndexWidthClass,
                     ]"
                   >
                     {{ String(itemPageStart + idx + 1).padStart(2, '0') }}
                   </span>
-                  <span class="inline-flex items-center justify-center gap-1.5 min-w-[68px] rounded-full border border-border bg-card/90 text-foreground font-medium whitespace-nowrap shrink-0 h-5 px-2 text-[10px]">
+                  <span class="inline-flex items-center justify-center gap-1 min-w-[56px] rounded-full border border-border bg-card/90 text-foreground font-medium whitespace-nowrap shrink-0 h-5 px-1.5 text-[10px]">
                     <span :class="['w-1.5 h-1.5 rounded-full shrink-0', itemStatusMeta(item.status).dot]" />
                     {{ itemStatusLabel(item) }}
                   </span>
@@ -1101,7 +1101,7 @@ function downloadExportTxt() {
                 />
               </div>
 
-              <div v-if="visibleItemError(item)" class="text-[11px] text-red-600 dark:text-red-400 pl-7">
+              <div v-if="visibleItemError(item)" class="text-[11px] text-red-600 dark:text-red-400 pl-6 sm:pl-[26px]">
                 {{ visibleItemError(item) }}
               </div>
             </div>

@@ -351,6 +351,9 @@ async def test_fetch_xhamster_subscriptions_filters_unsubscribed_recommendations
     )
 
     async def fake_fetch(url: str, **kwargs):
+        hdrs = kwargs.get("headers") or {}
+        assert hdrs.get("Cache-Control") == "no-cache"
+        assert hdrs.get("Pragma") == "no-cache"
         if url.endswith("/my/subscriptions/pornstars"):
             return PowFetchResult(pornstars_html, url, 200, 0, False), None
         if url.endswith("/my/subscriptions/channels"):
@@ -1106,8 +1109,12 @@ async def test_xhamster_manual_job_skips_pornhub_cookie_and_uploads_to_xh_remote
         ]
 
     async def fake_download_hls(**kwargs):
-        assert kwargs["segment_concurrency"] == 4
-        assert kwargs["max_buffer_bytes"] == 12 * 1024 * 1024
+        assert kwargs["segment_concurrency"] == 12
+        assert kwargs["max_buffer_bytes"] == 48 * 1024 * 1024
+        assert kwargs["memory_budget"].max_bytes == 48 * 1024 * 1024
+        assert kwargs["spill_to_disk"] is True
+        assert isinstance(kwargs["segment_semaphore"], asyncio.Semaphore)
+        assert kwargs["session"]._read_bufsize == 1024 * 1024
         dl_dir: Path = kwargs["download_dir"]
         dl_dir.mkdir(parents=True, exist_ok=True)
         out = dl_dir / "XH Demo [xhOwQIZ].mp4"
@@ -2026,6 +2033,9 @@ async def test_xhamster_subscriptions_detailed_attaches_bound_user_alias(monkeyp
     )
 
     async def fake_fetch(url: str, **kwargs):
+        hdrs = kwargs.get("headers") or {}
+        assert hdrs.get("Cache-Control") == "no-cache"
+        assert hdrs.get("Pragma") == "no-cache"
         if url.endswith("/my/subscriptions/pornstars"):
             return PowFetchResult(pornstars_html, url, 200, 0, False), None
         if url.endswith("/my/subscriptions/channels"):
