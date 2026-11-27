@@ -15,6 +15,7 @@ _ISO_DATE_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$")
 _US_DATE_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$")
 _CDN_VIDEO_DATE_RE = re.compile(r"/videos/(\d{4})(\d{2})/(\d{2})/")
 _DATE_PREFIX_RE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}[_\s-]|\[\d{4}-\d{2}-\d{2}\])")
+_WINDOWS_DEVICE = re.compile(r"(?:CON|PRN|AUX|NUL|(?:COM|LPT)[1-9¹²³])", re.IGNORECASE)
 
 
 def _effective_video_suffix(path: Path) -> str:
@@ -25,9 +26,13 @@ def _effective_video_suffix(path: Path) -> str:
 
 
 def sanitize_filename(name: str, max_bytes: int = 200) -> str:
-    cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name or "")
+    cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name or "").strip().rstrip(" .")
+    if _WINDOWS_DEVICE.fullmatch(cleaned.partition(".")[0].rstrip()):
+        cleaned = "_" + cleaned
     name_part, ext_part = os.path.splitext(cleaned)
     ext_bytes = len(ext_part.encode("utf-8"))
+    if ext_bytes > max_bytes // 2:
+        name_part, ext_part, ext_bytes = cleaned, "", 0
 
     out_chars = []
     used = 0
@@ -45,8 +50,15 @@ def sanitize_filename(name: str, max_bytes: int = 200) -> str:
 
 
 def video_filename_base(title: str, viewkey: str) -> str:
-    safe_title = sanitize_filename(title or viewkey, max_bytes=180)
+    safe_title = sanitize_filename(title or viewkey, max_bytes=min(180, 220 - len(viewkey.encode("utf-8"))))
     return f"{safe_title} [{viewkey}]"
+
+
+def is_within_directory(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _valid_date_str(year: int, month: int, day: int) -> str:

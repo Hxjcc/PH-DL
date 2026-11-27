@@ -27,7 +27,7 @@ class UpdateScheduler:
         self,
         repo: Repository,
         events: EventBus,
-        trigger_auto_update: Callable[[], Awaitable[int]],
+        trigger_auto_update: Callable[[str], Awaitable[Optional[int]]],
     ) -> None:
         self.repo = repo
         self.events = events
@@ -85,18 +85,14 @@ class UpdateScheduler:
                         today_str = now.strftime("%Y-%m-%d")
                         scheduled_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                         if scheduled_dt <= now and last_run != today_str:
-                            # Catch up when the process starts after the scheduled
-                            # time, then persist the run date only after the job
-                            # has actually been enqueued.
-                            job_id = await self._trigger_auto_update()
+                            job_id = await self._trigger_auto_update(today_str)
                             self._last_run_date = today_str
-                            await self.repo.set_scheduler_last_run_date(today_str)
-                            self.events.broadcast("overview_changed", {})
-                            self.events.emit_log(
-                                "INFO",
-                                f"定时追更触发（{settings.schedule_time}），已创建任务 #{job_id}",
-                                job_id=job_id,
-                            )
+                            if job_id is not None:
+                                self.events.emit_log(
+                                    "INFO",
+                                    f"定时追更触发（{settings.schedule_time}），已创建任务 #{job_id}",
+                                    job_id=job_id,
+                                )
             except asyncio.CancelledError:
                 raise
             except Exception as err:

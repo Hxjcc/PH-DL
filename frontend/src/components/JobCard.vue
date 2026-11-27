@@ -191,16 +191,9 @@ const retryButtonText = computed(() => {
 })
 
 const retryButtonTitle = computed(() => {
-  if (isExportJob.value) return '按原筛选条件重新导出链接'
-  if (isMetadataJob.value) return '重新补全仍缺少画质或文件大小的基线视频'
-  if (props.job.status === 'cancelled' && Number(props.job.failed_items || 0) === 0) {
-    return '继续未完成条目；如果之前还没有生成明细，将按原设置重试'
-  }
-  if (Number(props.job.failed_items || 0) === 0) return '按原设置重试该任务'
-  if (Number(props.job.failed_items || 0) > 0 && props.job.status !== 'cancelled') {
-    return '仅重新下载该任务中失败的条目（已下部分自动断点续传）'
-  }
-  return '继续下载该任务中全部失败与中断条目（已下部分自动断点续传，已完成项自动跳过）'
+  if (isExportJob.value) return '在当前任务中按原筛选条件重新导出链接'
+  if (isMetadataJob.value) return '在当前任务中继续补全缺少画质或文件大小的基线视频'
+  return '在当前任务卡片上继续执行，保留已完成条目和下载断点'
 })
 
 const itemFilterPills = computed(() =>
@@ -339,34 +332,24 @@ function visibleItemError(item) {
   return msg
 }
 
-async function ensureItemsLoaded(force = false, { silent = false } = {}) {
+async function ensureItemsLoaded(force = false) {
   if (loadingItems.value || hasNoJobItems.value) return
   const expectedTotal = Number(props.job.total_items || 0)
   const cached = store.jobItems[props.job.id]
   if (!force && cached && (expectedTotal <= 0 || cached.length >= expectedTotal || (!isActive.value && itemsLoaded.value))) {
+    store.touchJobDetail(props.job.id)
     return
   }
-  if (!silent) {
-    loadingItems.value = true
-    itemsLoadError.value = ''
-  }
+  loadingItems.value = true
+  itemsLoadError.value = ''
   try {
     const detail = await store.loadJobDetail(props.job.id)
     itemsLoaded.value = !['queued', 'scanning', 'running'].includes(detail?.job?.status || props.job.status)
   } catch (err) {
-    if (!silent) {
-      itemsLoadError.value = err.message || '读取视频明细失败，请重试。'
-    }
+    itemsLoadError.value = err.message || '读取视频明细失败，请重试。'
   } finally {
-    if (!silent) {
-      loadingItems.value = false
-    }
+    loadingItems.value = false
   }
-}
-
-function prefetchItemsOnHover() {
-  if (expanded.value || hasNoJobItems.value) return
-  ensureItemsLoaded(false, { silent: true })
 }
 
 async function toggleExpand() {
@@ -404,10 +387,20 @@ watch(
 watch(
   [() => props.job.total_items, () => props.job.status],
   async ([total]) => {
-    if (expanded.value && Number(total || 0) > items.value.length) {
+    if (props.routeActive && expanded.value && Number(total || 0) > items.value.length) {
       await ensureItemsLoaded(true)
     }
   }
+)
+
+watch(
+  () => props.routeActive && expanded.value ? props.job.id : null,
+  (id, _, onCleanup) => {
+    if (id === null || hasNoJobItems.value) return
+    onCleanup(store.pinJobDetail(id))
+    ensureItemsLoaded()
+  },
+  { immediate: true, flush: 'sync' }
 )
 
 async function handleCancel() {
@@ -425,9 +418,17 @@ async function handleCancel() {
 async function handleRetry() {
   busyAction.value = true
   try {
-    const res = await api.retryFailedJob(props.job.id)
-    store.notify(`已创建重试任务 #${res.job.id}`, 'success')
-    await store.refreshJobs()
+    const jobId = props.job.id
+    const res = await api.retryFailedJob(jobId)
+    store.notify(res.job.id === jobId
+      ? `任务 #${res.job.id} 已加入队列，正在原任务上继续续传`
+      : `已创建重试任务 #${res.job.id}`, 'success')
+    store._upsertJob(res.job)
+    const reloadItems = expanded.value || Array.isArray(store.jobItems[jobId])
+    await Promise.all([
+      reloadItems ? store.loadJobDetail(jobId).catch(() => {}) : null,
+      store.refreshJobs(),
+    ])
   } catch (err) {
     store.notify(err.message, 'error')
   } finally {
@@ -474,7 +475,6 @@ function downloadExportTxt() {
             ? 'border-brand/35 shadow-xs'
             : 'hover:border-foreground/20',
     ]"
-    @pointerenter="prefetchItemsOnHover"
   >
     <!-- Job Header -->
     <div class="px-3.5 sm:px-5 py-3.5 sm:py-4 cursor-pointer select-none" @click="toggleExpand">

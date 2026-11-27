@@ -178,9 +178,329 @@ async def test_failed_details_can_retry_with_original_filters(job_engine, monkey
     rows = await repo.list_job_items(failed["id"])
     assert rows[0]["status"] == "failed" and rows[0]["error_message"] == "HTTP 503"
     retry = (await retry_failed_items(failed["id"], SimpleNamespace(repo=repo, tasks=manager)))["job"]
+    assert retry["id"] == failed["id"]
     await manager._run_job(retry["id"])
     result = await repo.get_job(retry["id"])
     assert visits == 2 and result["status"] == "completed" and result["done_items"] == 1
+
+
+async def test_resume_items_preserves_identity_and_completed_rows(job_engine, monkeypatch):
+    manager, repo, env = job_engine
+    await repo.update_settings_patch({"max_concurrent_downloads": 1})
+    original_params = {
+        "site": "pornhub", "usernames": ["fixture"], "target_type": "model", "auto_upload": False,
+        "redownload": True, "quality": None, "profile_avatars": {"fixture": "https://cdn.example/avatar.jpg"},
+        "profile_names": {"fixture": "Fixture Creator"},
+    }
+    job = await repo.create_job("manual_target", "下载目标: fixture", original_params)
+    job_id = job["id"]
+    rows = {}
+    for key, status in [("done", "done"), ("skip", "skipped"), ("local", "downloaded"),
+                        ("unparsed", "cancelled"), ("partial", "failed")]:
+        rows[key] = await repo.add_job_item(
+            job_id, viewkey=key, title="Fixture", uploader="fixture", target_type="model", page_url=page(key),
+            status=status, upload_requested=True, error_message="broken" if status in {"failed", "cancelled"} else "",
+            download_url=f"https://cdn.example/{key}.mp4" if key == "partial" else "", quality="1080p",
+        )
+    await repo.update_job(job_id, status="partial_failed", error_message="previous error",
+                          started_at="2026-01-01", finished_at="2026-01-02")
+    newer = await repo.create_job("manual_urls", "newer history", {})
+    await repo.update_job(newer["id"], status="completed")
+    checkpoint = env.temp_dir / "fixture" / "Fixture [partial].mp4.tmp"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"checkpoint")
+
+    downloaded = []
+
+    async def tracked_download(**kwargs):
+        downloaded.append((kwargs["viewkey"], kwargs["partial_path"]))
+        return await fixture_download(**kwargs)
+
+    async def details(_ctx, items, *args, **kwargs):
+        assert [url for url, _, _ in items] == [page("unparsed")]
+        return [detail("unparsed")]
+
+    monkeypatch.setattr(engine, "download_mp4_with_resume", tracked_download)
+    monkeypatch.setattr(engine, "fetch_video_details_batch", details)
+    events = manager.events.subscribe()
+    queued = (await retry_failed_items(job_id, SimpleNamespace(repo=repo, tasks=manager)))["job"]
+    assert queued["id"] == job_id and queued["kind"] == job["kind"] and queued["label"] == job["label"]
+    assert queued["params"] == {**original_params, "resume_count": 1, "resume_mode": "items"}
+    assert queued["status"] == "queued" and queued["started_at"] is None and queued["finished_at"] is None
+    assert queued["error_message"] == "" and queued["failed_items"] == 0 and queued["done_items"] == 2
+    assert [row["id"] for row in await repo.list_jobs(limit=1)] == [job_id]
+    assert {events.get_nowait()["type"] for _ in range(events.qsize())} >= {
+        "job_updated", "job_items_changed", "overview_changed",
+    }
+    pending = await repo.get_job_item(rows["partial"]["id"])
+    assert (pending["status"], pending["error_message"]) == ("pending", "")
+    assert (pending["temp_path"], pending["bytes_downloaded"]) == (str(checkpoint), checkpoint.stat().st_size)
+
+    manager.start()
+    await asyncio.wait_for(manager._queue.join(), 5)
+    after = {row["viewkey"]: row for row in await repo.list_job_items(job_id)}
+    assert downloaded == [("partial", checkpoint), ("unparsed", None)]
+    assert {key: row["id"] for key, row in after.items()} == {key: row["id"] for key, row in rows.items()}
+    assert all(after[key] == rows[key] for key in ("done", "skip", "local"))
+    assert after["partial"]["status"] == after["unparsed"]["status"] == "downloaded"
+    final = await repo.get_job(job_id)
+    assert final["status"] == "completed" and final["params"] == {**original_params, "resume_count": 1}
+    assert (final["total_items"], final["done_items"], final["uploaded_items"], final["skipped_items"]) == (5, 4, 1, 1)
+    assert {row["id"] for row in await repo.list_jobs()} == {job_id, newer["id"]}
+    assert (await manager.resume_job_in_place(job_id))[2] == 400
+
+
+@pytest.mark.parametrize("opt_in", [True, None])
+async def test_resume_forced_download_uploads_valid_own_file_for_pending_site(job_engine, monkeypatch, opt_in):
+    manager, repo, env = job_engine
+    xh_url = "https://xhamster.com/videos/fixture-xhClip01"
+    job = await repo.create_job("manual_urls", "Mixed links", {
+        "urls": [page("done"), xh_url], "redownload": True, "auto_upload": opt_in,
+    })
+    job_id = job["id"]
+    local = env.downloads_dir / "Fixture [xhClip01].mp4"
+    local.write_bytes(mp4_payload())
+    complete = await repo.add_job_item(
+        job_id, viewkey="done", title="Done", uploader="fixture", target_type="model", page_url=page("done"),
+        status="downloaded", upload_requested=False,
+    )
+    pending = await repo.add_job_item(
+        job_id, site="xhamster", viewkey="xhClip01", title="Fixture", uploader="fixture", target_type="creator",
+        page_url=xh_url, status="failed", local_path=str(local), quality="1080p",
+    )
+    await repo.update_job(job_id, status="partial_failed")
+    uploaded = []
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Resume should upload the existing xHamster file without a download or PornHub request")
+
+    async def verify_copy(*, files_by_viewkey, **kwargs):
+        assert files_by_viewkey == {"xhClip01": local}
+        uploaded.extend(files_by_viewkey)
+        return UploadBatchResult(
+            uploaded_viewkeys=list(files_by_viewkey), remote_dir="fixture:cloud",
+            verified_sources={"xhClip01": file_snapshot(local)},
+        )
+
+    monkeypatch.setattr(engine, "check_cookie_valid", forbidden)
+    monkeypatch.setattr(engine, "fetch_video_details_batch", forbidden)
+    monkeypatch.setattr(engine, "download_hls_to_mp4", forbidden)
+    monkeypatch.setattr(engine, "upload_file_batch", verify_copy)
+    queued, _, status = await manager.resume_job_in_place(job_id)
+    assert status == 200
+    assert await manager._job_site_requirements(job["kind"], queued["params"], job_id=job_id) == (False, False, True)
+    await manager._run_job(job_id)
+    assert uploaded == ["xhClip01"]
+    assert (await repo.get_job(job_id))["status"] == "completed"
+    assert (await repo.get_job_item(pending["id"]))["status"] == "done"
+    assert await repo.get_job_item(complete["id"]) == complete
+
+
+@pytest.mark.parametrize(("kind", "interrupted"), [
+    ("manual_target", False), ("manual_target", True), ("manual_urls", False), ("auto_update", False),
+])
+async def test_resume_scan_keeps_existing_items_and_adds_each_new_video_once(job_engine, monkeypatch, kind, interrupted):
+    manager, repo, _ = job_engine
+    target = await repo.upsert_target("fixture", "model", enabled=True)
+    keys = ["complete", "waiting", "fresh"]
+    params = {"site": "pornhub", "auto_upload": False, "redownload": True}
+    if kind == "manual_target":
+        params.update(usernames=["fixture"], target_type="model")
+    elif kind == "manual_urls":
+        params.update(urls=[page(key) for key in keys] + [page("fresh")])
+    else:
+        params["target_ids"] = [target["id"]]
+    job = await repo.create_job(kind, "Original scan", params)
+    done = await repo.add_job_item(
+        job["id"], viewkey="complete", title="Fixture", uploader="fixture", target_type="model",
+        page_url=page("complete"), status="done",
+    )
+    waiting = await repo.add_job_item(
+        job["id"], viewkey="waiting", title="Fixture", uploader="fixture", target_type="model",
+        page_url=page("waiting"), download_url="https://cdn.example/waiting.mp4", status="failed", quality="1080p",
+    )
+    if interrupted:
+        await repo.update_job(job["id"], status="scanning")
+        assert await repo.recover_interrupted_jobs() == 1
+    else:
+        reason = "1 个目标检查失败" if kind == "auto_update" else "2 页扫描未完成"
+        await repo.update_job(job["id"], status="partial_failed", error_message=reason)
+    downloads = []
+
+    async def tracked_download(**kwargs):
+        downloads.append(kwargs["viewkey"])
+        return await fixture_download(**kwargs)
+
+    async def scan(*args, **kwargs):
+        assert kwargs["skip_vkeys"] >= {"complete", "waiting"}
+        return [ListedVideo(key, page(key), "Fixture", 1, idx, 4)
+                for idx, key in enumerate([*keys, "fresh"], start=1)]
+
+    async def scan_with_details(*args, **kwargs):
+        assert kwargs["catch_up"] is False
+        return await scan(*args, **kwargs), [detail(key) for key in [*keys, "fresh"]]
+
+    async def details(_ctx, items, *args, **kwargs):
+        assert [url for url, _, _ in items] == [page("fresh")]
+        return [detail("fresh")]
+
+    monkeypatch.setattr(engine, "scan_list_pages", scan)
+    monkeypatch.setattr(manager, "_scan_target_with_details", scan_with_details)
+    monkeypatch.setattr(engine, "fetch_video_details_batch", details)
+    monkeypatch.setattr(engine, "download_mp4_with_resume", tracked_download)
+    queued, _, status = await manager.resume_job_in_place(job["id"])
+    assert status == 200 and queued["params"]["resume_mode"] == "rescan"
+    await manager._run_job(job["id"])
+    rows = await repo.list_job_items(job["id"])
+    assert rows[0] == done and rows[1]["id"] == waiting["id"]
+    assert [(row["viewkey"], row["status"]) for row in rows] == [
+        ("complete", "done"), ("waiting", "downloaded"), ("fresh", "downloaded"),
+    ]
+    assert sorted(downloads) == ["fresh", "waiting"]
+    final = await repo.get_job(job["id"])
+    assert final["status"] == "completed" and final["params"] == {**params, "resume_count": 1}
+    assert final["kind"] == kind and final["total_items"] == final["done_items"] == 3
+
+
+async def test_cancel_queued_job_then_resume_uses_only_the_new_queue_token(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    first = await manager.enqueue_job("manual_urls", "First", {})
+    other = await manager.enqueue_job("manual_urls", "Other", {})
+    assert manager.queued_count == 2
+    assert await manager.cancel_job(first["id"])
+    assert manager.queued_count == 1
+    attempts = await asyncio.gather(*(manager.resume_job_in_place(first["id"]) for _ in range(2)))
+    assert sorted(result[2] for result in attempts) == [200, 409]
+    assert manager.queued_count == 2
+    processed = []
+
+    async def run(job_id):
+        processed.append(job_id)
+        assert await repo.claim_queued_job(job_id)
+        await repo.update_job(job_id, status="completed")
+
+    monkeypatch.setattr(manager, "_run_job", run)
+    manager.start()
+    await asyncio.wait_for(manager._queue.join(), 5)
+    assert processed == [other["id"], first["id"]]
+    assert manager.queued_count == 0
+
+
+async def test_cancel_queued_rescan_preserves_scan_gap_for_the_next_attempt(job_engine):
+    manager, repo, _ = job_engine
+    job = await repo.create_job("manual_target", "Original scan", {"usernames": ["fixture"]})
+    await repo.add_job_item(
+        job["id"], viewkey="waiting", title="Fixture", uploader="fixture", target_type="model",
+        page_url=page("waiting"), status="failed",
+    )
+    await repo.update_job(job["id"], status="partial_failed", error_message="1 页扫描未完成")
+    queued, _, _ = await manager.resume_job_in_place(job["id"])
+    assert queued["params"]["resume_mode"] == "rescan"
+    assert await manager.cancel_job(job["id"])
+    cancelled = await repo.get_job(job["id"])
+    assert "扫描未完成" in cancelled["error_message"] and "resume_mode" not in cancelled["params"]
+    again, _, status = await manager.resume_job_in_place(job["id"])
+    assert status == 200 and again["params"]["resume_mode"] == "rescan"
+    assert again["params"]["resume_count"] == 2
+
+
+async def test_rescan_export_clears_previous_links_and_reuses_job(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    job = await repo.create_job("manual_urls", "Original export", {"export_only": True, "urls": [page("fresh")]})
+    await repo.update_job(job["id"], status="partial_failed", export_text=page("stale"))
+
+    async def details(*args, **kwargs):
+        return [detail("fresh")]
+
+    monkeypatch.setattr(engine, "fetch_video_details_batch", details)
+    queued, _, status = await manager.resume_job_in_place(job["id"])
+    assert status == 200 and queued["id"] == job["id"] and queued["export_text"] == ""
+    assert queued["params"]["resume_mode"] == "rescan"
+    await manager._run_job(job["id"])
+    final = await repo.get_job(job["id"])
+    assert final["status"] == "completed" and final["export_text"] == f"{page('fresh')}\n"
+    assert not await repo.list_job_items(job["id"])
+
+
+async def test_resume_legacy_retry_without_own_items_falls_back_to_its_source(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    source = await repo.create_job("manual_urls", "Source", {"auto_upload": False})
+    item = await repo.add_job_item(
+        source["id"], viewkey="waiting", title="Fixture", uploader="fixture", target_type="model",
+        page_url=page("waiting"), download_url="https://cdn.example/waiting.mp4", status="failed",
+    )
+    await repo.update_job(source["id"], status="partial_failed")
+    legacy = await repo.create_job("retry_items", "Legacy", {"source_job_id": source["id"], "auto_upload": False})
+    await repo.update_job(legacy["id"], status="cancelled")
+    monkeypatch.setattr(engine, "download_mp4_with_resume", fixture_download)
+
+    queued, _, status = await manager.resume_job_in_place(legacy["id"])
+    assert status == 200 and queued["id"] == legacy["id"] and queued["params"]["resume_mode"] == "rescan"
+    await manager._run_job(legacy["id"])
+    own_items = await repo.list_job_items(legacy["id"])
+    assert [(row["viewkey"], row["status"]) for row in own_items] == [("waiting", "downloaded")]
+    assert await repo.get_job_item(item["id"]) == item
+    assert (await repo.get_job(legacy["id"]))["status"] == "completed"
+
+
+async def test_resume_temp_rescan_continues_existing_items(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    job = await repo.create_job("resume_temp", "Original checkpoint scan", {"auto_upload": False})
+    item = await repo.add_job_item(
+        job["id"], viewkey="waiting", title="Fixture", uploader="fixture", target_type="model",
+        page_url=page("waiting"), download_url="https://cdn.example/waiting.mp4", status="cancelled",
+    )
+    await repo.update_job(job["id"], status="cancelled", error_message="扫描未完成，已取消")
+    monkeypatch.setattr(engine, "download_mp4_with_resume", fixture_download)
+
+    queued, _, status = await manager.resume_job_in_place(job["id"])
+    assert status == 200 and queued["params"]["resume_mode"] == "rescan"
+    await manager._run_job(job["id"])
+    rows = await repo.list_job_items(job["id"])
+    assert [(row["id"], row["status"]) for row in rows] == [(item["id"], "downloaded")]
+    assert (await repo.get_job(job["id"]))["status"] == "completed"
+
+
+async def test_resume_metadata_reconciles_completed_and_outstanding_items(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    job = await repo.create_job("enrich_metadata", "Original metadata task", {})
+    rows = {}
+    for key, state in [("xhAlready", "done"), ("xhSettled", "failed"),
+                       ("xhPending", "cancelled"), ("xhNew", None)]:
+        url = f"https://xhamster.com/videos/fixture-{key}"
+        await repo.upsert_video(
+            key, site="xhamster", video_page_url=url, status="baseline",
+            quality="1080p" if key in {"xhAlready", "xhSettled"} else "",
+        )
+        if state is not None:
+            rows[key] = await repo.add_job_item(
+                job["id"], viewkey=key, page_url=url, title=key, uploader="fixture", target_type="creator",
+                status=state, error_message="" if state == "done" else "previous error",
+            )
+    await repo.update_job(job["id"], status="cancelled")
+    seen = []
+
+    async def details(_ctx, items, *args, **kwargs):
+        result = []
+        for url, _, _ in items:
+            key = url.rsplit("-", 1)[1]
+            seen.append(key)
+            result.append(VideoDetail(key, key, url, url, download_url="https://cdn.example/hls.m3u8", quality="1080p"))
+        return result
+
+    monkeypatch.setattr(engine, "fetch_video_details_batch", details)
+    queued, _, status = await manager.resume_job_in_place(job["id"])
+    assert status == 200 and queued["params"]["resume_mode"] == "enrich"
+    await manager._run_job(job["id"])
+    final_rows = {row["viewkey"]: row for row in await repo.list_job_items(job["id"])}
+    assert seen == ["xhPending", "xhNew"]
+    assert final_rows["xhAlready"] == rows["xhAlready"]
+    assert all(final_rows[key]["id"] == rows[key]["id"] for key in rows)
+    assert len(final_rows) == 4 and all(row["status"] == "done" and not row["error_message"] for row in final_rows.values())
+    final = await repo.get_job(job["id"])
+    assert final["status"] == "completed" and final["params"] == {"resume_count": 1}
+    assert final["total_items"] == final["done_items"] == 4 and final["uploaded_items"] == 0
+    assert (await manager.resume_job_in_place(job["id"]))[2] == 400
 
 
 async def test_duplicate_targets_and_old_quality_do_not_skip_or_overwrite(job_engine, monkeypatch):
@@ -367,6 +687,7 @@ async def test_queued_work_survives_restart_and_interrupted_scan_can_be_replayed
         assert await second_repo.recover_interrupted_jobs() == 1
         assert await restarted.restore_queued_jobs() == 2
         recovered = (await retry_failed_items(interrupted["id"], SimpleNamespace(repo=second_repo, tasks=restarted)))["job"]
+        assert recovered["id"] == interrupted["id"]
         assert recovered["kind"] == "manual_urls"
         assert recovered["params"]["urls"] == [page("recover")]
         assert recovered["params"]["auto_upload"] is False
@@ -561,3 +882,83 @@ async def test_resume_temp_cleans_stale_partial_when_already_uploaded(job_engine
     assert not part.exists()
     assert downloader.read_download_checkpoint(part) is None
     assert manager.list_temp_files() == []
+
+async def test_shutdown_finishes_resumed_attempt_and_keeps_queued_work(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+    entered = asyncio.Event()
+    first = await repo.create_job("manual_urls", "first", {"urls": [page("again")]})
+    await repo.update_job(first["id"], status="failed")
+    failed, _done = await repo.add_job_items_batch(first["id"], [
+        {"viewkey": "again", "status": "failed"}, {"viewkey": "done", "status": "done"},
+    ])
+    queued, _, code = await manager.resume_job_in_place(first["id"])
+    assert code == 200 and queued["failed_items"] == 0
+
+    async def cooperative_executor(job_id, params, settings, ctx):
+        await repo.update_job(job_id, status="running")
+        await repo.update_job_item(failed["id"], status="uploading")
+        entered.set()
+        await ctx.cancel_event.wait()
+
+    monkeypatch.setattr(manager, "_exec_resume_job_items", cooperative_executor)
+    other = await manager.enqueue_job("manual_urls", "other", {"urls": [page("other")]})
+    manager.start()
+    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(manager.stop(), 3)
+    current = await repo.get_job(first["id"])
+    assert current["status"] == "cancelled" and current["finished_at"]
+    assert current["revision"] > queued["revision"] and current["params"] == {"urls": [page("again")], "resume_count": 1}
+    assert (current["total_items"], current["done_items"], current["uploaded_items"], current["failed_items"]) == (2, 1, 1, 0)
+    assert (await repo.get_job_item(failed["id"]))["status"] == "cancelled"
+    assert (await repo.get_job(other["id"]))["status"] == "queued"
+    assert manager.queued_count == 1
+
+
+async def test_unexpected_upload_worker_failure_finishes_job_and_preserves_local_file(job_engine, monkeypatch):
+    manager, repo, _ = job_engine
+
+    async def parse(_ctx, urls, *_args, **_kwargs):
+        return [detail(url.split("=")[-1]) for url, *_ in urls]
+
+    async def broken_upload(**_kwargs):
+        raise OSError("fixture upload worker failed")
+
+    monkeypatch.setattr(engine, "fetch_video_details_batch", parse)
+    monkeypatch.setattr(engine, "download_mp4_with_resume", fixture_download)
+    monkeypatch.setattr(engine, "upload_file_batch", broken_upload)
+    job = await asyncio.wait_for(run_job(manager, repo, "manual_urls", urls=[page("uploadfail")], auto_upload=True), 4)
+    row, = await repo.list_job_items(job["id"])
+    assert job["status"] == "failed" and job["failed_items"] == 1
+    assert row["status"] == "failed" and Path(row["local_path"]).is_file()
+    assert (await repo.get_video("uploadfail"))["upload_requested"] == 1
+
+
+async def test_finished_job_retry_rules_and_recent_retention(job_engine):
+    manager, repo, _ = job_engine
+    old = await repo.create_job("manual_target", "old export", {"export_only": True})
+    await repo.update_job(old["id"], status="completed", finished_at="2026-01-01T00:00:00+00:00")
+    assert (await manager.resume_job_in_place(old["id"]))[2] == 400
+    newest_id = await repo.create_job("check_updates", "later id", {})
+    await repo.update_job(newest_id["id"], status="completed", finished_at="2026-02-01T00:00:00+00:00")
+    await repo.update_job(old["id"], status="partial_failed", finished_at="2026-03-01T00:00:00+00:00")
+    assert (await repo.list_jobs(limit=1))[0]["id"] == old["id"]
+    assert await repo.prune_old_jobs(1) == 1
+    assert await repo.get_job(old["id"])
+
+
+async def test_queued_resume_cancel_updates_ledger_and_drops_stale_tokens(job_engine):
+    manager, repo, _ = job_engine
+    job = await repo.create_job("manual_urls", "kept", {"urls": [page("again")]})
+    await repo.update_job(job["id"], status="failed")
+    item, = await repo.add_job_items_batch(job["id"], [
+        {"viewkey": "again", "status": "downloading", "bytes_downloaded": 900},
+    ])
+    for _ in range(70):
+        queued, _, code = await manager.resume_job_in_place(job["id"])
+        assert code == 200 and queued["status"] == "queued"
+        assert await manager.cancel_job(job["id"])
+    current = await repo.get_job(job["id"])
+    row = await repo.get_job_item(item["id"])
+    assert current["params"]["resume_count"] == 70 and "resume_mode" not in current["params"]
+    assert current["status"] == "cancelled" and row["status"] == "cancelled"
+    assert row["bytes_downloaded"] == 0 and manager.queued_count == 0 and manager._queue.qsize() <= 64

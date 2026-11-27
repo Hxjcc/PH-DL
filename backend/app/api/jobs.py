@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import List, Optional
 
@@ -48,12 +49,12 @@ async def list_jobs(
 
 @router.get("/temp-files")
 async def get_temp_files(container: AppContainer = Depends(require_auth)):
-    return {"items": container.tasks.list_temp_files()}
+    return {"items": await asyncio.to_thread(container.tasks.list_temp_files)}
 
 
 @router.post("/temp-files/resume")
 async def resume_temp_files(container: AppContainer = Depends(require_auth)):
-    temp_files = container.tasks.list_temp_files()
+    temp_files = await asyncio.to_thread(container.tasks.list_temp_files)
     if not temp_files:
         raise HTTPException(status_code=400, detail="当前没有可续传的临时文件")
     settings = await container.repo.get_settings()
@@ -73,9 +74,9 @@ async def resume_temp_files(container: AppContainer = Depends(require_auth)):
 
 @router.delete("/temp-files")
 async def clear_temp_files(container: AppContainer = Depends(require_auth)):
-    if container.tasks.current_job_id is not None:
+    removed = await container.tasks.clear_idle_temp_files()
+    if removed is None:
         raise HTTPException(status_code=409, detail="有任务正在运行，请先停止后再清理临时文件")
-    removed = container.tasks.clear_temp_files()
     container.events.broadcast("overview_changed", {})
     return {"removed": removed}
 
@@ -207,10 +208,9 @@ async def batch_delete_jobs(
 
 @router.get("/{job_id}")
 async def get_job_detail(job_id: int, container: AppContainer = Depends(require_auth)):
-    job = await container.repo.get_job(job_id)
+    job, items = await container.repo.get_job_detail(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
-    items = await container.repo.list_job_items(job_id)
     live = container.events.live_progress_snapshot()
     for it in items:
         prog = live.get(int(it["id"]))
@@ -251,116 +251,9 @@ async def cancel_job(job_id: int, container: AppContainer = Depends(require_auth
     return {"cancelled": True}
 
 
-async def _resolve_origin_job_info(container: AppContainer, source_job: dict) -> tuple[int, str]:
-    """Walk retry lineage (up to 5 hops) to recover the original descriptive job id and label."""
-    cur_job = source_job
-    visited = {int(source_job["id"])}
-    for _ in range(5):
-        params = cur_job.get("params") or {}
-        if params.get("origin_label"):
-            origin_id = int(params.get("origin_job_id") or cur_job["id"])
-            return origin_id, str(params["origin_label"]).strip()
-        parent_id = params.get("source_job_id")
-        if not parent_id:
-            break
-        try:
-            pid = int(parent_id)
-        except (TypeError, ValueError):
-            break
-        if pid in visited:
-            break
-        visited.add(pid)
-        parent = await container.repo.get_job(pid)
-        if not parent:
-            break
-        cur_job = parent
-    return int(cur_job["id"]), str(cur_job.get("label") or cur_job.get("kind") or "").strip()
-
-
 @router.post("/{job_id}/retry-failed")
 async def retry_failed_items(job_id: int, container: AppContainer = Depends(require_auth)):
-    source_job = await container.repo.get_job(job_id)
-    if not source_job:
-        raise HTTPException(status_code=404, detail="源任务不存在")
-    if source_job.get("status") in {"queued", "scanning", "running"}:
-        raise HTTPException(status_code=409, detail="运行或排队中的任务无法重试，请先停止")
-    if source_job.get("kind") == "enrich_metadata":
-        count = await container.repo.count_baseline_metadata_candidates()
-        if count == 0:
-            raise HTTPException(status_code=400, detail="没有仍需补全元数据的基线视频")
-        job = await container.tasks.enqueue_job(
-            kind="enrich_metadata",
-            label=f"重试补全基线元数据 ({count} 条)",
-            params={},
-        )
-        return {"job": job}
-    items = await container.repo.list_job_items(job_id)
-    retryable = [
-        it
-        for it in items
-        if it["status"] in {"failed", "cancelled", "pending", "downloaded", "uploading"}
-    ]
-    src_params = source_job.get("params") or {}
-    origin_job_id, origin_label = await _resolve_origin_job_info(container, source_job)
-    kind = source_job["kind"]
-    has_scan_gap = "扫描未完成" in (source_job.get("error_message") or "")
-    can_rescan = kind in {"manual_target", "manual_urls", "auto_update", "check_updates",
-                          "baseline_sync", "retry_items", "resume_temp"}
-    if (
-        can_rescan and source_job["status"] in {"cancelled", "failed", "partial_failed"}
-        and (not retryable or src_params.get("export_only") or has_scan_gap or kind == "baseline_sync")
-    ):
-        replay_params = {
-            **src_params, "source_job_id": job_id, "origin_job_id": origin_job_id, "origin_label": origin_label,
-        }
-        if kind == "manual_target" and src_params.get("redownload"):
-            # Retain an explicit forced download for failed/missing items, not ones
-            # this source task already completed before its scan/transfer stopped.
-            completed = set(src_params.get("skip_completed_viewkeys") or ())
-            completed.update(
-                it["viewkey"] for it in items
-                if it["status"] in {"done", "skipped"}
-                or (it["status"] == "downloaded" and it.get("upload_requested") == 0)
-            )
-            replay_params["skip_completed_viewkeys"] = sorted(completed)
-        if kind == "retry_items":
-            # This job's underlying source is required by the retry executor.
-            replay_params["source_job_id"] = src_params.get("source_job_id")
-        job = await container.tasks.enqueue_job(kind, f"重试 · {origin_label}", replay_params)
-        return {"job": job}
-    if not retryable:
-        raise HTTPException(status_code=400, detail="该任务没有失败或未完成的条目")
-
-    has_failed = any(it["status"] == "failed" for it in retryable)
-    has_incomplete = any(
-        it["status"] in {"cancelled", "pending", "downloaded", "uploading"}
-        for it in retryable
-    )
-    if has_failed and not has_incomplete:
-        action_prefix = "重试"
-    elif has_incomplete and not has_failed:
-        action_prefix = "续传"
-    else:
-        action_prefix = "重试/续传"
-
-    if origin_label:
-        label = f"{action_prefix} · {origin_label} ({len(retryable)} 项)"
-    else:
-        label = f"{action_prefix}任务 #{job_id} ({len(retryable)} 项)"
-
-    job = await container.tasks.enqueue_job(
-        kind="retry_items",
-        label=label,
-        params={
-            "source_job_id": job_id,
-            "source_job_label": str(source_job.get("label") or ""),
-            "origin_job_id": origin_job_id,
-            "origin_label": origin_label,
-            "auto_upload": src_params.get("auto_upload"),
-            "quality": src_params.get("quality"),
-            "redownload": bool(src_params.get("redownload", False)),
-            "keywords": src_params.get("keywords", ""),
-            "exclude_keywords": src_params.get("exclude_keywords", ""),
-        },
-    )
+    job, message, status_code = await container.tasks.resume_job_in_place(job_id)
+    if job is None:
+        raise HTTPException(status_code=status_code, detail=message)
     return {"job": job}

@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: phdl-backend
     restart: unless-stopped
+    stop_grace_period: 45s
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       - PHDL_DATA_DIR=/data

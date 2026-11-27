@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import secrets
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .redaction import redact_diagnostic
+
 REDACTED_PLACEHOLDER = "********"
+_SECRET_FLAGS = re.compile(r"--[\w-]*(?:password|pass|token|header|secret|credential|(?:^|-)key)[\w-]*", re.I)
 
 SENSITIVE_RUNTIME_FIELDS = frozenset(
     {
@@ -308,19 +313,42 @@ class RuntimeSettings(BaseModel):
 
     def to_redacted_dict(self) -> dict[str, Any]:
         data = self.model_dump()
-        for field in SENSITIVE_RUNTIME_FIELDS:
+        fields = set(SENSITIVE_RUNTIME_FIELDS)
+        if "@" in self.proxy_url:
+            fields.add("proxy_url")
+        if _SECRET_FLAGS.search(self.rclone_extra_flags):
+            fields.add("rclone_extra_flags")
+        if "@" in self.serverchan_api_url or "?" in self.serverchan_api_url:
+            fields.add("serverchan_api_url")
+        for field in fields:
             if data.get(field):
                 data[field] = REDACTED_PLACEHOLDER
         data["has_cookie"] = bool(self.ph_cookie.strip())
         data["has_xh_cookie"] = bool(self.xh_cookie.strip())
         return data
 
+    def diagnostic_secrets(self) -> tuple[str, ...]:
+        values = {getattr(self, field).strip() for field in SENSITIVE_RUNTIME_FIELDS}
+        for cookie in (self.ph_cookie, self.xh_cookie):
+            values.update(pair.partition("=")[2].strip().strip('"') for pair in cookie.split(";"))
+        for url in (self.proxy_url, self.serverchan_api_url):
+            try:
+                password = urlsplit(url).password
+                if password:
+                    values.update((password, unquote(password)))
+            except ValueError:
+                pass
+        return tuple(sorted(values - {""}, key=len, reverse=True))
+
+    def redact_diagnostic(self, text: str) -> str:
+        return redact_diagnostic(text, self.diagnostic_secrets())
+
     def merge_update(self, patch: dict[str, Any]) -> "RuntimeSettings":
         current = self.model_dump()
         for key, value in patch.items():
             if key not in current:
                 continue
-            if key in SENSITIVE_RUNTIME_FIELDS and str(value) == REDACTED_PLACEHOLDER:
+            if key in SENSITIVE_RUNTIME_FIELDS | {"proxy_url", "rclone_extra_flags", "serverchan_api_url"} and str(value) == REDACTED_PLACEHOLDER:
                 continue
             if key == "selectors" and isinstance(value, dict):
                 merged_sel = dict(current["selectors"])

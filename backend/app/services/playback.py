@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import io
 import re
 import secrets
 import time
 from collections import OrderedDict
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urljoin, urlsplit
@@ -22,12 +23,11 @@ from starlette.types import Receive, Scope, Send
 from ..config import RuntimeSettings
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.video import MediaSource, extract_viewkey_from_url, fetch_single_video_detail, is_video_url
-from ..parsers.xhamster import is_xhamster_host, is_xhamster_url
+from ..parsers.urls import is_cookie_origin, is_media_url, is_site_url
+from ..parsers.xhamster import is_xhamster_url
 from .downloader import DOWNLOAD_HEADERS
 from .http_proxy import create_aiohttp_connector, is_socks_proxy
 
-_PH_SITE = ("pornhub.com",)
-_MEDIA = ("pornhub.com", "phncdn.com", "phprcdn.com", "xhcdn.com")
 _REDIRECTS = {301, 302, 303, 307, 308}
 _REQUEST_RANGE = re.compile(r"bytes=(?:([0-9]{1,18})-([0-9]{0,18})|-([0-9]{1,18}))")
 _REPLY_RANGE = re.compile(r"bytes ([0-9]{1,18})-([0-9]{1,18})/([0-9]{1,18})")
@@ -43,51 +43,22 @@ _HLS_SEGMENT_TYPES = _MP4_TYPES | {
 }
 _HLS_URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 _MAX_PLAYLIST_BYTES = 4 * 1024 * 1024
-_MAX_HLS_ASSETS = 12_000
+_MAX_HLS_ASSETS = 6_000
+_MAX_PLAYBACK_SESSIONS = 32
+_MAX_SOCKS_CLIENTS = 2
 NO_CACHE = {"Cache-Control": "private, no-store"}
 
 
-def _allowed(url: str, domains: tuple[str, ...], *, allow_xhamster: bool = False) -> bool:
-    if "\\" in url or any(ord(char) <= 32 or ord(char) == 127 for char in url):
-        return False
-    try:
-        parsed = urlsplit(url)
-        host = parsed.hostname or ""
-        host_ok = any(host == domain or host.endswith("." + domain) for domain in domains) or (
-            allow_xhamster and is_xhamster_host(host)
-        )
-        return (
-            parsed.scheme == "https"
-            and parsed.username is None
-            and parsed.password is None
-            and parsed.port in {None, 443}
-            and host_ok
-        )
-    except ValueError:
-        return False
-
-
-def _ph_site_url(url: str) -> bool:
-    return _allowed(url, _PH_SITE)
-
-
-def _xh_site_url(url: str) -> bool:
-    return _allowed(url, (), allow_xhamster=True)
-
-
-def _site_url(url: str) -> bool:
-    return _allowed(url, _PH_SITE, allow_xhamster=True)
-
-
 def _media_url(url: str) -> bool:
-    return _allowed(url, _MEDIA, allow_xhamster=True)
+    return is_media_url(url, "pornhub") or is_media_url(url, "xhamster")
 
 
 def _playback_page(record: dict, viewkey: str) -> str:
     recorded = str(record.get("video_page_url") or "").strip()
-    if _site_url(recorded) and is_video_url(recorded) and extract_viewkey_from_url(recorded) == viewkey:
+    site = "xhamster" if str(record.get("site") or "").strip().lower() == "xhamster" or is_xhamster_url(recorded) else "pornhub"
+    if is_site_url(recorded, site) and is_video_url(recorded) and extract_viewkey_from_url(recorded) == viewkey:
         return recorded
-    if str(record.get("site") or "").strip().lower() == "xhamster":
+    if site == "xhamster":
         return f"https://xhamster.com/videos/{viewkey}"
     return f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
 
@@ -126,6 +97,8 @@ class _Playback:
     proxy_url: Optional[str]
     expires_at: float
     format: str = "mp4"
+    site: str = "pornhub"
+    hls_asset_bytes: int = 0
     hls_asset_urls: dict[int, list[str]] = field(default_factory=dict)
     hls_asset_index: dict[int, dict[str, int]] = field(default_factory=dict)
 
@@ -135,11 +108,13 @@ class _Playback:
         if existing is not None:
             return existing
         urls = self.hls_asset_urls.setdefault(index, [])
-        if len(urls) >= _MAX_HLS_ASSETS:
+        size = len(url.encode("utf-8"))
+        if len(urls) >= _MAX_HLS_ASSETS or self.hls_asset_bytes + size > _MAX_PLAYLIST_BYTES:
             raise HTTPException(502, "播放列表分片数量超出限制")
         seg_id = len(urls)
         urls.append(url)
         idx_map[url] = seg_id
+        self.hls_asset_bytes += size
         return seg_id
 
 
@@ -171,17 +146,21 @@ class PlaybackService:
         self._resolve_slots = asyncio.Semaphore(4)
         self._stream_slots = asyncio.Semaphore(12)
         self._http_client: Optional[aiohttp.ClientSession] = None
-        self._socks_http_clients: dict[str, aiohttp.ClientSession] = {}
+        self._socks_http_clients: OrderedDict[str, aiohttp.ClientSession] = OrderedDict()
+        self._socks_client_users: dict[str, int] = {}
         self._client_lock = asyncio.Lock()
 
+    async def _trim_socks_clients(self) -> None:
+        idle = [key for key in self._socks_http_clients if key not in self._socks_client_users]
+        for key in idle[:-_MAX_SOCKS_CLIENTS]:
+            await self._socks_http_clients.pop(key).close()
+
+    @asynccontextmanager
     async def _get_http_client(
-        self, proxy_url: Optional[str] = None
-    ) -> tuple[aiohttp.ClientSession, Optional[str]]:
+        self, proxy_url: Optional[str] = None,
+    ):
         cleaned_proxy = (proxy_url or "").strip() or None
         if cleaned_proxy and is_socks_proxy(cleaned_proxy):
-            existing = self._socks_http_clients.get(cleaned_proxy)
-            if existing is not None and not existing.closed:
-                return existing, None
             async with self._client_lock:
                 existing = self._socks_http_clients.get(cleaned_proxy)
                 if existing is None or existing.closed:
@@ -200,10 +179,20 @@ class PlaybackService:
                         auto_decompress=False,
                     )
                     self._socks_http_clients[cleaned_proxy] = existing
-                return existing, None
-
-        if self._http_client is not None and not self._http_client.closed:
-            return self._http_client, cleaned_proxy
+                self._socks_http_clients.move_to_end(cleaned_proxy)
+                self._socks_client_users[cleaned_proxy] = self._socks_client_users.get(cleaned_proxy, 0) + 1
+            try:
+                yield existing, None
+            finally:
+                with anyio.CancelScope(shield=True):
+                    async with self._client_lock:
+                        users = self._socks_client_users.get(cleaned_proxy, 0)
+                        if users > 1:
+                            self._socks_client_users[cleaned_proxy] = users - 1
+                        else:
+                            self._socks_client_users.pop(cleaned_proxy, None)
+                        await self._trim_socks_clients()
+            return
         async with self._client_lock:
             if self._http_client is None or self._http_client.closed:
                 connector, _ = create_aiohttp_connector(None, limit=32, limit_per_host=16)
@@ -213,7 +202,8 @@ class PlaybackService:
                     cookie_jar=aiohttp.DummyCookieJar(),
                     auto_decompress=False,
                 )
-            return self._http_client, cleaned_proxy
+            client = self._http_client
+        yield client, cleaned_proxy
 
     async def aclose(self) -> None:
         async with self._client_lock:
@@ -224,6 +214,8 @@ class PlaybackService:
                 if not client.closed:
                     await client.close()
             self._socks_http_clients.clear()
+            self._socks_client_users.clear()
+            self._sessions.clear()
 
     async def resolve(self, record: dict, settings: RuntimeSettings) -> dict:
         viewkey = str(record["viewkey"])
@@ -231,6 +223,7 @@ class PlaybackService:
             raise HTTPException(422, "这条记录没有可用的视频编号")
         page = _playback_page(record, viewkey)
         is_xh = str(record.get("site") or "").strip().lower() == "xhamster" or is_xhamster_url(page)
+        site = "xhamster" if is_xh else "pornhub"
         try:
             # Resolving a clip must not occupy a download worker or retry indefinitely.
             async with asyncio.timeout(35), self._resolve_slots, TaskHttpContext(
@@ -239,8 +232,8 @@ class PlaybackService:
                 concurrency=1,
                 timeout=min(settings.request_timeout, 12),
                 max_retries=1,
+                site=site,
                 allow_url=_media_url,
-                allow_cookie_url=_xh_site_url if is_xh else _ph_site_url,
             ) as ctx:
                 detail = await fetch_single_video_detail(
                     ctx, page, settings.selectors, timeout=min(settings.request_timeout, 12),
@@ -274,22 +267,21 @@ class PlaybackService:
                     selected_format = "hls"
         if not sources:
             reason = detail.error or "源站未返回可播放的地址"
-            raise HTTPException(502, reason)
+            raise HTTPException(502, settings.redact_diagnostic(reason))
 
         # Relay URLs are scoped to this authenticated resource; no client-supplied
         # destination or stored upstream cookie is ever sent back to the browser.
         now = time.monotonic()
-        for key in [key for key, entry in self._sessions.items() if entry.expires_at <= now]:
-            self._sessions.pop(key)
+        self._prune_expired_sessions(now)
         ticket = secrets.token_urlsafe(18)
         entry = _Playback(
             viewkey=viewkey, sources=tuple(sources.values()),
-            referer=detail.referer_url if _site_url(detail.referer_url) else page,
+            referer=detail.referer_url if is_site_url(detail.referer_url, site) else page,
             cookie=cookie, proxy_url=settings.normalized_proxy, expires_at=now + 30 * 60,
-            format=selected_format,
+            format=selected_format, site=site,
         )
         self._sessions[ticket] = entry
-        while len(self._sessions) > 128:
+        while len(self._sessions) > _MAX_PLAYBACK_SESSIONS:
             self._sessions.popitem(last=False)
         return {
             "format": selected_format,
@@ -306,9 +298,14 @@ class PlaybackService:
             ],
         }
 
+    def _prune_expired_sessions(self, now: float) -> None:
+        for key in [key for key, entry in self._sessions.items() if entry.expires_at <= now]:
+            del self._sessions[key]
+
     def _session(self, viewkey: str, ticket: str) -> _Playback:
+        self._prune_expired_sessions(time.monotonic())
         entry = self._sessions.get(ticket)
-        if not entry or entry.expires_at <= time.monotonic() or entry.viewkey != viewkey:
+        if not entry or entry.viewkey != viewkey:
             raise HTTPException(410, "播放地址已失效，请重新获取")
         return entry
 
@@ -335,20 +332,34 @@ class PlaybackService:
             )
             if upstream.status != 200:
                 raise HTTPException(502, "视频源暂时不可用")
-            raw = await upstream.content.read(_MAX_PLAYLIST_BYTES + 1)
+            return await self._rewrite_playlist(upstream, final_url, entry, index)
+
+    async def _rewrite_playlist(
+        self, upstream: aiohttp.ClientResponse, final_url: str, entry: _Playback, index: int, *, nested: bool = False,
+    ) -> Response:
+        raw = bytearray()
+        try:
+            async with asyncio.timeout(30):
+                async for chunk in upstream.content.iter_chunked(64 * 1024):
+                    if len(raw) + len(chunk) > _MAX_PLAYLIST_BYTES:
+                        raise HTTPException(502, "播放列表体积异常")
+                    raw.extend(chunk)
+        except (TimeoutError, aiohttp.ClientError, OSError) as err:
+            raise HTTPException(502, "无法完整读取播放列表") from err
+        encoding = upstream.headers.get("Content-Encoding", "identity").strip().lower()
+        if encoding == "gzip":
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+                    raw = compressed.read(_MAX_PLAYLIST_BYTES + 1)
+            except (OSError, EOFError) as err:
+                raise HTTPException(502, "无法解码播放列表") from err
             if len(raw) > _MAX_PLAYLIST_BYTES:
                 raise HTTPException(502, "播放列表体积异常")
-            encoding = upstream.headers.get("Content-Encoding", "identity").strip().lower()
-            if encoding == "gzip":
-                try:
-                    raw = gzip.decompress(raw)
-                except OSError as err:
-                    raise HTTPException(502, "无法解码播放列表") from err
-            elif encoding not in {"", "identity"}:
-                raise HTTPException(502, "视频源返回了不受支持的编码格式")
+        elif encoding not in {"", "identity"}:
+            raise HTTPException(502, "视频源返回了不受支持的编码格式")
 
-        text = raw.decode("utf-8", errors="replace")
-        if "#EXTM3U" not in text:
+        text = raw.decode("utf-8-sig", errors="replace")
+        if not text.lstrip().startswith("#EXTM3U"):
             raise HTTPException(502, "视频源没有返回有效的 HLS 播放列表")
 
         def _rewrite_uri(raw_uri: str) -> str:
@@ -356,7 +367,7 @@ class PlaybackService:
             if not _media_url(resolved):
                 raise HTTPException(502, "源站返回了不受支持的播放分片地址")
             seg_id = entry.register_hls_asset(index, resolved)
-            return f"seg/{seg_id}"
+            return str(seg_id) if nested else f"seg/{seg_id}"
 
         rewritten_lines: list[str] = []
         for line in text.splitlines():
@@ -408,6 +419,7 @@ class PlaybackService:
             byte_range,
             allowed_types=_HLS_SEGMENT_TYPES,
             forced_media_type=None,
+            playlist_index=index,
         )
 
     async def _open_upstream(
@@ -424,7 +436,7 @@ class PlaybackService:
                 await setup.enter_async_context(self._stream_slots)
         except TimeoutError as err:
             raise HTTPException(503, "播放请求过多，请稍后重试") from err
-        client, request_proxy = await self._get_http_client(entry.proxy_url)
+        client, request_proxy = await setup.enter_async_context(self._get_http_client(entry.proxy_url))
         upstream = None
         current_url = url
         try:
@@ -436,7 +448,7 @@ class PlaybackService:
                     headers.update(extra_headers)
                 if byte_range:
                     headers["Range"] = byte_range
-                if entry.cookie and _site_url(current_url):
+                if entry.cookie and is_cookie_origin(current_url, entry.site):
                     headers["Cookie"] = entry.cookie
                 candidate = await client.get(
                     current_url, headers=headers, proxy=request_proxy,
@@ -444,14 +456,14 @@ class PlaybackService:
                 )
                 if candidate.status not in _REDIRECTS:
                     upstream = candidate
-                    setup.push_async_callback(upstream.release)
+                    setup.callback(upstream.release)
                     break
                 try:
                     current_url = urljoin(current_url, candidate.headers["Location"])
                 except (KeyError, ValueError) as err:
                     candidate.close()
                     raise HTTPException(502, "源站的播放跳转无效") from err
-                await candidate.release()
+                candidate.release()
         except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as err:
             raise HTTPException(502, "无法连接视频源，请重新获取播放地址") from err
 
@@ -469,11 +481,12 @@ class PlaybackService:
         *,
         allowed_types: Optional[set[str]] = None,
         forced_media_type: Optional[str] = "video/mp4",
+        playlist_index: Optional[int] = None,
     ) -> Response:
         requested = _parse_range(byte_range)
         valid_types = allowed_types if allowed_types is not None else _MP4_TYPES
         async with AsyncExitStack() as setup:
-            upstream, _ = await self._open_upstream(setup, entry, url, byte_range)
+            upstream, final_url = await self._open_upstream(setup, entry, url, byte_range)
             if upstream.status == 416:
                 reply_range = upstream.headers.get("Content-Range", "")
                 headers = {"Content-Range": reply_range} if re.fullmatch(r"bytes \*/[0-9]{1,18}", reply_range) else {}
@@ -481,6 +494,13 @@ class PlaybackService:
             if upstream.status not in {200, 206}:
                 raise HTTPException(502, "视频源暂时不可用")
             content_type = upstream.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+            if playlist_index is not None and (
+                content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl"}
+                or urlsplit(final_url).path.lower().endswith(".m3u8")
+            ):
+                if upstream.status != 200:
+                    raise HTTPException(502, "视频源返回了不完整的播放列表")
+                return await self._rewrite_playlist(upstream, final_url, entry, playlist_index, nested=True)
             encoding = upstream.headers.get("Content-Encoding", "identity").strip().lower()
             length = upstream.headers.get("Content-Length")
             headers = {

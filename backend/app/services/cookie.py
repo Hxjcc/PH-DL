@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import contextlib
 import json
 import re
@@ -52,13 +53,13 @@ class _InflightLogin:
 
 # Coalesce concurrent auto-login calls per event loop + (account, proxy) to avoid
 # firing duplicate YesCaptcha solves or triggering PornHub's 1-hour account lock.
-_INFLIGHT_LOGINS: "WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[Tuple[str, str], _InflightLogin]]" = (
+_INFLIGHT_LOGINS: "WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[Tuple[str, str, bytes], _InflightLogin]]" = (
     WeakKeyDictionary()
 )
 
 
 async def _run_deduped_login(
-    dedup_key: Tuple[str, str],
+    dedup_key: Tuple[str, str, bytes],
     site_label: str,
     factory: Callable[[asyncio.Event, LogCallback], Awaitable["CookieLoginResult"]],
     *,
@@ -121,6 +122,10 @@ async def _run_deduped_login(
             entry.cancel_event.set()
             if inflight.get(dedup_key) is entry:
                 inflight.pop(dedup_key, None)
+            done, _ = await asyncio.wait({entry.task}, timeout=1.0)
+            if not done:
+                entry.task.cancel()
+            await asyncio.gather(entry.task, return_exceptions=True)
 
 
 @dataclass(frozen=True)
@@ -629,6 +634,7 @@ async def check_cookie_valid(
 
     try:
         ctx = TaskHttpContext(
+            site="pornhub",
             cookie_str=cookie_str,
             proxy_url=proxy_url,
             concurrency=1,
@@ -799,7 +805,7 @@ async def login_and_get_cookies(
     if not (username or "").strip() or not (password or "").strip():
         return _log_login_outcome(emit, CookieLoginResult(success=False, message="未配置 PornHub 账号或密码"))
 
-    dedup_key = (username.strip().lower(), (proxy_url or "").strip())
+    dedup_key = ("pornhub", username.strip().lower(), hashlib.sha256(json.dumps([password, proxy_url]).encode()).digest())
     return await _run_deduped_login(
         dedup_key,
         "PornHub",
@@ -844,6 +850,7 @@ async def _login_and_get_cookies_once(
                 return CookieLoginResult(success=False, message="自动登录已取消")
             emit("INFO", "开始登录，正在加载登录页...")
             ctx = TaskHttpContext(
+                site="pornhub",
                 cookie_str="",
                 proxy_url=proxy_url,
                 concurrency=1,
@@ -1131,7 +1138,7 @@ async def login_xhamster_and_get_cookies(
     if not (username or "").strip() or not (password or "").strip():
         return _log_login_outcome(emit, CookieLoginResult(success=False, message="未配置 xHamster 账号或密码"))
 
-    dedup_key = (f"xh:{username.strip().lower()}", (proxy_url or "").strip())
+    dedup_key = ("xhamster", username.strip().lower(), hashlib.sha256(json.dumps([password, proxy_url]).encode()).digest())
     return await _run_deduped_login(
         dedup_key,
         "xHamster",
@@ -1179,6 +1186,7 @@ async def _login_xhamster_once(
             emit("INFO", "开始登录，正在加载登录页...")
             # xHamster uses a double-submit CSRF cookie (`x_csrf_token` cookie == `X-CSRF-Token` header).
             ctx = TaskHttpContext(
+                site="xhamster",
                 cookie_str=f"x_csrf_token={XHAMSTER_DEFAULT_CSRF}",
                 proxy_url=proxy_url,
                 concurrency=1,

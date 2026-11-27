@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -198,6 +198,24 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE targets ADD COLUMN today_new_date TEXT NOT NULL DEFAULT '';",
             "ALTER TABLE targets ADD COLUMN today_new_count INTEGER NOT NULL DEFAULT 0;",
             "ALTER TABLE targets ADD COLUMN today_new_viewkeys TEXT NOT NULL DEFAULT '[]';",
+        ],
+    ),
+    (
+        11,
+        [
+            "ALTER TABLE jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
+            """CREATE TRIGGER jobs_revision AFTER UPDATE ON jobs
+                WHEN NEW.revision = OLD.revision
+                BEGIN
+                    UPDATE jobs SET revision = OLD.revision + 1 WHERE id = OLD.id;
+                END;""",
+            "ALTER TABLE job_items ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
+            """CREATE TRIGGER job_items_revision AFTER UPDATE ON job_items
+                WHEN NEW.revision = OLD.revision
+                BEGIN
+                    UPDATE job_items SET revision = OLD.revision + 1 WHERE id = OLD.id;
+                END;""",
+            "CREATE INDEX IF NOT EXISTS idx_job_items_job_viewkey ON job_items(job_id, viewkey, status);",
         ],
     ),
 ]

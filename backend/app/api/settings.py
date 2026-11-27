@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import secrets
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ..engine.scheduler import parse_hhmm
 from ..parsers.xhamster import check_xhamster_cookie_valid
@@ -60,14 +62,16 @@ def _detect_avatar_image(raw: bytes) -> Optional[Tuple[str, str]]:
 def _find_avatar_file(data_dir: Path) -> Optional[Tuple[Path, str]]:
     for ext, mime in _AVATAR_EXT_TO_MIME.items():
         candidate = data_dir / f"account_avatar{ext}"
-        if candidate.is_file():
+        if not candidate.is_symlink() and candidate.is_file():
             return candidate, mime
     return None
 
 
-def _remove_avatar_files(data_dir: Path) -> None:
+def _remove_avatar_files(data_dir: Path, *, keep: Optional[Path] = None) -> None:
     for ext in _AVATAR_EXT_TO_MIME:
         candidate = data_dir / f"account_avatar{ext}"
+        if candidate == keep:
+            continue
         try:
             candidate.unlink(missing_ok=True)
         except OSError:
@@ -112,8 +116,9 @@ async def update_settings(
 
     try:
         updated = await container.repo.update_settings_patch(patch)
-    except Exception as err:
-        raise HTTPException(status_code=400, detail=f"配置校验失败: {err}") from err
+    except ValidationError as err:
+        fields = [".".join(map(str, e["loc"])) or e["msg"] for e in err.errors(include_input=False, include_context=False)]
+        raise HTTPException(status_code=400, detail=f"配置校验失败: {', '.join(fields)}") from err
 
     if updated.ph_cookie != current.ph_cookie:
         container.tasks.reset_cookie_status()
@@ -142,7 +147,7 @@ async def test_cookie(container: AppContainer = Depends(require_auth)):
     resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username) if res.valid else ""
     if res.valid and resolved_user and resolved_user != settings.ph_logged_in_username:
         await container.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
-    status_msg = format_cookie_valid_message(resolved_user) if res.valid else res.message
+    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if res.valid else res.message)
     container.tasks.set_cookie_status(res.valid, status_msg)
     container.events.emit_log(
         "INFO" if res.valid else "WARNING",
@@ -170,7 +175,7 @@ async def import_cookie(
     resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username) if res.valid else ""
     if res.valid and resolved_user and resolved_user != settings.ph_logged_in_username:
         await container.repo.update_settings_patch({"ph_logged_in_username": resolved_user})
-    status_msg = format_cookie_valid_message(resolved_user) if res.valid else res.message
+    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if res.valid else res.message)
     container.tasks.set_cookie_status(res.valid, status_msg)
     container.events.emit_log(
         "INFO" if res.valid else "WARNING",
@@ -200,7 +205,7 @@ async def _perform_ph_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
             on_log=lambda level, message: container.events.emit_log(level, message),
         )
     except Exception as err:  # pragma: no cover - defensive
-        message = f"自动登录异常: {err}"
+        message = f"自动登录异常 ({type(err).__name__})"
         container.tasks.set_cookie_status(False, message)
         container.events.broadcast("overview_changed", {})
         return {"success": False, "message": message}
@@ -208,19 +213,17 @@ async def _perform_ph_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
     if not res.success:
         container.tasks.set_cookie_status(False, res.message)
         container.events.broadcast("overview_changed", {})
-        return {"success": False, "message": res.message}
+        return {"success": False, "message": container.repo.redact_diagnostic(res.message)}
 
     resolved_user = prefer_cased_username(res.logged_in_username, settings.ph_logged_in_username)
-    patch: Dict[str, Any] = {"ph_cookie": res.cookie_str}
-    if resolved_user:
-        patch["ph_logged_in_username"] = resolved_user
-    await container.repo.update_settings_patch(patch)
+    if await container.repo.save_refreshed_cookie("ph", settings, res.cookie_str, resolved_user) is None:
+        return {"success": False, "message": "登录期间连接配置已变更，请重试"}
     container.tasks.set_cookie_status(True, format_cookie_valid_message(resolved_user))
     container.events.broadcast("overview_changed", {})
     return {
         "success": True,
         "logged_in_username": resolved_user,
-        "message": res.message,
+        "message": container.repo.redact_diagnostic(res.message),
     }
 
 
@@ -259,7 +262,7 @@ async def test_xh_cookie(container: AppContainer = Depends(require_auth)):
     resolved_user = prefer_cased_username(username, settings.xh_logged_in_username) if valid else ""
     if valid and resolved_user and resolved_user != settings.xh_logged_in_username:
         await container.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
-    status_msg = format_cookie_valid_message(resolved_user) if valid else message
+    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if valid else message)
     container.tasks.set_xh_cookie_status(valid, status_msg)
     container.events.emit_log(
         "INFO" if valid else "WARNING",
@@ -287,7 +290,7 @@ async def import_xh_cookie(
     resolved_user = prefer_cased_username(username, settings.xh_logged_in_username) if valid else ""
     if valid and resolved_user and resolved_user != settings.xh_logged_in_username:
         await container.repo.update_settings_patch({"xh_logged_in_username": resolved_user})
-    status_msg = format_cookie_valid_message(resolved_user) if valid else message
+    status_msg = container.repo.redact_diagnostic(format_cookie_valid_message(resolved_user) if valid else message)
     container.tasks.set_xh_cookie_status(valid, status_msg)
     container.events.emit_log(
         "INFO" if valid else "WARNING",
@@ -317,7 +320,7 @@ async def _perform_xh_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
             on_log=lambda level, message: container.events.emit_log(level, message),
         )
     except Exception as err:  # pragma: no cover - defensive
-        message = f"xHamster 自动登录异常: {err}"
+        message = f"xHamster 自动登录异常 ({type(err).__name__})"
         container.tasks.set_xh_cookie_status(False, message)
         container.events.broadcast("overview_changed", {})
         return {"success": False, "message": message}
@@ -325,19 +328,17 @@ async def _perform_xh_cookie_refresh(container: AppContainer) -> Dict[str, Any]:
     if not res.success:
         container.tasks.set_xh_cookie_status(False, res.message)
         container.events.broadcast("overview_changed", {})
-        return {"success": False, "message": res.message}
+        return {"success": False, "message": container.repo.redact_diagnostic(res.message)}
 
     resolved_user = prefer_cased_username(res.logged_in_username, settings.xh_logged_in_username)
-    patch: Dict[str, Any] = {"xh_cookie": res.cookie_str}
-    if resolved_user:
-        patch["xh_logged_in_username"] = resolved_user
-    await container.repo.update_settings_patch(patch)
+    if await container.repo.save_refreshed_cookie("xh", settings, res.cookie_str, resolved_user) is None:
+        return {"success": False, "message": "登录期间连接配置已变更，请重试"}
     container.tasks.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
     container.events.broadcast("overview_changed", {})
     return {
         "success": True,
         "logged_in_username": resolved_user,
-        "message": res.message,
+        "message": container.repo.redact_diagnostic(res.message),
     }
 
 
@@ -368,9 +369,9 @@ async def test_yescaptcha(container: AppContainer = Depends(require_auth)):
     try:
         balance = await get_yescaptcha_balance(settings.yescaptcha_client_key)
     except CaptchaError as err:
-        return {"ok": False, "message": str(err)}
+        return {"ok": False, "message": settings.redact_diagnostic(str(err))}
     except Exception as err:  # pragma: no cover - defensive
-        return {"ok": False, "message": f"YesCaptcha 连接异常: {err}"}
+        return {"ok": False, "message": f"YesCaptcha 连接异常 ({type(err).__name__})"}
     return {
         "ok": True,
         "balance": balance,
@@ -392,7 +393,10 @@ async def test_rclone(container: AppContainer = Depends(require_auth)):
     healthy = [str(r["remote"]) for r in results if r.get("ok") and r.get("remote")]
     if healthy:
         container.tasks.clear_remote_cooldowns(healthy)
-    return {"ok": ok, "message": msg, "results": results}
+    for result in results:
+        if "message" in result:
+            result["message"] = settings.redact_diagnostic(result["message"])
+    return {"ok": ok, "message": settings.redact_diagnostic(msg), "results": results}
 
 
 @router.post("/notify/test")
@@ -414,9 +418,12 @@ async def get_account_avatar(container: AppContainer = Depends(require_auth)):
         raise HTTPException(status_code=404, detail="未设置自定义头像")
     path, mime = found
     try:
-        content = path.read_bytes()
+        with path.open("rb") as handle:
+            content = handle.read(MAX_AVATAR_BYTES + 1)
     except OSError as err:
         raise HTTPException(status_code=404, detail="头像文件读取失败") from err
+    if len(content) > MAX_AVATAR_BYTES or _detect_avatar_image(content) is None:
+        raise HTTPException(status_code=404, detail="头像文件无效")
     return Response(
         content=content,
         media_type=mime,
@@ -433,6 +440,8 @@ async def upload_account_avatar(
     if not raw_str:
         raise HTTPException(status_code=400, detail="请选择要上传的图片")
     b64_part = raw_str.split(",", 1)[1] if raw_str.startswith("data:") and "," in raw_str else raw_str
+    if len(b64_part) > 4 * ((MAX_AVATAR_BYTES + 2) // 3):
+        raise HTTPException(status_code=400, detail="头像图片过大（请控制在 2 MB 以内）")
     try:
         decoded = base64.b64decode(b64_part, validate=True)
     except (binascii.Error, ValueError) as err:
@@ -448,9 +457,17 @@ async def upload_account_avatar(
     ext, _ = detected
     data_dir = container.env.resolved_data_dir
     container.env.ensure_dirs()
-    _remove_avatar_files(data_dir)
     target_path = data_dir / f"account_avatar{ext}"
-    target_path.write_bytes(decoded)
+    draft = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=data_dir, prefix=".avatar-", delete=False) as handle:
+            draft = Path(handle.name)
+            handle.write(decoded)
+        os.replace(draft, target_path)
+        _remove_avatar_files(data_dir, keep=target_path)
+    finally:
+        if draft is not None:
+            draft.unlink(missing_ok=True)
 
     version = secrets.token_hex(6)
     updated = await container.repo.update_settings_patch({"account_avatar_version": version})

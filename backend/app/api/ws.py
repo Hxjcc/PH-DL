@@ -28,8 +28,8 @@ async def ws_events(websocket: WebSocket):
 
     try:
         # Send initial snapshot so client renders immediately
-        await websocket.send_json(
-            {
+        with anyio.fail_after(15):
+            await websocket.send_json({
                 "type": "snapshot",
                 "data": {
                     "logs": container.events.recent_logs(200),
@@ -37,8 +37,7 @@ async def ws_events(websocket: WebSocket):
                     "scheduler_status": container.events.scheduler_status_snapshot(),
                     "scan_status": container.events.scan_status_snapshot(),
                 },
-            }
-        )
+            })
 
         async with anyio.create_task_group() as tg:
             async def _sender() -> None:
@@ -47,13 +46,12 @@ async def ws_events(websocket: WebSocket):
                         event = None
                         with anyio.move_on_after(25.0):
                             event = await queue.get()
+                            queue.task_done()
                         if not container.auth.verify_websocket(websocket):
                             break
-                        if event is None:
-                            await websocket.send_json({"type": "ping"})
-                        else:
-                            await websocket.send_json(event)
-                except (WebSocketDisconnect, RuntimeError):
+                        with anyio.fail_after(15):
+                            await websocket.send_json(event if event is not None else {"type": "ping"})
+                except (WebSocketDisconnect, RuntimeError, TimeoutError):
                     pass
                 finally:
                     tg.cancel_scope.cancel()
@@ -76,7 +74,7 @@ async def ws_events(websocket: WebSocket):
             tg.start_soon(_session_guard)
         if not container.auth.verify_websocket(websocket):
             await websocket.close(code=4401, reason="Session invalidated")
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, TimeoutError):
         pass
     finally:
         container.events.unsubscribe(queue)

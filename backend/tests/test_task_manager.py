@@ -988,9 +988,10 @@ async def test_scheduler_catches_up_after_scheduled_time(tmp_path: Path):
         await repo.update_settings_patch({"schedule_enabled": True, "schedule_time": "00:00"})
         triggered = []
 
-        async def _trigger():
+        async def _trigger(date):
             triggered.append(True)
-            return 42
+            job = await repo.create_scheduled_job(date)
+            return job["id"] if job else None
 
         sched = UpdateScheduler(repo=repo, events=events, trigger_auto_update=_trigger)
         sched.start()

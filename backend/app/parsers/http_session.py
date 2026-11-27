@@ -9,7 +9,7 @@ import warnings
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 warnings.filterwarnings(
     "ignore",
@@ -17,6 +17,7 @@ warnings.filterwarnings(
 )
 
 from curl_cffi.requests import AsyncSession as CffiSession
+from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 
 try:
     from curl_cffi import CurlHttpVersion
@@ -35,6 +36,7 @@ except Exception:  # pragma: no cover
 
 from ..cancel import StopRequested, until_stopped
 from . import challenge
+from .urls import is_cookie_origin, is_media_url
 
 # Only Chrome fingerprints: Safari fingerprints trigger a stripped-down PornHub HTML layout
 # that omits videos and breaks primary container selectors. Prefer modern desktop Chrome
@@ -62,6 +64,8 @@ DEFAULT_HEADERS: Dict[str, str] = {
 }
 
 LogCallback = Callable[[str, str], None]
+_MAX_PAGE_BYTES = 8 * 1024 * 1024
+_MAX_SESSION_COOKIES = 128
 
 
 @dataclass(frozen=True)
@@ -134,7 +138,7 @@ class TaskHttpContext:
 
     - Pins ONE Chrome TLS fingerprint across list pages, detail pages, get_media, and link refreshes.
     - Shares server-issued session cookies and PoW cookies across the entire job.
-    - Reserves 2x concurrency pool size to avoid HTTP/2 multiplexing curl(16) errors.
+    - Caps the lazily created connection pool and defaults to HTTP/1.1.
     """
 
     def __init__(
@@ -152,12 +156,13 @@ class TaskHttpContext:
         min_request_interval: Optional[float] = None,
         cancel_event: Optional[asyncio.Event] = None,
         on_log: Optional[LogCallback] = None,
+        site: Optional[str] = None,
         allow_url: Optional[Callable[[str], bool]] = None,
         allow_cookie_url: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.base_cookies: Dict[str, str] = parse_cookie_string(cookie_str)
         self.proxy_url = (proxy_url or "").strip() or None
-        self.pool_size = max(4, int(concurrency) * 2)
+        self.pool_size = max(4, min(int(concurrency) + 2, 16))
         self.timeout = float(timeout)
         self.max_retries = max(0, int(max_retries))
         self.retry_delay_base = float(retry_delay_base)
@@ -172,9 +177,13 @@ class TaskHttpContext:
         self.pow_cookies: Dict[str, str] = {}
         self.cancel_event = cancel_event or asyncio.Event()
         self.on_log = on_log
-        self._allow_url = allow_url
-        self._allow_cookie_url = allow_cookie_url
+        self.site = site
+        self._allow_url = allow_url or ((lambda url: is_media_url(url, site)) if site is not None else None)
+        self._allow_cookie_url = allow_cookie_url or ((lambda url: is_cookie_origin(url, site)) if site is not None else None)
+        self._entered = False
         self._session: Optional[CffiSession] = None
+        self._session_lock = asyncio.Lock()
+        self._session_requests = 0
         self._cookie_lock = asyncio.Lock()
         self._challenge_lock = asyncio.Lock()
         self._pacing_lock = asyncio.Lock()
@@ -196,14 +205,28 @@ class TaskHttpContext:
         return kwargs
 
     async def __aenter__(self) -> "TaskHttpContext":
-        self._session = CffiSession(**self._session_kwargs(self.pool_size))
-        await self._session.__aenter__()
+        self._entered = True
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        async with self._session_lock:
+            self._entered = False
+            await self._close_session(exc_type, exc, tb)
+
+    async def _close_session(self, exc_type=None, exc=None, tb=None) -> None:
         if self._session is not None:
-            await self._session.__aexit__(exc_type, exc, tb)
-            self._session = None
+            session, self._session = self._session, None
+            closing = asyncio.create_task(session.__aexit__(exc_type, exc, tb))
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                await asyncio.gather(closing, return_exceptions=True)
+                raise
+
+    async def release_idle_session(self) -> None:
+        async with self._session_lock:
+            if self._session_requests == 0:
+                await self._close_session()
 
     def _emit(self, level: str, msg: str) -> None:
         if self.on_log:
@@ -282,7 +305,13 @@ class TaskHttpContext:
         if not parsed:
             return
         async with self._cookie_lock:
-            self.session_cookies.update(parsed)
+            for name, value in parsed.items():
+                if len(name) + len(value) > 4096:
+                    continue
+                self.session_cookies.pop(name, None)
+                self.session_cookies[name] = value
+            while len(self.session_cookies) > _MAX_SESSION_COOKIES:
+                self.session_cookies.pop(next(iter(self.session_cookies)))
 
     def merged_cookies(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         merged = dict(self.base_cookies)
@@ -316,36 +345,81 @@ class TaskHttpContext:
 
         async def _do(sess: CffiSession) -> Tuple[str, str, List[str], int]:
             current_url = url
+            if self._allow_url and url.startswith("http://"):
+                parsed = urlsplit(url)
+                if parsed.port != 80:
+                    current_url = f"https://{url[7:]}"
+                else:
+                    current_url = parsed._replace(scheme="https", netloc=parsed.netloc.removesuffix(":80")).geturl()
+            hop_cookies = dict(cookies)
             for _ in range(6):
                 if self._allow_url and not self._allow_url(current_url):
                     raise ValueError("请求地址不在允许范围内")
                 can_use_cookies = not self._allow_cookie_url or self._allow_cookie_url(current_url)
+                if verb == "POST" and not can_use_cookies:
+                    raise ValueError("提交地址不在允许范围内")
+                request_headers = merged_headers if can_use_cookies else {
+                    k: v for k, v in merged_headers.items() if k.lower() not in {"cookie", "authorization"}
+                }
                 request_kwargs = {
-                    "cookies": (cookies or None) if can_use_cookies else None,
-                    "headers": merged_headers,
+                    "cookies": (hop_cookies or None) if can_use_cookies else None,
+                    "headers": request_headers,
                     "timeout": req_timeout,
                     "allow_redirects": self._allow_url is None,
                     "impersonate": self.impersonate,
                     "discard_cookies": True,
                 }
+                body = bytearray()
+                overflow = False
+
+                def receive(chunk: bytes) -> int:
+                    nonlocal overflow
+                    if len(body) + len(chunk) > _MAX_PAGE_BYTES:
+                        overflow = True
+                        return CURL_WRITEFUNC_ERROR
+                    body.extend(chunk)
+                    return len(chunk)
+
+                if self._allow_url:
+                    request_kwargs["content_callback"] = receive
                 if self.http_version is not None:
                     request_kwargs["http_version"] = self.http_version
-                if verb == "POST":
-                    resp = await sess.post(current_url, data=data, **request_kwargs)
-                else:
-                    resp = await sess.get(current_url, **request_kwargs)
+                try:
+                    if verb == "POST":
+                        resp = await sess.post(current_url, data=data, **request_kwargs)
+                    else:
+                        resp = await sess.get(current_url, **request_kwargs)
+                except Exception as err:
+                    if overflow:
+                        raise ValueError("页面响应体积超出限制") from err
+                    raise
                 set_cookies = extract_set_cookie_headers(resp.headers) if can_use_cookies else []
                 await self._absorb_set_cookies(set_cookies)
                 status = int(resp.status_code)
                 location = resp.headers.get("Location")
                 if self._allow_url and verb == "GET" and status in {301, 302, 303, 307, 308} and location:
+                    hop_cookies.update(self.session_cookies)
                     current_url = urljoin(str(resp.url), location)
                     continue
+                if body:
+                    resp.content = bytes(body)
                 return resp.text, str(resp.url), set_cookies, status
             raise ValueError("请求重定向次数过多")
 
-        if self._session is not None:
-            return await _do(self._session)
+        session = None
+        async with self._session_lock:
+            if self._entered:
+                if self._session is None:
+                    session = CffiSession(**self._session_kwargs(self.pool_size))
+                    await session.__aenter__()
+                    self._session = session
+                session = self._session
+                self._session_requests += 1
+        if session is not None:
+            try:
+                return await _do(session)
+            finally:
+                self._session_requests -= 1
         async with CffiSession(**self._session_kwargs(2)) as temp_session:
             return await _do(temp_session)
 

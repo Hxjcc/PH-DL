@@ -112,6 +112,7 @@ async def create_target(
         settings = await container.repo.get_settings()
         probe_timeout = min(float(settings.request_timeout), 10.0)
         async with TaskHttpContext(
+            site=norm_site,
             cookie_str=settings.xh_cookie if norm_site == "xhamster" else settings.ph_cookie,
             proxy_url=settings.normalized_proxy,
             concurrency=2,
@@ -194,6 +195,7 @@ async def batch_create_targets(
         probe_timeout = min(float(settings.request_timeout), 10.0)
         if needs_ph_auto:
             async with TaskHttpContext(
+                site="pornhub",
                 cookie_str=settings.ph_cookie,
                 proxy_url=settings.normalized_proxy,
                 concurrency=3,
@@ -213,6 +215,7 @@ async def batch_create_targets(
                     resolved_types[("pornhub", key)] = (detected or "model", uname, "", "")
         if needs_xh_auto:
             async with TaskHttpContext(
+                site="xhamster",
                 cookie_str=settings.xh_cookie,
                 proxy_url=settings.normalized_proxy,
                 concurrency=3,

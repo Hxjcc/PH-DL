@@ -36,6 +36,7 @@ const pageUrl = computed(() => {
 let player = null
 let Player = null
 let HlsCtor = null
+let hlsClient = null
 let controller = null
 let timer = null
 let bufferTimer = null
@@ -62,7 +63,19 @@ function releasePlayer() {
   fullscreenTarget.value = null
   const instance = player
   player = null
-  instance?.destroy()
+  const media = instance?.video
+  const hls = hlsClient
+  hlsClient = null
+  try {
+    hls?.destroy()
+  } finally {
+    instance?.destroy()
+    if (media) {
+      media.pause()
+      media.removeAttribute('src')
+      media.load()
+    }
+  }
 }
 
 function stopBuffering() {
@@ -118,7 +131,8 @@ function connect(index, previous) {
     }
     if (isHls) {
       playerOptions.customType = {
-        m3u8(video, url, art) {
+        m3u8(video, url) {
+          if (!isCurrent()) return
           if (HlsCtor && HlsCtor.isSupported()) {
             usedHlsJs = true
             let mediaRecoveryTries = 0
@@ -128,10 +142,8 @@ function connect(index, previous) {
               maxBufferLength: 30,
               maxMaxBufferLength: 60,
               startPosition: previous.time > 0 ? previous.time : -1,
-              xhrSetup(xhr) {
-                xhr.withCredentials = true
-              },
             })
+            hlsClient = hls
             hls.loadSource(url)
             hls.attachMedia(video)
             hls.on(HlsCtor.Events.ERROR, (_evt, data) => {
@@ -141,13 +153,7 @@ function connect(index, previous) {
                 hls.recoverMediaError()
                 return
               }
-              hls.destroy()
               queueMicrotask(failed)
-            })
-            art.hls = hls
-            art.on('destroy', () => {
-              hls.destroy()
-              art.hls = null
             })
           } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
             video.src = url
@@ -232,7 +238,7 @@ async function loadSources() {
       if (closed || request.signal.aborted) return
       HlsCtor = hlsMod.default
     }
-    sources.value = (response?.sources || []).filter((source) => source.relay_url)
+    sources.value = (response?.sources || []).filter((source) => source.relay_url?.startsWith('/api/videos/'))
     if (!sources.value.length) {
       showError('当前没有可播放的视频。')
       return
@@ -242,6 +248,9 @@ async function loadSources() {
     if (!closed && !request.signal.aborted) connect(Math.max(0, selected), previous)
   } catch (err) {
     if (!closed && !request.signal.aborted) showError(err.message || '获取播放地址失败，请重试。')
+  } finally {
+    request.abort()
+    if (controller === request) controller = null
   }
 }
 

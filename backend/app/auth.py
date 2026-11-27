@@ -8,12 +8,13 @@ import hmac
 import secrets
 import time
 import urllib.parse
-from collections import defaultdict
-from typing import Dict, Iterable, List, Optional
+from collections import OrderedDict
+from typing import Iterable, List, Mapping, Optional
 
 from fastapi import HTTPException, Request, WebSocket, status
 
 SESSION_COOKIE_NAME = "phdl_session"
+_MAX_TRACKED_CLIENTS = 2048
 
 
 class AuthManager:
@@ -31,7 +32,7 @@ class AuthManager:
         self._secret_key = secret_key.encode("utf-8")
         self._ttl_seconds = max(3600, int(ttl_hours) * 3600)
         self.cookie_secure = cookie_secure
-        self._failed_attempts: Dict[str, List[float]] = defaultdict(list)
+        self._failed_attempts: OrderedDict[str, List[float]] = OrderedDict()
         self._generation = generation if generation is not None else 1 + secrets.randbelow(2 ** 60)
         self.session_invalidated = asyncio.Event()
 
@@ -41,15 +42,6 @@ class AuthManager:
     def check_rate_limit(self, client_ip: str) -> None:
         now = time.monotonic()
         window = 300.0  # 5 min
-        # Periodically prune stale IP buckets to avoid unbounded memory growth
-        if len(self._failed_attempts) > 256:
-            stale_ips = [
-                ip for ip, stamps in self._failed_attempts.items()
-                if not any(now - ts < window for ts in stamps)
-            ]
-            for ip in stale_ips:
-                self._failed_attempts.pop(ip, None)
-
         recent = [ts for ts in self._failed_attempts.get(client_ip, []) if now - ts < window]
         if recent:
             self._failed_attempts[client_ip] = recent
@@ -62,7 +54,11 @@ class AuthManager:
             )
 
     def record_login_failure(self, client_ip: str) -> None:
-        self._failed_attempts[client_ip].append(time.monotonic())
+        attempts = self._failed_attempts.setdefault(client_ip, [])
+        attempts.append(time.monotonic())
+        self._failed_attempts.move_to_end(client_ip)
+        if len(self._failed_attempts) > _MAX_TRACKED_CLIENTS:
+            self._failed_attempts.popitem(last=False)
 
     def clear_login_failures(self, client_ip: str) -> None:
         self._failed_attempts.pop(client_ip, None)
@@ -133,36 +129,33 @@ class AuthManager:
 
     @staticmethod
     def verify_websocket_origin(websocket: WebSocket, allowed_origins: Iterable[str] = ()) -> bool:
-        origin = (websocket.headers.get("origin") or "").strip().rstrip("/")
+        return AuthManager.verify_origin(websocket.headers, allowed_origins)
+
+    @staticmethod
+    def verify_origin(headers: Mapping[str, str], allowed_origins: Iterable[str] = ()) -> bool:
+        origin = (headers.get("origin") or "").strip().rstrip("/")
         if not origin:
             return True
         try:
             parsed = urllib.parse.urlsplit(origin)
+            port = parsed.port
         except ValueError:
             return False
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None
+                or parsed.path or parsed.query or parsed.fragment or port == 0):
             return False
 
         normalized_allowed = {o.strip().rstrip("/").lower() for o in allowed_origins if o and o.strip()}
         if origin.lower() in normalized_allowed:
             return True
 
-        origin_netloc = parsed.netloc.lower()
-        origin_host = parsed.hostname.lower()
-        host_candidates = [
-            (websocket.headers.get("x-forwarded-host") or "").split(",")[0].strip().lower(),
-            (websocket.headers.get("host") or "").strip().lower(),
-        ]
-        for candidate in host_candidates:
-            if not candidate:
-                continue
-            if origin_netloc == candidate:
-                return True
-            # Handle proxies that forward Host without port (e.g. Nginx `$host`)
-            cand_parsed = urllib.parse.urlsplit(f"//{candidate}")
-            if cand_parsed.port is None and cand_parsed.hostname and origin_host == cand_parsed.hostname.lower():
-                return True
-        return False
+        try:
+            host = urllib.parse.urlsplit(f"//{(headers.get('host') or '').strip()}")
+            default_port = 443 if parsed.scheme == "https" else 80
+            return (host.username is None and not (host.path or host.query or host.fragment)
+                    and parsed.hostname == host.hostname and (port or default_port) == (host.port or default_port))
+        except ValueError:
+            return False
 
     @property
     def max_age_seconds(self) -> int:

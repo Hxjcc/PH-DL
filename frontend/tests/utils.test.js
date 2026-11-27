@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createPinia } from 'pinia'
 
+import { api } from '../src/api/client.js'
+import { useAppStore } from '../src/stores/app.js'
 import { parseVideoLinks } from '../src/utils/videoLinks.js'
 import { buildExportFilename } from '../src/utils/exportFilename.js'
 import { formatBytes, formatPublishedDate, formatSpeed, formatVideoDuration, siteMeta, targetTypeMeta } from '../src/utils/format.js'
@@ -152,6 +155,74 @@ test('resolveJobVisual extracts category, display title, avatars, and capsules',
     [{ id: 9, username: 'ariavix', display_name: 'AriaVix', target_type: 'model', avatar_url: '', enabled: true }]
   )
   assert.ok(baseVisual.capsules.some((c) => c.text === '@ariavix' && c.handle === true))
+})
+
+test('resolveJobVisual strips site prefixes from historical retry labels and keeps lineage', () => {
+  for (const site of ['xHamster', 'PornHub']) {
+    const visual = resolveJobVisual({
+      kind: 'retry_items',
+      label: `续传 · [${site}] 下载目标: alice (2 项)`,
+      params: { source_job_id: 92, resume_count: 2 },
+    })
+    assert.equal(visual.title, 'alice')
+    assert.equal(visual.avatars[0].username, 'alice')
+    assert.ok(visual.capsules.some(({ text }) => text === '已续传 2 次'))
+    assert.ok(visual.capsules.some(({ text }) => text === '源自 #92'))
+  }
+})
+
+test('resolveJobVisual keeps the original category and profile on in-place resume', () => {
+  const job = {
+    kind: 'manual_target',
+    label: '[xHamster] 下载目标: alice',
+    params: {
+      site: 'xhamster',
+      usernames: ['alice'],
+      profile_names: { alice: 'Alice' },
+      profile_avatars: { alice: 'https://cdn.example/alice.jpg' },
+      resume_count: 1,
+    },
+  }
+  const visual = resolveJobVisual(job)
+  assert.equal(visual.category.key, 'target_download')
+  assert.equal(visual.title, 'Alice')
+  assert.equal(visual.avatars[0].avatarUrl, 'https://cdn.example/alice.jpg')
+  assert.deepEqual(visual.capsules.filter(({ text }) => /续传|源自/.test(text)), [{ text: '已续传 1 次' }])
+  job.params.resume_count = 0
+  assert.ok(resolveJobVisual(job).capsules.every(({ text }) => !text.startsWith('已续传')))
+})
+
+test('app store caps inactive job details and preserves active jobs and recent accesses', async (t) => {
+  const store = useAppStore(createPinia())
+  const job = (id, status = 'completed', resumeCount = 0) => ({
+    id,
+    status,
+    params: { resume_count: resumeCount },
+    params_json: JSON.stringify({ resume_count: resumeCount }),
+  })
+  t.mock.method(api, 'getJob', async (id) => ({
+    job: job(id, id === 1 ? 'running' : id === 2 ? 'queued' : 'completed'),
+    items: [{ id: 100 + id, job_id: id }],
+  }))
+
+  try {
+    for (let id = 1; id <= 10; id++) await store.loadJobDetail(id)
+    store.touchJobDetail(3)
+    store.liveProgress[104] = { job_id: 4 }
+    await store.loadJobDetail(11)
+    assert.deepEqual(Object.keys(store.jobItems).map(Number), [1, 2, 3, 5, 6, 7, 8, 9, 10, 11])
+    assert.equal(store.liveProgress[104], undefined)
+
+    store._upsertJob(job(11, 'queued', 1))
+    assert.deepEqual(store.jobs.slice(0, 3).map(({ id }) => id), [1, 11, 2])
+    assert.equal(store._upsertJob(job(11)), false)
+    assert.equal(store.jobs[1].status, 'queued')
+    await store.loadJobDetail(12)
+    assert.ok(Array.isArray(store.jobItems[11]))
+    assert.equal(Object.keys(store.jobItems).length, 11)
+  } finally {
+    store._resetSessionState()
+  }
 })
 
 test('computeJobLiveMetrics includes fractional byte progress and speed while done_items is 0', () => {

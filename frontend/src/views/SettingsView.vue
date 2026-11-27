@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, ref, watch } from 'vue'
+import { computed, onActivated, onDeactivated, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Save,
@@ -135,21 +135,24 @@ const AUTH_MODES = [
 const LOGIN_POLL_INTERVAL_MS = 2500
 const LOGIN_POLL_TIMEOUT_MS = 15 * 60 * 1000
 const LOGIN_POLL_MAX_ERRORS = 5
+let loginPoll = null
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function waitForLoginResult(fetchStatus) {
+async function waitForLoginResult(fetchStatus, signal) {
   const deadline = Date.now() + LOGIN_POLL_TIMEOUT_MS
   let consecutiveErrors = 0
   while (Date.now() < deadline) {
     await sleep(LOGIN_POLL_INTERVAL_MS)
+    signal.throwIfAborted()
     let status = null
     try {
-      status = await fetchStatus()
+      status = await fetchStatus(signal)
       consecutiveErrors = 0
     } catch (err) {
+      signal.throwIfAborted()
       consecutiveErrors += 1
       if (consecutiveErrors >= LOGIN_POLL_MAX_ERRORS) throw err
       continue
@@ -509,6 +512,17 @@ onActivated(() => {
   loadSettings()
 })
 
+onDeactivated(() => {
+  loginPoll?.abort()
+  pasteCookie.value = ''
+  pasteXhCookie.value = ''
+  if (form.value) {
+    for (const key of ['ph_password', 'xh_password', 'serverchan_send_key', 'yescaptcha_client_key', 'proxy_url', 'rclone_extra_flags']) {
+      form.value[key] = store.settingsCache?.[key] || ''
+    }
+  }
+})
+
 async function saveAll() {
   if (!form.value) return
   const schedTime = String(form.value.schedule_time || '').trim()
@@ -623,6 +637,8 @@ async function handleRefreshCookie() {
     return
   }
   busyTool.value = 'cookie_refresh'
+  const request = new AbortController()
+  loginPoll = request
   try {
     const saved = await api.saveSettings(form.value)
     if (saved?.settings) {
@@ -630,13 +646,15 @@ async function handleRefreshCookie() {
       store.setSettingsCache(saved.settings)
     }
     const started = await api.refreshCookie()
-    const res = started?.running ? await waitForLoginResult(api.cookieRefreshStatus) : started
+    const res = started?.running ? await waitForLoginResult(api.cookieRefreshStatus, request.signal) : started
+    request.signal.throwIfAborted()
     if (res.success) store.clearSubscriptionsCache()
     store.notify(res.message, res.success ? 'success' : 'error')
     await Promise.all([loadSettings(), store.refreshOverview()])
   } catch (err) {
-    store.notify(err.message, 'error')
+    if (!request.signal.aborted) store.notify(err.message, 'error')
   } finally {
+    if (loginPoll === request) loginPoll = null
     busyTool.value = ''
   }
 }
@@ -677,6 +695,8 @@ async function handleRefreshXhCookie() {
     return
   }
   busyTool.value = 'xh_cookie_refresh'
+  const request = new AbortController()
+  loginPoll = request
   try {
     const saved = await api.saveSettings(form.value)
     if (saved?.settings) {
@@ -684,13 +704,15 @@ async function handleRefreshXhCookie() {
       store.setSettingsCache(saved.settings)
     }
     const started = await api.refreshXhCookie()
-    const res = started?.running ? await waitForLoginResult(api.xhCookieRefreshStatus) : started
+    const res = started?.running ? await waitForLoginResult(api.xhCookieRefreshStatus, request.signal) : started
+    request.signal.throwIfAborted()
     if (res.success) store.clearSubscriptionsCache()
     store.notify(res.message, res.success ? 'success' : 'error')
     await Promise.all([loadSettings(), store.refreshOverview()])
   } catch (err) {
-    store.notify(err.message, 'error')
+    if (!request.signal.aborted) store.notify(err.message, 'error')
   } finally {
+    if (loginPoll === request) loginPoll = null
     busyTool.value = ''
   }
 }

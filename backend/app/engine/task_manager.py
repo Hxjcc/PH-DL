@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import time
 import urllib.parse
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -20,7 +20,7 @@ import aiohttp
 
 from ..cancel import StopRequested, until_stopped
 from ..config import EnvSettings, RuntimeSettings
-from ..db.repo import Repository, normalize_site, utc_now_iso
+from ..db.repo import Repository, job_scan_incomplete, job_uses_item_counts, normalize_site, utc_now_iso
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.list_scanner import ListedVideo, build_target_list_url, scan_list_pages
 from ..parsers.target import (
@@ -65,6 +65,7 @@ from ..services.hls_downloader import download_hls_to_mp4, is_hls_url
 from ..services.filename import (
     format_remote_video_filename,
     is_valid_video_file,
+    is_within_directory,
     normalized_quality,
     sanitize_filename,
     video_filename_base,
@@ -80,6 +81,7 @@ from ..services.uploader import (
 )
 from .events import EventBus
 from .disk_scheduler import AdaptiveDiskScheduler, SmartUploadPool, UploadQueuedItem
+from .memory import reclaim_memory
 
 
 def _split_csv_set(raw: Optional[str], lower: bool = False) -> Optional[Set[str]]:
@@ -93,6 +95,19 @@ def _split_csv_set(raw: Optional[str], lower: bool = False) -> Optional[Set[str]
 
 def _quality_set(raw: Optional[str]) -> Optional[Set[str]]:
     return {q for part in (_split_csv_set(raw) or ()) if (q := normalized_quality(part))} or None
+
+
+def _effective_auto_upload(params: Dict[str, Any], settings: RuntimeSettings) -> bool:
+    opt_in = params.get("auto_upload")
+    return opt_in is True or (opt_in is None and settings.uploader_enabled)
+
+
+def _item_site(item: Dict[str, Any]) -> str:
+    return "xhamster" if is_xhamster_url(item.get("page_url")) else normalize_site(item.get("site"))
+
+
+def _item_key(viewkey: str, page_url: str) -> str:
+    return viewkey or extract_viewkey_from_url(page_url) or page_url
 
 
 def _target_folder_name(username: Optional[str], target_type: str, site: str = "pornhub") -> str:
@@ -166,12 +181,15 @@ class TaskManager:
         self.repo = repo
         self.events = events
 
-        self._queue: asyncio.Queue[int] = asyncio.Queue()
+        self._queue: asyncio.Queue[Tuple[int, int]] = asyncio.Queue()
+        self._pending_tokens: Dict[int, int] = {}
+        self._enqueue_seq = 0
+        self._queue_lock = asyncio.Lock()
         self._worker_task: Optional[asyncio.Task] = None
+        self._stopping = False
         self._current_job_id: Optional[int] = None
         self._current_cancel_event: Optional[asyncio.Event] = None
         self._current_halt_reason: str = ""
-        self._cancelled_queued_ids: Set[int] = set()
         self._last_cookie_valid: Optional[bool] = None
         self._last_cookie_message: str = "未检测"
         self._last_xh_cookie_valid: Optional[bool] = None
@@ -289,21 +307,30 @@ class TaskManager:
 
     def start(self) -> None:
         if self._worker_task is None or self._worker_task.done():
+            self._stopping = False
             self._worker_task = asyncio.create_task(self._worker_loop(), name="phdl-task-worker")
 
     async def restore_queued_jobs(self) -> int:
-        job_ids = await self.repo.list_queued_job_ids()
-        for job_id in job_ids:
-            await self._queue.put(job_id)
-        return len(job_ids)
+        restored = 0
+        async with self._queue_lock:
+            for job_id in await self.repo.list_queued_job_ids():
+                if job_id not in self._pending_tokens and job_id != self._current_job_id:
+                    self._enqueue(job_id)
+                    restored += 1
+        return restored
 
     async def stop(self) -> None:
+        self._stopping = True
+        worker = self._worker_task
+        if worker is None:
+            return
         if self._current_cancel_event is not None:
             self._current_cancel_event.set()
-        if self._worker_task is not None and not self._worker_task.done():
-            self._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._worker_task
+            await asyncio.wait({worker}, timeout=5.0)
+        if not worker.done():
+            worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
         self._worker_task = None
 
     @property
@@ -312,7 +339,7 @@ class TaskManager:
 
     @property
     def queued_count(self) -> int:
-        return self._queue.qsize()
+        return len(self._pending_tokens)
 
     @property
     def cookie_status(self) -> Dict[str, Any]:
@@ -320,7 +347,7 @@ class TaskManager:
 
     def set_cookie_status(self, valid: Optional[bool], message: str) -> None:
         self._last_cookie_valid = valid
-        self._last_cookie_message = message
+        self._last_cookie_message = self.repo.redact_diagnostic(message)
         self.events.broadcast("overview_changed", {})
 
     def reset_cookie_status(self) -> None:
@@ -333,7 +360,7 @@ class TaskManager:
 
     def set_xh_cookie_status(self, valid: Optional[bool], message: str) -> None:
         self._last_xh_cookie_valid = valid
-        self._last_xh_cookie_message = message
+        self._last_xh_cookie_message = self.repo.redact_diagnostic(message)
 
     def reset_xh_cookie_status(self) -> None:
         self._last_xh_cookie_valid = None
@@ -345,6 +372,16 @@ class TaskManager:
             return self._current_xh_ctx
         return default_ctx
 
+    async def _release_idle_http_sessions(self, ctx: TaskHttpContext) -> None:
+        await ctx.release_idle_session()
+        if self._current_xh_ctx is not None:
+            await self._current_xh_ctx.release_idle_session()
+
+    def _enqueue(self, job_id: int) -> None:
+        self._enqueue_seq += 1
+        self._pending_tokens[job_id] = self._enqueue_seq
+        self._queue.put_nowait((job_id, self._enqueue_seq))
+
     async def enqueue_job(
         self,
         kind: str,
@@ -352,67 +389,156 @@ class TaskManager:
         params: Dict[str, Any],
         trigger: str = "manual",
     ) -> Dict[str, Any]:
-        job = await self.repo.create_job(kind=kind, label=label, params=params, trigger=trigger)
-        job_id = int(job["id"])
-        await self._queue.put(job_id)
+        async with self._queue_lock:
+            job = await self.repo.create_job(kind=kind, label=label, params=params, trigger=trigger)
+            job_id = int(job["id"])
+            self._enqueue(job_id)
         self.events.broadcast("job_updated", job)
         self.events.broadcast("overview_changed", {})
         self.events.emit_log("INFO", f"任务已入队: {label}", job_id=job_id)
         return job
 
+    async def enqueue_scheduled_job(self, date: str) -> Optional[int]:
+        async with self._queue_lock:
+            job = await self.repo.create_scheduled_job(date)
+            if job is None:
+                return None
+            self._enqueue(job["id"])
+        self.events.broadcast("job_updated", job)
+        self.events.broadcast("overview_changed", {})
+        return job["id"]
+
     async def cancel_job(self, job_id: int) -> bool:
-        job = await self.repo.get_job(job_id)
-        if not job:
-            return False
-        if job["status"] not in {"queued", "scanning", "running"}:
-            return False
-
-        if self._current_job_id == job_id and self._current_cancel_event is not None:
-            self._current_cancel_event.set()
-            self.events.emit_log("WARNING", "收到停止指令，正在安全中止当前任务...", job_id=job_id)
-            return True
-
-        updated = await self.repo.cancel_queued_job(job_id)
+        async with self._queue_lock:
+            job = await self.repo.get_job(job_id)
+            if not job or job["status"] not in {"queued", "scanning", "running"}:
+                return False
+            if self._current_job_id == job_id and self._current_cancel_event is not None:
+                self._current_cancel_event.set()
+                self.events.emit_log("WARNING", "收到停止指令，正在安全中止当前任务...", job_id=job_id)
+                return True
+            updated = await self.repo.cancel_queued_job(job_id)
+            if updated:
+                self._pending_tokens.pop(job_id, None)
+                self._discard_stale_tokens()
         if updated:
-            self._cancelled_queued_ids.add(job_id)
             self.events.broadcast("job_updated", updated)
+            self.events.broadcast("job_items_changed", {"job_id": job_id})
             self.events.broadcast("overview_changed", {})
             self.events.emit_log("WARNING", "已取消排队中的任务", job_id=job_id)
             return True
-        if self._current_job_id == job_id and self._current_cancel_event is not None:
-            self._current_cancel_event.set()
-            return True
         return False
 
+    def _discard_stale_tokens(self) -> None:
+        if self._queue.qsize() <= len(self._pending_tokens) + 64:
+            return
+        for _ in range(self._queue.qsize()):
+            job_id, token = self._queue.get_nowait()
+            if self._pending_tokens.get(job_id) == token:
+                self._queue.put_nowait((job_id, token))
+            self._queue.task_done()
+
+    async def resume_job_in_place(self, job_id: int) -> Tuple[Optional[Dict[str, Any]], str, int]:
+        active_error = "运行或排队中的任务无法重试，请先停止"
+        async with self._queue_lock:
+            job = await self.repo.get_job(job_id)
+            if job is None:
+                return None, "源任务不存在", 404
+            if job["status"] in {"queued", "scanning", "running"} or self._current_job_id == job_id:
+                return None, active_error, 409
+
+            kind, params = job["kind"], job["params"]
+            export_only = bool(params.get("export_only"))
+            replayable = job["status"] in {"cancelled", "failed", "partial_failed"}
+            item_resets = None
+            if kind == "enrich_metadata":
+                if await self.repo.count_baseline_metadata_candidates() == 0 and not replayable:
+                    return None, "没有仍需补全元数据的基线视频", 400
+                mode = "enrich"
+            else:
+                auto_upload = _effective_auto_upload(params, await self.repo.get_settings())
+                retryable = await self.repo.list_retryable_job_items(job_id, auto_upload=auto_upload)
+                has_scan_gap = any(marker in job["error_message"] for marker in ("扫描未完成", "目标检查失败"))
+                if replayable and (
+                    export_only or kind in {"baseline_sync", "check_updates"}
+                    or (has_scan_gap and kind != "retry_items")
+                    or not retryable
+                ):
+                    mode = "rescan"
+                elif retryable:
+                    mode = "items"
+                else:
+                    return None, "该任务没有失败或未完成的条目", 400
+                if mode == "items" or (
+                    mode == "rescan" and kind in {"manual_target", "manual_urls", "auto_update", "resume_temp"}
+                ):
+                    item_resets = await asyncio.to_thread(self._resume_item_resets, retryable)
+
+            requeued = await self.repo.requeue_job_in_place(
+                job_id, params_patch={"resume_mode": mode}, clear_export_text=export_only, item_resets=item_resets,
+            )
+            if requeued is None:
+                if await self.repo.get_job(job_id) is None:
+                    return None, "源任务不存在", 404
+                return None, active_error, 409
+            self._enqueue(job_id)
+
+        self.events.broadcast("job_updated", requeued)
+        self.events.broadcast("job_items_changed", {"job_id": job_id})
+        self.events.broadcast("overview_changed", {})
+        self.events.emit_log("INFO", f"原任务已重新入队: {requeued['label']}", job_id=job_id)
+        return requeued, "", 200
+
     async def _worker_loop(self) -> None:
-        while True:
-            job_id = await self._queue.get()
+        while not self._stopping:
+            job_id, token = await self._queue.get()
             try:
-                if job_id in self._cancelled_queued_ids:
-                    self._cancelled_queued_ids.discard(job_id)
-                    continue
-                await self._run_job(job_id)
+                async with self._queue_lock:
+                    if self._pending_tokens.get(job_id) != token:
+                        continue
+                    if self._stopping:
+                        self._queue.put_nowait((job_id, token))
+                        return
+                    del self._pending_tokens[job_id]
+                try:
+                    await self._run_job(job_id)
+                except Exception as err:
+                    failed = await self._fail_job(job_id, err)
+                    if failed:
+                        self.events.broadcast("job_updated", failed)
+                finally:
+                    self._current_job_id = None
+                    self._current_cancel_event = None
+                    self._current_halt_reason = ""
+                    self.events.clear_job_progress(job_id)
+                    with contextlib.suppress(Exception):
+                        await self.repo.prune_old_jobs(200)
+                    with contextlib.suppress(Exception):
+                        await reclaim_memory(self.repo.db)
+                    self.events.broadcast("overview_changed", {})
             except asyncio.CancelledError:
+                if self._pending_tokens.get(job_id) == token:
+                    self._queue.put_nowait((job_id, token))
                 raise
-            except Exception as err:
-                self.events.emit_log("ERROR", f"任务执行发生未捕获异常: {err}", job_id=job_id)
-                updated = await self.repo.update_job(
-                    job_id,
-                    status="failed",
-                    error_message=str(err),
-                    finished_at=utc_now_iso(),
-                )
-                if updated:
-                    self.events.broadcast("job_updated", updated)
             finally:
-                self._current_job_id = None
-                self._current_cancel_event = None
-                self._current_halt_reason = ""
-                self.events.clear_job_progress(job_id)
-                with contextlib.suppress(Exception):
-                    await self.repo.prune_old_jobs(200)
-                self.events.broadcast("overview_changed", {})
                 self._queue.task_done()
+
+    async def _fail_job(self, job_id: int, err: Exception) -> Optional[Dict[str, Any]]:
+        self.events.emit_log("ERROR", f"任务执行发生未捕获异常: {err}", job_id=job_id)
+        job = await self.repo.get_job(job_id)
+        message = str(err)
+        if job and (job_scan_incomplete(job) or "扫描未完成" in job["error_message"]
+                    or "目标检查失败" in job["error_message"]):
+            message = f"扫描未完成：{message}"
+        return await self.repo.finish_job(job_id, "failed", message)
+
+    async def _cancel_active_job(self, job_id: int, message: str) -> Optional[Dict[str, Any]]:
+        job = await self.repo.get_job(job_id)
+        if job is None:
+            return None
+        if job_scan_incomplete(job) or any(marker in job["error_message"] for marker in ("扫描未完成", "目标检查失败")):
+            message = f"扫描未完成，{message}"
+        return await self.repo.finish_job(job_id, "cancelled", message, cancel_items=True)
 
     async def _ensure_valid_cookie(
         self,
@@ -451,10 +577,9 @@ class TaskManager:
             async def _persist_ph(res: CookieLoginResult) -> None:
                 if not (res.success and res.cookie_str):
                     return
-                patch: Dict[str, Any] = {"ph_cookie": res.cookie_str}
-                if res.logged_in_username:
-                    patch["ph_logged_in_username"] = res.logged_in_username
-                updated = await self.repo.update_settings_patch(patch)
+                updated = await self.repo.save_refreshed_cookie("ph", settings, res.cookie_str, res.logged_in_username)
+                if updated is None:
+                    return
                 resolved_user = (res.logged_in_username or updated.ph_logged_in_username or "").strip()
                 self.set_cookie_status(True, format_cookie_valid_message(resolved_user))
                 persisted.append(updated)
@@ -475,8 +600,11 @@ class TaskManager:
             if login_res.success and login_res.cookie_str:
                 if not persisted:
                     await _persist_ph(login_res)
-                return persisted[-1]
-            err_msg = login_res.message
+                if persisted:
+                    return persisted[-1]
+                err_msg = "登录期间连接配置已变更，请重试"
+            else:
+                err_msg = login_res.message
         else:
             err_msg = "未配置有效 Cookie，且未填写 PornHub 账号密码"
 
@@ -485,7 +613,7 @@ class TaskManager:
         if notify_on_failure:
             await send_serverchan(
                 "PH-DL 告警：Cookie 失效",
-                f"定时追更因 Cookie 失效中止：{err_msg}\n请打开 Web 面板在【系统设置】中手动粘贴浏览器 Cookie。",
+                f"定时追更因 Cookie 失效中止：{self._last_cookie_message}\n请打开 Web 面板在【系统设置】中手动粘贴浏览器 Cookie。",
                 settings,
             )
         return None
@@ -494,8 +622,19 @@ class TaskManager:
         self,
         kind: str,
         params: Dict[str, Any],
+        *,
+        job_id: Optional[int] = None,
     ) -> Tuple[bool, bool, bool]:
         """Return ``(needs_ph_cookie, needs_xh_cookie, needs_xh_ctx)`` for a job."""
+        resume_mode = params.get("resume_mode")
+        pending_sites: Set[str] = set()
+        if job_id is not None and (
+            resume_mode == "items" or (resume_mode == "rescan" and kind in {"auto_update", "resume_temp"})
+        ):
+            pending_sites = {_item_site(item) for item in await self.repo.list_job_items(job_id, status="pending")}
+            if resume_mode == "items":
+                return "pornhub" in pending_sites, False, "xhamster" in pending_sites
+
         if kind == "manual_target":
             site = normalize_site(params.get("site"))
             if site == "xhamster":
@@ -528,16 +667,15 @@ class TaskManager:
                         targets.append(row)
             else:
                 targets = await self.repo.list_targets(enabled_only=True)
-            if not targets:
+            if not targets and not pending_sites:
                 return True, False, False
-            has_ph = any(normalize_site(t.get("site")) == "pornhub" for t in targets)
-            has_xh = any(normalize_site(t.get("site")) == "xhamster" for t in targets)
+            sites = pending_sites | {normalize_site(t.get("site")) for t in targets}
             needs_xh_cookie = any(
                 normalize_site(t.get("site")) == "xhamster"
                 and str(t.get("target_type") or "").lower() == "favorites"
                 for t in targets
             )
-            return has_ph, needs_xh_cookie, has_xh
+            return "pornhub" in sites, needs_xh_cookie, "xhamster" in sites
 
         if kind == "retry_items":
             source_job_id = int(params.get("source_job_id") or 0)
@@ -559,24 +697,26 @@ class TaskManager:
             return has_ph, False, has_xh
 
         if kind == "resume_temp":
-            temp_files = self.list_temp_files()
-            if not temp_files:
+            temp_files = await asyncio.to_thread(self.list_temp_files)
+            if not temp_files and not pending_sites:
                 return True, False, False
-            has_xh = any(tf.get("site") == "xhamster" for tf in temp_files)
-            has_ph = any(tf.get("site") != "xhamster" for tf in temp_files)
-            return has_ph, False, has_xh
+            sites = pending_sites | {normalize_site(tf.get("site")) for tf in temp_files}
+            return "pornhub" in sites, False, "xhamster" in sites
 
         if kind == "enrich_metadata":
             limit = int(params.get("limit") or 0)
-            candidates = await self.repo.list_baseline_metadata_candidates(limit=limit)
+            resumed = params.get("resume_mode") == "enrich"
+            candidates = await self.repo.list_baseline_metadata_candidates(
+                limit=limit, resume_job_id=job_id if resumed else None, site_only=True,
+            )
             if not candidates:
-                return True, False, False
+                return not resumed, False, False
             has_xh = any(
-                normalize_site(c.get("site")) == "xhamster" or is_xhamster_url(c.get("video_page_url"))
+                normalize_site(c.get("site")) == "xhamster"
                 for c in candidates
             )
             has_ph = any(
-                normalize_site(c.get("site")) == "pornhub" and not is_xhamster_url(c.get("video_page_url"))
+                normalize_site(c.get("site")) == "pornhub"
                 for c in candidates
             )
             return has_ph, False, has_xh
@@ -619,10 +759,9 @@ class TaskManager:
             async def _persist_xh(res: CookieLoginResult) -> None:
                 if not (res.success and res.cookie_str):
                     return
-                patch: Dict[str, Any] = {"xh_cookie": res.cookie_str}
-                if res.logged_in_username:
-                    patch["xh_logged_in_username"] = res.logged_in_username
-                updated = await self.repo.update_settings_patch(patch)
+                updated = await self.repo.save_refreshed_cookie("xh", settings, res.cookie_str, res.logged_in_username)
+                if updated is None:
+                    return
                 resolved_user = (res.logged_in_username or updated.xh_logged_in_username or "").strip()
                 self.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
                 persisted.append(updated)
@@ -643,8 +782,11 @@ class TaskManager:
             if login_res.success and login_res.cookie_str:
                 if not persisted:
                     await _persist_xh(login_res)
-                return persisted[-1]
-            err_msg = login_res.message or "xHamster 自动登录失败"
+                if persisted:
+                    return persisted[-1]
+                err_msg = "登录期间连接配置已变更，请重试"
+            else:
+                err_msg = login_res.message or "xHamster 自动登录失败"
         elif settings.xh_cookie.strip():
             err_msg = "xHamster Cookie 已失效，且未配置 xHamster 账号密码"
         else:
@@ -655,27 +797,56 @@ class TaskManager:
         return None
 
     async def _run_job(self, job_id: int) -> None:
-        job = await self.repo.get_job(job_id)
-        if not job or job["status"] != "queued":
-            return
-
         cancel_event = asyncio.Event()
+        self._pending_tokens.pop(job_id, None)
         self._current_job_id = job_id
         self._current_cancel_event = cancel_event
         self._current_halt_reason = ""
         self._current_xh_ctx = None
 
-        started = await self.repo.claim_queued_job(job_id)
-        if not started:
-            return
-        self.events.broadcast("job_updated", started)
-        self.events.broadcast("overview_changed", {})
+        try:
+            started = await self.repo.claim_queued_job(job_id)
+            if not started:
+                return
+            self.events.broadcast("job_updated", started)
+            self.events.broadcast("overview_changed", {})
+            try:
+                finished = await self._execute_job(job_id, started, cancel_event)
+            except StopRequested:
+                finished = await self._cancel_active_job(job_id, "已取消")
+            except Exception as err:
+                finished = await self._fail_job(job_id, err)
+            if finished:
+                if finished["status"] != "completed":
+                    self.events.broadcast("job_items_changed", {"job_id": job_id})
+                self.events.broadcast("job_updated", finished)
+                self.events.emit_log(
+                    "INFO",
+                    f"任务结束 [{finished['status']}]: 总计 {finished['total_items']}，"
+                    f"完成 {finished['done_items']}，已上传 {finished['uploaded_items']}，"
+                    f"跳过 {finished['skipped_items']}，失败 {finished['failed_items']}",
+                    job_id=job_id,
+                )
+        except asyncio.CancelledError:
+            finished = await self._cancel_active_job(job_id, "服务停止，可点击续传或重试")
+            if finished:
+                self.events.broadcast("job_updated", finished)
+            raise
+        finally:
+            self._current_job_id = None
+            self._current_cancel_event = None
+            self._current_halt_reason = ""
 
+    async def _execute_job(
+        self, job_id: int, job: Dict[str, Any], cancel_event: asyncio.Event,
+    ) -> Optional[Dict[str, Any]]:
         settings = await self.repo.get_settings()
         kind = job["kind"]
         params = job.get("params") or {}
 
-        needs_ph_cookie, needs_xh_cookie, needs_xh_ctx = await self._job_site_requirements(kind, params)
+        resume_mode = params.get("resume_mode")
+        needs_ph_cookie, needs_xh_cookie, needs_xh_ctx = await self._job_site_requirements(kind, params, job_id=job_id)
+        scan_error_prefix = "扫描未完成：" if resume_mode == "rescan" else ""
 
         # Validate required site cookie(s) before network work
         try:
@@ -688,15 +859,7 @@ class TaskManager:
                     ), cancel_event,
                 )
                 if checked_settings is None:
-                    failed = await self.repo.update_job(
-                        job_id,
-                        status="failed",
-                        error_message=self._last_cookie_message,
-                        finished_at=utc_now_iso(),
-                    )
-                    if failed:
-                        self.events.broadcast("job_updated", failed)
-                    return
+                    return await self.repo.finish_job(job_id, "failed", scan_error_prefix + self._last_cookie_message)
                 settings = checked_settings
 
             if needs_xh_cookie:
@@ -704,15 +867,7 @@ class TaskManager:
                     self._ensure_valid_xh_cookie(settings, job_id, cancel_event=cancel_event), cancel_event,
                 )
                 if checked_xh is None:
-                    failed = await self.repo.update_job(
-                        job_id,
-                        status="failed",
-                        error_message=self._last_xh_cookie_message,
-                        finished_at=utc_now_iso(),
-                    )
-                    if failed:
-                        self.events.broadcast("job_updated", failed)
-                    return
+                    return await self.repo.finish_job(job_id, "failed", scan_error_prefix + self._last_xh_cookie_message)
                 settings = checked_xh
             elif (
                 needs_xh_ctx
@@ -734,14 +889,12 @@ class TaskManager:
                         job_id=job_id,
                     )
         except StopRequested:
-            stopped = await self.repo.update_job(job_id, status="cancelled", error_message="已取消", finished_at=utc_now_iso())
-            if stopped:
-                self.events.broadcast("job_updated", stopped)
-            return
+            return await self._cancel_active_job(job_id, "已取消")
 
         async with contextlib.AsyncExitStack() as stack:
             ctx = await stack.enter_async_context(
                 TaskHttpContext(
+                    site="pornhub",
                     cookie_str=settings.ph_cookie,
                     proxy_url=settings.normalized_proxy,
                     concurrency=settings.max_concurrent_video_details,
@@ -756,6 +909,7 @@ class TaskManager:
             if needs_xh_ctx:
                 self._current_xh_ctx = await stack.enter_async_context(
                     TaskHttpContext(
+                        site="xhamster",
                         cookie_str=settings.xh_cookie,
                         proxy_url=settings.normalized_proxy,
                         concurrency=settings.max_concurrent_video_details,
@@ -768,7 +922,9 @@ class TaskManager:
                     )
                 )
             try:
-                if kind == "manual_target":
+                if resume_mode == "items":
+                    await self._exec_resume_job_items(job_id, params, settings, ctx)
+                elif kind == "manual_target":
                     await self._exec_manual_target(job_id, params, settings, ctx)
                 elif kind == "manual_urls":
                     await self._exec_manual_urls(job_id, params, settings, ctx)
@@ -785,54 +941,37 @@ class TaskManager:
                 elif kind == "enrich_metadata":
                     await self._exec_enrich_metadata(job_id, params, settings, ctx)
                 elif kind == "retry_items":
-                    await self._exec_retry_items(job_id, params, settings, ctx)
+                    if resume_mode != "rescan" or not await self.repo.list_job_items(job_id):
+                        await self._exec_retry_items(job_id, params, settings, ctx)
                 elif kind == "resume_temp":
                     await self._exec_resume_temp(job_id, params, settings, ctx)
                 else:
-                    await self.repo.update_job(
-                        job_id,
-                        status="failed",
-                        error_message=f"未知任务类型: {kind}",
-                        finished_at=utc_now_iso(),
-                    )
-                    return
+                    return await self.repo.finish_job(job_id, "failed", f"未知任务类型: {kind}")
             finally:
                 self._current_xh_ctx = None
 
-        uses_job_items = kind not in {"baseline_sync", "check_updates"} and not bool(params.get("export_only", False))
         final_job = (
             await self.repo.recalculate_job_counts(job_id)
-            if uses_job_items
+            if job_uses_item_counts(job)
             else await self.repo.get_job(job_id)
         )
         if final_job is None:
-            return
+            return None
         if final_job["status"] in {"scanning", "running"}:
-            update_fields: Dict[str, Any] = {"finished_at": utc_now_iso()}
+            message = final_job["error_message"]
             if self._current_halt_reason:
                 final_status = "partial_failed"
-                if not str(final_job.get("error_message") or "").strip():
-                    update_fields["error_message"] = self._current_halt_reason
+                message = message or self._current_halt_reason
             elif cancel_event.is_set():
                 final_status = "cancelled"
-            elif int(final_job.get("failed_items") or 0) > 0 or str(final_job.get("error_message") or "").strip():
+                if job_scan_incomplete(final_job) and "扫描未完成" not in message:
+                    message = f"扫描未完成，{message or '已取消'}"
+            elif int(final_job.get("failed_items") or 0) > 0 or message.strip():
                 final_status = "partial_failed"
             else:
                 final_status = "completed"
-            final_job = await self.repo.update_job(
-                job_id,
-                status=final_status,
-                **update_fields,
-            )
-        if final_job:
-            self.events.broadcast("job_updated", final_job)
-            self.events.emit_log(
-                "INFO",
-                f"任务结束 [{final_job['status']}]: 总计 {final_job['total_items']}，"
-                f"完成 {final_job['done_items']}，已上传 {final_job['uploaded_items']}，"
-                f"跳过 {final_job['skipped_items']}，失败 {final_job['failed_items']}",
-                job_id=job_id,
-            )
+            final_job = await self.repo.finish_job(job_id, final_status, message, cancel_items=cancel_event.is_set())
+        return final_job
 
     # ------------------------------------------------------------------
     # Pipeline: Streaming Pre-Parse -> Adaptive Download -> Multi-Worker Upload
@@ -989,7 +1128,6 @@ class TaskManager:
                         else fatal_limit
                     )
                     self._current_halt_reason = halt_msg
-                    await self.repo.update_job(job_id, error_message=halt_msg)
                     self.events.emit_log(
                         "ERROR",
                         f"检测到网盘上传硬性限制（{halt_msg}），已自动暂停当前任务剩余下载与上传，本地已下载文件均已保留。",
@@ -1092,13 +1230,13 @@ class TaskManager:
                                 entry.viewkey,
                                 str(entry.local_path),
                                 verified_remote_path,
+                                item_id=entry.item_id,
                             )
                         ):
                             local_path = str(entry.local_path)
                             removed_local = False
                             if not ctx.cancel_event.is_set() and delete_verified_source(entry.local_path, snapshot):
                                 await self.repo.clear_uploaded_local_path(entry.viewkey, local_path)
-                                local_path = ""
                                 removed_local = True
                             elif not ctx.cancel_event.is_set():
                                 self.events.emit_log(
@@ -1106,12 +1244,9 @@ class TaskManager:
                                     f"[上传] 本地副本未移除: {entry.local_path.name}",
                                     job_id=job_id,
                                 )
-                            it = await self.repo.update_job_item(
-                                entry.item_id,
-                                status="done",
-                                local_path=local_path,
-                                upload_requested=0,
-                                error_message="",
+                            it = (
+                                await self.repo.update_job_item(entry.item_id, local_path="")
+                                if removed_local else await self.repo.get_job_item(entry.item_id)
                             )
                             if it:
                                 self.events.broadcast("item_updated", it)
@@ -1231,13 +1366,16 @@ class TaskManager:
                 self.events.broadcast("job_updated", refreshed)
 
         async def _upload_worker() -> None:
-            while True:
-                chunk = await upload_pool.take_next_chunk(ctx.cancel_event)
-                if chunk is None:
-                    return
-                await _upload_chunk(chunk)
-                if ctx.cancel_event.is_set():
-                    return
+            try:
+                while not ctx.cancel_event.is_set():
+                    chunk = await upload_pool.take_next_chunk(ctx.cancel_event)
+                    if chunk is None:
+                        return
+                    await _upload_chunk(chunk)
+            except Exception:
+                ctx.cancel_event.set()
+                await upload_pool.notify_cancel()
+                raise
 
         async def _enqueue_for_upload(
             *,
@@ -1301,20 +1439,29 @@ class TaskManager:
 
             timeout = aiohttp.ClientTimeout(total=None, connect=20.0, sock_connect=20.0, sock_read=45.0)
             dl_slots = max(1, int(settings.max_concurrent_downloads))
-            conn_per_host = max(32, min(96, dl_slots * 12))
-            conn_total = max(128, conn_per_host * 2)
+            if dl_slots == 1:
+                hls_seg_concurrency, hls_max_buffer_bytes = 8, 24 * 1024 * 1024
+            elif dl_slots == 2:
+                hls_seg_concurrency, hls_max_buffer_bytes = 6, 16 * 1024 * 1024
+            else:
+                hls_seg_concurrency, hls_max_buffer_bytes = 4, 12 * 1024 * 1024
+            conn_per_host = max(12, min(48, dl_slots * hls_seg_concurrency + 4))
+            conn_total = max(24, conn_per_host * 2)
+            if not pass_parse_specs:
+                await self._release_idle_http_sessions(ctx)
             connector, _ = create_aiohttp_connector(
                 settings.normalized_proxy,
                 limit=conn_total,
                 limit_per_host=conn_per_host,
-                keepalive_timeout=60.0,
+                keepalive_timeout=20.0,
                 ttl_dns_cache=300,
             )
 
             async with aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
-                read_bufsize=2 * 1024 * 1024,
+                read_bufsize=256 * 1024,
+                cookie_jar=aiohttp.DummyCookieJar(),
             ) as dl_session:
                 async def _dl_one(item_id: int) -> None:
                     if ctx.cancel_event.is_set():
@@ -1325,9 +1472,7 @@ class TaskManager:
                         return
 
                     vkey = item["viewkey"]
-                    item_site = normalize_site(
-                        item.get("site") or ("xhamster" if is_xhamster_url(item.get("page_url")) else "pornhub")
-                    )
+                    item_site = _item_site(item)
                     site_ctx = self._ctx_for_site(ctx, item_site)
                     site_cookie = settings.xh_cookie if item_site == "xhamster" else settings.ph_cookie
                     uploader_folder = _target_folder_name(item["uploader"], item["target_type"], site=item_site)
@@ -1342,10 +1487,16 @@ class TaskManager:
                         else (self.env.temp_dir / uploader_folder)
                     )
                     partial_path = Path(item["temp_path"]) if item.get("temp_path") else None
-                    if partial_path is not None and partial_path.resolve().is_relative_to(self.env.temp_dir.resolve()):
+                    if partial_path is not None and not partial_path.is_symlink() and is_within_directory(partial_path, self.env.temp_dir):
                         tmp_dir = partial_path.parent
                     else:
                         partial_path = None
+                    if not is_within_directory(dl_dir, self.env.downloads_dir) or not is_within_directory(tmp_dir, self.env.temp_dir):
+                        it = await self.repo.update_job_item(item_id, status="failed", error_message="文件目录超出允许范围")
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        await _refresh_job_progress()
+                        return
                     will_upload = auto_upload and item.get("upload_requested") != 0
                     requested = _resolve_item_qualities(item_id)
                     ledger = await self.repo.get_video(vkey) if vkey and not redownload else None
@@ -1385,50 +1536,68 @@ class TaskManager:
                         await _refresh_job_progress()
                         return
 
-                    if ledger and ledger["status"] == "downloaded" and ledger["local_path"] and quality_matches:
-                        existing_local = Path(ledger["local_path"])
-                        if existing_local.resolve().is_relative_to(self.env.downloads_dir.resolve()) and await asyncio.to_thread(
-                            is_valid_video_file, existing_local, settings.min_file_size_bytes, ledger["file_size"] or None,
-                        ):
-                            existing_size = existing_local.stat().st_size
-                            pub_date = str(item.get("published_at") or ledger.get("published_at") or "").strip()
-                            dur_sec = int(item.get("duration_seconds") or ledger.get("duration_seconds") or 0)
-                            await self.repo.upsert_video(
-                                vkey,
-                                site=item_site,
-                                status="downloaded",
-                                local_path=str(existing_local),
+                    local_file = None
+                    if vkey and item.get("local_path"):
+                        local_file = await asyncio.to_thread(
+                            self._existing_local_file, item["local_path"], settings.min_file_size_bytes,
+                            item.get("bytes_total") or None,
+                        )
+                    own_local_file = local_file is not None
+                    local_quality = item["quality"]
+                    if local_file is None and ledger and ledger["status"] == "downloaded" and ledger["local_path"] and quality_matches:
+                        local_file = await asyncio.to_thread(
+                            self._existing_local_file, ledger["local_path"], settings.min_file_size_bytes,
+                            ledger["file_size"] or None,
+                        )
+                        local_quality = ledger["quality"]
+
+                    if local_file is not None:
+                        existing_local, existing_size = local_file
+                        pub_date = str(item.get("published_at") or (ledger or {}).get("published_at") or "").strip()
+                        dur_sec = int(item.get("duration_seconds") or (ledger or {}).get("duration_seconds") or 0)
+                        local_metadata = {
+                            "title": item["title"], "uploader": item["uploader"], "target_type": item["target_type"],
+                            "quality": local_quality, "video_page_url": item["page_url"],
+                        } if own_local_file else {}
+                        await self.repo.upsert_video(
+                            vkey,
+                            site=item_site,
+                            status="downloaded",
+                            local_path=str(existing_local),
+                            file_size=existing_size,
+                            force_status=own_local_file,
+                            upload_requested=will_upload,
+                            published_at=pub_date,
+                            duration_seconds=dur_sec,
+                            **local_metadata,
+                        )
+                        completed_here = will_upload or own_local_file
+                        it = await self.repo.update_job_item(
+                            item_id,
+                            status="downloaded" if completed_here else "skipped",
+                            local_path=str(existing_local),
+                            quality=local_quality,
+                            bytes_downloaded=existing_size,
+                            bytes_total=existing_size,
+                            upload_requested=int(will_upload),
+                            error_message="" if completed_here else "本地已有符合画质的完整文件，跳过",
+                        )
+                        if it:
+                            self.events.broadcast("item_updated", it)
+                        if will_upload:
+                            await _enqueue_for_upload(
+                                item_id=item_id,
+                                viewkey=vkey,
+                                uploader_folder=uploader_folder,
+                                download_dir=existing_local.parent,
+                                local_path=existing_local,
+                                page_url=item["page_url"],
                                 file_size=existing_size,
-                                upload_requested=will_upload,
                                 published_at=pub_date,
-                                duration_seconds=dur_sec,
+                                site=item_site,
                             )
-                            it = await self.repo.update_job_item(
-                                item_id,
-                                status="downloaded" if will_upload else "skipped",
-                                local_path=str(existing_local),
-                                quality=ledger["quality"],
-                                bytes_downloaded=existing_size,
-                                bytes_total=existing_size,
-                                upload_requested=int(will_upload),
-                                error_message="" if will_upload else "本地已有符合画质的完整文件，跳过",
-                            )
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            if will_upload:
-                                await _enqueue_for_upload(
-                                    item_id=item_id,
-                                    viewkey=vkey,
-                                    uploader_folder=uploader_folder,
-                                    download_dir=existing_local.parent,
-                                    local_path=existing_local,
-                                    page_url=item["page_url"],
-                                    file_size=existing_size,
-                                    published_at=pub_date,
-                                    site=item_site,
-                                )
-                            await _refresh_job_progress()
-                            return
+                        await _refresh_job_progress()
+                        return
 
                     required_bytes = 0
                     disk_wait_rounds = 0
@@ -1513,6 +1682,8 @@ class TaskManager:
                                     preferred_qualities=requested,
                                     xh_preferred_codec=settings.xh_preferred_codec,
                                     max_attempts=settings.download_attempts,
+                                    segment_concurrency=hls_seg_concurrency,
+                                    max_buffer_bytes=hls_max_buffer_bytes,
                                     retry_delay_base=settings.retry_delay_base,
                                     retry_delay_max=settings.retry_delay_max,
                                     request_timeout=settings.request_timeout,
@@ -1840,6 +2011,7 @@ class TaskManager:
                             pworkers = [asyncio.create_task(_parse_worker()) for _ in range(parse_concurrency)]
                             try:
                                 await asyncio.gather(*pworkers)
+                                await self._release_idle_http_sessions(ctx)
                             finally:
                                 for pw in pworkers:
                                     if not pw.done():
@@ -1965,16 +2137,26 @@ class TaskManager:
                         site=row_site,
                     )
                     _record_failed_url(folder, row["page_url"])
+        except BaseException:
+            ctx.cancel_event.set()
+            raise
         finally:
+            upload_results = []
             if upload_tasks:
+                with contextlib.suppress(Exception):
+                    await self._release_idle_http_sessions(ctx)
                 await upload_pool.mark_downloads_done()
                 if ctx.cancel_event.is_set():
                     await upload_pool.notify_cancel()
-                await asyncio.gather(*upload_tasks, return_exceptions=True)
+                upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
                 leftovers = await upload_pool.drain_all()
                 if leftovers:
                     await _mark_entries_cancelled(leftovers)
             self.events.clear_scheduler_status(job_id)
+
+        for result in upload_results:
+            if isinstance(result, Exception):
+                raise result
 
         return dict(uploaded_by_uploader), dict(failed_urls_by_uploader)
 
@@ -1991,6 +2173,7 @@ class TaskManager:
         group_by_uploader: bool = True,
         upload_requested: bool = False,
         site: str = "pornhub",
+        seen_item_keys: Optional[Set[str]] = None,
     ) -> List[int]:
         norm_site = normalize_site(site)
         item_ids: List[int] = []
@@ -1998,7 +2181,9 @@ class TaskManager:
         for detail in details:
             if detail.filtered_out or detail.error == "操作已取消":
                 continue
-            key = detail.viewkey or detail.page_url
+            key = _item_key(detail.viewkey, detail.page_url)
+            if seen_item_keys is not None and key in seen_item_keys:
+                continue
             old = selected.get(key)
             if old is None or (old.error and not detail.error and detail.download_url):
                 selected[key] = detail
@@ -2033,6 +2218,8 @@ class TaskManager:
                 self.events.emit_log("WARNING", f"视频解析失败 [{detail.viewkey}]: {error}", job_id=job_id)
 
         rows = await self.repo.add_job_items_batch(job_id, specs)
+        if seen_item_keys is not None:
+            seen_item_keys.update(selected)
         for row in rows:
             if row.get("status") == "pending":
                 item_ids.append(int(row["id"]))
@@ -2099,6 +2286,7 @@ class TaskManager:
         videos_spec: Optional[str] = None,
         catch_up: bool = False,
         skip_vkeys: Optional[Set[str]] = None,
+        lookup_skipped: Optional[Callable[[List[str]], Awaitable[Set[str]]]] = None,
         preferred_qualities: Optional[Set[str]] = None,
         include_keywords: Optional[Set[str]] = None,
         exclude_keywords: Optional[Set[str]] = None,
@@ -2112,7 +2300,8 @@ class TaskManager:
         """Scan list pages with 4-way prefetch and stream details through one concurrency limit."""
         site_ctx = self._ctx_for_site(ctx, site)
         detail_semaphore = asyncio.Semaphore(max(1, settings.max_concurrent_video_details))
-        page_detail_tasks: List[asyncio.Task] = []
+        page_detail_tasks: deque[asyncio.Task] = deque()
+        details: List[VideoDetail] = []
         active_hint: Optional[Tuple[str, str]] = uploader_hint
 
         async def _handle_canonical(canon_type: str, canon_user: str) -> None:
@@ -2139,6 +2328,8 @@ class TaskManager:
 
         async def _on_page(page_items: List[ListedVideo]) -> None:
             page_detail_tasks.append(asyncio.create_task(_parse_page_details(page_items)))
+            if len(page_detail_tasks) >= max(2, 2 * settings.max_concurrent_list_pages):
+                details.extend(await page_detail_tasks.popleft())
 
         self.events.emit_log(
             "INFO",
@@ -2162,6 +2353,8 @@ class TaskManager:
                 "on_page": _on_page,
                 "on_error": on_scan_error,
             }
+            if lookup_skipped is not None:
+                scan_kwargs["lookup_skipped"] = lookup_skipped
             if on_canonical_target is not None:
                 scan_kwargs["on_canonical_target"] = _handle_canonical
             if on_subscribe_action is not None:
@@ -2197,8 +2390,8 @@ class TaskManager:
                     task.cancel()
                 await asyncio.gather(*page_detail_tasks, return_exceptions=True)
                 raise
-            details = [detail for group in detail_groups for detail in group]
-        else:
+            details.extend(detail for group in detail_groups for detail in group)
+        elif not details:
             # Compatibility path for scanners that do not stream page callbacks.
             details = await _parse_page_details(listed)
         details.sort(key=lambda d: (d.page_num, d.item_num))
@@ -2306,9 +2499,13 @@ class TaskManager:
         videos_spec = (params.get("videos") or "").strip() or None
         redownload = bool(params.get("redownload", False))
         export_only = bool(params.get("export_only", False))
-        auto_upload = bool(params.get("auto_upload", settings.uploader_enabled))
+        auto_upload = _effective_auto_upload(params, settings)
         add_to_auto_track = bool(params.get("add_to_auto_track", False))
         subscribe_creator = bool(params.get("subscribe_creator", False))
+        historical_items = (
+            await self.repo.list_job_items(job_id) if not export_only and params.get("resume_mode") == "rescan" else []
+        )
+        existing_keys = {_item_key(item["viewkey"], item["page_url"]) for item in historical_items}
 
         targets: List[Tuple[str, str]] = []
         resolved_profile_names: Dict[str, str] = {}
@@ -2367,10 +2564,14 @@ class TaskManager:
         if not targets:
             await self.repo.update_job(job_id, error_message="没有有效的下载目标")
             self.events.emit_log("WARNING", "没有有效的下载目标。", job_id=job_id)
-            return
+            if not historical_items:
+                return
 
-        known_vkeys = set() if (redownload or export_only or qualities) else await self.repo.get_uploaded_viewkeys()
-        known_vkeys.update(params.get("skip_completed_viewkeys") or ())
+        known_vkeys = set(params.get("skip_completed_viewkeys") or ())
+        known_vkeys.update(existing_keys)
+
+        async def lookup_uploaded(keys: List[str]) -> Set[str]:
+            return await self.repo.get_known_viewkeys(keys, uploaded_only=True)
         all_details: List[VideoDetail] = []
         scoped_listed: Dict[str, Tuple[ListedVideo, str, str]] = {}
         scan_errors: List[str] = []
@@ -2510,6 +2711,7 @@ class TaskManager:
                     pages_spec=pages_spec,
                     videos_spec=videos_spec,
                     skip_vkeys=known_vkeys,
+                    lookup_skipped=None if redownload or export_only or qualities else lookup_uploaded,
                     preferred_qualities=qualities,
                     include_keywords=include_kw,
                     exclude_keywords=exclude_kw,
@@ -2537,6 +2739,8 @@ class TaskManager:
                     "on_page_progress": _emit_manual_page_progress,
                     "on_error": page_errors.append,
                 }
+                if not (redownload or export_only or qualities):
+                    scan_kwargs["lookup_skipped"] = lookup_uploaded
                 if can_link_creator:
                     scan_kwargs["on_canonical_target"] = _handle_manual_canonical
                 if on_sub_cb is not None:
@@ -2577,6 +2781,7 @@ class TaskManager:
                     fallback_action or SubscribeAction(site=site),
                     (prof_res.final_url if prof_res is not None else profile_url),
                 )
+                del prof_res
 
             if add_to_auto_track and can_link_creator and not ctx.cancel_event.is_set():
                 await self._maybe_track_creator(
@@ -2598,9 +2803,10 @@ class TaskManager:
                 all_details.extend(details)
             else:
                 for lv in listed:
-                    key = lv.viewkey or lv.url
-                    if key not in scoped_listed:
+                    key = _item_key(lv.viewkey, lv.url)
+                    if key not in existing_keys and key not in scoped_listed:
                         scoped_listed[key] = (lv, resolved_user, active_utype)
+            listed = []
 
         if scan_errors:
             await self.repo.update_job(job_id, error_message=f"{len(scan_errors)} 页扫描未完成：{scan_errors[0]}")
@@ -2608,10 +2814,13 @@ class TaskManager:
             await self._record_export_result(job_id, all_details)
             return
 
-        if not scoped_listed or ctx.cancel_event.is_set():
+        if ctx.cancel_event.is_set() or (not scoped_listed and not historical_items):
             return
 
+        all_item_ids, parse_specs, item_qualities = await self._prepare_resume_items(historical_items, params, settings)
+        del historical_items, existing_keys
         listed_entries = list(scoped_listed.values())
+        scoped_listed.clear()
         item_specs = [
             {
                 "site": site,
@@ -2632,8 +2841,6 @@ class TaskManager:
             for lv, uname, utype in listed_entries
         ]
         rows = await self.repo.add_job_items_batch(job_id, item_specs)
-        all_item_ids: List[int] = []
-        parse_specs: Dict[int, _PendingParseSpec] = {}
         for row, (lv, uname, utype) in zip(rows, listed_entries):
             iid = int(row["id"])
             all_item_ids.append(iid)
@@ -2649,6 +2856,8 @@ class TaskManager:
                 site=site,
             )
             self.events.broadcast("item_updated", row)
+        del listed_entries, item_specs, rows
+        known_vkeys.clear()
         updated_job = await self.repo.recalculate_job_counts(job_id)
         if updated_job:
             self.events.broadcast("job_updated", updated_job)
@@ -2659,6 +2868,8 @@ class TaskManager:
         )
         if all_item_ids and not ctx.cancel_event.is_set():
             self.events.clear_scan_status(job_id)
+            await self._release_idle_http_sessions(ctx)
+            await reclaim_memory(self.repo.db)
             await self._run_download_upload_pipeline(
                 job_id,
                 all_item_ids,
@@ -2667,46 +2878,26 @@ class TaskManager:
                 auto_upload=auto_upload,
                 redownload=redownload,
                 preferred_qualities=qualities,
+                item_preferred_qualities=item_qualities or None,
                 parse_specs=parse_specs,
                 include_keywords=include_kw,
                 exclude_keywords=exclude_kw,
             )
 
-    async def _exec_manual_urls(
-        self,
-        job_id: int,
-        params: Dict[str, Any],
-        settings: RuntimeSettings,
-        ctx: TaskHttpContext,
-    ) -> None:
-        video_urls, ignored = collect_video_urls(str(url) for url in (params.get("urls") or []))
-        skipped_non_video = ignored + int(params.get("skipped_non_video") or 0)
-
-        if skipped_non_video:
-            self.events.emit_log("WARNING", f"已跳过 {skipped_non_video} 条非视频链接。", job_id=job_id)
-        if not video_urls:
-            await self.repo.update_job(job_id, error_message="未识别到有效的视频链接")
-            self.events.emit_log("WARNING", "未识别到任何有效视频链接。", job_id=job_id)
-            return
-
-        quality_setting = params.get("quality")
-        qualities = _quality_set(settings.preferred_quality if quality_setting is None else quality_setting)
-        include_kw = _split_csv_set(params.get("keywords"), lower=True)
-        exclude_kw = _split_csv_set(params.get("exclude_keywords"), lower=True)
-        group_by_uploader = bool(params.get("group_by_uploader", True))
-        redownload = bool(params.get("redownload", False))
-        export_only = bool(params.get("export_only", False))
-        auto_upload = bool(params.get("auto_upload", settings.uploader_enabled))
+    def _url_creator_linkage_handler(
+        self, job_id: int, params: Dict[str, Any], settings: RuntimeSettings, ctx: TaskHttpContext,
+    ) -> Optional[Callable[[VideoDetail], Awaitable[None]]]:
         add_to_auto_track = bool(params.get("add_to_auto_track", False))
         subscribe_creator = bool(params.get("subscribe_creator", False))
-        batch_folder = sanitize_filename(params.get("batch_name") or "url_batch")
+        if not (add_to_auto_track or subscribe_creator):
+            return None
 
         creator_link_lock = asyncio.Lock()
         tracked_keys: Set[Tuple[str, str]] = set()
         subscribed_keys: Set[str] = set()
 
         async def _handle_url_creator_linkage(detail: VideoDetail) -> None:
-            if not (add_to_auto_track or subscribe_creator) or ctx.cancel_event.is_set():
+            if ctx.cancel_event.is_set():
                 return
             async with creator_link_lock:
                 detail_site = detect_site_from_url(detail.page_url)
@@ -2752,6 +2943,37 @@ class TaskManager:
                         site=detail_site,
                     )
 
+        return _handle_url_creator_linkage
+
+    async def _exec_manual_urls(
+        self,
+        job_id: int,
+        params: Dict[str, Any],
+        settings: RuntimeSettings,
+        ctx: TaskHttpContext,
+    ) -> None:
+        video_urls, ignored = collect_video_urls(str(url) for url in (params.get("urls") or []))
+        skipped_non_video = ignored + int(params.get("skipped_non_video") or 0)
+
+        if skipped_non_video:
+            self.events.emit_log("WARNING", f"已跳过 {skipped_non_video} 条非视频链接。", job_id=job_id)
+        if not video_urls:
+            await self.repo.update_job(job_id, error_message="未识别到有效的视频链接")
+            self.events.emit_log("WARNING", "未识别到任何有效视频链接。", job_id=job_id)
+            return
+
+        quality_setting = params.get("quality")
+        qualities = _quality_set(settings.preferred_quality if quality_setting is None else quality_setting)
+        include_kw = _split_csv_set(params.get("keywords"), lower=True)
+        exclude_kw = _split_csv_set(params.get("exclude_keywords"), lower=True)
+        group_by_uploader = bool(params.get("group_by_uploader", True))
+        redownload = bool(params.get("redownload", False))
+        export_only = bool(params.get("export_only", False))
+        auto_upload = _effective_auto_upload(params, settings)
+        batch_folder = sanitize_filename(params.get("batch_name") or "url_batch")
+
+        on_detail_parsed = self._url_creator_linkage_handler(job_id, params, settings, ctx)
+
         if export_only:
             self.events.emit_log("INFO", f"正在并发解析 {len(video_urls)} 条视频链接...", job_id=job_id)
             by_site_urls: Dict[str, List[Tuple[str, int, int]]] = defaultdict(list)
@@ -2773,13 +2995,19 @@ class TaskManager:
                     )
                 )
             details.sort(key=lambda d: (d.page_num, d.item_num))
-            if add_to_auto_track or subscribe_creator:
+            if on_detail_parsed is not None:
                 for d in details:
                     if not d.error or d.filtered_out:
-                        await _handle_url_creator_linkage(d)
+                        await on_detail_parsed(d)
             await self._record_export_result(job_id, details)
             return
 
+        historical_items = await self.repo.list_job_items(job_id) if params.get("resume_mode") == "rescan" else []
+        existing_keys = {_item_key(item["viewkey"], item["page_url"]) for item in historical_items}
+        existing_keys.update(_item_key("", item["page_url"]) for item in historical_items)
+        item_ids, parse_specs, item_qualities = await self._prepare_resume_items(historical_items, params, settings)
+        del historical_items
+        new_urls = [u for u in video_urls if _item_key("", u) not in existing_keys]
         item_specs = [
             {
                 "site": detect_site_from_url(u),
@@ -2795,12 +3023,10 @@ class TaskManager:
                 "error_message": "",
                 "upload_requested": auto_upload,
             }
-            for u in video_urls
+            for u in new_urls
         ]
         rows = await self.repo.add_job_items_batch(job_id, item_specs)
-        item_ids: List[int] = []
-        parse_specs: Dict[int, _PendingParseSpec] = {}
-        for idx, (row, u) in enumerate(zip(rows, video_urls), start=1):
+        for idx, (row, u) in enumerate(zip(rows, new_urls), start=1):
             iid = int(row["id"])
             item_ids.append(iid)
             url_site = detect_site_from_url(u)
@@ -2815,6 +3041,7 @@ class TaskManager:
                 site=url_site,
             )
             self.events.broadcast("item_updated", row)
+        del item_specs, rows, existing_keys
         updated_job = await self.repo.recalculate_job_counts(job_id)
         if updated_job:
             self.events.broadcast("job_updated", updated_job)
@@ -2832,10 +3059,11 @@ class TaskManager:
                 auto_upload=auto_upload,
                 redownload=redownload,
                 preferred_qualities=qualities,
+                item_preferred_qualities=item_qualities or None,
                 parse_specs=parse_specs,
                 include_keywords=include_kw,
                 exclude_keywords=exclude_kw,
-                on_detail_parsed=_handle_url_creator_linkage if (add_to_auto_track or subscribe_creator) else None,
+                on_detail_parsed=on_detail_parsed,
             )
 
     async def _exec_update_check(
@@ -2847,6 +3075,10 @@ class TaskManager:
         *,
         auto_download: bool,
     ) -> None:
+        rescan = params.get("resume_mode") == "rescan"
+        auto_upload = _effective_auto_upload(params, settings)
+        historical_items = await self.repo.list_job_items(job_id) if auto_download and rescan else []
+        existing_keys = {_item_key(item["viewkey"], item["page_url"]) for item in historical_items}
         target_ids = params.get("target_ids")
         if target_ids:
             targets = []
@@ -2858,7 +3090,7 @@ class TaskManager:
             targets = await self.repo.list_targets(enabled_only=True)
 
         pending_upload_ids: List[int] = []
-        if auto_download and settings.uploader_enabled and not target_ids:
+        if auto_download and auto_upload and not target_ids:
             # Reconcile files left behind by a previous cancelled/failed upload
             # instead of silently skipping them forever via the dedup ledger.
             cleared_ghosts = 0
@@ -2907,12 +3139,14 @@ class TaskManager:
                     "duration_seconds": int(video.get("duration_seconds") or 0),
                 }
                 for video in valid_pending
+                if video["viewkey"] not in existing_keys
             ]
             if pending_specs:
-                inserted_rows = await self.repo.add_job_items_batch(job_id, pending_specs)
-                for row in inserted_rows:
+                for row in await self.repo.add_job_items_batch(job_id, pending_specs):
                     pending_upload_ids.append(int(row["id"]))
+                    existing_keys.add(row["viewkey"])
                     self.events.broadcast("item_updated", row)
+            del pending_videos, valid_pending, pending_specs
             if pending_upload_ids:
                 refreshed_pending = await self.repo.recalculate_job_counts(job_id)
                 if refreshed_pending:
@@ -2923,11 +3157,12 @@ class TaskManager:
                     job_id=job_id,
                 )
 
-        if not targets and not pending_upload_ids:
+        if not targets and not pending_upload_ids and not historical_items:
             self.events.emit_log("WARNING", "追更列表为空或没有已启用的目标。", job_id=job_id)
             return
 
-        known_vkeys = await self.repo.get_known_viewkeys()
+        known_vkeys = set(existing_keys)
+        discovered_vkeys: Set[str] = set()
         new_by_target: Dict[str, int] = {}
         new_item_ids: List[int] = []
         item_qual_map: Dict[int, Optional[Set[str]]] = dict.fromkeys(pending_upload_ids)
@@ -3065,8 +3300,9 @@ class TaskManager:
                         target_type=utype,
                         settings=settings,
                         site=tsite,
-                        catch_up=(not full_scan and not needs_rescan),
+                        catch_up=(not full_scan and not needs_rescan and not (auto_download and rescan and historical_items)),
                         skip_vkeys=known_vkeys,
+                        lookup_skipped=self.repo.get_known_viewkeys,
                         preferred_qualities=qual_set,
                         uploader_hint=(default_uploader, utype),
                         on_profile=_save_profile,
@@ -3096,9 +3332,14 @@ class TaskManager:
                     self.events.emit_log(
                         "INFO", f"目标 '{display}' 列表发现 {len(listed)} 个候选，详情解析结束。", job_id=job_id,
                     )
-                candidates = [d for d in details if not d.viewkey or d.viewkey not in known_vkeys]
+                canonical_known = await self.repo.get_known_viewkeys(d.viewkey for d in details)
+                candidates = [
+                    d for d in details
+                    if not d.viewkey or (d.viewkey not in known_vkeys and d.viewkey not in canonical_known and d.viewkey not in discovered_vkeys)
+                ]
                 valid_new = [d for d in candidates if d.download_url and d.viewkey and not d.error]
                 valid_new.sort(key=lambda d: (d.page_num, d.item_num))
+                discovered_vkeys.update(d.viewkey for d in valid_new)
                 detail_failures = self._detail_failures(candidates)
                 errors = list(page_errors)
                 if detail_failures:
@@ -3115,8 +3356,6 @@ class TaskManager:
                 folder = _target_folder_name(uname, utype, site=tsite)
                 if valid_new:
                     new_by_target[folder] = new_by_target.get(folder, 0) + len(valid_new)
-                    for d in valid_new:
-                        known_vkeys.add(d.viewkey)
 
                 completed_targets += 1
                 self.events.emit_scan_status(
@@ -3151,7 +3390,9 @@ class TaskManager:
             else:
                 await asyncio.gather(*(_scan_one_target(idx, t) for idx, t in enumerate(targets)))
 
-        for outcome in ordered_outcomes:
+        for idx in range(len(ordered_outcomes)):
+            outcome = ordered_outcomes[idx]
+            ordered_outcomes[idx] = None
             if outcome is None or ctx.cancel_event.is_set():
                 continue
             tsite = outcome["site"]
@@ -3164,12 +3405,13 @@ class TaskManager:
             if auto_download:
                 created = await self._create_items_from_details(
                     job_id,
-                    candidates,
+                    [d for d in candidates if d.viewkey not in discovered_vkeys or (d.download_url and not d.error)],
                     default_uploader=default_uploader,
                     default_type=utype,
                     group_by_uploader=False,
-                    upload_requested=settings.uploader_enabled,
+                    upload_requested=auto_upload,
                     site=tsite,
+                    seen_item_keys=existing_keys,
                 )
                 new_item_ids.extend(created)
                 for cid in created:
@@ -3186,6 +3428,10 @@ class TaskManager:
                     )
                 check_notes.append("\n".join(lines))
 
+        del ordered_outcomes
+        outcome = candidates = valid_new = None
+        known_vkeys.clear()
+        discovered_vkeys.clear()
         self.events.broadcast("overview_changed", {})
 
         if target_error_count > 0:
@@ -3196,19 +3442,25 @@ class TaskManager:
         if ctx.cancel_event.is_set():
             return
 
-        pipeline_item_ids = [*pending_upload_ids, *new_item_ids]
         if auto_download:
+            resumed_ids, parse_specs, resumed_qualities = await self._prepare_resume_items(historical_items, params, settings)
+            del historical_items, existing_keys
+            item_qual_map.update(resumed_qualities)
+            pipeline_item_ids = [*resumed_ids, *pending_upload_ids, *new_item_ids]
             if pipeline_item_ids:
                 self.events.clear_scan_status(job_id)
+                await self._release_idle_http_sessions(ctx)
+                await reclaim_memory(self.repo.db)
                 uploaded_by, failed_urls_by = await self._run_download_upload_pipeline(
                     job_id,
                     pipeline_item_ids,
                     settings,
                     ctx,
-                    auto_upload=settings.uploader_enabled,
-                    redownload=False,
+                    auto_upload=auto_upload,
+                    redownload=bool(params.get("redownload", False)),
                     preferred_qualities=_quality_set(settings.preferred_quality),
                     item_preferred_qualities=item_qual_map,
+                    parse_specs=parse_specs or None,
                 )
                 if not ctx.cancel_event.is_set():
                     if pending_upload_ids and not new_item_ids:
@@ -3387,7 +3639,15 @@ class TaskManager:
         ctx: TaskHttpContext,
     ) -> None:
         limit = int(params.get("limit") or 0)
-        candidates = await self.repo.list_baseline_metadata_candidates(limit=limit)
+        resumed = params.get("resume_mode") == "enrich"
+        item_ids: Dict[str, int] = {}
+        if resumed:
+            await self.repo.reconcile_metadata_job_items(job_id)
+            item_ids = {item["viewkey"]: int(item["id"]) for item in await self.repo.list_job_items(job_id)}
+            self.events.broadcast("job_items_changed", {"job_id": job_id})
+        candidates = await self.repo.list_baseline_metadata_candidates(
+            limit=limit, resume_job_id=job_id if resumed else None,
+        )
         if not candidates:
             self.events.emit_log("INFO", "没有需要补全元数据的基线视频。", job_id=job_id)
             return
@@ -3415,13 +3675,15 @@ class TaskManager:
                 "status": "pending",
             }
             for candidate in candidates
+            if candidate["viewkey"] not in item_ids
         ]
-        inserted_items = await self.repo.add_job_items_batch(job_id, item_specs)
-        item_ids: Dict[str, int] = {
-            row["viewkey"]: int(row["id"]) for row in inserted_items
-        }
+        item_ids.update(
+            (row["viewkey"], int(row["id"])) for row in await self.repo.add_job_items_batch(job_id, item_specs)
+        )
+        del item_specs
 
-        created_job = await self.repo.update_job(job_id, total_items=len(candidates), status="running")
+        await self.repo.update_job(job_id, status="running")
+        created_job = await self.repo.recalculate_job_counts(job_id)
         if created_job:
             self.events.broadcast("job_updated", created_job)
 
@@ -3449,6 +3711,7 @@ class TaskManager:
                             cookie_str=site_cookie,
                             proxy_url=settings.normalized_proxy,
                             timeout=settings.request_timeout,
+                            site=csite,
                         ),
                         ctx.cancel_event,
                     )
@@ -3464,10 +3727,13 @@ class TaskManager:
         timeout = aiohttp.ClientTimeout(total=25.0, connect=10.0, sock_read=20.0)
         connector, _ = create_aiohttp_connector(
             settings.normalized_proxy,
-            limit=size_limit + 8,
-            limit_per_host=16,
+            limit=size_limit,
+            limit_per_host=size_limit,
+            keepalive_timeout=20.0,
         )
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as size_session:
+        async with aiohttp.ClientSession(
+            timeout=timeout, connector=connector, cookie_jar=aiohttp.DummyCookieJar(),
+        ) as size_session:
             for start in range(0, len(candidates), chunk_size):
                 if ctx.cancel_event.is_set():
                     break
@@ -3585,12 +3851,14 @@ class TaskManager:
             return 0
         try:
             p = Path(temp_path_str)
+            if p.is_symlink() or not is_within_directory(p, self.env.temp_dir):
+                return 0
             if p.is_file():
                 return p.stat().st_size
             if p.is_dir():
                 total = 0
                 for child in p.iterdir():
-                    if child.is_file() and child.name != "manifest.json" and not child.name.endswith(".ytdl"):
+                    if not child.is_symlink() and child.is_file() and child.name not in {"manifest.json", "manifest.json.tmp"} and not child.name.endswith(".ytdl"):
                         with contextlib.suppress(OSError):
                             total += child.stat().st_size
                 return total
@@ -3598,45 +3866,54 @@ class TaskManager:
             pass
         return 0
 
-    async def _exec_retry_items(
-        self,
-        job_id: int,
-        params: Dict[str, Any],
-        settings: RuntimeSettings,
-        ctx: TaskHttpContext,
-    ) -> None:
-        source_job_id = int(params.get("source_job_id") or 0)
-        source_items = await self.repo.list_job_items(source_job_id)
-        retryable = [
-            it
-            for it in source_items
-            if it["status"] in {"failed", "cancelled", "pending", "downloaded", "uploading"}
-        ]
-        if not retryable:
-            self.events.emit_log("INFO", f"源任务 #{source_job_id} 没有可重试/续传的条目。", job_id=job_id)
-            return
+    def _existing_local_file(
+        self, local_path: str, min_size: int, expected_size: Optional[int],
+    ) -> Optional[Tuple[Path, int]]:
+        if local_path:
+            path = Path(local_path)
+            with contextlib.suppress(OSError, RuntimeError):
+                if not path.is_symlink() and is_within_directory(path, self.env.downloads_dir) and is_valid_video_file(
+                    path, min_size, expected_size,
+                ):
+                    return path, path.stat().st_size
+        return None
 
-        # Prioritize items that already have a partial .mp4.tmp file or .hls dir on disk while keeping relative order
-        annotated = []
-        for idx, old in enumerate(retryable):
-            old_site = normalize_site(
-                old.get("site") or ("xhamster" if is_xhamster_url(old.get("page_url")) else "pornhub")
-            )
-            tmp_size = self._existing_temp_size(old.get("temp_path") or "")
-            if tmp_size == 0 and old.get("viewkey"):
-                folder = _target_folder_name(old.get("uploader"), old.get("target_type") or "model", site=old_site)
-                base_tmp_dir = (self.env.temp_dir / "xHamster" / folder) if old_site == "xhamster" else (self.env.temp_dir / folder)
-                base_name = video_filename_base(old.get("title") or "", old["viewkey"])
-                for candidate in (base_tmp_dir / f"{base_name}.mp4.tmp", base_tmp_dir / f"{base_name}.hls"):
-                    tmp_size = self._existing_temp_size(str(candidate))
-                    if tmp_size > 0:
-                        old = {**old, "temp_path": str(candidate)}
-                        break
-            annotated.append((0 if tmp_size > 0 else 1, idx, old, tmp_size, old_site))
-        annotated.sort(key=lambda x: (x[0], x[1]))
+    def _retry_checkpoint(self, item: Dict[str, Any]) -> Tuple[str, int]:
+        temp_path = item.get("temp_path") or ""
+        if temp_path:
+            part = Path(temp_path)
+            with contextlib.suppress(OSError, RuntimeError):
+                if part.name.endswith((".mp4.tmp", ".hls")):
+                    size = self._existing_temp_size(temp_path)
+                    if size > 0:
+                        return temp_path, size
+        if item["viewkey"]:
+            site = _item_site(item)
+            folder = _target_folder_name(item.get("uploader"), item.get("target_type") or "model", site=site)
+            parent = self.env.temp_dir / "xHamster" / folder if site == "xhamster" else self.env.temp_dir / folder
+            base_name = video_filename_base(item.get("title") or "", item["viewkey"])
+            suffixes = (".hls", ".mp4.tmp") if is_hls_url(item.get("download_url")) else (".mp4.tmp", ".hls")
+            for suffix in suffixes:
+                candidate = str(parent / f"{base_name}{suffix}")
+                size = self._existing_temp_size(candidate)
+                if size > 0:
+                    return candidate, size
+        return "", 0
 
-        original_opt_in = params.get("auto_upload")
-        auto_upload = original_opt_in is True or (original_opt_in is None and settings.uploader_enabled)
+    def _resume_item_resets(self, items: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        resets = {}
+        for item in items:
+            temp_path, tmp_size = self._retry_checkpoint(item)
+            resets[int(item["id"])] = {"temp_path": temp_path, "bytes_downloaded": tmp_size}
+        return resets
+
+    async def _prepare_resume_items(
+        self, rows: List[Dict[str, Any]], params: Dict[str, Any], settings: RuntimeSettings,
+    ) -> Tuple[List[int], Dict[int, _PendingParseSpec], Dict[int, Optional[Set[str]]]]:
+        pending = [item for item in rows if item["status"] == "pending"]
+        if not pending:
+            return [], {}, {}
+        await asyncio.to_thread(pending.sort, key=lambda it: not self._existing_temp_size(it["temp_path"]))
         quality_option = params.get("quality")
         qualities = _quality_set(settings.preferred_quality if quality_option is None else quality_option)
         target_qual_by_pair: Dict[Tuple[str, str, str], Optional[Set[str]]] = {}
@@ -3660,111 +3937,131 @@ class TaskManager:
                     if t_low not in {"favorites", "liked"} and (s_low, u_low) not in target_qual_by_user:
                         target_qual_by_user[(s_low, u_low)] = q_set
 
-        def _item_default_qualities(old_item: Dict[str, Any], item_site: str) -> Optional[Set[str]]:
+        def _item_default_qualities(item: Dict[str, Any], item_site: str) -> Optional[Set[str]]:
             if quality_option is not None:
                 return qualities
-            u_low = str(old_item.get("uploader") or "").strip().lower()
-            t_low = str(old_item.get("target_type") or "model").strip().lower()
+            u_low = str(item.get("uploader") or "").strip().lower()
+            t_low = str(item.get("target_type") or "model").strip().lower()
             if (item_site, u_low, t_low) in target_qual_by_pair:
                 return target_qual_by_pair[(item_site, u_low, t_low)]
             if t_low not in {"favorites", "liked"} and (item_site, u_low) in target_qual_by_user:
                 return target_qual_by_user[(item_site, u_low)]
             return qualities
 
-        include_kw = _split_csv_set(params.get("keywords"), lower=True)
-        exclude_kw = _split_csv_set(params.get("exclude_keywords"), lower=True)
 
-        deduped_entries: List[Tuple[Dict[str, Any], int, str]] = []
-        seen: Set[str] = set()
-        for _, _, old, tmp_size, old_site in annotated:
-            key = old["viewkey"] or old["page_url"]
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped_entries.append((old, tmp_size, old_site))
-
-        item_specs: List[Dict[str, Any]] = []
-        for old, tmp_size, old_site in deduped_entries:
-            opt_in = old.get("upload_requested")
-            wanted_upload = auto_upload and (bool(opt_in) if opt_in is not None else original_opt_in is True)
-            status = "cancelled" if ctx.cancel_event.is_set() else "pending"
-            error = "已取消" if ctx.cancel_event.is_set() else ""
-            item_specs.append(
-                {
-                    "site": old_site,
-                    "viewkey": old["viewkey"],
-                    "title": old["title"],
-                    "uploader": old["uploader"],
-                    "target_type": old["target_type"],
-                    "page_url": old["page_url"],
-                    "download_url": old.get("download_url") or "",
-                    "referer_url": old.get("referer_url") or old.get("page_url") or "",
-                    "quality": old.get("quality") or "",
-                    "temp_path": old.get("temp_path") or "",
-                    "local_path": old.get("local_path") or "",
-                    "bytes_downloaded": tmp_size,
-                    "upload_requested": wanted_upload,
-                    "status": status,
-                    "error_message": error,
-                    "published_at": str(old.get("published_at") or ""),
-                    "duration_seconds": int(old.get("duration_seconds") or 0),
-                }
-            )
-
-        rows = await self.repo.add_job_items_batch(job_id, item_specs)
-        retry_qualities: Dict[int, Optional[Set[str]]] = {}
-        new_item_ids: List[int] = []
+        item_ids = []
         parse_specs: Dict[int, _PendingParseSpec] = {}
-        for idx, (row, (old, _, old_site)) in enumerate(zip(rows, deduped_entries), start=1):
-            iid = int(row["id"])
-            if row["status"] == "pending":
-                new_item_ids.append(iid)
-                if not old.get("download_url") and not old.get("local_path") and old.get("page_url"):
-                    parse_specs[iid] = _PendingParseSpec(
-                        item_id=iid,
-                        page_url=old["page_url"],
-                        page_num=0,
-                        item_num=idx,
-                        default_uploader=old.get("uploader") or "",
-                        default_type=old.get("target_type") or ("creator" if old_site == "xhamster" else "model"),
-                        group_by_uploader=False,
-                        uploader_hint=(
-                            (old.get("uploader") or "", old.get("target_type") or ("creator" if old_site == "xhamster" else "model"))
-                            if old.get("uploader")
-                            else None
-                        ),
-                        site=old_site,
-                    )
-            previous_quality = normalized_quality(old.get("quality") or "")
-            item_q = _item_default_qualities(old, old_site)
-            retry_qualities[iid] = item_q or ({previous_quality} if previous_quality else None)
-            self.events.broadcast("item_updated", row)
+        item_qualities: Dict[int, Optional[Set[str]]] = {}
+        from_urls = bool(params.get("urls"))
+        for idx, item in enumerate(pending, start=1):
+            iid = int(item["id"])
+            item_ids.append(iid)
+            site = _item_site(item)
+            previous_quality = normalized_quality(item.get("quality") or "")
+            item_qualities[iid] = _item_default_qualities(item, site) or (
+                {previous_quality} if previous_quality and quality_option is None else None
+            )
+            if item.get("download_url") or not item.get("page_url"):
+                continue
+            if item.get("local_path") and await asyncio.to_thread(
+                self._existing_local_file, item["local_path"], settings.min_file_size_bytes,
+                item.get("bytes_total") or None,
+            ):
+                continue
+            uploader = item.get("uploader") or ""
+            target_type = item.get("target_type") or ("creator" if site == "xhamster" else "model")
+            parse_specs[iid] = _PendingParseSpec(
+                item_id=iid,
+                page_url=item["page_url"],
+                page_num=0,
+                item_num=idx,
+                default_uploader=uploader,
+                default_type=target_type,
+                group_by_uploader=from_urls and bool(params.get("group_by_uploader", True)),
+                uploader_hint=(uploader, target_type) if uploader and not from_urls else None,
+                site=site,
+            )
+        return item_ids, parse_specs, item_qualities
 
-        updated_job = await self.repo.recalculate_job_counts(job_id)
-        if updated_job:
-            self.events.broadcast("job_updated", updated_job)
-
+    async def _exec_resume_job_items(
+        self,
+        job_id: int,
+        params: Dict[str, Any],
+        settings: RuntimeSettings,
+        ctx: TaskHttpContext,
+    ) -> None:
+        item_ids, parse_specs, item_qualities = await self._prepare_resume_items(
+            await self.repo.list_job_items(job_id, status="pending"), params, settings,
+        )
         self.events.emit_log(
             "INFO",
-            f"已入队 {len(new_item_ids)} 条重试/续传项"
+            f"已入队 {len(item_ids)} 条重试/续传项"
             + (f"（其中 {len(parse_specs)} 条按需流式解析）" if parse_specs else "")
             + "，开始下载与上传...",
             job_id=job_id,
         )
-
         await self._run_download_upload_pipeline(
             job_id,
-            new_item_ids,
+            item_ids,
             settings,
             ctx,
-            auto_upload=auto_upload,
-            redownload=bool(params.get("redownload", False)),
-            preferred_qualities=qualities,
-            item_preferred_qualities=retry_qualities,
+            auto_upload=_effective_auto_upload(params, settings),
+            redownload=bool(params.get("redownload")),
+            item_preferred_qualities=item_qualities,
             parse_specs=parse_specs or None,
-            include_keywords=include_kw,
-            exclude_keywords=exclude_kw,
+            include_keywords=_split_csv_set(params.get("keywords"), lower=True),
+            exclude_keywords=_split_csv_set(params.get("exclude_keywords"), lower=True),
+            on_detail_parsed=self._url_creator_linkage_handler(job_id, params, settings, ctx) if params.get("urls") else None,
         )
+
+    async def _exec_retry_items(
+        self,
+        job_id: int,
+        params: Dict[str, Any],
+        settings: RuntimeSettings,
+        ctx: TaskHttpContext,
+    ) -> None:
+        source_job_id = int(params.get("source_job_id") or 0)
+        source_items = await self.repo.list_job_items(source_job_id)
+        retryable = [
+            item for item in source_items
+            if item["status"] in {"failed", "cancelled", "pending", "downloaded", "uploading"}
+        ]
+        if not retryable:
+            self.events.emit_log("INFO", f"源任务 #{source_job_id} 没有可重试/续传的条目。", job_id=job_id)
+            return
+
+        checkpoints = await asyncio.to_thread(self._resume_item_resets, retryable)
+        retryable.sort(key=lambda item: not checkpoints[int(item["id"])]["bytes_downloaded"])
+        auto_upload = _effective_auto_upload(params, settings)
+        seen: Set[str] = set()
+        item_specs: List[Dict[str, Any]] = []
+        for old in retryable:
+            key = _item_key(old["viewkey"], old["page_url"])
+            if key in seen:
+                continue
+            seen.add(key)
+            opt_in = old.get("upload_requested")
+            wanted_upload = auto_upload and (bool(opt_in) if opt_in is not None else params.get("auto_upload") is True)
+            cancelled = ctx.cancel_event.is_set()
+            item_specs.append({
+                **old,
+                "site": _item_site(old),
+                "referer_url": old["referer_url"] or old["page_url"],
+                "bytes_downloaded": 0,
+                **checkpoints[int(old["id"])],
+                "upload_requested": wanted_upload,
+                "status": "cancelled" if cancelled else "pending",
+                "error_message": "已取消" if cancelled else "",
+            })
+
+        for row in await self.repo.add_job_items_batch(job_id, item_specs):
+            self.events.broadcast("item_updated", row)
+        updated_job = await self.repo.recalculate_job_counts(job_id)
+        if updated_job:
+            self.events.broadcast("job_updated", updated_job)
+        del source_items, retryable, checkpoints, item_specs
+        await self._exec_resume_job_items(job_id, params, settings, ctx)
 
     async def _exec_resume_temp(
         self,
@@ -3773,15 +4070,17 @@ class TaskManager:
         settings: RuntimeSettings,
         ctx: TaskHttpContext,
     ) -> None:
-        temp_files = self.list_temp_files()
-        if not temp_files:
+        rescan = params.get("resume_mode") == "rescan"
+        historical_items = await self.repo.list_job_items(job_id) if rescan else []
+        handled = {item["viewkey"] for item in historical_items}
+        item_ids, parse_specs, preferred_by_item = await self._prepare_resume_items(historical_items, params, settings)
+        del historical_items
+        temp_files = await asyncio.to_thread(self.list_temp_files)
+        if not temp_files and not item_ids:
             self.events.emit_log("INFO", "没有找到可续传的临时文件。", job_id=job_id)
             return
 
-        auto_upload = bool(params.get("auto_upload", settings.uploader_enabled)) and settings.uploader_enabled
-        new_item_ids: List[int] = []
-        preferred_by_item: Dict[int, Optional[Set[str]]] = {}
-        handled: Set[str] = set()
+        auto_upload = _effective_auto_upload(params, settings) and (rescan or settings.uploader_enabled)
         # Prefer a checkpoint with an identity record over an older orphan for the same video.
         temp_files.sort(key=lambda tf: (not tf["verified_checkpoint"], -tf["size_bytes"]))
         for tf in temp_files:
@@ -3829,7 +4128,7 @@ class TaskManager:
                 published_at=str(prior.get("published_at") or ""),
                 duration_seconds=int(prior.get("duration_seconds") or 0),
             )
-            new_item_ids.append(int(row["id"]))
+            item_ids.append(int(row["id"]))
             wanted_quality = normalized_quality(quality)
             preferred_by_item[int(row["id"])] = {wanted_quality} if wanted_quality else _quality_set(settings.preferred_quality)
             self.events.broadcast("item_updated", row)
@@ -3837,15 +4136,16 @@ class TaskManager:
         updated_job = await self.repo.recalculate_job_counts(job_id)
         if updated_job:
             self.events.broadcast("job_updated", updated_job)
-        if new_item_ids:
+        if item_ids:
             await self._run_download_upload_pipeline(
                 job_id,
-                new_item_ids,
+                item_ids,
                 settings,
                 ctx,
                 auto_upload=auto_upload,
                 redownload=False,
                 item_preferred_qualities=preferred_by_item,
+                parse_specs=parse_specs or None,
             )
 
     # ------------------------------------------------------------------
@@ -3940,8 +4240,19 @@ class TaskManager:
                 remove_download_checkpoint(tmp)
                 removed += 1
         for hls_dir in list(self.env.temp_dir.rglob("*.hls")):
-            if hls_dir.is_dir():
+            if not hls_dir.is_symlink() and hls_dir.is_dir():
                 with contextlib.suppress(OSError):
-                    shutil.rmtree(hls_dir, ignore_errors=True)
+                    shutil.rmtree(hls_dir)
                     removed += 1
         return removed
+
+    async def clear_idle_temp_files(self) -> Optional[int]:
+        async with self._queue_lock:
+            if self._current_job_id is not None:
+                return None
+            cleanup = asyncio.create_task(asyncio.to_thread(self.clear_temp_files))
+            try:
+                return await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await asyncio.gather(cleanup, return_exceptions=True)
+                raise

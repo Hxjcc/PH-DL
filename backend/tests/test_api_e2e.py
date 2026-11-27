@@ -192,7 +192,7 @@ def test_auth_settings_targets_videos_jobs_and_ws(tmp_path: Path):
             assert "logs" in msg["data"]
             assert "live_progress" in msg["data"]
 
-        # WebSocket Origin check blocks cross-site hijacking while allowing same-host & proxy Host without port
+        # WebSocket Origin check uses the complete public Host supplied by the proxy.
         import pytest
         from starlette.websockets import WebSocketDisconnect
 
@@ -203,7 +203,7 @@ def test_auth_settings_targets_videos_jobs_and_ws(tmp_path: Path):
 
         with client.websocket_connect(
             "/api/ws",
-            headers={"Host": "panel.local", "Origin": "http://panel.local:8080"},
+            headers={"Host": "panel.local:8080", "Origin": "http://panel.local:8080"},
         ) as ws_same_host:
             assert ws_same_host.receive_json()["type"] == "snapshot"
 
@@ -334,14 +334,17 @@ def test_retry_failed_preserves_redownload_param(tmp_path: Path):
         resp = client.post(f"/api/jobs/{src_id}/retry-failed")
         assert resp.status_code == 200
         retry_job = resp.json()["job"]
+        assert retry_job["id"] == src_id
+        assert retry_job["kind"] == "manual_urls"
+        assert retry_job["label"] == "forced redownload"
+        assert retry_job["status"] == "queued"
         assert retry_job["params"]["redownload"] is True
         assert retry_job["params"]["auto_upload"] is False
-        assert retry_job["params"]["source_job_id"] == src_id
-        assert retry_job["params"]["origin_job_id"] == src_id
-        assert retry_job["params"]["origin_label"] == "forced redownload"
-        assert "forced redownload" in retry_job["label"]
+        assert retry_job["params"]["resume_mode"] == "items"
+        assert retry_job["params"]["resume_count"] == 1
+        assert "source_job_id" not in retry_job["params"]
 
-        # Chained retry from a legacy-style retry job (no origin_label stored) still resolves root label
+        # Legacy retry jobs retain their original identity and lineage.
         async def _seed_legacy_retry_chain():
             root = await container.repo.create_job("manual_target", "下载目标: lovely-asuna", {"usernames": ["lovely-asuna"]})
             await container.repo.update_job(root["id"], status="cancelled")
@@ -366,10 +369,11 @@ def test_retry_failed_preserves_redownload_param(tmp_path: Path):
         resp2 = client.post(f"/api/jobs/{legacy_id}/retry-failed")
         assert resp2.status_code == 200
         chained = resp2.json()["job"]
-        assert chained["params"]["source_job_id"] == legacy_id
-        assert chained["params"]["origin_job_id"] == root_id
-        assert chained["params"]["origin_label"] == "下载目标: lovely-asuna"
-        assert chained["label"].startswith("续传 · 下载目标: lovely-asuna")
+        assert chained["id"] == legacy_id
+        assert chained["kind"] == "retry_items"
+        assert chained["params"]["source_job_id"] == root_id
+        assert chained["params"]["resume_count"] == 1
+        assert chained["label"] == f"重试任务 #{root_id} (2 项)"
 
 
 def test_video_history_uses_target_display_name(tmp_path: Path):
@@ -475,8 +479,9 @@ def test_retry_accepts_downloaded_and_uploading_items(tmp_path: Path):
         resp = client.post(f"/api/jobs/{source_id}/retry-failed")
         assert resp.status_code == 200
         retry_job = resp.json()["job"]
-        assert retry_job["params"]["source_job_id"] == source_id
-        assert retry_job["kind"] == "retry_items"
+        assert retry_job["id"] == source_id and retry_job["kind"] == "manual_target"
+        assert retry_job["params"]["resume_mode"] == "items"
+        assert retry_job["label"] == "取消后补偿"
 
 
 def test_delete_video_optionally_removes_local_file_inside_downloads_only(tmp_path: Path):

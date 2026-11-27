@@ -87,13 +87,13 @@ async def _post_json(
     headers = {"Accept-Language": "zh-CN"}
     try:
         async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-            async with session.post(url, json=payload, headers=headers) as response:
+            async with session.post(url, json=payload, headers=headers, allow_redirects=False) as response:
                 text = await response.text()
-                if response.status >= 400:
+                if not 200 <= response.status < 300:
                     safe_text = text.replace(secret, "***") if secret else text
                     raise CaptchaError(f"YesCaptcha HTTP {response.status}: {safe_text[:300]}")
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
-        raise CaptchaError(f"连接 YesCaptcha 失败: {type(err).__name__}: {err}") from err
+        raise CaptchaError(f"连接 YesCaptcha 失败: {type(err).__name__}") from err
 
     safe_text = text.replace(secret, "***") if secret else text
     try:

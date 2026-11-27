@@ -22,8 +22,8 @@ from ..cancel import StopRequested, until_stopped
 from ..config import SelectorSettings
 from ..parsers.http_session import TaskHttpContext
 from ..parsers.video import fetch_single_video_detail
-from .filename import is_valid_video_file, normalized_quality, video_filename_base
-from .http_proxy import effective_request_proxy
+from .filename import is_valid_video_file, is_within_directory, normalized_quality, video_filename_base
+from .http_proxy import effective_request_proxy, open_media_response
 
 DOWNLOAD_HEADERS = {
     "User-Agent": (
@@ -160,7 +160,10 @@ def _checkpoint_path(path: Path) -> Path:
 
 def read_download_checkpoint(path: Path) -> Optional[DownloadCheckpoint]:
     try:
-        data = json.loads(_checkpoint_path(path).read_text(encoding="utf-8"))
+        sidecar = _checkpoint_path(path)
+        if sidecar.is_symlink() or sidecar.stat().st_size > 16_384:
+            return None
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
         if data.pop("version") != 1:
             return None
         checkpoint = DownloadCheckpoint(**data)
@@ -179,11 +182,20 @@ def remove_download_checkpoint(path: Path) -> None:
     _checkpoint_path(path).unlink(missing_ok=True)
 
 
+def write_atomic_json(path: Path, data: dict) -> None:
+    draft = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=".checkpoint-", delete=False) as handle:
+            draft = Path(handle.name)
+            json.dump(data, handle)
+        os.replace(draft, path)
+    finally:
+        if draft is not None:
+            draft.unlink(missing_ok=True)
+
+
 def _write_checkpoint(path: Path, checkpoint: DownloadCheckpoint) -> None:
-    sidecar = _checkpoint_path(path)
-    draft = sidecar.with_suffix(".json.new")
-    draft.write_text(json.dumps({"version": 1, **asdict(checkpoint)}), encoding="utf-8")
-    os.replace(draft, sidecar)
+    write_atomic_json(_checkpoint_path(path), {"version": 1, **asdict(checkpoint)})
 
 
 def _size(path: Path) -> int:
@@ -201,6 +213,7 @@ async def probe_download_size(
     cookie_str: str = "",
     proxy_url: Optional[str] = None,
     timeout: float = 20.0,
+    site: Optional[str] = None,
 ) -> Optional[int]:
     """Read total media size with a one-byte Range request without downloading the file."""
     if not download_url:
@@ -213,10 +226,11 @@ async def probe_download_size(
     if cookie_str:
         headers["Cookie"] = cookie_str
     try:
-        async with session.get(
+        async with open_media_response(
+            session,
             download_url,
             headers=headers,
-            allow_redirects=True,
+            site=site,
             proxy=effective_request_proxy(session, proxy_url),
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as response:
@@ -274,14 +288,14 @@ async def download_mp4_with_resume(
     base_name = video_filename_base(title, viewkey)
     default_part = temp_dir / f"{base_name}.mp4.tmp"
     part = default_part
-    if partial_path is not None and partial_path.resolve().is_relative_to(temp_dir.resolve()):
+    if partial_path is not None and not partial_path.is_symlink() and is_within_directory(partial_path, temp_dir):
         if partial_path.name.endswith(".mp4.tmp") and partial_path.is_file():
             part = partial_path
 
     url = (download_url or "").strip()
     referer = (referer_url or page_url or "https://www.pornhub.com/").strip()
     current_quality = (quality or "").strip()
-    initial_checkpoint = read_download_checkpoint(part)
+    initial_checkpoint = None if part.is_symlink() else read_download_checkpoint(part)
     if not current_quality and initial_checkpoint and initial_checkpoint.viewkey == viewkey:
         current_quality = initial_checkpoint.quality
     disk = disk_budget or DownloadDiskBudget(temp_dir, 0)
@@ -315,7 +329,7 @@ async def download_mp4_with_resume(
 
     def new_part() -> Path:
         # Never truncate an earlier download while restarting with a different/unknown source.
-        if not default_part.exists():
+        if not default_part.exists() and not default_part.is_symlink():
             return default_part
         # Keep the random suffix after the viewkey, so legacy file listings can still identify it.
         fd, name = tempfile.mkstemp(prefix=f"{base_name}.", suffix=".mp4.tmp", dir=temp_dir)
@@ -353,7 +367,7 @@ async def download_mp4_with_resume(
 
     async def receive() -> int:
         nonlocal part, force_fresh
-        offset = _size(part)
+        offset = 0 if part.is_symlink() else _size(part)
         checkpoint = read_download_checkpoint(part) if offset else None
         if not (
             checkpoint and not force_fresh and checkpoint.viewkey == viewkey
@@ -370,8 +384,10 @@ async def download_mp4_with_resume(
             headers["Range"] = f"bytes={offset}-"
             headers["If-Range"] = checkpoint.etag
 
-        async with session.get(url, headers=headers, allow_redirects=True, proxy=effective_request_proxy(session, proxy_url),
-                               auto_decompress=False) as response:
+        async with open_media_response(
+            session, url, headers=headers, site=getattr(parse_ctx, "site", None),
+            proxy=effective_request_proxy(session, proxy_url), auto_decompress=False,
+        ) as response:
             if response.status not in {200, 206, 416}:
                 response.raise_for_status()
                 raise _RangeMismatch(f"意外的下载响应 HTTP {response.status}")
@@ -410,7 +426,9 @@ async def download_mp4_with_resume(
 
             with disk.reserve(expected) as prepare_write:
                 if mode == "wb":
-                    if _size(part) and part not in owned_parts:
+                    if part.is_symlink():
+                        part = new_part()
+                    elif _size(part) and part not in owned_parts:
                         prev_cp = read_download_checkpoint(part)
                         if (
                             prev_cp is not None
@@ -436,13 +454,13 @@ async def download_mp4_with_resume(
                 # Unbuffered writes keep the disk free-space check aligned with written bytes;
                 # offload large chunks to a worker thread so 1000 Mbps disk I/O never stalls the loop.
                 with open(part, mode, buffering=0) as fp:
-                    async for chunk in response.content.iter_chunked(2 * 1024 * 1024):
+                    async for chunk in response.content.iter_chunked(512 * 1024):
                         if stop.is_set():
                             raise StopRequested
                         if expected and downloaded - start + len(chunk) > expected:
                             raise _RangeMismatch("下载响应超过声明的字节范围")
                         prepare_write(len(chunk))
-                        if len(chunk) >= 512 * 1024:
+                        if len(chunk) >= 256 * 1024:
                             write_task = asyncio.create_task(asyncio.to_thread(fp.write, chunk))
                             try:
                                 written = await write_task

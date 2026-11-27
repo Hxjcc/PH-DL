@@ -2,12 +2,44 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Optional, Tuple
+from urllib.parse import urljoin
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
 
+from ..parsers.urls import is_cookie_origin, is_media_url
+
 _SOCKS_SCHEMES = ("socks4://", "socks4a://", "socks5://", "socks5h://")
+_REDIRECTS = {301, 302, 303, 307, 308}
+
+
+class MediaPolicyError(ValueError):
+    pass
+
+
+@asynccontextmanager
+async def open_media_response(session, url: str, *, headers: dict, site: Optional[str], **kwargs):
+    if site is None:
+        async with session.get(url, headers=headers, allow_redirects=True, **kwargs) as response:
+            yield response
+        return
+
+    public_headers = {name: value for name, value in headers.items() if name.lower() not in {"cookie", "authorization"}}
+    for _ in range(6):
+        if not is_media_url(url, site):
+            raise MediaPolicyError("媒体源地址不在允许范围内")
+        request_headers = headers if is_cookie_origin(url, site) else public_headers
+        async with session.get(url, headers=request_headers, allow_redirects=False, **kwargs) as response:
+            if response.status not in _REDIRECTS:
+                yield response
+                return
+            location = response.headers.get("Location")
+            if not location:
+                raise MediaPolicyError("媒体源重定向缺少目标地址")
+            url = urljoin(url, location)
+    raise MediaPolicyError("媒体源重定向次数过多")
 
 
 def is_socks_proxy(proxy_url: Optional[str]) -> bool:

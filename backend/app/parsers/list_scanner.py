@@ -284,9 +284,12 @@ def extract_video_cards_from_list_page(
     target_type: Optional[str] = None,
 ) -> List[Tuple[str, str, str, str, int]]:
     """Extract unique ``(viewkey, full_url, title, published_at, duration_seconds)`` items from list HTML."""
-    if not html:
-        return []
-    tree = HTMLParser(html)
+    return _extract_video_cards(HTMLParser(html), selectors, target_type) if html else []
+
+
+def _extract_video_cards(
+    tree: HTMLParser, selectors: SelectorSettings, target_type: Optional[str],
+) -> List[Tuple[str, str, str, str, int]]:
     norm_type = (target_type or "").strip().lower() or None
 
     def _collect(element, sel_list: List[str], *, skip_chrome: bool = True):
@@ -439,9 +442,10 @@ def _normalize_avatar_name(value: Optional[str]) -> str:
 
 def extract_target_display_name(html: str, username: Optional[str] = None) -> str:
     """Return the site-facing profile name (for example ``KKFox baby``)."""
-    if not html:
-        return ""
-    tree = HTMLParser(html)
+    return _extract_target_display_name(HTMLParser(html), username) if html else ""
+
+
+def _extract_target_display_name(tree: HTMLParser, username: Optional[str]) -> str:
     wanted_name = _normalize_avatar_name(username)
 
     for img in tree.css("img#getAvatar, img.jcrop-preview"):
@@ -474,10 +478,10 @@ def extract_target_avatar(html: str, username: Optional[str] = None) -> str:
     model/user/favorites pages. The subscription grid uses the same image, so
     this keeps the card image at the highest resolution the site exposes.
     """
-    if not html:
-        return ""
+    return _extract_target_avatar(HTMLParser(html), username) if html else ""
 
-    tree = HTMLParser(html)
+
+def _extract_target_avatar(tree: HTMLParser, username: Optional[str]) -> str:
     wanted_name = _normalize_avatar_name(username)
 
     def _src_of(img) -> str:
@@ -506,6 +510,25 @@ def extract_target_avatar(html: str, username: Optional[str] = None) -> str:
     return ""
 
 
+def _parse_list_page(
+    html: str,
+    selectors: SelectorSettings,
+    target_type: Optional[str],
+    profile_username: Optional[str],
+    want_profile: bool,
+    want_subscribe: bool,
+) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[SubscribeAction]]:
+    if not html:
+        return [], "", "", None
+    tree = HTMLParser(html)
+    return (
+        _extract_video_cards(tree, selectors, target_type),
+        _extract_target_avatar(tree, profile_username) if want_profile else "",
+        _extract_target_display_name(tree, profile_username) if want_profile else "",
+        extract_subscribe_action(html) if want_subscribe else None,
+    )
+
+
 def _build_paged_url(initial_url: str, page_num: int) -> str:
     if page_num <= 1:
         return initial_url
@@ -526,6 +549,7 @@ async def scan_list_pages(
     videos_spec: Optional[str] = None,
     catch_up: bool = False,
     skip_vkeys: Optional[Set[str]] = None,
+    lookup_skipped: Optional[Callable[[List[str]], Awaitable[Set[str]]]] = None,
     delay_min: float = 0.5,
     delay_max: float = 1.5,
     page_concurrency: int = 1,
@@ -548,6 +572,7 @@ async def scan_list_pages(
             videos_spec=videos_spec,
             catch_up=catch_up,
             skip_vkeys=skip_vkeys,
+            lookup_skipped=lookup_skipped,
             delay_min=delay_min,
             delay_max=delay_max,
             page_concurrency=page_concurrency,
@@ -575,7 +600,7 @@ async def scan_list_pages(
 
     collected: List[ListedVideo] = []
     seen_all_vkeys: Set[str] = set()
-    skip_set = set(skip_vkeys or ())
+    skip_set = skip_vkeys if isinstance(skip_vkeys, (set, frozenset)) else frozenset(skip_vkeys or ())
     pages_scanned = 0
     end_reached = False
     profile_found = False
@@ -619,10 +644,12 @@ async def scan_list_pages(
 
         page_results = await asyncio.gather(*(_fetch_page(page_num) for page_num in batch_pages))
         batch_failed = False
-        for current_page, page_url, res, err in page_results:
+        for idx in range(len(page_results)):
             if ctx.cancel_event.is_set():
                 end_reached = True
                 break
+            current_page, page_url, res, err = page_results[idx]
+            page_results[idx] = None
             pages_scanned += 1
 
             if res is None:
@@ -699,26 +726,14 @@ async def scan_list_pages(
 
             want_profile = bool(on_profile and not profile_found)
             want_subscribe = bool(on_subscribe_action and not subscribe_notified)
-            if len(res.text) >= _OFFLOAD_HTML_THRESHOLD:
-                def _parse_page_sync(
-                    html_body: str = res.text,
-                    fetch_profile: bool = want_profile,
-                    fetch_subscribe: bool = want_subscribe,
-                    prof_user: Optional[str] = effective_profile_username,
-                    parse_type: Optional[str] = effective_target_type,
-                ) -> Tuple[List[Tuple[str, str, str, str, int]], str, str, Optional[SubscribeAction]]:
-                    av = extract_target_avatar(html_body, prof_user) if fetch_profile else ""
-                    dn = extract_target_display_name(html_body, prof_user) if fetch_profile else ""
-                    sub = extract_subscribe_action(html_body) if fetch_subscribe else None
-                    items = extract_video_cards_from_list_page(html_body, selectors, target_type=parse_type)
-                    return items, av, dn, sub
-
-                raw_items, avatar_url, display_name, subscribe_action = await asyncio.to_thread(_parse_page_sync)
+            referer = res.final_url or page_url
+            parse_args = (res.text, selectors, effective_target_type, effective_profile_username, want_profile, want_subscribe)
+            res = None
+            if len(parse_args[0]) >= _OFFLOAD_HTML_THRESHOLD:
+                raw_items, avatar_url, display_name, subscribe_action = await asyncio.to_thread(_parse_list_page, *parse_args)
             else:
-                avatar_url = extract_target_avatar(res.text, effective_profile_username) if want_profile else ""
-                display_name = extract_target_display_name(res.text, effective_profile_username) if want_profile else ""
-                subscribe_action = extract_subscribe_action(res.text) if want_subscribe else None
-                raw_items = extract_video_cards_from_list_page(res.text, selectors, target_type=effective_target_type)
+                raw_items, avatar_url, display_name, subscribe_action = _parse_list_page(*parse_args)
+            del parse_args
 
             if want_profile and (avatar_url or display_name):
                 profile_found = True
@@ -726,7 +741,7 @@ async def scan_list_pages(
 
             if want_subscribe and subscribe_action is not None:
                 subscribe_notified = True
-                await on_subscribe_action(subscribe_action, res.final_url or page_url)
+                await on_subscribe_action(subscribe_action, referer)
 
             if not raw_items:
                 if is_natural and current_page == 1:
@@ -747,6 +762,7 @@ async def scan_list_pages(
             if specific_map and any(index >= total_on_page for index in specific_map[current_page]):
                 report_error(current_page, f"部分指定位置超出此页 {total_on_page} 个视频")
             page_videos: List[ListedVideo] = []
+            known_on_page = await lookup_skipped([item[0] for item in raw_items]) if lookup_skipped else set()
             for idx, (vkey, url, title, published_at, duration_seconds) in enumerate(raw_items, start=1):
                 if specific_map and current_page in specific_map:
                     if (idx - 1) not in specific_map[current_page]:
@@ -755,7 +771,7 @@ async def scan_list_pages(
                     continue
                 seen_all_vkeys.add(vkey)
                 new_unique_on_page += 1
-                if vkey in skip_set:
+                if vkey in skip_set or vkey in known_on_page:
                     continue
                 page_videos.append(
                     ListedVideo(
@@ -787,11 +803,13 @@ async def scan_list_pages(
                 end_reached = True
                 break
 
-            if catch_up and raw_items[-1][0] in skip_set and not batch_failed:
+            if catch_up and (raw_items[-1][0] in skip_set or raw_items[-1][0] in known_on_page) and not batch_failed:
                 ctx._emit("INFO", f"[PornHub 扫描] 第 {current_page} 页已衔接已知视频，结束补扫。")
                 end_reached = True
                 break
 
+        res = None
+        page_results.clear()
         # Keep the valid pages already returned by this batch, but don't scan
         # arbitrarily far past a failed page without a known boundary.
         if is_natural and batch_failed:

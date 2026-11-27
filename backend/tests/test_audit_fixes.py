@@ -396,15 +396,13 @@ async def test_socks5_connector_helpers_and_playback_pool():
 
     svc = PlaybackService()
     try:
-        client, req_proxy = await svc._get_http_client("socks5://127.0.0.1:1080")
-        assert isinstance(client.connector, ProxyConnector)
-        assert req_proxy is None
-        assert svc._http_client is None  # default non-SOCKS slot untouched
-
-        # Reuses cached SOCKS client
-        client2, req_proxy2 = await svc._get_http_client("socks5://127.0.0.1:1080")
-        assert client2 is client
-        assert req_proxy2 is None
+        async with svc._get_http_client("socks5://127.0.0.1:1080") as (client, req_proxy):
+            assert isinstance(client.connector, ProxyConnector)
+            assert req_proxy is None
+            assert svc._http_client is None
+        async with svc._get_http_client("socks5://127.0.0.1:1080") as (client2, req_proxy2):
+            assert client2 is client
+            assert req_proxy2 is None
     finally:
         await svc.aclose()
     assert svc._socks_http_clients == {}
@@ -436,8 +434,11 @@ async def test_hls_and_playback_handle_proxy_value_error_cleanly(tmp_path: Path)
 
     svc = PlaybackService()
 
+    from contextlib import AsyncExitStack, asynccontextmanager
+
+    @asynccontextmanager
     async def _bad_client(_proxy=None):
-        return _BrokenProxySession(), "socks5://127.0.0.1:1080"
+        yield _BrokenProxySession(), "socks5://127.0.0.1:1080"
 
     svc._get_http_client = _bad_client  # type: ignore[method-assign]
     entry = _Playback(
@@ -448,8 +449,6 @@ async def test_hls_and_playback_handle_proxy_value_error_cleanly(tmp_path: Path)
         sources=[],
         expires_at=9e12,
     )
-    from contextlib import AsyncExitStack
-
     async with AsyncExitStack() as stack:
         with pytest.raises(HTTPException) as exc:
             await svc._open_upstream(stack, entry, "https://cdn.xhcdn.com/seg.mp4", None)
@@ -607,7 +606,7 @@ def test_videos_stats_site_filter_and_case_insensitive_uploader_facets(tmp_path:
                 viewkey="xh_1", site="xhamster", title="X1", uploader="bob", status="baseline", quality="1080p"
             )
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         all_res = client.get("/api/videos").json()
         assert all_res["stats"]["total"] == 3
@@ -685,7 +684,7 @@ async def test_hls_estimation_uses_duration_and_excludes_inflight_inflation(tmp_
             self.url = url
             self._text = text_body
             self.content_length = len(raw) if raw else None
-            self.content = _FakeContent(url, raw)
+            self.content = _FakeContent(url, raw or text_body.encode())
 
         async def text(self, errors="replace"):
             return self._text

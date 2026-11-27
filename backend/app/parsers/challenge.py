@@ -7,6 +7,7 @@ from http.cookies import SimpleCookie
 from typing import List, Optional
 
 MAX_CHALLENGE_SOLVES = 6
+_MAX_FACTOR_STEPS = 1_000_000
 
 
 def is_challenge(html: str) -> bool:
@@ -31,13 +32,14 @@ def _least_factor(n: int) -> int:
         return 3
     if n % 5 == 0:
         return 5
-    i = 7
-    while i * i <= n:
+    for step in range(_MAX_FACTOR_STEPS):
+        i = 7 + 30 * step
+        if i * i > n:
+            return n
         for d in (0, 4, 6, 10, 12, 16, 22, 24):
             if n % (i + d) == 0:
                 return i + d
-        i += 30
-    return n
+    raise ValueError("PoW 求解超出运算预算")
 
 
 def solve_challenge(html: str) -> str:
@@ -69,6 +71,8 @@ def solve_challenge(html: str) -> str:
     if m_tail:
         p = p + _eval_term(m_tail.group(2)) if m_tail.group(1) == "+" else p - _eval_term(m_tail.group(2))
 
+    if not 1 <= p < 2 ** 53:
+        raise ValueError("PoW 参数超出安全整数范围")
     n = _least_factor(p)
     if n <= 0 or n * (p // n) != p:
         raise ValueError(f"PoW factorization check failed: {n} * {p // n if n else 0} != {p}")

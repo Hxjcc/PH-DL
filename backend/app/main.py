@@ -8,7 +8,9 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .api import auth as auth_router
 from .api import jobs as jobs_router
@@ -80,20 +82,12 @@ def create_app(env_settings: Optional[EnvSettings] = None) -> FastAPI:
             cookie_secure=env.cookie_secure,
             generation=await repo.get_auth_generation(),
         )
-        events = EventBus(max_logs=500)
+        await repo.get_settings()
+        events = EventBus(max_logs=500, redact=repo.redact_diagnostic)
         loop_monitor = EventLoopMonitor(events)
         tasks = TaskManager(env=env, repo=repo, events=events)
 
-        async def _trigger_scheduled_update() -> int:
-            job = await tasks.enqueue_job(
-                kind="auto_update",
-                label="定时自动追更",
-                params={},
-                trigger="schedule",
-            )
-            return int(job["id"])
-
-        scheduler = UpdateScheduler(repo=repo, events=events, trigger_auto_update=_trigger_scheduled_update)
+        scheduler = UpdateScheduler(repo=repo, events=events, trigger_auto_update=tasks.enqueue_scheduled_job)
 
         app.state.container = AppContainer(
             env=env,
@@ -149,11 +143,24 @@ def create_app(env_settings: Optional[EnvSettings] = None) -> FastAPI:
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
-        response = await call_next(request)
+        api_request = request.url.path.startswith("/api/")
+        if api_request and request.method in {"POST", "PUT", "PATCH", "DELETE"} and not AuthManager.verify_origin(
+            request.headers, allowed_origins,
+        ):
+            response = JSONResponse({"detail": "请求来源不受信任"}, status_code=403)
+        else:
+            response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if api_request:
+            response.headers.setdefault("Cache-Control", "private, no-store")
         return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, error: RequestValidationError) -> JSONResponse:
+        detail = [{key: entry[key] for key in ("loc", "msg", "type")} for entry in error.errors()]
+        return JSONResponse({"detail": detail}, status_code=422)
 
     @app.get("/api/health", tags=["health"])
     async def health():

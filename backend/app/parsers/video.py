@@ -17,6 +17,7 @@ from ..config import SelectorSettings
 from ..services.filename import extract_date_from_cdn_url, normalize_published_date
 from .http_session import TaskHttpContext
 from .target import SubscribeAction, extract_subscribe_action, select_one
+from .urls import is_site_url
 from .xhamster import (
     extract_xhamster_viewkey,
     fetch_xhamster_video_detail,
@@ -155,16 +156,9 @@ def extract_viewkey_from_url(url: Optional[str]) -> Optional[str]:
 
 def _video_url_key(url: str) -> Optional[str]:
     u = (url or "").strip()
-    if "\\" in u or any(char.isspace() for char in u):
-        return None
     if is_xhamster_url(u):
         return extract_xhamster_viewkey(u)
-    try:
-        parsed = urllib.parse.urlparse(u)
-    except ValueError:
-        return None
-    host = (parsed.hostname or "").rstrip(".").lower()
-    if parsed.scheme not in {"https", "http"} or (host != "pornhub.com" and not host.endswith(".pornhub.com")):
+    if not is_site_url(u, "pornhub", legacy_http=True):
         return None
     return extract_viewkey_from_url(u)
 
@@ -568,6 +562,7 @@ async def fetch_single_video_detail(
                 elif is_mp4_media_option(item):
                     mp4_options.extend(_mp4_option_list([item], final_url))
 
+        html = vdata = media_defs = item = None
         media_lookup_failed = False
         if remote_url:
             gm_base = min(1.0, ctx.retry_delay_base) if ctx.retry_delay_base >= 0 else 1.0
@@ -717,9 +712,16 @@ async def fetch_video_details_batch(
                 on_parsed(done_count, total, detail)
             return detail
 
-    tasks = [asyncio.create_task(_worker(u, pn, itn)) for u, pn, itn in items]
+    indexed_items = iter(enumerate(items))
+    results: List[Optional[VideoDetail]] = [None] * total
+
+    async def _consume() -> None:
+        for index, (page_url, page_num, item_num) in indexed_items:
+            results[index] = await _worker(page_url, page_num, item_num)
+
+    tasks = [asyncio.create_task(_consume()) for _ in range(max(1, min(total, int(concurrency))))]
     try:
-        results = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
     except BaseException:
         for t in tasks:
             if not t.done():
@@ -727,4 +729,4 @@ async def fetch_video_details_batch(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
 
-    return list(results)
+    return [detail for detail in results if detail is not None]

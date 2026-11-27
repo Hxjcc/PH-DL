@@ -6,14 +6,18 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
+import re
 import shlex
 import tempfile
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..config import RuntimeSettings
 from .filename import is_valid_video_file
+from .subprocesses import run_bounded_process
 
 FileSnapshot = Tuple[int, int, int, int, int]
 UploadProgressCallback = Callable[[str, int, int, float, str], None]  # (viewkey, bytes_sent, total, speed_bps, phase)
@@ -36,7 +40,7 @@ def parse_rclone_json_line(line: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -166,22 +170,6 @@ def delete_verified_source(path: Path, snapshot: Optional[FileSnapshot]) -> bool
         return False
 
 
-async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        proc.terminate()
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=3.0)
-        return
-    except asyncio.TimeoutError:
-        pass
-    with contextlib.suppress(ProcessLookupError):
-        proc.kill()
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(proc.wait(), timeout=3.0)
-
-
 async def _run_cmd(
     cmd: List[str],
     *,
@@ -189,120 +177,39 @@ async def _run_cmd(
     cancel_event: Optional[asyncio.Event] = None,
     on_stderr_line: Optional[Callable[[str], None]] = None,
 ) -> Tuple[int, str, str]:
-    if cancel_event is not None and cancel_event.is_set():
-        return 130, "", "rclone 执行已取消"
+    env = os.environ.copy()
+    env.setdefault("GOGC", "50")
+    env.setdefault("GOMEMLIMIT", "256MiB")
+
+    def filter_line(text: str) -> Optional[str]:
+        with contextlib.suppress(Exception):
+            if on_stderr_line is not None:
+                on_stderr_line(text)
+        parsed = parse_rclone_json_line(text)
+        if parsed is None:
+            return text
+        if isinstance(parsed.get("stats"), dict):
+            return None
+        if str(parsed.get("level") or "").lower() in {"error", "critical", "fatal", "warning"}:
+            return str(parsed.get("msg") or "").strip()
+        return None
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        rc, out, err = await run_bounded_process(
+            cmd, timeout=timeout, cancel_event=cancel_event, env=env,
+            capture_stdout=len(cmd) < 2 or cmd[1] not in {"copy", "copyto", "mkdir"},
+            filter_stderr=filter_line if on_stderr_line is not None else None,
         )
     except FileNotFoundError as err:
         return 127, "", f"找不到可执行文件: {err}"
     except Exception as err:
         return 1, "", f"{type(err).__name__}: {err}"
 
-    if on_stderr_line is not None:
-        stderr_lines: List[str] = []
-
-        async def _stream_communicate() -> Tuple[bytes, bytes]:
-            async def _read_stdout() -> bytes:
-                if proc.stdout is None:
-                    return b""
-                return await proc.stdout.read()
-
-            async def _read_stderr() -> None:
-                if proc.stderr is None:
-                    return
-                while True:
-                    raw = await proc.stderr.readline()
-                    if not raw:
-                        break
-                    text = raw.decode(errors="replace").rstrip("\r\n")
-                    if text:
-                        parsed = parse_rclone_json_line(text)
-                        if parsed is not None:
-                            if not isinstance(parsed.get("stats"), dict):
-                                msg = str(parsed.get("msg") or "").strip()
-                                lvl = str(parsed.get("level") or "").lower()
-                                if msg and lvl in {"error", "critical", "fatal", "warning"}:
-                                    stderr_lines.append(msg)
-                                    if len(stderr_lines) > 50:
-                                        stderr_lines.pop(0)
-                        else:
-                            stderr_lines.append(text)
-                            if len(stderr_lines) > 50:
-                                stderr_lines.pop(0)
-                        with contextlib.suppress(Exception):
-                            on_stderr_line(text)
-
-            out_b, _ = await asyncio.gather(_read_stdout(), _read_stderr())
-            await proc.wait()
-            return out_b, ("\n".join(stderr_lines)).encode("utf-8", errors="replace")
-
-        comm_coro = _stream_communicate()
-    else:
-        comm_coro = proc.communicate()
-
-    if timeout is None and cancel_event is None:
-        try:
-            stdout_b, stderr_b = await comm_coro
-        except asyncio.CancelledError:
-            await _terminate_process(proc)
-            raise
-        return (
-            int(proc.returncode or 0),
-            (stdout_b or b"").decode(errors="replace"),
-            (stderr_b or b"").decode(errors="replace"),
-        )
-
-    communicate_task = asyncio.create_task(comm_coro)
-    cancel_task = asyncio.create_task(cancel_event.wait()) if cancel_event is not None else None
-    wait_tasks = {communicate_task}
-    if cancel_task is not None:
-        wait_tasks.add(cancel_task)
-
-    try:
-        done, _ = await asyncio.wait(
-            wait_tasks,
-            timeout=timeout,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if communicate_task in done:
-            stdout_b, stderr_b = communicate_task.result()
-            return (
-                int(proc.returncode or 0),
-                (stdout_b or b"").decode(errors="replace"),
-                (stderr_b or b"").decode(errors="replace"),
-            )
-
-        cancelled = cancel_task is not None and cancel_task in done
-        reason = "rclone 执行已取消" if cancelled else f"rclone 执行超时（{timeout}s）"
-        await _terminate_process(proc)
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(communicate_task, timeout=3.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            communicate_task.cancel()
-            with contextlib.suppress(BaseException):
-                await communicate_task
-            stdout_b, stderr_b = b"", b""
-
-        stderr_text = (stderr_b or b"").decode(errors="replace").strip()
-        stderr_text = f"{stderr_text}\n{reason}".strip()
-        return (
-            130 if cancelled else 124,
-            (stdout_b or b"").decode(errors="replace"),
-            stderr_text,
-        )
-    except asyncio.CancelledError:
-        await _terminate_process(proc)
-        raise
-    finally:
-        for task in wait_tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*wait_tasks, return_exceptions=True)
+    if rc == 130:
+        err = f"{err}\nrclone 执行已取消".strip()
+    elif rc == 124:
+        err = f"{err}\nrclone 执行超时（{timeout}s）".strip()
+    return rc, out, err
 
 
 def _parse_listremotes_long(output: str) -> Dict[str, str]:
@@ -365,7 +272,7 @@ def parse_safe_rclone_extra_flags(raw: str) -> List[str]:
             idx += 1
             continue
         flag_name = tok.split("=", 1)[0].strip().lower()
-        if flag_name in _BLOCKED_EXTRA_FLAGS or flag_name.startswith("--rc-"):
+        if flag_name in _BLOCKED_EXTRA_FLAGS or flag_name.startswith(("--rc-", "--dump")):
             # Skip blocked flag and its separate value token if present
             if "=" not in tok and idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
                 idx += 2
@@ -432,13 +339,25 @@ async def detect_remote_type(
 
 def build_remote_dir(settings: RuntimeSettings, uploader_folder: str, site: str = "pornhub") -> str:
     remote = (settings.rclone_remote or "pikpak").strip().rstrip(":")
+    if not _valid_remote_name(remote):
+        raise ValueError("rclone 远端名称无效，请使用 rclone.conf 中的名称")
     norm_site = (site or "pornhub").strip().lower()
     if norm_site in {"xhamster", "xh"}:
         base = (getattr(settings, "rclone_xh_remote_base_dir", "xHamster") or "xHamster").strip().strip("/")
     else:
         base = (settings.rclone_remote_base_dir or "Pornhub").strip().strip("/")
     sub = (uploader_folder or "Ungrouped").strip().strip("/")
+    if not _valid_remote_path(base) or not _valid_remote_path(sub):
+        raise ValueError("rclone 目标目录含不受支持的路径成分")
     return f"{remote}:{base}/{sub}" if base else f"{remote}:{sub}"
+
+
+def _valid_remote_name(remote: str) -> bool:
+    return bool(re.fullmatch(r"[\w.][\w. -]*", remote)) and remote not in {".", ".."}
+
+
+def _valid_remote_path(path: str) -> bool:
+    return not re.search(r"[\\:\x00-\x1f\x7f]", path) and all(part not in {".", ".."} for part in path.split("/"))
 
 
 def build_rclone_copy_opts(
@@ -498,8 +417,12 @@ def build_rclone_copy_opts(
             opts.append(f"--tpslimit-burst={settings.rclone_tpslimit_burst}")
 
     extra_flags = parse_safe_rclone_extra_flags(getattr(settings, "rclone_extra_flags", ""))
-    if extra_flags:
-        opts.extend(extra_flags)
+    flag_names = {flag.split("=", 1)[0].lower() for flag in extra_flags if flag.startswith("--")}
+    if "--buffer-size" not in flag_names:
+        opts.append("--buffer-size=8Mi")
+    if "--use-mmap" not in flag_names:
+        opts.append("--use-mmap")
+    opts.extend(extra_flags)
     return opts
 
 
@@ -674,6 +597,8 @@ async def _probe_single_remote(
 
     Returns ``(ok, detail, detected_type)``.
     """
+    if not _valid_remote_name(remote) or not _valid_remote_path(base):
+        return False, "rclone 远端名称或目标目录无效", ""
     if remote not in remotes_map:
         available = ", ".join(remotes_map.keys()) or "无"
         return False, f"未在 rclone.conf 找到远端 '{remote}'（当前可用: {available}）", ""
@@ -876,7 +801,7 @@ async def upload_file_batch(
 
     def _make_stderr_handler(
         subset: Dict[str, Tuple[Path, str, str, FileSnapshot]],
-        error_sink: List[str],
+        error_sink: deque[str],
     ) -> Callable[[str], None]:
         by_relative: Dict[str, Tuple[str, int]] = {}
         by_name: Dict[str, Tuple[str, int]] = {}
@@ -896,16 +821,16 @@ async def upload_file_batch(
             if parsed is None:
                 text = (line or "").strip()
                 if text:
-                    error_sink.append(text)
+                    error_sink.append(text[:4096])
                 return
             lvl = str(parsed.get("level") or "").lower()
             if lvl in {"error", "critical", "fatal", "warning"}:
                 msg = str(parsed.get("msg") or "").strip()
                 err_field = str(parsed.get("error") or "").strip()
                 if msg:
-                    error_sink.append(msg)
+                    error_sink.append(msg[:4096])
                 if err_field and err_field not in msg:
-                    error_sink.append(err_field)
+                    error_sink.append(err_field[:4096])
             if on_progress is None:
                 return
             stats = parsed.get("stats")
@@ -955,7 +880,7 @@ async def upload_file_batch(
     copy_opts = build_rclone_copy_opts(settings, remote_type=remote_type, stream_stats=on_progress is not None)
 
     if same_name_entries:
-        reported_error_lines: List[str] = []
+        reported_error_lines: deque[str] = deque(maxlen=32)
         with _upload_file_list([entry[1] for entry in same_name_entries.values()]) as list_file:
             cmd = [
                 rclone,
@@ -975,7 +900,7 @@ async def upload_file_batch(
             rc, _, stderr = await _run_cmd(cmd, **run_kwargs)
         if rc != 0:
             err_msg, fatal_msg = summarize_rclone_error(
-                reported_error_lines + stderr.splitlines(),
+                [*reported_error_lines, *stderr.splitlines()],
                 rc=rc,
                 remote_type=remote_type,
                 action="copy",
@@ -995,7 +920,7 @@ async def upload_file_batch(
             async with transfer_sem:
                 if cancel_event is not None and cancel_event.is_set():
                     return vk_item, False, "rclone 执行已取消", ""
-                err_lines_one: List[str] = []
+                err_lines_one: deque[str] = deque(maxlen=32)
                 cmd = [
                     rclone,
                     "copyto",
@@ -1013,7 +938,7 @@ async def upload_file_batch(
                 if rc_one == 0:
                     return vk_item, True, "", ""
                 err_msg, fatal_msg = summarize_rclone_error(
-                    err_lines_one + stderr_one.splitlines(),
+                    [*err_lines_one, *stderr_one.splitlines()],
                     rc=rc_one,
                     remote_type=remote_type,
                     action="copyto",

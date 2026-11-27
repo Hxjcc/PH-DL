@@ -18,12 +18,9 @@ from ..cancel import StopRequested, until_stopped
 from ..services.filename import normalize_published_date
 from .http_session import TaskHttpContext, parse_cookie_string
 from .target import SubscribeAction, SubscribeResult
+from .urls import is_site_url, is_xhamster_host
 
 XH_ORIGIN = "https://xhamster.com"
-_XH_HOST_RE = re.compile(
-    r"^(?:[a-z0-9-]+\.)*xhamster\d*\.(?:com|desi|one|tv|xxx|live)$",
-    re.IGNORECASE,
-)
 _XH_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _XH_PRINTABLE_RE = re.compile(r"^[\x20-\x7E]+$")
 _XH_INITIALS_RE = re.compile(r"window\.initials\s*=\s*\{")
@@ -34,20 +31,8 @@ _XH_QUALITY_IN_URI_RE = re.compile(r"(?:^|[/_.-])(\d{3,4})p(?=[._/-]|$)", re.IGN
 _OFFLOAD_HTML_THRESHOLD = 32_768
 
 
-def is_xhamster_host(host: str) -> bool:
-    clean = (host or "").strip().rstrip(".").lower()
-    return bool(clean and _XH_HOST_RE.fullmatch(clean))
-
-
 def is_xhamster_url(url: Optional[str]) -> bool:
-    raw = (url or "").strip()
-    if not raw or "\\" in raw or any(ch.isspace() for ch in raw):
-        return False
-    try:
-        parsed = urllib.parse.urlparse(raw)
-    except ValueError:
-        return False
-    return parsed.scheme in {"https", "http"} and is_xhamster_host(parsed.hostname or "")
+    return is_site_url((url or "").strip(), "xhamster", legacy_http=True)
 
 
 def detect_site_from_url(url: Optional[str]) -> str:
@@ -969,6 +954,7 @@ async def scan_xhamster_list_pages(
     videos_spec: Optional[str] = None,
     catch_up: bool = False,
     skip_vkeys: Optional[Set[str]] = None,
+    lookup_skipped: Optional[Callable[[List[str]], Awaitable[Set[str]]]] = None,
     delay_min: float = 0.5,
     delay_max: float = 1.5,
     page_concurrency: int = 1,
@@ -1002,7 +988,7 @@ async def scan_xhamster_list_pages(
     collected: List[ListedVideo] = []
     seen_all_vkeys: Set[str] = set()
     external_seen = set(already_seen_vkeys or ())
-    skip_set = set(skip_vkeys or ())
+    skip_set = skip_vkeys if isinstance(skip_vkeys, (set, frozenset)) else frozenset(skip_vkeys or ())
     pages_scanned = 0
     end_reached = False
     profile_found = False
@@ -1058,10 +1044,12 @@ async def scan_xhamster_list_pages(
 
         page_results = await asyncio.gather(*(_fetch_page(page_num) for page_num in batch_pages))
         batch_failed = False
-        for current_page, page_url, res, err in page_results:
+        for idx in range(len(page_results)):
             if ctx.cancel_event.is_set():
                 end_reached = True
                 break
+            current_page, page_url, res, err = page_results[idx]
+            page_results[idx] = None
             pages_scanned += 1
 
             if res is None:
@@ -1123,6 +1111,8 @@ async def scan_xhamster_list_pages(
                 raw_items, avatar_url, display_name, max_pages, page_bound_user, subscribe_action = _extract_xhamster_page_data(
                     res.text, effective_target_type
                 )
+            referer = res.final_url or page_url
+            res = None
             any_page_succeeded = True
             if bound_user_info is None and page_bound_user is not None:
                 bound_user_info = page_bound_user
@@ -1136,7 +1126,7 @@ async def scan_xhamster_list_pages(
 
             if on_subscribe_action and not subscribe_notified and subscribe_action is not None:
                 subscribe_notified = True
-                await on_subscribe_action(subscribe_action, res.final_url or page_url)
+                await on_subscribe_action(subscribe_action, referer)
 
             if not raw_items:
                 if is_natural and current_page == 1:
@@ -1157,6 +1147,7 @@ async def scan_xhamster_list_pages(
             if specific_map and any(index >= total_on_page for index in specific_map[current_page]):
                 report_error(current_page, f"部分指定位置超出此页 {total_on_page} 个视频")
             page_videos: List[ListedVideo] = []
+            known_on_page = await lookup_skipped([item[0] for item in raw_items]) if lookup_skipped else set()
             for idx, (vkey, url, title, published_at, duration_seconds) in enumerate(raw_items, start=1):
                 if specific_map and current_page in specific_map:
                     if (idx - 1) not in specific_map[current_page]:
@@ -1165,7 +1156,7 @@ async def scan_xhamster_list_pages(
                     continue
                 seen_all_vkeys.add(vkey)
                 new_unique_on_page += 1
-                if vkey in skip_set or vkey in external_seen:
+                if vkey in skip_set or vkey in external_seen or vkey in known_on_page:
                     continue
                 page_videos.append(
                     ListedVideo(
@@ -1201,11 +1192,13 @@ async def scan_xhamster_list_pages(
                 end_reached = True
                 break
 
-            if catch_up and raw_items[-1][0] in skip_set and not batch_failed:
+            if catch_up and (raw_items[-1][0] in skip_set or raw_items[-1][0] in known_on_page) and not batch_failed:
                 ctx._emit("INFO", f"[xHamster 扫描] 第 {current_page} 页已衔接已知视频，结束补扫。")
                 end_reached = True
                 break
 
+        res = None
+        page_results.clear()
         if is_natural and batch_failed:
             break
 
@@ -1230,6 +1223,7 @@ async def scan_xhamster_list_pages(
             target_type="users",
             catch_up=catch_up,
             skip_vkeys=skip_set,
+            lookup_skipped=lookup_skipped,
             delay_min=delay_min,
             delay_max=delay_max,
             page_concurrency=page_concurrency,
@@ -1237,7 +1231,7 @@ async def scan_xhamster_list_pages(
             profile_username=bound_slug,
             on_page=on_page,
             on_page_progress=None,
-            on_error=None,
+            on_error=on_error,
             include_bound_user=False,
             already_seen_vkeys=seen_all_vkeys | external_seen,
         )
@@ -1276,6 +1270,7 @@ async def scan_xhamster_list_pages(
                 target_type=c_type,
                 catch_up=catch_up,
                 skip_vkeys=skip_set,
+                lookup_skipped=lookup_skipped,
                 delay_min=delay_min,
                 delay_max=delay_max,
                 page_concurrency=page_concurrency,
@@ -1283,7 +1278,7 @@ async def scan_xhamster_list_pages(
                 profile_username=c_slug,
                 on_page=on_page,
                 on_page_progress=None,
-                on_error=None,
+                on_error=on_error,
                 include_bound_user=False,
                 already_seen_vkeys=seen_all_vkeys | external_seen,
             )
@@ -1658,6 +1653,7 @@ async def fetch_xhamster_video_detail(
 
     pref_codec = "av1" if str(preferred_codec or "").strip().lower() == "av1" else "h264"
     hls_candidates = _extract_hls_master_candidates(sources, preferred_codec=pref_codec)
+    del res, initials, video_model, xplayer, raw_sources, sources
 
     selected_variant: Optional[HlsVariant] = None
     had_any_variants = False
@@ -1821,6 +1817,7 @@ async def check_xhamster_cookie_valid(
 
     try:
         async with TaskHttpContext(
+            site="xhamster",
             cookie_str=cookie_str,
             proxy_url=proxy_url,
             concurrency=1,

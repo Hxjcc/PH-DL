@@ -86,7 +86,8 @@ const CATEGORY_MAP = {
 
 function stripKnownPrefix(rawLabel = '') {
   let text = String(rawLabel || '').trim()
-  text = text.replace(/^(重试\/续传|续传|重试)\s*·\s*/, '')
+  const sitePrefix = /^\[(xHamster|PornHub)\]\s*/i
+  text = text.replace(sitePrefix, '').replace(/^(重试\/续传|续传|重试)\s*·\s*/, '').replace(sitePrefix, '')
   text = text.replace(/\s*\(\d+\s*[项条个]\)\s*$/, '')
   text = text.replace(
     /^(下载目标|导出页面链接|链接下载|指定追更|指定检查更新|初始化基线|仅续传临时文件)\s*[:：]\s*/,
@@ -389,6 +390,9 @@ export function resolveJobVisual(job, targetsList = []) {
   }
   if (job?.trigger === 'schedule') {
     capsules.push({ text: '定时触发', tone: 'brand' })
+  }
+  if (Number(params.resume_count || 0) > 0) {
+    capsules.push({ text: `已续传 ${params.resume_count} 次` })
   }
   if (params.source_job_id) {
     capsules.push({ text: `源自 #${params.source_job_id}`, mono: true })

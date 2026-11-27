@@ -1106,6 +1106,8 @@ async def test_xhamster_manual_job_skips_pornhub_cookie_and_uploads_to_xh_remote
         ]
 
     async def fake_download_hls(**kwargs):
+        assert kwargs["segment_concurrency"] == 4
+        assert kwargs["max_buffer_bytes"] == 12 * 1024 * 1024
         dl_dir: Path = kwargs["download_dir"]
         dl_dir.mkdir(parents=True, exist_ok=True)
         out = dl_dir / "XH Demo [xhOwQIZ].mp4"

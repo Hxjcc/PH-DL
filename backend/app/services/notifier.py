@@ -29,7 +29,9 @@ async def send_serverchan(
         timeout = aiohttp.ClientTimeout(total=15.0)
         async with aiohttp.ClientSession(timeout=timeout) as client:
             if is_turbo:
-                async with client.post(api_url, data=payload, proxy=settings.normalized_proxy) as resp:
+                async with client.post(api_url, data=payload, proxy=settings.normalized_proxy, allow_redirects=False) as resp:
+                    if resp.status < 200 or resp.status >= 300:
+                        return False, f"ServerChan 返回 HTTP {resp.status}"
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
                 ok = data.get("code") == 0 and data.get("data", {}).get("errno") == 0
@@ -38,7 +40,10 @@ async def send_serverchan(
                     api_url,
                     params={"text": title, "desp": content},
                     proxy=settings.normalized_proxy,
+                    allow_redirects=False,
                 ) as resp:
+                    if resp.status < 200 or resp.status >= 300:
+                        return False, f"ServerChan 返回 HTTP {resp.status}"
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
                 ok = data.get("errno") == 0
@@ -46,9 +51,9 @@ async def send_serverchan(
             if ok:
                 return True, "通知发送成功"
             err_msg = data.get("message") or data.get("errmsg") or "未知错误"
-            return False, f"ServerChan 返回错误: {err_msg}"
+            return False, settings.redact_diagnostic(f"ServerChan 返回错误: {err_msg}")
     except Exception as err:
-        return False, f"通知发送异常: {err}"
+        return False, f"通知发送异常 ({type(err).__name__})"
 
 
 def build_auto_update_report(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from typing import Optional
 
@@ -21,9 +22,8 @@ router = APIRouter(prefix="/api", tags=["overview"])
 async def get_overview(container: AppContainer = Depends(require_auth)):
     settings = await container.repo.get_settings()
     video_stats = await container.repo.get_video_stats()
-    targets = await container.repo.list_targets()
-    enabled_targets = sum(1 for t in targets if t["enabled"])
-    temp_files = container.tasks.list_temp_files()
+    target_count, enabled_targets = await container.repo.count_targets()
+    temp_files = await asyncio.to_thread(container.tasks.list_temp_files)
     next_run = await container.scheduler.next_run_iso()
 
     disk_free_bytes = 0
@@ -69,7 +69,7 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
         },
         "uploader_enabled": settings.uploader_enabled,
         "event_loop": container.loop_monitor.snapshot(),
-        "targets_total": len(targets),
+        "targets_total": target_count,
         "targets_enabled": enabled_targets,
         "videos": video_stats,
         "temp_files_count": len(temp_files),
@@ -104,22 +104,25 @@ async def get_subscriptions(
                 on_log=lambda level, message: container.events.emit_log(level, message),
             )
             if login_res.success and login_res.cookie_str:
-                patch = {"xh_cookie": login_res.cookie_str}
-                if login_res.logged_in_username:
-                    patch["xh_logged_in_username"] = login_res.logged_in_username
-                settings = await container.repo.update_settings_patch(patch)
+                refreshed = await container.repo.save_refreshed_cookie(
+                    "xh", settings, login_res.cookie_str, login_res.logged_in_username,
+                )
+                if refreshed is None:
+                    raise HTTPException(409, "登录期间连接配置已变更，请重试")
+                settings = refreshed
                 resolved_user = (login_res.logged_in_username or settings.xh_logged_in_username or "").strip()
                 container.tasks.set_xh_cookie_status(True, format_cookie_valid_message(resolved_user))
                 xh_cookie = settings.xh_cookie.strip()
             else:
                 container.tasks.set_xh_cookie_status(False, login_res.message)
-                raise HTTPException(status_code=400, detail=login_res.message)
+                raise HTTPException(status_code=400, detail=container.repo.redact_diagnostic(login_res.message))
         if not xh_cookie:
             raise HTTPException(
                 status_code=400,
                 detail="请先在【系统设置 → Cookie 与账号】中登录 xHamster 账号或粘贴有效 Cookie",
             )
         async with TaskHttpContext(
+            site="xhamster",
             cookie_str=xh_cookie,
             proxy_url=settings.normalized_proxy,
             concurrency=2,
@@ -154,6 +157,7 @@ async def get_subscriptions(
         raise HTTPException(status_code=400, detail="请先在【系统设置】中配置有效 Cookie")
 
     async with TaskHttpContext(
+        site="pornhub",
         cookie_str=settings.ph_cookie,
         proxy_url=settings.normalized_proxy,
         concurrency=2,

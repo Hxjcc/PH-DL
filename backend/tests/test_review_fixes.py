@@ -309,13 +309,16 @@ async def test_retry_failed_preserves_none_quality_and_applies_target_and_global
         resp_auto = client.post(f"/api/jobs/{src_auto_id}/retry-failed")
         assert resp_auto.status_code == 200
         retry_auto = resp_auto.json()["job"]
-        assert retry_auto["params"]["quality"] is None
+        assert retry_auto["id"] == src_auto_id and retry_auto["kind"] == "auto_update"
+        assert "quality" not in retry_auto["params"]
 
         resp_explicit = client.post(f"/api/jobs/{src_explicit_id}/retry-failed")
         assert resp_explicit.status_code == 200
-        assert resp_explicit.json()["job"]["params"]["quality"] == ""
+        retry_explicit = resp_explicit.json()["job"]
+        assert retry_explicit["id"] == src_explicit_id
+        assert retry_explicit["params"]["quality"] == ""
 
-    # Verify _exec_retry_items passes target preferred_quality ('1080') for alice and global ('720') for bob
+    # In-place resume uses the target preference for Alice and the global preference for Bob.
     env = EnvSettings(data_dir=tmp_path / "exec")
     env.ensure_dirs()
     db = Database(env.db_path)
@@ -389,16 +392,14 @@ async def test_retry_failed_preserves_none_quality_and_applies_target_and_global
         monkeypatch.setattr(engine, "fetch_video_details_batch", fake_details)
         monkeypatch.setattr(engine, "download_mp4_with_resume", fake_download)
 
-        retry_job = await repo.create_job(
-            "retry_items",
-            "重试",
-            {"source_job_id": src["id"], "auto_upload": False, "quality": None},
-        )
         manager = engine.TaskManager(env, repo, EventBus())
-        await manager._run_job(retry_job["id"])
+        retry_job, _, status = await manager.resume_job_in_place(src["id"])
+        assert status == 200 and retry_job["id"] == src["id"]
+        await manager._run_job(src["id"])
 
         assert seen_fetch_quals["vk_a"] == {"1080"}
         assert seen_fetch_quals["vk_b"] == {"720"}
+        assert (await repo.get_job(src["id"]))["params"] == {"target_ids": None, "resume_count": 1}
     finally:
         await db.close()
 

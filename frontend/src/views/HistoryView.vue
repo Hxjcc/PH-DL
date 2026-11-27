@@ -262,6 +262,7 @@ let fetchingTimer = null
 let prefetchTimer = null
 let reqSeq = 0
 let activatedOnce = false
+let routeActive = false
 let activeAbortController = null
 
 const QUERY_CACHE_MAX = 48
@@ -339,6 +340,7 @@ function prefetchPage(targetPage) {
   const promise = api
     .listVideos(query, { signal: controller.signal })
     .then((res) => {
+      if (controller.signal.aborted) return null
       const nextItems = res.items || []
       const nextTotal = res.total || 0
       writeQueryCache(key, nextItems, nextTotal)
@@ -355,6 +357,7 @@ function prefetchPage(targetPage) {
 }
 
 function scheduleAdjacentPrefetch() {
+  if (!routeActive) return
   clearTimeout(prefetchTimer)
   prefetchTimer = setTimeout(() => {
     prefetchTimer = null
@@ -411,6 +414,7 @@ function applyVideoList(nextItems, nextTotal) {
 }
 
 async function loadVideos({ silent = false, includeMeta = true, useCache = false } = {}) {
+  if (!routeActive) return
   const cacheKey = buildQueryCacheKey()
   if (useCache && !includeMeta) {
     const hit = readQueryCache(cacheKey)
@@ -792,7 +796,7 @@ function applyRouteQueryFilters() {
 watch(
   () => [route.name, route.fullPath],
   ([name]) => {
-    if (name !== 'history' || !activatedOnce) return
+    if (name !== 'history' || !activatedOnce || !routeActive) return
     const { changed, siteChanged } = applyRouteQueryFilters()
     if (!changed) return
     clearTimeout(debounceTimer)
@@ -802,6 +806,7 @@ watch(
 )
 
 onActivated(() => {
+  routeActive = true
   const { changed } = applyRouteQueryFilters()
   if (changed) {
     activatedOnce = true
@@ -832,16 +837,23 @@ onActivated(() => {
   loadVideos({ silent: true, includeMeta: true })
 })
 
-onUnmounted(() => {
+function stopHistoryRequests() {
+  routeActive = false
+  ++reqSeq
   clearTimeout(debounceTimer)
   clearTimeout(loadingTimer)
   clearTimeout(fetchingTimer)
   cancelAllPrefetches()
   activeAbortController?.abort()
-})
+  activeAbortController = null
+  fetching.value = false
+  loading.value = false
+}
+
+onUnmounted(stopHistoryRequests)
 
 onDeactivated(() => {
-  cancelAllPrefetches()
+  stopHistoryRequests()
   playingVideo.value = null
   playbackTrigger = null
 })

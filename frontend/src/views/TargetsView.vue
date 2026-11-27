@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onDeactivated, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Plus,
@@ -538,12 +538,16 @@ onActivated(() => {
     }
     return
   }
-  loadData({ silent: true })
+  if (Date.now() - Math.min(store.targetsLoadedAt, store.settingsLoadedAt) > 1500) loadData({ silent: true })
 })
 
-onUnmounted(() => {
+function clearLoadingTimer() {
   clearTimeout(loadingTimer)
-})
+  loading.value = false
+}
+
+onDeactivated(clearLoadingTimer)
+onUnmounted(clearLoadingTimer)
 
 async function saveSchedule() {
   if (!schedule.time) return false

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onActivated, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onDeactivated, ref, watch } from 'vue'
 import { Trash2, Search, Copy, Terminal, Activity } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
 import { formatLogTime, formatLogTimestamp } from '../utils/format'
@@ -14,6 +14,7 @@ const levelFilter = ref('ALL')
 const search = ref('')
 const autoScroll = ref(true)
 const boxRef = ref(null)
+let routeActive = false
 
 const levelPills = [
   { label: '全部', value: 'ALL' },
@@ -48,15 +49,19 @@ const loopHealth = computed(() => {
 })
 
 async function scrollToBottom() {
-  if (!autoScroll.value) return
+  if (!routeActive || !autoScroll.value) return
   await nextTick()
-  if (boxRef.value) {
+  if (routeActive && boxRef.value) {
     boxRef.value.scrollTop = boxRef.value.scrollHeight
   }
 }
 
-watch(() => filtered.value.length, scrollToBottom)
-onActivated(scrollToBottom)
+watch(() => filtered.value.at(-1), scrollToBottom)
+onActivated(() => {
+  routeActive = true
+  scrollToBottom()
+})
+onDeactivated(() => { routeActive = false })
 
 function levelStyle(level) {
   if (level === 'ERROR' || level === 'CRITICAL') return 'text-red-500 dark:text-red-400'

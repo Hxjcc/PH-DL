@@ -23,6 +23,28 @@ from tests.media_fixtures import mp4_payload
 VALID_MP4 = mp4_payload()
 
 
+@pytest.mark.parametrize("flag", ["--buffer-size=32Mi", "--buffer-size 32Mi"])
+def test_rclone_copy_memory_flags_allow_user_overrides(flag):
+    defaults = uploader.build_rclone_copy_opts(RuntimeSettings())
+    assert "--buffer-size=8Mi" in defaults and "--use-mmap" in defaults
+    custom = uploader.build_rclone_copy_opts(RuntimeSettings(rclone_extra_flags=f"{flag} --use-mmap=false"))
+    assert all(token in custom for token in flag.split())
+    assert "--use-mmap=false" in custom
+    assert "--buffer-size=8Mi" not in custom and "--use-mmap" not in custom
+
+
+async def test_rclone_subprocess_respects_existing_go_limits(monkeypatch):
+    cmd = [sys.executable, "-c", "import os; print(os.environ['GOGC'], os.environ['GOMEMLIMIT'])"]
+    monkeypatch.delenv("GOGC", raising=False)
+    monkeypatch.delenv("GOMEMLIMIT", raising=False)
+    default_rc, default_limits, _ = await uploader._run_cmd(cmd)
+    assert default_rc == 0 and default_limits.strip() == "50 256MiB"
+    monkeypatch.setenv("GOGC", "75")
+    monkeypatch.setenv("GOMEMLIMIT", "512MiB")
+    override_rc, override_limits, _ = await uploader._run_cmd(cmd)
+    assert override_rc == 0 and override_limits.strip() == "75 512MiB"
+
+
 class _FakeContent:
     def __init__(self, chunks: List[bytes]):
         self._chunks = chunks

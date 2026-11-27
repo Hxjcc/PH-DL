@@ -10,6 +10,7 @@ export class EventStreamClient {
   }
 
   connect() {
+    if (!this.stopped) return
     this.stopped = false
     this._open()
   }
@@ -31,17 +32,20 @@ export class EventStreamClient {
 
   _open() {
     if (this.stopped) return
+    this.timer = null
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const url = `${proto}//${window.location.host}/api/ws`
     const ws = new WebSocket(url)
     this.ws = ws
 
     ws.onopen = () => {
+      if (this.ws !== ws || this.stopped) return
       this.retryMs = 1000
       this.onStatusChange?.(true)
     }
 
     ws.onmessage = (evt) => {
+      if (this.ws !== ws || this.stopped) return
       try {
         const msg = JSON.parse(evt.data)
         if (msg.type !== 'ping') {
@@ -51,8 +55,9 @@ export class EventStreamClient {
     }
 
     ws.onclose = (evt) => {
+      if (this.ws !== ws || this.stopped) return
+      this.ws = null
       this.onStatusChange?.(false)
-      if (this.stopped) return
       if (evt.code === 4401) {
         this.stopped = true
         this.onUnauthorized?.()

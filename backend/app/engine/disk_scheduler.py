@@ -318,18 +318,15 @@ class AdaptiveDiskScheduler:
         cond_wait = asyncio.create_task(self._cond.wait())
         cancel_wait = asyncio.create_task(cancel_event.wait())
         try:
-            done, pending = await asyncio.wait(
+            await asyncio.wait(
                 {cond_wait, cancel_wait},
                 timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-        except BaseException:
+        finally:
             cond_wait.cancel()
             cancel_wait.cancel()
-            raise
+            await asyncio.gather(cond_wait, cancel_wait, return_exceptions=True)
 
 
 class SmartUploadPool:

@@ -7,17 +7,20 @@ import logging
 import secrets
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
+
+from ..redaction import redact_diagnostic
 
 logger = logging.getLogger("phdl")
 
 
 class EventBus:
-    def __init__(self, max_logs: int = 500) -> None:
+    def __init__(self, max_logs: int = 500, redact: Callable[[str], str] = redact_diagnostic) -> None:
         self._subscribers: Set[asyncio.Queue[Dict[str, Any]]] = set()
         self._logs: Deque[Dict[str, Any]] = deque(maxlen=max_logs)
         self._boot_id: str = secrets.token_hex(4)
         self._log_seq: int = 0
+        self._redact = redact
         self._live_progress: Dict[int, Dict[str, Any]] = {}
         self._scheduler_status: Dict[int, Dict[str, Any]] = {}
         self._scan_status: Dict[int, Dict[str, Any]] = {}
@@ -40,6 +43,7 @@ class EventBus:
             if q.full():
                 try:
                     q.get_nowait()
+                    q.task_done()
                 except asyncio.QueueEmpty:
                     pass
             try:
@@ -49,6 +53,7 @@ class EventBus:
 
     def emit_log(self, level: str, message: str, job_id: Optional[int] = None) -> None:
         lvl = (level or "INFO").upper()
+        message = self._redact(message)
         self._log_seq += 1
         entry = {
             "id": self._log_seq,

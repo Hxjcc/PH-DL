@@ -1,10 +1,10 @@
 import { markRaw } from 'vue'
 import { defineStore } from 'pinia'
 import { toast } from 'vue-sonner'
-import { api } from '../api/client'
-import { EventStreamClient } from '../api/ws'
-import { appendLiveLog, mergeLogsSnapshot } from '../utils/logBuffer'
-import { JOB_LIMITS, HISTORY_PAGE_SIZES, readListPreference, saveListPreference } from '../utils/listPreferences'
+import { api } from '../api/client.js'
+import { EventStreamClient } from '../api/ws.js'
+import { appendLiveLog, mergeLogsSnapshot } from '../utils/logBuffer.js'
+import { JOB_LIMITS, HISTORY_PAGE_SIZES, readListPreference, saveListPreference } from '../utils/listPreferences.js'
 
 export const DEFAULT_HISTORY_FILTERS = Object.freeze({
   site: '',
@@ -24,19 +24,91 @@ const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
 const LIVE_PROGRESS_FLUSH_MS = 140
 const ITEM_UPDATE_FLUSH_MS = 120
 const JOB_ITEMS_RELOAD_DEBOUNCE_MS = 240
+const JOB_DETAILS_HISTORY_LIMIT = 8
+const SESSION_CACHE_MAX_CHARS = 256 * 1024
+const JOB_RUN_ORDER = { queued: 0, scanning: 1, running: 2 }
 
 const inflight = new Map()
-const latestSeq = new Map()
 let sessionEpoch = 0
 let persistTimer = null
 let persistIdleId = null
 let persistGen = 0
+let lastSnapshot = ''
 let pendingLiveProgress = null
 let liveProgressFlushTimer = null
 let pendingItemUpdates = null
 let itemUpdateFlushTimer = null
 const jobItemIndexMap = new Map()
 const jobItemsReloadTimers = new Map()
+const jobItemAccessOrder = new Map()
+const jobItemPins = new Map()
+const detailUpdates = new Map()
+
+function isActiveJobStatus(status) {
+  return JOB_RUN_ORDER[status] !== undefined
+}
+
+function jobListPriority(status) {
+  if (status === 'queued') return 1
+  return isActiveJobStatus(status) ? 0 : 2
+}
+
+function compareJobListOrder(a, b) {
+  return jobListPriority(a.status) - jobListPriority(b.status) ||
+    String(b.finished_at || b.created_at || '').localeCompare(String(a.finished_at || a.created_at || '')) || b.id - a.id
+}
+
+function isOlderJobUpdate(job, current) {
+  if (!current) return false
+  if (Number.isInteger(job.revision) && Number.isInteger(current.revision)) {
+    return job.revision < current.revision
+  }
+  const incomingRun = Number(job.params?.resume_count || 0)
+  const currentRun = Number(current.params?.resume_count || 0)
+  return incomingRun < currentRun || (
+    incomingRun === currentRun && (JOB_RUN_ORDER[job.status] ?? 3) < (JOB_RUN_ORDER[current.status] ?? 3)
+  )
+}
+
+function touchJobItems(jobId, status = jobItemAccessOrder.get(jobId)) {
+  jobItemAccessOrder.delete(jobId)
+  jobItemAccessOrder.set(jobId, status)
+}
+
+function updateCachedJobStatus(store, job, previousJob) {
+  const jid = Number(job.id)
+  if (!jobItemAccessOrder.has(jid)) return
+  const previous = jobItemAccessOrder.get(jid)
+  jobItemAccessOrder.set(jid, job.status)
+  if (Number(job.params?.resume_count || 0) > Number(previousJob?.params?.resume_count || 0) ||
+      (!isActiveJobStatus(previous) && isActiveJobStatus(job.status))) {
+    pendingItemUpdates?.delete(jid)
+    clearLiveProgressForJob(store, jid)
+    scheduleJobItemsReload(store, jid)
+  }
+}
+
+function evictJobItems(store, jid) {
+  delete store.jobItems[jid]
+  jobItemAccessOrder.delete(jid)
+  jobItemIndexMap.delete(jid)
+  detailUpdates.delete(jid)
+  inflight.delete(`jobDetail:${jid}`)
+  pendingItemUpdates?.delete(jid)
+  clearTimeout(jobItemsReloadTimers.get(jid))
+  jobItemsReloadTimers.delete(jid)
+  clearLiveProgressForJob(store, jid)
+}
+
+function trimJobItemsCache(store) {
+  const inactive = []
+  for (const [jid, status] of jobItemAccessOrder) {
+    if (!isActiveJobStatus(status) && !jobItemPins.has(jid)) inactive.push(jid)
+  }
+  for (let i = 0; i < inactive.length - JOB_DETAILS_HISTORY_LIMIT; i++) {
+    evictJobItems(store, inactive[i])
+  }
+}
 
 function indexJobItems(jobId, items) {
   const jid = Number(jobId)
@@ -54,6 +126,7 @@ function clearPendingItemUpdates() {
     itemUpdateFlushTimer = null
   }
   pendingItemUpdates = null
+  detailUpdates.clear()
   jobItemIndexMap.clear()
   for (const timer of jobItemsReloadTimers.values()) {
     clearTimeout(timer)
@@ -81,7 +154,7 @@ function flushPendingItemUpdates(store) {
     for (const [itemId, item] of updatesById) {
       const idx = idxMap.get(itemId)
       if (idx !== undefined && idx < nextList.length) {
-        nextList[idx] = { ...nextList[idx], ...item }
+        if (!(item.revision < nextList[idx].revision)) nextList[idx] = { ...nextList[idx], ...item }
       } else {
         idxMap.set(itemId, nextList.length)
         nextList.push(item)
@@ -98,6 +171,7 @@ function queueItemUpdate(store, item) {
     delete store.liveProgress[item.id]
   }
   const jid = Number(item.job_id)
+  detailUpdates.get(jid)?.set(item.id, item)
   if (!Array.isArray(store.jobItems[jid])) return
   if (!pendingItemUpdates) pendingItemUpdates = new Map()
   let jobMap = pendingItemUpdates.get(jid)
@@ -113,11 +187,14 @@ function queueItemUpdate(store, item) {
 
 function scheduleJobItemsReload(store, jobId) {
   const jid = Number(jobId)
-  if (!jid || !store.authenticated || !Array.isArray(store.jobItems[jid])) return
+  if (!jid || !store.authenticated || (!Array.isArray(store.jobItems[jid]) && !jobItemPins.has(jid))) return
   if (jobItemsReloadTimers.has(jid)) return
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
+    const pending = inflight.get(`jobDetail:${jid}`)
+    if (pending) await pending.catch(() => {})
+    if (jobItemsReloadTimers.get(jid) !== timer) return
     jobItemsReloadTimers.delete(jid)
-    if (!store.authenticated || !Array.isArray(store.jobItems[jid])) return
+    if (!store.authenticated || (!Array.isArray(store.jobItems[jid]) && !jobItemPins.has(jid))) return
     store.loadJobDetail(jid).catch(() => {})
   }, JOB_ITEMS_RELOAD_DEBOUNCE_MS)
   jobItemsReloadTimers.set(jid, timer)
@@ -186,8 +263,7 @@ function readSessionCache() {
     const raw = window.sessionStorage.getItem(SESSION_CACHE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw)
-    if (!parsed || parsed.v !== 1 || !parsed.authenticated) return null
-    if (Date.now() - Number(parsed.ts || 0) > SESSION_CACHE_TTL_MS) {
+    if (!parsed || parsed.v !== 2 || !parsed.authenticated || Date.now() - Number(parsed.ts || 0) > SESSION_CACHE_TTL_MS) {
       window.sessionStorage.removeItem(SESSION_CACHE_KEY)
       return null
     }
@@ -199,10 +275,26 @@ function readSessionCache() {
 
 function clearSessionCache() {
   persistGen += 1
+  lastSnapshot = ''
   cancelScheduledPersist()
   try {
     window.sessionStorage.removeItem(SESSION_CACHE_KEY)
   } catch {}
+}
+
+function cachedJobSummary(job) {
+  if (!job) return null
+  const { params, params_json, export_text, error_message, ...summary } = job
+  return {
+    ...summary,
+    label: String(job.label || '').slice(0, 512),
+    params: {
+      resume_count: params?.resume_count,
+      site: params?.site,
+      export_only: params?.export_only,
+      target_type: params?.target_type,
+    },
+  }
 }
 
 function schedulePersistSessionCache(store) {
@@ -214,30 +306,16 @@ function schedulePersistSessionCache(store) {
     persistIdleId = null
     if (gen !== persistGen || !store.authenticated) return
     try {
-      const runningJobId = store.overview?.current_job?.id
-      const compactJobItems = {}
-      if (runningJobId && Array.isArray(store.jobItems[runningJobId])) {
-        compactJobItems[runningJobId] = store.jobItems[runningJobId].slice(0, 100)
-      }
-      const payload = {
-        v: 1,
-        ts: Date.now(),
-        authenticated: true,
-        overview: store.overviewLoaded ? store.overview : null,
-        overviewLoaded: store.overviewLoaded,
-        jobs: store.jobsLoaded ? store.jobs.slice(0, store.jobsLimit) : null,
+      const snapshot = {
+        overview: store.overview ? { ...store.overview, current_job: cachedJobSummary(store.overview.current_job) } : null,
+        overviewLoaded: Boolean(store.overview),
+        jobs: store.jobsLoaded ? store.jobs.slice(0, store.jobsLimit).map(cachedJobSummary) : null,
         jobsFetchedLimit: Math.min(store.jobsFetchedLimit, store.jobsLimit),
-        tempFiles: store.tempFilesLoaded ? store.tempFiles : null,
-        targetsCache: store.targetsCache,
-        subscriptionsCache: store.subscriptionsCache,
-        subscriptionsLastSource: store.subscriptionsLastSource,
-        settingsCache: store.settingsCache,
-        rcloneRemotesCache: store.rcloneRemotesCache,
-        historyCache: store.historyCache,
-        jobItems: compactJobItems,
-        logs: store.logsLoaded ? store.logs.slice(-200) : null,
       }
-      window.sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify(payload))
+      const serialized = JSON.stringify(snapshot)
+      if (serialized.length > SESSION_CACHE_MAX_CHARS || serialized === lastSnapshot) return
+      window.sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify({ v: 2, ts: Date.now(), authenticated: true, ...snapshot }))
+      lastSnapshot = serialized
     } catch {}
   }
   persistTimer = setTimeout(() => {
@@ -248,20 +326,17 @@ function schedulePersistSessionCache(store) {
     } else {
       flush()
     }
-  }, 450)
+  }, 1200)
 }
 
 function resetInflight() {
   sessionEpoch += 1
   inflight.clear()
-  latestSeq.clear()
 }
 
 function runRequest(key, fn) {
-  const seq = (latestSeq.get(key) || 0) + 1
-  latestSeq.set(key, seq)
   const epoch = sessionEpoch
-  const isLatest = () => epoch === sessionEpoch && latestSeq.get(key) === seq
+  const isLatest = () => epoch === sessionEpoch && inflight.get(key) === p
   const p = Promise.resolve()
     .then(() => fn({ isLatest }))
     .finally(() => {
@@ -311,17 +386,7 @@ export const useAppStore = defineStore('app', {
       historyCache: hasCache && cached.historyCache ? cached.historyCache : null,
       historyLoadedAt: 0,
       historyPageSize: readListPreference('history', HISTORY_PAGE_SIZES),
-      jobItems: (() => {
-        if (!hasCache || !cached.jobItems || typeof cached.jobItems !== 'object') return {}
-        const hydrated = {}
-        for (const [jid, list] of Object.entries(cached.jobItems)) {
-          if (Array.isArray(list)) {
-            hydrated[jid] = markRaw(list)
-            indexJobItems(jid, list)
-          }
-        }
-        return hydrated
-      })(),
+      jobItems: {},
       liveProgress: {},
       schedulerStatus: {},
       scanStatus: {},
@@ -507,6 +572,8 @@ export const useAppStore = defineStore('app', {
       }
       clearPendingLiveProgress()
       clearPendingItemUpdates()
+      jobItemAccessOrder.clear()
+      jobItemPins.clear()
       clearSessionCache()
       this.hydratedFromCache = false
       this.authenticated = false
@@ -662,13 +729,22 @@ export const useAppStore = defineStore('app', {
     async refreshJobs(limit = this.jobsLimit) {
       if (!this.authenticated) return []
       limit = Math.max(1, Math.min(200, Math.trunc(Number(limit)) || this.jobsLimit))
+      if (inflight.has('jobs') && this._jobsRequestedLimit === limit) return inflight.get('jobs')
       this._jobsRequestedLimit = limit
       return runRequest('jobs', async ({ isLatest }) => {
         try {
+          const before = new Map(this.jobs.map((job) => [job.id, job]))
           const res = await api.listJobs(limit)
           const items = res.items || []
           if (isLatest()) {
-            this.jobs = items
+            const current = new Map(this.jobs.map((job) => [job.id, job]))
+            const merged = new Map(items.map((job) => [job.id, isOlderJobUpdate(job, current.get(job.id)) ? current.get(job.id) : job]))
+            for (const job of current.values()) {
+              if (!merged.has(job.id) && before.get(job.id) !== job) merged.set(job.id, job)
+            }
+            this.jobs = [...merged.values()].sort(compareJobListOrder).slice(0, limit)
+            for (const job of this.jobs) updateCachedJobStatus(this, job, current.get(job.id))
+            trimJobItemsCache(this)
             this.jobsLoaded = true
             this.jobsLoadedAt = Date.now()
             this.jobsFetchedLimit = limit
@@ -1000,33 +1076,51 @@ export const useAppStore = defineStore('app', {
       const idSet = new Set(jobIds.map((x) => Number(x)))
       this.jobs = this.jobs.filter((j) => !idSet.has(Number(j.id)))
       for (const jid of idSet) {
-        delete this.jobItems[jid]
+        evictJobItems(this, jid)
+        inflight.delete(`jobDetail:${jid}`)
         delete this.schedulerStatus[jid]
-        jobItemIndexMap.delete(jid)
-        pendingItemUpdates?.delete(jid)
-        if (jobItemsReloadTimers.has(jid)) {
-          clearTimeout(jobItemsReloadTimers.get(jid))
-          jobItemsReloadTimers.delete(jid)
-        }
       }
       this.persistCache()
     },
 
     async loadJobDetail(jobId) {
-      const res = await api.getJob(jobId)
-      if (res?.job) {
-        this._upsertJob(res.job)
-      }
-      if (Array.isArray(res?.items)) {
-        const jid = Number(jobId)
-        pendingItemUpdates?.delete(jid)
-        this.jobItems[jid] = markRaw(res.items)
-        indexJobItems(jid, res.items)
-        for (const it of res.items) {
-          if (it.speed_bps > 0 || it.status === 'downloading' || it.status === 'uploading') {
+      const jid = Number(jobId)
+      const key = `jobDetail:${jid}`
+      if (inflight.has(key)) return inflight.get(key)
+      clearTimeout(jobItemsReloadTimers.get(jid))
+      jobItemsReloadTimers.delete(jid)
+      return runRequest(key, async ({ isLatest }) => {
+        const updates = new Map()
+        detailUpdates.set(jid, updates)
+        let res
+        try {
+          res = await api.getJob(jid)
+        } finally {
+          if (detailUpdates.get(jid) === updates) detailUpdates.delete(jid)
+        }
+        if (!isLatest()) return res
+        const current = this.jobs.find((job) => job.id === jid)
+        if (res?.job && Number(res.job.params?.resume_count || 0) < Number(current?.params?.resume_count || 0)) {
+          scheduleJobItemsReload(this, jid)
+          return res
+        }
+        if (res?.job) this._upsertJob(res.job)
+        if (Array.isArray(res?.items)) {
+          pendingItemUpdates?.delete(jid)
+          const rows = new Map(res.items.map((item) => [item.id, item]))
+          for (const item of updates.values()) {
+            if (!(item.revision < rows.get(item.id)?.revision)) rows.set(item.id, item)
+          }
+          const items = [...rows.values()]
+          this.jobItems[jid] = markRaw(items)
+          indexJobItems(jid, items)
+          const status = this.jobs.find((job) => job.id === jid)?.status || res.job?.status
+          touchJobItems(jid, status)
+          for (const it of isActiveJobStatus(status) ? items : []) {
+            if (!it.speed_bps && it.status !== 'downloading' && it.status !== 'uploading') continue
             const isUploading = it.status === 'uploading' || ['uploading', 'verifying'].includes(it.progress_phase)
             this.liveProgress[it.id] = {
-              job_id: Number(jobId),
+              job_id: jid,
               item_id: it.id,
               bytes_downloaded: isUploading ? Number(it.upload_bytes || 0) : Number(it.bytes_downloaded || 0),
               bytes_total: Number(it.bytes_total || 0),
@@ -1034,31 +1128,46 @@ export const useAppStore = defineStore('app', {
               phase: it.progress_phase || (isUploading ? 'uploading' : 'downloading'),
             }
           }
+          trimJobItemsCache(this)
+          if (jid === Number(this.overview?.current_job?.id)) this.persistCache()
         }
-        if (Number(jobId) === Number(this.overview?.current_job?.id)) {
-          this.persistCache()
-        }
+        return res
+      })
+    },
+
+    pinJobDetail(jobId) {
+      const jid = Number(jobId)
+      jobItemPins.set(jid, (jobItemPins.get(jid) || 0) + 1)
+      this.touchJobDetail(jid)
+      return () => {
+        const count = jobItemPins.get(jid)
+        if (count > 1) jobItemPins.set(jid, count - 1)
+        else jobItemPins.delete(jid)
+        trimJobItemsCache(this)
       }
-      return res
+    },
+
+    touchJobDetail(jobId) {
+      const jid = Number(jobId)
+      if (Array.isArray(this.jobItems[jid])) touchJobItems(jid)
     },
 
     ensureJobDetail(jobId) {
       if (!this.authenticated || !jobId) return Promise.resolve()
-      return ensureRequest(
-        `jobDetail:${jobId}`,
-        () => Array.isArray(this.jobItems[jobId]),
-        async () => {
-          try {
-            await this.loadJobDetail(jobId)
-          } catch {}
-        }
-      )
+      if (Array.isArray(this.jobItems[jobId])) {
+        this.touchJobDetail(jobId)
+        return Promise.resolve()
+      }
+      return inflight.get(`jobDetail:${jobId}`) || this.loadJobDetail(jobId).catch(() => {})
     },
 
     _upsertJob(job) {
       const idx = this.jobs.findIndex((j) => j.id === job.id)
+      let orderChanged = idx < 0
+      const previousJob = idx >= 0 ? this.jobs[idx] : undefined
       if (idx >= 0) {
         const cur = this.jobs[idx]
+        if (isOlderJobUpdate(job, cur)) return false
         const unchanged =
           cur.status === job.status &&
           cur.total_items === job.total_items &&
@@ -1067,14 +1176,22 @@ export const useAppStore = defineStore('app', {
           cur.failed_items === job.failed_items &&
           cur.skipped_items === job.skipped_items &&
           cur.error_message === job.error_message &&
+          cur.started_at === job.started_at &&
           cur.finished_at === job.finished_at &&
           cur.label === job.label &&
           cur.export_text === job.export_text &&
-          cur.params_json === job.params_json
+          cur.params_json === job.params_json &&
+          cur.revision === job.revision
         if (unchanged) return
+        orderChanged = jobListPriority(cur.status) !== jobListPriority(job.status) || cur.finished_at !== job.finished_at
         this.jobs[idx] = { ...cur, ...job }
       } else {
         this.jobs.unshift(job)
+      }
+      updateCachedJobStatus(this, job, previousJob)
+      trimJobItemsCache(this)
+      if (orderChanged) {
+        this.jobs.sort(compareJobListOrder)
       }
       if (this.jobs.length > this.jobsLimit) {
         this.jobs = this.jobs.slice(0, this.jobsLimit)
@@ -1112,6 +1229,9 @@ export const useAppStore = defineStore('app', {
           if (reconnected && this.authenticated) {
             this.refreshOverview()
             if (this.jobsLoaded) this.refreshJobs()
+            for (const [jid, status] of jobItemAccessOrder) {
+              if (isActiveJobStatus(status) || jobItemPins.has(jid)) scheduleJobItemsReload(this, jid)
+            }
           }
         },
         onUnauthorized: () => {
@@ -1135,7 +1255,7 @@ export const useAppStore = defineStore('app', {
             }
             this.logsLoaded = true
           } else if (msg.type === 'job_updated') {
-            this._upsertJob(msg.data)
+            if (this._upsertJob(msg.data) === false) return
             this._scheduleOverviewRefresh()
             if (['completed', 'cancelled', 'failed', 'partial_failed'].includes(msg.data?.status)) {
               flushPendingItemUpdates(this)

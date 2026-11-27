@@ -13,6 +13,7 @@ from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from ..config import SelectorSettings
 from .http_session import TaskHttpContext
+from .urls import is_cookie_origin
 
 PH_ORIGIN = "https://www.pornhub.com"
 _SUBSCRIBE_TAG_RE = re.compile(
@@ -68,12 +69,7 @@ def extract_subscribe_action(html: str) -> Optional[SubscribeAction]:
 
 
 def _is_pornhub_url(url: str) -> bool:
-    try:
-        parsed = urllib.parse.urlparse(url)
-    except ValueError:
-        return False
-    host = (parsed.hostname or "").rstrip(".").lower()
-    return parsed.scheme in {"https", "http"} and (host == "pornhub.com" or host.endswith(".pornhub.com"))
+    return is_cookie_origin(url, "pornhub")
 
 
 async def subscribe_from_action(

@@ -8,10 +8,50 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+import aiosqlite
+
 from ..config import RuntimeSettings
+from ..redaction import redact_diagnostic
 from .database import Database
 
 STATUS_RANK = {"baseline": 1, "downloaded": 2, "uploaded": 3}
+_SCAN_JOB_KINDS = frozenset({"manual_target", "manual_urls", "auto_update", "check_updates", "baseline_sync", "resume_temp"})
+_BASELINE_METADATA_FILTER = """
+    status = 'baseline' AND video_page_url != ''
+    AND (quality = '' OR (LOWER(COALESCE(site, 'pornhub')) != 'xhamster' AND file_size <= 0))
+"""
+_RECALCULATE_JOB_COUNTS = """
+    UPDATE jobs
+    SET (total_items, done_items, uploaded_items, failed_items, skipped_items) = (
+        SELECT COUNT(*),
+               COUNT(CASE WHEN status IN ('done', 'downloaded', 'uploading') THEN 1 END),
+               CASE WHEN jobs.kind = 'enrich_metadata' THEN 0 ELSE COUNT(CASE WHEN status = 'done' THEN 1 END) END,
+               COUNT(CASE WHEN status = 'failed' THEN 1 END),
+               COUNT(CASE WHEN status = 'skipped' THEN 1 END)
+        FROM job_items WHERE job_id = jobs.id
+    )
+    WHERE id = ?
+"""
+
+
+def _parse_job_params(raw: Optional[str]) -> Dict[str, Any]:
+    try:
+        params = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return params if isinstance(params, dict) else {}
+
+
+def job_scan_incomplete(job: Dict[str, Any]) -> bool:
+    return (
+        job["status"] == "scanning"
+        and job["kind"] in _SCAN_JOB_KINDS
+        and (job.get("params") or {}).get("resume_mode") != "items"
+    )
+
+
+def job_uses_item_counts(job: Dict[str, Any]) -> bool:
+    return job["kind"] not in {"baseline_sync", "check_updates"} and not job["params"].get("export_only")
 
 
 def normalize_site(site: Optional[str]) -> str:
@@ -64,12 +104,24 @@ def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
 class Repository:
     def __init__(self, db: Database) -> None:
         self.db = db
+        self._diagnostic_secrets: tuple[str, ...] = ()
+        self._previous_diagnostic_secrets: tuple[str, ...] = ()
+
+    def redact_diagnostic(self, message: str) -> str:
+        return redact_diagnostic(message, (*self._diagnostic_secrets, *self._previous_diagnostic_secrets))
+
+    def _remember_settings(self, settings: RuntimeSettings) -> RuntimeSettings:
+        values = settings.diagnostic_secrets()
+        if values != self._diagnostic_secrets:
+            self._previous_diagnostic_secrets = self._diagnostic_secrets
+            self._diagnostic_secrets = values
+        return settings
 
     # ------------------------------------------------------------------
     # Settings
     # ------------------------------------------------------------------
-    async def get_settings(self) -> RuntimeSettings:
-        row = await self.db.fetch_one("SELECT value_json FROM settings WHERE key = ?", ("runtime",))
+    async def get_settings(self, *, conn: Optional[aiosqlite.Connection] = None) -> RuntimeSettings:
+        row = await self.db.fetch_one("SELECT value_json FROM settings WHERE key = ?", ("runtime",), conn=conn)
         if not row:
             return RuntimeSettings()
         try:
@@ -88,7 +140,7 @@ class Repository:
                             data["retry_delay_base"] = float(data["retry_delay_max"])
                     except (TypeError, ValueError):
                         pass
-            return RuntimeSettings.model_validate(data)
+            return self._remember_settings(RuntimeSettings.model_validate(data))
         except Exception:
             return RuntimeSettings()
 
@@ -102,15 +154,40 @@ class Repository:
             """,
             ("runtime", payload, utc_now_iso()),
         )
-        return settings
+        return self._remember_settings(settings)
 
     async def update_settings_patch(self, patch: Dict[str, Any]) -> RuntimeSettings:
-        current = await self.get_settings()
-        updated = current.merge_update(patch)
-        return await self.save_settings(updated)
+        async with self.db.transaction() as conn:
+            current = await self.get_settings(conn=conn)
+            return await self._save_runtime_settings(conn, current.merge_update(patch))
 
-    async def get_scheduler_last_run_date(self) -> Optional[str]:
-        row = await self.db.fetch_one("SELECT value_json FROM settings WHERE key = ?", ("scheduler_state",))
+    async def _save_runtime_settings(self, conn: aiosqlite.Connection, settings: RuntimeSettings) -> RuntimeSettings:
+        async with conn.execute(
+            """
+            INSERT INTO settings (key, value_json, updated_at) VALUES ('runtime', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+            """,
+            (json.dumps(settings.model_dump(), ensure_ascii=False), utc_now_iso()),
+        ):
+            return self._remember_settings(settings)
+
+    async def save_refreshed_cookie(
+        self, prefix: str, original: RuntimeSettings, cookie: str, username: str,
+    ) -> Optional[RuntimeSettings]:
+        key = f"{prefix}_cookie"
+        async with self.db.transaction() as conn:
+            current = await self.get_settings(conn=conn)
+            if any(getattr(current, attr) != getattr(original, attr) for attr in (
+                f"{prefix}_username", f"{prefix}_password", "proxy_url",
+            )) or getattr(current, key) not in {getattr(original, key), cookie}:
+                return None
+            patch = {key: cookie}
+            if username:
+                patch[f"{prefix}_logged_in_username"] = username
+            return await self._save_runtime_settings(conn, current.merge_update(patch))
+
+    async def get_scheduler_last_run_date(self, *, conn: Optional[aiosqlite.Connection] = None) -> Optional[str]:
+        row = await self.db.fetch_one("SELECT value_json FROM settings WHERE key = ?", ("scheduler_state",), conn=conn)
         if not row:
             return None
         try:
@@ -258,13 +335,19 @@ class Repository:
             r["video_total_count"] = matched["total"]
             r["video_saved_count"] = matched["saved"]
             r["video_baseline_count"] = matched["baseline"]
+            r["last_error"] = self.redact_diagnostic(r["last_error"])
         return rows
+
+    async def count_targets(self) -> tuple[int, int]:
+        row = await self.db.fetch_one("SELECT COUNT(*) AS total, COUNT(CASE WHEN enabled THEN 1 END) AS enabled FROM targets")
+        return int(row["total"]), int(row["enabled"])
 
     async def get_target(self, target_id: int) -> Optional[Dict[str, Any]]:
         row = await self.db.fetch_one("SELECT * FROM targets WHERE id = ?", (target_id,))
         if row:
             row["enabled"] = bool(row["enabled"])
             row["site"] = normalize_site(row.get("site"))
+            row["last_error"] = self.redact_diagnostic(row["last_error"])
         return row
 
     async def _find_target_by_identity(
@@ -620,7 +703,7 @@ class Repository:
             (
                 utc_now_iso(),
                 clean_new_count,
-                error,
+                self.redact_diagnostic(error),
                 today_str,
                 next_today_count,
                 json.dumps(merged_vkeys, ensure_ascii=False),
@@ -638,16 +721,19 @@ class Repository:
     # ------------------------------------------------------------------
     # Videos (unified dedup & history ledger)
     # ------------------------------------------------------------------
-    async def get_known_viewkeys(self, viewkeys: Optional[Iterable[str]] = None) -> Set[str]:
+    async def get_known_viewkeys(self, viewkeys: Optional[Iterable[str]] = None, *, uploaded_only: bool = False) -> Set[str]:
         if viewkeys is None:
             rows = await self.db.fetch_all("SELECT viewkey FROM videos")
             return {r["viewkey"] for r in rows}
         vlist = [v for v in set(viewkeys) if v]
-        if not vlist:
-            return set()
-        placeholders = ",".join("?" for _ in vlist)
-        rows = await self.db.fetch_all(f"SELECT viewkey FROM videos WHERE viewkey IN ({placeholders})", vlist)
-        return {r["viewkey"] for r in rows}
+        found: Set[str] = set()
+        status_filter = " AND status = 'uploaded'" if uploaded_only else ""
+        for start in range(0, len(vlist), 400):
+            batch = vlist[start : start + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = await self.db.fetch_all(f"SELECT viewkey FROM videos WHERE viewkey IN ({placeholders}){status_filter}", batch)
+            found.update(r["viewkey"] for r in rows)
+        return found
 
     async def get_uploaded_viewkeys(self) -> Set[str]:
         rows = await self.db.fetch_all("SELECT viewkey FROM videos WHERE status = 'uploaded'")
@@ -710,10 +796,7 @@ class Repository:
             f"""
             SELECT COUNT(*) AS cnt
             FROM videos
-            WHERE status = 'baseline'
-              AND video_page_url != ''
-              AND (quality = '' OR (LOWER(COALESCE(site, 'pornhub')) != 'xhamster' AND file_size <= 0))
-              {where_site}
+            WHERE {_BASELINE_METADATA_FILTER} {where_site}
             """,
             params,
         )
@@ -723,22 +806,39 @@ class Repository:
         self,
         limit: int = 0,
         site: str = "",
+        *,
+        resume_job_id: Optional[int] = None,
+        site_only: bool = False,
     ) -> List[Dict[str, Any]]:
         site_filter = normalize_site(site) if (site or "").strip() else ""
         where_site = " AND LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
         sql = f"""
             SELECT viewkey, site, title, uploader, target_type, quality, file_size, video_page_url
             FROM videos
-            WHERE status = 'baseline'
-              AND video_page_url != ''
-              AND (quality = '' OR (LOWER(COALESCE(site, 'pornhub')) != 'xhamster' AND file_size <= 0))
-              {where_site}
-            ORDER BY created_at ASC, viewkey ASC
+            WHERE {_BASELINE_METADATA_FILTER} {where_site}
         """
         params: List[Any] = [site_filter] if site_filter else []
+        if resume_job_id is not None:
+            sql += """
+              AND NOT EXISTS (
+                  SELECT 1 FROM job_items WHERE job_id = ? AND viewkey = videos.viewkey AND status IN ('done', 'skipped')
+              )
+              ORDER BY EXISTS (
+                  SELECT 1 FROM job_items WHERE job_id = ? AND viewkey = videos.viewkey
+              ) DESC, created_at ASC, viewkey ASC
+            """
+            params.extend((resume_job_id, resume_job_id))
+        else:
+            sql += " ORDER BY created_at ASC, viewkey ASC"
         if limit > 0:
-            sql += " LIMIT ?"
-            params.append(int(limit))
+            if resume_job_id is None:
+                sql += " LIMIT ?"
+                params.append(int(limit))
+            else:
+                sql += " LIMIT MAX(0, ? - (SELECT COUNT(*) FROM job_items WHERE job_id = ? AND status IN ('done', 'skipped')))"
+                params.extend((int(limit), resume_job_id))
+        if site_only:
+            sql = f"SELECT DISTINCT site FROM ({sql})"
         return await self.db.fetch_all(sql, params)
 
     async def update_video_metadata(
@@ -1003,19 +1103,32 @@ class Repository:
             force_status=True,
         )
 
-    async def record_verified_upload(self, viewkey: str, local_path: str, remote_path: str) -> bool:
+    async def record_verified_upload(
+        self, viewkey: str, local_path: str, remote_path: str, *, item_id: Optional[int] = None,
+    ) -> bool:
         """Persist the verified destination before it is safe to remove a local copy."""
-        await self.db.execute(
-            """
-            UPDATE videos
-            SET status='uploaded', remote_path=?, uploaded_at=?, upload_requested=0
-            WHERE viewkey=? AND local_path=?
-            """,
-            (remote_path, utc_now_iso(), viewkey, local_path),
-        )
-        row = await self.get_video(viewkey)
-        return bool(row and row["status"] == "uploaded" and row["local_path"] == local_path
-                    and row["remote_path"] == remote_path)
+        now = utc_now_iso()
+        async with self.db.transaction() as conn:
+            async with conn.execute(
+                """
+                UPDATE videos SET status='uploaded', remote_path=?, uploaded_at=?, upload_requested=0
+                WHERE viewkey=? AND local_path=?
+                """,
+                (remote_path, now, viewkey, local_path),
+            ) as cursor:
+                if not cursor.rowcount:
+                    return False
+            if item_id is not None:
+                async with conn.execute(
+                    """
+                    UPDATE job_items SET status='done', local_path=?, upload_requested=0, error_message='', updated_at=?
+                    WHERE id=? AND job_items.viewkey=? AND status='uploading'
+                    """,
+                    (local_path, now, item_id, viewkey),
+                ) as cursor:
+                    if not cursor.rowcount:
+                        raise RuntimeError("上传条目状态已变更")
+            return True
 
     async def clear_uploaded_local_path(self, viewkey: str, local_path: str) -> None:
         await self.db.execute(
@@ -1290,25 +1403,45 @@ class Repository:
         )
         return (await self.get_job(job_id)) or {}
 
-    async def get_job(self, job_id: int) -> Optional[Dict[str, Any]]:
-        row = await self.db.fetch_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    async def create_scheduled_job(self, date: str) -> Optional[Dict[str, Any]]:
+        async with self.db.transaction() as conn:
+            if await self.get_scheduler_last_run_date(conn=conn) == date:
+                return None
+            now = utc_now_iso()
+            async with conn.execute(
+                "INSERT INTO jobs (kind, trigger, label, created_at) VALUES ('auto_update', 'schedule', '定时自动追更', ?)",
+                (now,),
+            ) as cursor:
+                job_id = cursor.lastrowid
+            async with conn.execute(
+                """
+                INSERT INTO settings (key, value_json, updated_at) VALUES ('scheduler_state', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+                """,
+                (json.dumps({"last_run_date": date}), now),
+            ):
+                pass
+            return await self.get_job(job_id, conn=conn)
+
+    async def get_job(self, job_id: int, *, conn: Optional[aiosqlite.Connection] = None) -> Optional[Dict[str, Any]]:
+        row = await self.db.fetch_one("SELECT * FROM jobs WHERE id = ?", (job_id,), conn=conn)
         if row:
-            try:
-                row["params"] = json.loads(row.get("params_json") or "{}")
-            except Exception:
-                row["params"] = {}
+            row["params"] = _parse_job_params(row["params_json"])
+            row["error_message"] = self.redact_diagnostic(row["error_message"])
         return row
 
     async def list_jobs(self, limit: int = 30) -> List[Dict[str, Any]]:
         rows = await self.db.fetch_all(
-            "SELECT * FROM jobs ORDER BY id DESC LIMIT ?",
+            """
+            SELECT * FROM jobs
+            ORDER BY CASE WHEN status IN ('running', 'scanning') THEN 0 WHEN status = 'queued' THEN 1 ELSE 2 END,
+                     COALESCE(finished_at, created_at) DESC, id DESC LIMIT ?
+            """,
             (max(1, min(limit, 200)),),
         )
         for row in rows:
-            try:
-                row["params"] = json.loads(row.get("params_json") or "{}")
-            except Exception:
-                row["params"] = {}
+            row["params"] = _parse_job_params(row["params_json"])
+            row["error_message"] = self.redact_diagnostic(row["error_message"])
         return rows
 
     async def list_queued_job_ids(self) -> List[int]:
@@ -1323,14 +1456,66 @@ class Repository:
         return await self.get_job(job_id) if changed else None
 
     async def cancel_queued_job(self, job_id: int) -> Optional[Dict[str, Any]]:
-        changed = await self.db.execute_returning(
-            """
-            UPDATE jobs SET status='cancelled', error_message='用户取消排队任务', finished_at=?
-            WHERE id=? AND status='queued' RETURNING id
-            """,
-            (utc_now_iso(), job_id),
-        )
-        return await self.get_job(job_id) if changed else None
+        async with self.db.transaction() as conn:
+            job = await self.get_job(job_id, conn=conn)
+            if job is None or job["status"] != "queued":
+                return None
+            mode = job["params"].get("resume_mode")
+            message = "用户取消排队任务，扫描未完成" if mode == "rescan" else "用户取消排队任务"
+            return await self._finish_job(conn, job, "cancelled", message, cancel_items=True)
+
+    async def requeue_job_in_place(
+        self,
+        job_id: int,
+        *,
+        params_patch: Dict[str, Any],
+        clear_export_text: bool = False,
+        item_resets: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        async with self.db.transaction() as conn:
+            async with conn.execute("SELECT params_json FROM jobs WHERE id = ?", (job_id,)) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+            params = _parse_job_params(row["params_json"])
+            try:
+                resume_count = int(params.get("resume_count") or 0)
+            except (TypeError, ValueError):
+                resume_count = 0
+            params.update(params_patch)
+            params["resume_count"] = resume_count + 1
+            export_reset = ", export_text = ''" if clear_export_text else ""
+            async with conn.execute(
+                f"""
+                UPDATE jobs SET status = 'queued', error_message = '', started_at = NULL, finished_at = NULL,
+                                params_json = ? {export_reset}
+                WHERE id = ? AND status NOT IN ('queued', 'scanning', 'running') RETURNING id
+                """,
+                (json.dumps(params, ensure_ascii=False), job_id),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return None
+            if item_resets:
+                now = utc_now_iso()
+                async with conn.executemany(
+                    """
+                    UPDATE job_items SET status = 'pending', error_message = '', updated_at = ?,
+                           temp_path = COALESCE(?, temp_path), bytes_downloaded = COALESCE(?, bytes_downloaded),
+                           upload_requested = COALESCE(?, upload_requested)
+                    WHERE job_id = ? AND id = ?
+                      AND (status IN ('failed', 'cancelled', 'pending', 'downloading', 'uploading')
+                           OR (status = 'downloaded' AND upload_requested IS NOT 0))
+                    """,
+                    (
+                        (now, patch.get("temp_path"), patch.get("bytes_downloaded"), patch.get("upload_requested"),
+                         job_id, item_id)
+                        for item_id, patch in item_resets.items()
+                    ),
+                ):
+                    pass
+                async with conn.execute(_RECALCULATE_JOB_COUNTS, (job_id,)):
+                    pass
+            return await self.get_job(job_id, conn=conn)
 
     async def update_job(self, job_id: int, **fields: Any) -> Optional[Dict[str, Any]]:
         allowed = {
@@ -1351,31 +1536,30 @@ class Repository:
         for k, v in fields.items():
             if k in allowed:
                 sets.append(f"{k} = ?")
-                params.append(v)
+                params.append(self.redact_diagnostic(v) if k == "error_message" else v)
         if sets:
             params.append(job_id)
             await self.db.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", params)
         return await self.get_job(job_id)
 
     async def merge_job_params(self, job_id: int, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        job = await self.get_job(job_id)
-        if not job:
-            return None
-        merged = {**(job.get("params") or {}), **patch}
-        await self.db.execute(
-            "UPDATE jobs SET params_json = ? WHERE id = ?",
-            (json.dumps(merged, ensure_ascii=False), job_id),
-        )
-        return await self.get_job(job_id)
+        async with self.db.transaction() as conn:
+            job = await self.get_job(job_id, conn=conn)
+            if not job:
+                return None
+            merged = {**job["params"], **patch}
+            async with conn.execute(
+                "UPDATE jobs SET params_json = ? WHERE id = ?",
+                (json.dumps(merged, ensure_ascii=False), job_id),
+            ):
+                pass
+            return await self.get_job(job_id, conn=conn)
 
     async def delete_job(self, job_id: int) -> Tuple[bool, str]:
-        job = await self.get_job(job_id)
-        if not job:
-            return False, "not_found"
-        if job.get("status") in {"queued", "scanning", "running"}:
-            return False, "active"
-        await self.db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-        return True, ""
+        result = await self.delete_jobs([job_id])
+        if result["deleted_ids"]:
+            return True, ""
+        return False, "active" if result["skipped_active_ids"] else "not_found"
 
     async def delete_jobs(self, job_ids: List[int]) -> Dict[str, Any]:
         unique_ids = []
@@ -1391,45 +1575,38 @@ class Repository:
         if not unique_ids:
             return {"deleted_ids": [], "skipped_active_ids": []}
 
-        placeholders = ",".join("?" for _ in unique_ids)
-        rows = await self.db.fetch_all(
-            f"SELECT id, status FROM jobs WHERE id IN ({placeholders})",
-            unique_ids,
-        )
         deletable: List[int] = []
         skipped_active: List[int] = []
-        for row in rows:
-            if row["status"] in {"queued", "scanning", "running"}:
-                skipped_active.append(int(row["id"]))
-            else:
-                deletable.append(int(row["id"]))
-
-        if deletable:
-            del_placeholders = ",".join("?" for _ in deletable)
-            await self.db.execute(
-                f"DELETE FROM jobs WHERE id IN ({del_placeholders})",
-                deletable,
-            )
+        async with self.db.transaction() as conn:
+            for start in range(0, len(unique_ids), 400):
+                chunk = unique_ids[start : start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                deleted = await self.db.fetch_all(
+                    f"""DELETE FROM jobs WHERE id IN ({placeholders})
+                        AND status NOT IN ('queued', 'scanning', 'running') RETURNING id""",
+                    chunk, conn=conn,
+                )
+                active = await self.db.fetch_all(
+                    f"SELECT id FROM jobs WHERE id IN ({placeholders})", chunk, conn=conn,
+                )
+                deletable.extend(row["id"] for row in deleted)
+                skipped_active.extend(row["id"] for row in active)
         return {"deleted_ids": deletable, "skipped_active_ids": skipped_active}
 
     async def prune_old_jobs(self, max_finished_jobs: int = 200) -> int:
         if max_finished_jobs <= 0:
             return 0
-        rows = await self.db.fetch_all(
-            """
-            SELECT id FROM jobs
-            WHERE status NOT IN ('queued', 'scanning', 'running')
-            ORDER BY id DESC
-            LIMIT -1 OFFSET ?
-            """,
-            (int(max_finished_jobs),),
-        )
-        if not rows:
-            return 0
-        stale_ids = [int(r["id"]) for r in rows]
-        placeholders = ",".join("?" for _ in stale_ids)
-        await self.db.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", stale_ids)
-        return len(stale_ids)
+        async with self.db.transaction() as conn:
+            async with conn.execute(
+                """
+                DELETE FROM jobs WHERE id IN (
+                    SELECT id FROM jobs WHERE status NOT IN ('queued', 'scanning', 'running')
+                    ORDER BY COALESCE(finished_at, created_at) DESC, id DESC LIMIT -1 OFFSET ?
+                )
+                """,
+                (int(max_finished_jobs),),
+            ) as cursor:
+                return cursor.rowcount
 
     async def add_job_items_batch(
         self,
@@ -1477,7 +1654,7 @@ class Repository:
                         int(spec.get("bytes_downloaded") or 0),
                         now,
                         None if up_req is None else int(bool(up_req)),
-                        spec.get("error_message", ""),
+                        self.redact_diagnostic(spec.get("error_message", "")),
                         str(spec.get("published_at") or "").strip(),
                         max(0, int(spec.get("duration_seconds") or 0)),
                     )
@@ -1546,11 +1723,37 @@ class Repository:
     async def get_job_item(self, item_id: int) -> Optional[Dict[str, Any]]:
         return await self.db.fetch_one("SELECT * FROM job_items WHERE id = ?", (item_id,))
 
-    async def list_job_items(self, job_id: int) -> List[Dict[str, Any]]:
+    async def list_job_items(self, job_id: int, *, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        if status is not None:
+            return await self.db.fetch_all(
+                "SELECT * FROM job_items WHERE job_id = ? AND status = ? ORDER BY id ASC",
+                (job_id, status),
+            )
         return await self.db.fetch_all(
             "SELECT * FROM job_items WHERE job_id = ? ORDER BY id ASC",
             (job_id,),
         )
+
+    async def list_retryable_job_items(self, job_id: int, *, auto_upload: bool) -> List[Dict[str, Any]]:
+        return await self.db.fetch_all(
+            """
+            SELECT * FROM job_items WHERE job_id = ?
+              AND (status IN ('failed', 'cancelled', 'pending', 'downloading', 'uploading')
+                   OR (? AND status = 'downloaded' AND upload_requested IS NOT 0))
+            ORDER BY id ASC
+            """,
+            (job_id, auto_upload),
+        )
+
+    async def get_job_detail(self, job_id: int) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        async with self.db.read() as conn:
+            job = await self.get_job(job_id, conn=conn)
+            items = await self.db.fetch_all(
+                "SELECT * FROM job_items WHERE job_id = ? ORDER BY id ASC", (job_id,), conn=conn,
+            ) if job else []
+            for item in items:
+                item["error_message"] = self.redact_diagnostic(item["error_message"])
+            return job, items
 
     async def find_temp_job_item(self, viewkey: str, temp_path: str) -> Optional[Dict[str, Any]]:
         return await self.db.fetch_one(
@@ -1587,7 +1790,7 @@ class Repository:
         for k, v in fields.items():
             if k in allowed:
                 sets.append(f"{k} = ?")
-                params.append(v)
+                params.append(self.redact_diagnostic(v) if k == "error_message" else v)
         params.append(item_id)
         await self.db.execute(f"UPDATE job_items SET {', '.join(sets)} WHERE id = ?", params)
         return await self.get_job_item(item_id)
@@ -1618,73 +1821,83 @@ class Repository:
             for start in range(0, len(ids), step):
                 chunk = ids[start : start + step]
                 placeholders = ",".join("?" for _ in chunk)
-                await conn.execute(
+                async with conn.execute(
                     f"""
                     UPDATE job_items
                     SET status = 'cancelled', error_message = ?, updated_at = ?
-                    WHERE job_id = ? AND id IN ({placeholders})
+                    WHERE job_id = ? AND status = 'pending' AND id IN ({placeholders})
                     """,
                     [error_message, now, int(job_id), *chunk],
-                )
+                ):
+                    pass
         return len(ids)
 
     async def recalculate_job_counts(self, job_id: int) -> Optional[Dict[str, Any]]:
-        job = await self.get_job(job_id)
-        job_kind = (job or {}).get("kind")
-        rows = await self.db.fetch_all(
-            "SELECT status, COUNT(*) AS cnt FROM job_items WHERE job_id = ? GROUP BY status",
-            (job_id,),
-        )
-        total = 0
-        done = 0
-        uploaded = 0
-        failed = 0
-        skipped = 0
-        for r in rows:
-            st = r["status"]
-            c = int(r["cnt"])
-            total += c
-            if st == "done":
-                done += c
-                if job_kind != "enrich_metadata":
-                    uploaded += c
-            elif st in {"downloaded", "uploading"}:
-                done += c
-            elif st == "failed":
-                failed += c
-            elif st == "skipped":
-                skipped += c
-        return await self.update_job(
-            job_id,
-            total_items=total,
-            done_items=done,
-            uploaded_items=uploaded,
-            failed_items=failed,
-            skipped_items=skipped,
+        await self.db.execute(_RECALCULATE_JOB_COUNTS, (job_id,))
+        return await self.get_job(job_id)
+
+    async def finish_job(
+        self, job_id: int, status: str, error_message: str = "", *, cancel_items: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        async with self.db.transaction() as conn:
+            job = await self.get_job(job_id, conn=conn)
+            if job is None or job["status"] not in {"scanning", "running"}:
+                return None
+            return await self._finish_job(conn, job, status, error_message, cancel_items=cancel_items)
+
+    async def _finish_job(
+        self, conn: aiosqlite.Connection, job: Dict[str, Any], status: str, message: str, *, cancel_items: bool,
+    ) -> Optional[Dict[str, Any]]:
+        now = utc_now_iso()
+        job_id = job["id"]
+        message = self.redact_diagnostic(message)
+        item_message = message or ("已取消" if cancel_items else "任务结束时条目尚未处理")
+        async with conn.execute(
+            """
+            UPDATE job_items SET status = ?, error_message = ?, updated_at = ?
+            WHERE job_id = ? AND status IN ('pending', 'downloading', 'uploading')
+            """,
+            ("cancelled" if cancel_items else "failed", item_message, now, job_id),
+        ) as cursor:
+            if cursor.rowcount and status == "completed":
+                status, message = "partial_failed", item_message
+        if job_uses_item_counts(job):
+            async with conn.execute(_RECALCULATE_JOB_COUNTS, (job_id,)):
+                pass
+        job["params"].pop("resume_mode", None)
+        async with conn.execute(
+            "UPDATE jobs SET status = ?, error_message = ?, finished_at = ?, params_json = ? WHERE id = ?",
+            (status, message, now, json.dumps(job["params"], ensure_ascii=False), job_id),
+        ):
+            pass
+        return await self.get_job(job_id, conn=conn)
+
+    async def reconcile_metadata_job_items(self, job_id: int) -> None:
+        await self.db.execute(
+            f"""
+            UPDATE job_items
+            SET status = CASE WHEN NOT EXISTS (
+                    SELECT 1 FROM videos WHERE videos.viewkey = job_items.viewkey AND videos.status = 'baseline'
+                ) THEN 'skipped' WHEN EXISTS (
+                    SELECT 1 FROM videos WHERE videos.viewkey = job_items.viewkey AND {_BASELINE_METADATA_FILTER}
+                ) THEN 'pending' ELSE 'done' END,
+                error_message = '', updated_at = ?
+            WHERE job_id = ? AND status IN ('pending', 'failed', 'cancelled')
+            """,
+            (utc_now_iso(), job_id),
         )
 
     async def recover_interrupted_jobs(self) -> int:
         """Mark interrupted work cancelled; unstarted jobs remain durably queued."""
-        active = await self.db.fetch_all(
-            "SELECT id FROM jobs WHERE status IN ('scanning', 'running')"
-        )
-        now = utc_now_iso()
-        for row in active:
-            jid = row["id"]
-            await self.db.execute(
-                """
-                UPDATE job_items
-                SET status = 'cancelled', error_message = '服务重启中断', updated_at = ?
-                WHERE job_id = ? AND status IN ('pending', 'downloading', 'uploading')
-                """,
-                (now, jid),
+        async with self.db.transaction() as conn:
+            active = await self.db.fetch_all(
+                "SELECT id, kind, status, error_message, params_json FROM jobs WHERE status IN ('scanning', 'running')",
+                conn=conn,
             )
-            await self.db.execute(
-                """
-                UPDATE jobs
-                SET status = 'cancelled', error_message = '服务重启中断，可点击续传或重试', finished_at = ?
-                WHERE id = ?
-                """,
-                (now, jid),
-            )
-        return len(active)
+            for job in active:
+                job["params"] = _parse_job_params(job["params_json"])
+                message = "服务重启中断，可点击续传或重试"
+                if job_scan_incomplete(job) or any(s in job["error_message"] for s in ("扫描未完成", "目标检查失败")):
+                    message = f"扫描未完成，{message}"
+                await self._finish_job(conn, job, "cancelled", message, cancel_items=True)
+            return len(active)
