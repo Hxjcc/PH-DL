@@ -115,6 +115,9 @@ const filters = reactive<VideoFilters>({
   ...initialRouteFilters,
   page_size: store.historyPageSize,
 })
+const loadingHistory = computed(() => loading.value || (
+  store.hydratedFromCache && isDefaultFilters() && !store.hasRouteCache('history')
+))
 
 const siteOptions = [
   { label: '全部站点', value: '' },
@@ -754,8 +757,7 @@ watch(
   (val) => {
     invalidateQueryCache()
     if (!val || !isDefaultFilters() || Number(val.page_size || 30) !== filters.page_size) return
-    items.value = [...(val.items || [])]
-    total.value = Number(val.total || 0)
+    applyVideoList([...val.items], val.total)
     facets.value = {
       uploaders: [...(val.facets?.uploaders || [])],
       uploader_labels: { ...(val.facets?.uploader_labels || {}) },
@@ -826,8 +828,8 @@ onActivated(() => {
       loadVideos({ silent: false, includeMeta: true })
       return
     }
-    if (store.hydratedFromCache && store.hasRouteCache('history')) {
-      scheduleAdjacentPrefetch()
+    if (store.hydratedFromCache) {
+      if (store.hasRouteCache('history')) scheduleAdjacentPrefetch()
       return
     }
     if (!store.hasRouteCache('history')) {
@@ -1047,7 +1049,7 @@ onDeactivated(() => {
             <span class="tabular-nums text-[11px]">本页 {{ items.length }} 条</span>
           </div>
 
-          <div v-if="loading && items.length === 0" class="py-12 text-center text-xs text-muted-foreground">
+          <div v-if="loadingHistory && items.length === 0" class="py-12 text-center text-xs text-muted-foreground">
             <div class="inline-flex items-center justify-center gap-2 leading-none">
               <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
               <span>加载中...</span>
@@ -1246,7 +1248,7 @@ onDeactivated(() => {
               </tr>
             </thead>
             <tbody :class="['divide-y divide-border transition-opacity duration-150', fetching ? 'opacity-65' : '']">
-              <tr v-if="loading && items.length === 0">
+              <tr v-if="loadingHistory && items.length === 0">
                 <td colspan="8" class="py-12 text-center text-xs text-muted-foreground">
                   <div class="inline-flex items-center justify-center gap-2 leading-none">
                     <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />

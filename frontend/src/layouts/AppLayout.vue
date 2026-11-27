@@ -129,7 +129,7 @@ async function handleLogout() {
 }
 
 onMounted(() => {
-  if (!store.overviewLoaded) {
+  if (!store.overviewLoaded && !store.hydratedFromCache) {
     store.refreshOverview()
   }
 })

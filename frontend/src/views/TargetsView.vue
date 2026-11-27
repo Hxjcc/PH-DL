@@ -508,13 +508,7 @@ async function loadData({ silent = false } = {}) {
     }, 120)
   }
   try {
-    const [items, settings] = await Promise.all([store.refreshTargets(), store.refreshSettings()])
-    targets.value = [...items]
-    if (settings) {
-      schedule.enabled = Boolean(settings.schedule_enabled)
-      schedule.time = settings.schedule_time || '04:00'
-      schedule.scan_mode = settings.update_scan_mode === 'full' ? 'full' : 'catch_up'
-    }
+    await Promise.all([store.refreshTargets(), store.refreshSettings()])
   } catch (err: unknown) {
     store.notify(getErrorMessage(err), 'error')
   } finally {
@@ -534,11 +528,17 @@ watch(
 
 watch(
   () => store.settingsCache,
-  (val) => {
+  (val, previous) => {
     if (val) {
-      schedule.enabled = Boolean(val.schedule_enabled)
-      schedule.time = val.schedule_time || '04:00'
-      schedule.scan_mode = val.update_scan_mode === 'full' ? 'full' : 'catch_up'
+      if (!previous || schedule.enabled === Boolean(previous.schedule_enabled)) {
+        schedule.enabled = Boolean(val.schedule_enabled)
+      }
+      if (!previous || schedule.time === (previous.schedule_time || '04:00')) {
+        schedule.time = val.schedule_time || '04:00'
+      }
+      if (!previous || schedule.scan_mode === previous.update_scan_mode) {
+        schedule.scan_mode = val.update_scan_mode === 'full' ? 'full' : 'catch_up'
+      }
     }
   }
 )
@@ -1035,7 +1035,7 @@ async function handleDelete(t: TargetRecord) {
 
       <!-- Loading / Empty State -->
       <Card
-        v-if="loading && targets.length === 0"
+        v-if="(loading || (store.hydratedFromCache && store.targetsCache === null)) && targets.length === 0"
         class="py-16 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none"
       >
         <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />

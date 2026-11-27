@@ -4,7 +4,9 @@ import { createPinia } from 'pinia'
 import { api } from '../src/api/client'
 import { EventStreamClient } from '../src/api/ws'
 import { useAppStore } from '../src/stores/app'
-import type { JobDetailResponse, JobStatus, RuntimeSettings, WsMessage } from '../src/types/api'
+import { SESSION_CACHE_KEY, SESSION_CACHE_MAX_CHARS } from '../src/stores/sessionCache'
+import { resolveJobVisual } from '../src/utils/jobMeta'
+import type { JobDetailResponse, JobStatus, OverviewResponse, RuntimeSettings, TargetRecord, VideoListResponse, WsMessage } from '../src/types/api'
 import { makeJob, makeJobItem } from './fixtures'
 
 afterEach(() => {
@@ -15,6 +17,86 @@ afterEach(() => {
 
 function job(id: number, status: JobStatus, revision: number, resumeCount = 0) {
   return { ...makeJob(id, status, { resume_count: resumeCount }), revision }
+}
+
+function mockSessionStorage(pathname = '/', initial: string | null = null) {
+  let raw = initial
+  let writes = 0
+  const browser = Object.assign(new EventTarget(), {
+    location: { pathname },
+    sessionStorage: {
+      getItem: (key: string) => key === SESSION_CACHE_KEY ? raw : null,
+      removeItem: (key: string) => { if (key === SESSION_CACHE_KEY) raw = null },
+      setItem: (key: string, value: string) => {
+        assert.equal(key, SESSION_CACHE_KEY)
+        raw = value
+        writes++
+      },
+    },
+  })
+  const listener = vi.spyOn(browser, 'addEventListener')
+  vi.stubGlobal('window', browser)
+  return {
+    get raw() { return raw },
+    get writes() { return writes },
+    pagehide: () => browser.dispatchEvent(new Event('pagehide')),
+    listener,
+  }
+}
+
+const stats = { total: 1, uploaded: 1, downloaded: 0, baseline: 0, published_7d: 0, baseline_missing_metadata: 0 }
+const accountCookie = { configured: true, username: 'member', valid: true, message: 'Cookie valid' }
+const overview: OverviewResponse = {
+  running: false, current_job: null, queued_count: 0,
+  account: { username: 'member', avatar_url: '/api/settings/avatar?v=version1' },
+  cookie: accountCookie, xh_cookie: accountCookie,
+  schedule: { enabled: true, time: '04:00', scan_mode: 'catch_up', next_run_at: null },
+  uploader_enabled: true,
+  event_loop: { current_ms: 0, avg_ms: 0, max_ms: 0, warning_count: 0, warning_threshold_ms: 250 },
+  targets_total: 1, targets_enabled: 1, videos: stats, temp_files_count: 1,
+  disk: { free_bytes: 1024, total_bytes: 2048 },
+}
+const target: TargetRecord = {
+  id: 42, site: 'xhamster', username: 'fragile-tempt', target_type: 'creator', display_name: 'Fragile Tempt',
+  avatar_url: 'https://cdn.example/fragile-tempt.jpg', enabled: true, preferred_quality: '1080', created_at: '',
+  last_checked_at: null, last_new_count: 0, last_error: 'target-error-secret',
+  today_new_date: '2026-11-27', today_new_count: 2, video_total_count: 7, video_saved_count: 5, video_baseline_count: 2,
+}
+const history: VideoListResponse = {
+  items: [{
+    viewkey: 'ph123', site: 'pornhub', title: 'Saved video', uploader: 'member', target_type: 'model',
+    video_page_url: 'https://www.pornhub.com/view_video.php?viewkey=ph123', quality: '1080', status: 'uploaded',
+    file_size: 1024, duration_seconds: 5, published_at: '', created_at: '', downloaded_at: null, uploaded_at: null,
+    local_path: 'private-local-path', remote_path: 'private-remote-path', upload_requested: 1,
+  }],
+  total: 1, page: 1, page_size: 30, stats,
+  facets: { sites: ['pornhub'], uploaders: ['member'], uploader_labels: { member: 'Member' }, qualities: ['1080'] },
+}
+const settings = {
+  ph_logged_in_username: 'member', ph_cookie: '********', has_cookie: true, account_avatar_version: 'version1',
+  proxy_url: 'http://localhost:8080', serverchan_enabled: true, serverchan_send_key: '********',
+  serverchan_api_url: 'https://sctapi.ftqq.com', rclone_remote: 'backup', rclone_extra_flags: '--bwlimit=5Mi',
+  schedule_enabled: true, schedule_time: '04:00', update_scan_mode: 'catch_up',
+} as RuntimeSettings
+const tempFile = { name: 'clip.mp4.tmp', folder: 'creator', site: 'xhamster', viewkey: 'xh123', size_bytes: 2048, verified_checkpoint: true } as const
+const remotes = [{ name: 'backup', type: 'drive' }]
+const log = { id: 0, ts: '2026-11-27T12:00:00Z', level: 'INFO', job_id: null, message: 'Download complete' }
+
+function seedRouteStore() {
+  const store = useAppStore(createPinia())
+  store.authenticated = true
+  store.overview = overview
+  store.overviewLoaded = true
+  store.jobsLoaded = true
+  store.jobsFetchedLimit = store.jobsLimit
+  store.tempFilesLoaded = true
+  store.tempFiles = [tempFile]
+  store.setTargetsCache([target])
+  store.setSettingsCache(settings)
+  store.setRcloneRemotesCache(remotes)
+  store.setHistoryCache(history)
+  store._applyLogsSnapshot([log])
+  return store
 }
 
 test('job revisions order repeated resumes and reject stale terminal snapshots', () => {
@@ -78,37 +160,216 @@ test('open job cards keep their cached details until all their pins are released
   }
 })
 
-test('persistent session summaries omit previous caches, credentials and signed media', () => {
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-  let raw: string | null = JSON.stringify({ v: 1, authenticated: true, settingsCache: { ph_password: 'test-secret' } })
-  let writes = 0
-  vi.stubGlobal('window', { sessionStorage: {
-    getItem: () => raw,
-    removeItem: () => { raw = null },
-    setItem: (_key: string, value: string) => {
-      raw = value
-      writes++
-    },
-  } })
+test.each([1, 2])('discards session cache schema v%i', (v) => {
+  const storage = mockSessionStorage('/', JSON.stringify({ v, ts: Date.now(), authenticated: true,
+    settingsCache: { ph_password: 'test-secret' } }))
   const store = useAppStore(createPinia())
+  assert.equal(store.hydratedFromCache, false)
+  assert.equal(storage.raw, null)
+})
+
+test('session summaries only persist redacted credentials and allowlisted display fields', () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const storage = mockSessionStorage()
+  const store = seedRouteStore()
   try {
-    assert.equal(raw, null)
-    store.authenticated = true
-    store.jobsLoaded = true
-    store.jobs = [{ ...job(1, 'completed', 1), export_text: 'signed-media-url', params_json: 'raw-params',
-      params: { urls: ['raw-url'], resume_count: 1 } }]
-    store.settingsCache = { ph_password: 'test-secret' } as RuntimeSettings
+    const liveJob = { ...job(1, 'completed', 1), export_text: 'signed-media-url', params_json: 'raw-params',
+      error_message: 'job-error-secret', params: { urls: ['raw-url'], resume_count: 1, keywords: 'private-query',
+        profile_avatars: { member: 'https://cdn.example/avatar.jpg?token=signed-avatar' } } }
+    store.jobs = [liveJob]
+    store.overview = { ...overview, current_job: liveJob }
+    store.setSettingsCache({ ...settings, ph_password: 'test-secret', ph_cookie: 'ph-cookie-secret',
+      xh_password: 'xh-password-secret', xh_cookie: 'xh-cookie-secret', serverchan_send_key: 'serverchan-secret',
+      yescaptcha_client_key: 'yescaptcha-secret', proxy_url: 'http://user:proxy-password@localhost:8080',
+      serverchan_api_url: 'https://sctapi.ftqq.com?token=notify-url-secret', rclone_extra_flags: '--s3-access-key-id flags-secret',
+      ...{ future_credential: 'unknown-settings-secret' } })
+    store.setTargetsCache([{ ...target, avatar_url: 'https://user:avatar-password@cdn.example/pic.jpg' }])
+    store.setHistoryCache({ ...history, items: [{ ...history.items[0],
+      video_page_url: 'https://www.pornhub.com/view_video.php?token=signed-history?viewkey=ph123' }] })
+    store.setRcloneRemotesCache([{ ...remotes[0], ...{ token: 'remote-secret' } }])
+    store.tempFiles = [{ ...tempFile, ...{ path: 'private-temp-path' } }]
+    store.subscriptionsCache = { member: { site: 'pornhub', username: 'private-subscriptions-user', subscriptions: [], fetchedAt: Date.now() } }
+    store.subscriptionsLastSource = 'private-subscriptions-source'
     store.jobItems = { 1: [makeJobItem(1, 1, { download_url: 'signed-download-url' })] }
+    store.liveProgress = { 1: { job_id: 1, item_id: 1, bytes_downloaded: 1, bytes_total: 2, speed_bps: 3, phase: 'downloading' } }
     store.persistCache()
     store.persistCache()
-    vi.advanceTimersByTime(1200)
-    assert.equal(writes, 1)
-    assert.ok(raw)
-    assert.equal(JSON.parse(raw).jobs[0].params.resume_count, 1)
-    assert.doesNotMatch(raw, /test-secret|signed-media|signed-download|raw-params|raw-url/)
+    vi.advanceTimersByTime(400)
+    assert.equal(storage.writes, 1)
+    assert.ok(storage.raw)
+    const data = JSON.parse(storage.raw)
+    assert.equal(data.v, 3)
+    assert.equal(data.jobs[0].params.resume_count, 1)
+    assert.equal(data.jobs[0].params.url_count, 1)
+    assert.equal(data.jobs[0].params.urls, undefined)
+    assert.equal(data.overview.current_job.params.urls, undefined)
+    for (const key of ['ph_password', 'ph_cookie', 'xh_password', 'xh_cookie', 'serverchan_send_key',
+      'yescaptcha_client_key', 'proxy_url', 'serverchan_api_url', 'rclone_extra_flags']) {
+      assert.equal(data.settingsCache[key], '********')
+    }
+    for (const key of ['subscriptionsCache', 'subscriptionsLastSource', 'jobItems', 'liveProgress']) {
+      assert.equal(data[key], undefined)
+    }
+    assert.deepEqual(data.tempFiles, [tempFile])
+    assert.deepEqual(data.rcloneRemotesCache, remotes)
+    assert.equal(data.targetsCache[0].last_error, '')
+    assert.deepEqual(data.historyCache.items[0], { ...history.items[0], local_path: '', remote_path: '', video_page_url: '' })
+    assert.doesNotMatch(storage.raw, /-secret|private-|signed-|raw-params|raw-url|proxy-password|avatar-password/)
+    assert.doesNotMatch(storage.raw, /"(?:export_text|error_message|params_json|urls|download_url)"/)
     store.persistCache()
-    vi.advanceTimersByTime(1200)
-    assert.equal(writes, 1)
+    vi.advanceTimersByTime(400)
+    assert.equal(storage.writes, 1)
+  } finally {
+    store._resetSessionState()
+  }
+})
+
+test('the first frame after reload has data for all six routes and identical job visuals', () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const storage = mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  try {
+    const creator = { ...job(1, 'completed', 1, 2), kind: 'manual_target' as const, params: {
+      site: 'xhamster' as const, usernames: ['yourselena'], target_type: 'creator' as const, auto_upload: true,
+      profile_names: { yourselena: 'YourSelena' }, profile_avatars: { yourselena: 'https://cdn.example/yourselena.jpg' },
+      quality: '1080', pages: 'all', source_job_id: 87, resume_count: 2,
+    } }
+    store.jobs = [
+      creator,
+      { ...job(2, 'completed', 2), kind: 'baseline_sync', params: { target_id: target.id } },
+      { ...job(3, 'completed', 3), kind: 'auto_update', params: {} },
+      { ...job(4, 'completed', 4), kind: 'check_updates', params: { target_ids: [target.id] } },
+      { ...job(5, 'completed', 5), params: { urls: ['https://xhamster.com/videos/smoke-xh12345'], group_by_uploader: true } },
+      { ...job(6, 'completed', 6), params: { urls: ['https://www.pornhub.com/view_video.php?viewkey=ph123'],
+        group_by_uploader: false, batch_name: 'Named batch' } },
+      { ...job(7, 'completed', 7), kind: 'retry_items', params: { origin_label: 'Fragile Tempt', source_job_id: 87 } },
+    ]
+    const liveVisuals = store.jobs.map((row) => resolveJobVisual(row, store.targetsCache || []))
+    store._applyLogsSnapshot(Array.from({ length: 110 }, (_, i) => ({ ...log, id: i + 1 })))
+    storage.pagehide()
+    const hydrated = useAppStore(createPinia())
+    assert.equal(hydrated.hydratedFromCache, true)
+    assert.equal(hydrated.authChecked, false)
+    assert.equal(hydrated.jobsLoadedAt, 0)
+    for (const route of ['download', 'jobs', 'targets', 'history', 'logs', 'settings']) {
+      assert.equal(hydrated.hasRouteCache(route), true, `${route} has a first-frame snapshot`)
+    }
+    assert.deepEqual(hydrated.jobs[0].params, creator.params)
+    assert.deepEqual(hydrated.jobs.slice(4, 6).map((row) => [row.params.url_count, row.params.site]), [[1, 'xhamster'], [1, 'pornhub']])
+    assert.deepEqual(hydrated.jobs.map((row) => resolveJobVisual(row, hydrated.targetsCache || [])), liveVisuals)
+    assert.deepEqual(hydrated.targetsCache?.[0], { ...target, last_error: '' })
+    assert.deepEqual(hydrated.rcloneRemotesCache, remotes)
+    assert.equal(hydrated.settingsCache?.serverchan_send_key, '********')
+    assert.equal(hydrated.settingsCache?.yescaptcha_client_key, '')
+    assert.equal(hydrated.settingsCache?.rclone_extra_flags, settings.rclone_extra_flags)
+    assert.equal(hydrated.settingsCache?.proxy_url, settings.proxy_url)
+    assert.equal(hydrated.accountAvatarUrl, '/api/settings/avatar?v=version1')
+    assert.equal(hydrated.historyCache?.items[0].video_page_url, history.items[0].video_page_url)
+    assert.deepEqual(hydrated.historyCache?.facets, history.facets)
+    assert.equal(hydrated.logs.length, 100)
+    assert.equal(hydrated.logs.at(-1)?.id, 110)
+  } finally {
+    store._resetSessionState()
+  }
+})
+
+test('ensureRouteData fetches full jobs after hydration and reuses the live list afterward', async () => {
+  const storage = mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  try {
+    const fullJob = { ...job(1, 'completed', 1), params: { urls: ['https://www.pornhub.com/view_video.php?viewkey=ph123'] },
+      export_text: 'live export', error_message: 'live error' }
+    store.jobs = [fullJob]
+    storage.pagehide()
+    const hydrated = useAppStore(createPinia())
+    assert.equal(hydrated.hasRouteCache('jobs'), true)
+    assert.equal(hydrated.jobs[0].export_text, undefined)
+    const listJobs = vi.spyOn(api, 'listJobs').mockResolvedValue({ items: [fullJob] })
+    await hydrated.ensureRouteData('jobs')
+    assert.deepEqual(hydrated.jobs, [fullJob])
+    assert.ok(hydrated.jobsLoadedAt > 0)
+    await hydrated.ensureRouteData('jobs')
+    assert.equal(listJobs.mock.calls.length, 1)
+  } finally {
+    store._resetSessionState()
+  }
+})
+
+test.each([
+  ['download', ['jobs', 'tempFiles', 'targets']], ['jobs', ['jobs', 'targets']], ['settings', ['settings', 'remotes']],
+  ['targets', ['targets', 'settings']], ['history', ['history']], ['logs', ['logs']],
+])('revalidation refreshes the overview and all data for %s even when cached', async (route, expected) => {
+  const storage = mockSessionStorage()
+  const store = seedRouteStore()
+  try {
+    storage.pagehide()
+    const hydrated = useAppStore(createPinia())
+    vi.spyOn(hydrated, 'startRealtime').mockImplementation(() => {})
+    vi.spyOn(hydrated, 'prefetchAll').mockImplementation(() => {})
+    const auth = vi.spyOn(api, 'me').mockResolvedValue({ authenticated: true })
+    const getOverview = vi.spyOn(api, 'overview').mockResolvedValue(overview)
+    const responses = [
+      ['jobs', vi.spyOn(api, 'listJobs').mockResolvedValue({ items: [] })],
+      ['tempFiles', vi.spyOn(api, 'listTempFiles').mockResolvedValue({ items: [tempFile] })],
+      ['targets', vi.spyOn(api, 'listTargets').mockResolvedValue({ items: [target] })],
+      ['settings', vi.spyOn(api, 'getSettings').mockResolvedValue({ settings, cookie_status: accountCookie, xh_cookie_status: accountCookie })],
+      ['remotes', vi.spyOn(api, 'listRcloneRemotes').mockResolvedValue({ remotes })],
+      ['history', vi.spyOn(api, 'listVideos').mockResolvedValue(history)],
+      ['logs', vi.spyOn(api, 'getLogs').mockResolvedValue({ items: [log] })],
+    ] as const
+    assert.equal(hydrated.hasRouteCache(route), true)
+    assert.equal(await hydrated.revalidateSession(route), true)
+    assert.equal(auth.mock.calls.length, 1)
+    assert.equal(getOverview.mock.calls.length, 1)
+    assert.deepEqual(responses.filter(([, call]) => call.mock.calls.length === 1).map(([key]) => key), expected)
+    assert.equal(hydrated.hydratedFromCache, false)
+  } finally {
+    store._resetSessionState()
+  }
+})
+
+test('pagehide flushes pending writes synchronously and logout cancels the next write', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const storage = mockSessionStorage('/targets')
+  const store = seedRouteStore()
+  try {
+    store.setTargetsCache([{ ...target, display_name: 'Newest target name' }])
+    assert.equal(storage.writes, 0)
+    storage.pagehide()
+    assert.equal(storage.writes, 1)
+    const hydrated = useAppStore(createPinia())
+    assert.equal(hydrated.targetsCache?.[0].display_name, 'Newest target name')
+    assert.deepEqual(storage.listener.mock.calls.map(([event]) => event), ['pagehide'])
+    vi.advanceTimersByTime(400)
+    assert.equal(storage.writes, 1)
+
+    vi.spyOn(api, 'logout').mockResolvedValue({ authenticated: false })
+    store.setTargetsCache([])
+    const pendingLogout = store.logout()
+    storage.pagehide()
+    assert.equal(storage.raw, null)
+    await pendingLogout
+    vi.advanceTimersByTime(400)
+    assert.equal(storage.writes, 1)
+  } finally {
+    store._resetSessionState()
+  }
+})
+
+test.each([['/jobs', 'history'], ['/logs', 'logs']])('oversized snapshots keep core data and prioritize %s', (pathname, kept) => {
+  const storage = mockSessionStorage(pathname)
+  const store = seedRouteStore()
+  try {
+    store.jobs = [job(1, 'completed', 1)]
+    store.setHistoryCache({ ...history, items: [{ ...history.items[0], title: 'h'.repeat(140 * 1024) }] })
+    store._applyLogsSnapshot(Array.from({ length: 100 }, (_, i) => ({ ...log, id: i + 1, message: 'l'.repeat(1500) })))
+    storage.pagehide()
+    assert.ok(storage.raw && storage.raw.length < SESSION_CACHE_MAX_CHARS)
+    const hydrated = useAppStore(createPinia())
+    for (const route of ['download', 'jobs', 'settings', 'targets']) assert.equal(hydrated.hasRouteCache(route), true)
+    assert.equal(hydrated.hasRouteCache('history'), kept === 'history')
+    assert.equal(hydrated.hasRouteCache('logs'), kept === 'logs')
+    assert.equal(hydrated.jobs[0].id, 1)
   } finally {
     store._resetSessionState()
   }

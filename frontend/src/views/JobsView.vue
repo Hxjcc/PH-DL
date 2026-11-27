@@ -35,7 +35,8 @@ const changingLimit = ref(false)
 const categoryFilter = ref('all')
 const isRouteActive = ref(true)
 const limitOptions = JOB_LIMITS.map((value) => ({ label: `${value} 条`, value }))
-const allLoadedJobs = computed(() => store.jobs.slice(0, store.jobsLimit))
+const canShowJobs = computed(() => store.targetsCache !== null || (!store.hydratedFromCache && store.jobsLoadedAt > 0))
+const allLoadedJobs = computed(() => canShowJobs.value ? store.jobs.slice(0, store.jobsLimit) : [])
 
 const categoryCounts = computed(() => {
   const counts = { all: allLoadedJobs.value.length, download: 0, update: 0, maintenance: 0 }
@@ -244,17 +245,13 @@ let activatedOnce = false
 onActivated(async () => {
   isRouteActive.value = true
   const tasks = []
-  if (store.targetsCache === null) {
-    tasks.push(store.ensureTargets())
-  }
-  if (!activatedOnce) {
-    activatedOnce = true
-    if (!store.hasRouteCache('jobs') || (!store.hydratedFromCache && Date.now() - store.jobsLoadedAt > 1500)) {
+  if (activatedOnce || !store.hydratedFromCache) {
+    if (store.targetsCache === null) tasks.push(store.ensureTargets())
+    if (activatedOnce || !store.hasRouteCache('jobs') || Date.now() - store.jobsLoadedAt > 1500) {
       tasks.push(store.refreshJobs())
     }
-  } else {
-    tasks.push(store.refreshJobs())
   }
+  activatedOnce = true
   if (tasks.length > 0) await Promise.all(tasks)
   await scrollToFocusedJob()
 })
@@ -380,7 +377,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div v-if="!store.jobsLoaded" class="py-16 rounded-b-[calc(var(--radius-2xl)-1px)] flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
+      <div v-if="!store.jobsLoaded || (store.hydratedFromCache && !canShowJobs)" class="py-16 rounded-b-[calc(var(--radius-2xl)-1px)] flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
         <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
         <span>任务队列加载中...</span>
       </div>

@@ -1,5 +1,5 @@
-FROM rclone/rclone:1.68.2 AS rclone
-FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg
+FROM rclone/rclone:1.76.0 AS rclone
+FROM mwader/static-ffmpeg:9.1 AS ffmpeg
 
 FROM python:3.12-slim
 

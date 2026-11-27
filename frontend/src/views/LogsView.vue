@@ -182,7 +182,7 @@ async function handleClear() {
           v-if="filtered.length === 0"
           class="h-full flex items-center justify-center text-muted-foreground font-sans text-xs"
         >
-          暂无日志，等待实时推送...
+          {{ store.logsLoaded ? '暂无日志，等待实时推送...' : '日志加载中...' }}
         </div>
 
         <div

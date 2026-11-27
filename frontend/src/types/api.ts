@@ -12,6 +12,7 @@ export interface JobParams {
   usernames?: string[]
   target_type?: TargetTypeInput
   urls?: string[]
+  url_count?: number
   skipped_non_video?: number
   group_by_uploader?: boolean
   batch_name?: string
@@ -369,7 +370,11 @@ export interface OverviewResponse {
 }
 
 export interface TempFileEntry {
+  name?: string
   folder: string
+  site?: SiteKey
+  viewkey?: string
+  size_bytes?: number
   verified_checkpoint?: boolean
 }
 

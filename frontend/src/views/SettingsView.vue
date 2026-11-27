@@ -26,6 +26,7 @@ import { api } from '../api/client'
 import type { LoginOpStatus, RuntimeSettings, SelectorSettings, SettingsInput, SiteKey } from '../types/api'
 import { useAppStore } from '../stores/app'
 import { prepareAvatarDataUrl } from '../utils/avatarImage'
+import { redactedSettingsFields } from '../utils/settingsRedaction'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
@@ -116,10 +117,13 @@ const RCLONE_STRATEGY_OPTIONS = [
   { label: '多盘轮询（均摊每日额度 + 限额切换）', value: 'round_robin' },
 ] as const
 
+function cloneSettings(src: RuntimeSettings): SettingsInput
+function cloneSettings(src: RuntimeSettings | null): SettingsInput | null
 function cloneSettings(src: RuntimeSettings | null): SettingsInput | null {
   if (!src) return null
   return {
     ...src,
+    ...redactedSettingsFields(src),
     rclone_backup_remotes: src.rclone_backup_remotes ?? '',
     rclone_remote_strategy: src.rclone_remote_strategy || 'failover',
     yescaptcha_ph_task_type:
@@ -127,6 +131,14 @@ function cloneSettings(src: RuntimeSettings | null): SettingsInput | null {
     yescaptcha_xh_task_type: src.yescaptcha_xh_task_type || 'RecaptchaV2TaskProxyless',
     selectors: { ...DEFAULT_SELECTORS, ...(src.selectors || {}) },
   }
+}
+
+function keepDraftEdits<T extends object>(draft: T, previous: T, incoming: T): T {
+  const merged = { ...incoming }
+  for (const key of Object.keys(previous) as (keyof T)[]) {
+    if (draft[key] !== previous[key]) merged[key] = draft[key]
+  }
+  return merged
 }
 
 const AUTH_MODES = [
@@ -184,7 +196,7 @@ const route = useRoute()
 const router = useRouter()
 const store = useAppStore()
 const activeTab = ref(resolveSettingsTab(route.query.tab))
-const loading = ref(!store.settingsCache)
+const loading = ref(false)
 const saving = ref(false)
 const busyTool = ref('')
 const form = ref(cloneSettings(store.settingsCache))
@@ -222,6 +234,9 @@ const avatarInputRef = ref<HTMLInputElement | null>(null)
 const avatarLoadError = ref(false)
 const rcloneRemotes = computed(() => store.rcloneRemotesCache || [])
 const loadingRemotes = ref(false)
+const remotesPending = computed(() => loadingRemotes.value || (
+  store.hydratedFromCache && store.rcloneRemotesCache === null
+))
 
 watch(
   () => store.accountAvatarUrl,
@@ -432,7 +447,7 @@ watch(activeTab, (tab) => {
       router.replace({ query: nextQuery })
     }
   }
-  if (nextTab === 'rclone') {
+  if (nextTab === 'rclone' && !store.hydratedFromCache) {
     loadRcloneRemotes()
   }
 })
@@ -448,7 +463,7 @@ watch(
   }
 )
 
-if (activeTab.value === 'rclone' && store.rcloneRemotesCache === null) {
+if (activeTab.value === 'rclone' && store.rcloneRemotesCache === null && !store.hydratedFromCache) {
   loadRcloneRemotes()
 }
 
@@ -482,11 +497,7 @@ function syncInitialAuthModes(settings: RuntimeSettings) {
 async function loadSettings() {
   if (!form.value) loading.value = true
   try {
-    const settings = await store.refreshSettings()
-    if (settings && !saving.value) {
-      form.value = cloneSettings(settings)
-      syncInitialAuthModes(settings)
-    }
+    await store.refreshSettings()
   } catch (err: unknown) {
     store.notify(getErrorMessage(err), 'error')
   } finally {
@@ -496,12 +507,19 @@ async function loadSettings() {
 
 watch(
   () => store.settingsCache,
-  (val) => {
-    if (val && !saving.value) {
-      form.value = cloneSettings(val)
-      syncInitialAuthModes(val)
-      loading.value = false
+  (val, previous) => {
+    if (!val || saving.value) return
+    const next = cloneSettings(val)
+    const baseline = cloneSettings(previous)
+    const draft = form.value
+    if (draft && baseline) {
+      const merged = keepDraftEdits(draft, baseline, next)
+      merged.selectors = keepDraftEdits(draft.selectors, baseline.selectors, next.selectors)
+      form.value = merged
+    } else {
+      form.value = next
     }
+    syncInitialAuthModes(val)
   }
 )
 
@@ -523,10 +541,8 @@ onDeactivated(() => {
   loginPoll?.abort()
   pasteCookie.value = ''
   pasteXhCookie.value = ''
-  if (form.value) {
-    for (const key of ['ph_password', 'xh_password', 'serverchan_send_key', 'yescaptcha_client_key', 'proxy_url', 'rclone_extra_flags'] as const) {
-      form.value[key] = store.settingsCache?.[key] || ''
-    }
+  if (form.value && store.settingsCache) {
+    Object.assign(form.value, redactedSettingsFields(store.settingsCache))
   }
 })
 
@@ -805,9 +821,12 @@ async function handleTestNotify() {
       </Button>
     </div>
 
-    <div v-if="loading || !form" class="py-16 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
-      <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
-      <span>加载配置中...</span>
+    <div v-if="!form" class="py-16 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
+      <template v-if="loading || store.hydratedFromCache">
+        <Loader2 class="w-4 h-4 animate-spin shrink-0 text-brand" />
+        <span>加载配置中...</span>
+      </template>
+      <Button v-else variant="outline" size="sm" @click="loadSettings">重新加载配置</Button>
     </div>
 
     <template v-else>
@@ -1245,10 +1264,10 @@ async function handleTestNotify() {
               size="xs"
               class="h-8"
               title="重新扫描 rclone.conf"
-              :disabled="loadingRemotes"
+              :disabled="remotesPending"
               @click="loadRcloneRemotes({ force: true })"
             >
-              <RefreshCw :class="['w-3.5 h-3.5', loadingRemotes ? 'animate-spin' : '']" />
+              <RefreshCw :class="['w-3.5 h-3.5', remotesPending ? 'animate-spin' : '']" />
               扫描配置
             </Button>
             <Button variant="outline" size="xs" class="h-8" :disabled="busyTool !== ''" @click="handleTestRclone">

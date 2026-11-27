@@ -20,23 +20,18 @@ import type {
   SubscriptionsResponse,
   TargetRecord,
   TempFileEntry,
-  VideoFilterFacets,
   VideoFilters,
   VideoListResponse,
-  VideoStats,
 } from '../types/api'
 import { appendLiveLog, mergeLogsSnapshot } from '../utils/logBuffer'
 import { JOB_LIMITS, HISTORY_PAGE_SIZES, readListPreference, saveListPreference } from '../utils/listPreferences'
+import { readSessionCache, serializeSessionCache, SESSION_CACHE_KEY, type HistoryCache } from './sessionCache'
 
 type RouteName = RouteRecordName | null | undefined
 type Timer = ReturnType<typeof setTimeout>
 type NoticeType = 'info' | 'success' | 'error' | 'warning'
 type SubscriptionsCacheEntry = SubscriptionsResponse & { fetchedAt: number }
 type SubscriptionsResult = SubscriptionsCacheEntry & { fromCache: boolean }
-type HistoryCache = Pick<VideoListResponse, 'items' | 'total' | 'page_size'> & {
-  facets: Pick<VideoFilterFacets, 'uploaders' | 'qualities'> & Partial<VideoFilterFacets>
-  stats: Omit<VideoStats, 'baseline_missing_metadata'> & Partial<Pick<VideoStats, 'baseline_missing_metadata'>>
-}
 type ItemUpdates = Map<number, Map<number, JobItemRecord>>
 
 interface AppState {
@@ -77,25 +72,6 @@ interface AppState {
   _overviewTimer: Timer | null
 }
 
-interface SessionCache {
-  v: 2
-  ts: number
-  authenticated: true
-  overview: OverviewResponse | null
-  overviewLoaded: boolean
-  jobs: JobRecord[] | null
-  jobsFetchedLimit: number
-  // Older entries can contain additional route data.
-  tempFiles?: TempFileEntry[]
-  targetsCache?: TargetRecord[]
-  subscriptionsCache?: AppState['subscriptionsCache']
-  subscriptionsLastSource?: string
-  settingsCache?: RuntimeSettings
-  rcloneRemotesCache?: RcloneRemote[]
-  historyCache?: HistoryCache
-  logs?: LogEntry[]
-}
-
 interface RequestResults {
   revalidate: boolean
   overview: OverviewResponse | null | void
@@ -127,22 +103,20 @@ export const DEFAULT_HISTORY_FILTERS = Object.freeze<VideoFilters>({
   page_size: 30,
 })
 
-const SESSION_CACHE_KEY = 'phdl-session-cache-v1'
-const SESSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000
+const SESSION_PERSIST_MS = 300
 const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
 const LIVE_PROGRESS_FLUSH_MS = 140
 const ITEM_UPDATE_FLUSH_MS = 120
 const JOB_ITEMS_RELOAD_DEBOUNCE_MS = 240
 const JOB_DETAILS_HISTORY_LIMIT = 8
-const SESSION_CACHE_MAX_CHARS = 256 * 1024
 const JOB_RUN_ORDER: Partial<Record<JobStatus, number>> = { queued: 0, scanning: 1, running: 2 }
 
 const inflight = new Map<keyof RequestResults, Promise<RequestResults[keyof RequestResults]>>()
 let sessionEpoch = 0
 let persistTimer: Timer | null = null
-let persistIdleId: number | null = null
-let persistGen = 0
-let lastSnapshot = ''
+let pendingPersist: AppState | null = null
+let persistWindow: Window | undefined
+let lastSnapshot: string | null = null
 let pendingLiveProgress: Map<number, LiveProgressEntry> | null = null
 let liveProgressFlushTimer: Timer | null = null
 let pendingItemUpdates: ItemUpdates | null = null
@@ -368,83 +342,39 @@ function cancelScheduledPersist() {
     clearTimeout(persistTimer)
     persistTimer = null
   }
-  if (persistIdleId !== null && typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
-    window.cancelIdleCallback(persistIdleId)
-    persistIdleId = null
-  }
-}
-
-function readSessionCache(): SessionCache | null {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_CACHE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as SessionCache | null
-    if (!parsed || parsed.v !== 2 || !parsed.authenticated || Date.now() - Number(parsed.ts || 0) > SESSION_CACHE_TTL_MS) {
-      window.sessionStorage.removeItem(SESSION_CACHE_KEY)
-      return null
-    }
-    return parsed
-  } catch {
-    return null
-  }
+  pendingPersist = null
 }
 
 function clearSessionCache() {
-  persistGen += 1
-  lastSnapshot = ''
+  lastSnapshot = null
   cancelScheduledPersist()
+  if (typeof window === 'undefined') return
   try {
     window.sessionStorage.removeItem(SESSION_CACHE_KEY)
   } catch {}
 }
 
-function cachedJobSummary(job: JobRecord): JobRecord
-function cachedJobSummary(job: JobRecord | null): JobRecord | null
-function cachedJobSummary(job: JobRecord | null): JobRecord | null {
-  if (!job) return null
-  const { params, params_json, export_text, error_message, ...summary } = job
-  return {
-    ...summary,
-    label: String(job.label || '').slice(0, 512),
-    params: {
-      resume_count: params?.resume_count,
-      site: params?.site,
-      export_only: params?.export_only,
-      target_type: params?.target_type,
-    },
-  }
+function flushScheduledPersist() {
+  const store = pendingPersist
+  cancelScheduledPersist()
+  if (!store?.authenticated || typeof window === 'undefined') return
+  try {
+    const { raw, payload } = serializeSessionCache(store, window.location?.pathname || '/')
+    if (payload === lastSnapshot) return
+    window.sessionStorage.setItem(SESSION_CACHE_KEY, raw)
+    lastSnapshot = payload
+  } catch {}
 }
 
 function schedulePersistSessionCache(store: AppState) {
-  if (!store.authenticated) return
-  if (persistTimer !== null || persistIdleId !== null) return
-  const gen = persistGen
-  const flush = () => {
-    persistTimer = null
-    persistIdleId = null
-    if (gen !== persistGen || !store.authenticated) return
-    try {
-      const snapshot = {
-        overview: store.overview ? { ...store.overview, current_job: cachedJobSummary(store.overview.current_job) } : null,
-        overviewLoaded: Boolean(store.overview),
-        jobs: store.jobsLoaded ? store.jobs.slice(0, store.jobsLimit).map(cachedJobSummary) : null,
-        jobsFetchedLimit: Math.min(store.jobsFetchedLimit, store.jobsLimit),
-      }
-      const serialized = JSON.stringify(snapshot)
-      if (serialized.length > SESSION_CACHE_MAX_CHARS || serialized === lastSnapshot) return
-      window.sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify({ v: 2, ts: Date.now(), authenticated: true, ...snapshot }))
-      lastSnapshot = serialized
-    } catch {}
+  if (!store.authenticated || typeof window === 'undefined') return
+  if (persistWindow !== window && typeof window.addEventListener === 'function') {
+    persistWindow?.removeEventListener('pagehide', flushScheduledPersist)
+    window.addEventListener('pagehide', flushScheduledPersist)
+    persistWindow = window
   }
-  persistTimer = setTimeout(() => {
-    persistTimer = null
-    if (gen !== persistGen || !store.authenticated) return
-    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
-      persistIdleId = window.requestIdleCallback(flush, { timeout: 800 })
-    } else {
-      flush()
-    }
-  }, 1200)
+  pendingPersist = store
+  if (persistTimer === null) persistTimer = setTimeout(flushScheduledPersist, SESSION_PERSIST_MS)
 }
 
 function resetInflight() {
@@ -491,20 +421,20 @@ export const useAppStore = defineStore('app', {
       hydratedFromCache: hasCache,
       authenticated: hasCache,
       wsConnected: hasCache,
-      overview: hasCache && cached.overviewLoaded ? cached.overview : null,
-      overviewLoaded: Boolean(hasCache && cached.overviewLoaded),
+      overview: cached?.overview ?? null,
+      overviewLoaded: Boolean(cached?.overview),
       jobs: hasCache && Array.isArray(cached.jobs) ? cached.jobs : [],
       jobsLoaded: Boolean(hasCache && Array.isArray(cached.jobs)),
       jobsLoadedAt: 0,
       jobsLimit: readListPreference('jobs', JOB_LIMITS),
-      jobsFetchedLimit: hasCache && Array.isArray(cached.jobs) ? Number(cached.jobsFetchedLimit || 30) : 0,
+      jobsFetchedLimit: Array.isArray(cached?.jobs) ? Number(cached.jobsFetchedLimit || 0) : 0,
       _jobsRequestedLimit: 0,
       tempFiles: hasCache && Array.isArray(cached.tempFiles) ? cached.tempFiles : [],
       tempFilesLoaded: Boolean(hasCache && Array.isArray(cached.tempFiles)),
       tempFilesLoadedAt: 0,
       targetsCache: hasCache && Array.isArray(cached.targetsCache) ? cached.targetsCache : null,
-      subscriptionsCache: hasCache && cached.subscriptionsCache ? cached.subscriptionsCache : {},
-      subscriptionsLastSource: hasCache ? cached.subscriptionsLastSource || '' : '',
+      subscriptionsCache: {},
+      subscriptionsLastSource: '',
       targetsLoadedAt: 0,
       settingsCache: hasCache && cached.settingsCache ? cached.settingsCache : null,
       settingsLoadedAt: 0,
@@ -559,7 +489,7 @@ export const useAppStore = defineStore('app', {
         return this.tempFilesLoaded && this.jobsLoaded && this.targetsCache !== null
       }
       if (routeName === 'jobs') {
-        return this.jobsLoaded && this.jobsFetchedLimit >= this.jobsLimit
+        return this.jobsLoaded && this.jobsFetchedLimit >= this.jobsLimit && this.targetsCache !== null
       }
       if (routeName === 'targets') {
         return this.targetsCache !== null && this.settingsCache !== null
@@ -647,7 +577,6 @@ export const useAppStore = defineStore('app', {
         }
         if (!isLatest()) return ok
         this.authChecked = true
-        this.hydratedFromCache = false
         if (!ok) {
           this.handleUnauthorized()
           return false
@@ -656,9 +585,9 @@ export const useAppStore = defineStore('app', {
         this.startRealtime()
         const tasks: Promise<unknown>[] = [this.refreshOverview()]
         if (routeName === 'download') {
-          tasks.push(this.refreshTempFiles(), this.refreshJobs())
+          tasks.push(this.refreshTempFiles(), this.refreshJobs(), this.refreshTargets())
         } else if (routeName === 'jobs') {
-          tasks.push(this.refreshJobs(), this.ensureTargets())
+          tasks.push(this.refreshJobs(), this.refreshTargets())
         } else if (routeName === 'targets') {
           tasks.push(this.refreshTargets(), this.refreshSettings())
         } else if (routeName === 'history') {
@@ -666,9 +595,11 @@ export const useAppStore = defineStore('app', {
         } else if (routeName === 'logs') {
           tasks.push(this.refreshLogs())
         } else if (routeName === 'settings') {
-          tasks.push(this.refreshSettings())
+          tasks.push(this.refreshSettings(), this.refreshRcloneRemotes())
         }
         await Promise.allSettled(tasks)
+        if (!isLatest()) return this.authenticated
+        this.hydratedFromCache = false
         if (
           (routeName === 'download' || routeName === 'jobs') &&
           this.overview?.current_job?.id
@@ -734,10 +665,10 @@ export const useAppStore = defineStore('app', {
     async logout() {
       this.stopRealtime()
       resetInflight()
+      this._resetSessionState()
       try {
         await api.logout()
       } catch {}
-      this._resetSessionState()
     },
 
     handleUnauthorized() {
@@ -896,7 +827,7 @@ export const useAppStore = defineStore('app', {
     ensureJobs(limit?: number): Promise<JobRecord[] | void> {
       if (limit === undefined) limit = this.jobsLimit
       if (!this.authenticated) return Promise.resolve()
-      if (this.jobsLoaded && this.jobsFetchedLimit >= limit) return Promise.resolve(this.jobs)
+      if (this.jobsLoadedAt > 0 && this.jobsFetchedLimit >= limit) return Promise.resolve(this.jobs)
       const existing = getInflight('jobs')
       if (existing && this._jobsRequestedLimit === limit) return existing
       return this.refreshJobs(limit)
@@ -1085,7 +1016,7 @@ export const useAppStore = defineStore('app', {
     },
 
     setHistoryCache(data: VideoListResponse) {
-      if (!data) return
+      if (!data || data.page !== 1) return
       const pageSize = Number(data.page_size || this.historyPageSize)
       if (pageSize !== this.historyPageSize) return
       this.historyCache = {
@@ -1104,7 +1035,8 @@ export const useAppStore = defineStore('app', {
       if (!this.authenticated) return null
       return runRequest('history', async ({ isLatest }) => {
         const res = await api.listVideos(query)
-        if (isLatest()) {
+        if (isLatest() && Object.entries(this.defaultHistoryFilters()).every(([key, value]) =>
+          query[key as keyof VideoFilters] === value)) {
           this.setHistoryCache(res)
         }
         return res
@@ -1391,6 +1323,7 @@ export const useAppStore = defineStore('app', {
               this.logs = nextLogs
             }
             this.logsLoaded = true
+            this.persistCache()
           } else if (msg.type === 'job_updated') {
             if (this._upsertJob(msg.data) === false) return
             this._scheduleOverviewRefresh()

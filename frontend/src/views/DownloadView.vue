@@ -234,6 +234,12 @@ const form = reactive<DownloadForm>({
   subscribe_creator: false,
 })
 
+watch(() => store.overview?.uploader_enabled, (enabled, previous) => {
+  if (typeof enabled === 'boolean' && form.auto_upload === (previous ?? true)) {
+    form.auto_upload = enabled
+  }
+})
+
 const isSelfCollectionTarget = computed(
   () => form.target_type === 'liked' || (form.site === 'xhamster' && form.target_type === 'favorites')
 )
@@ -587,14 +593,7 @@ onActivated(async () => {
   nextTick(updateQuickScrollState)
   if (!activatedOnce) {
     activatedOnce = true
-    if (
-      store.hydratedFromCache &&
-      store.jobsLoaded &&
-      store.tempFilesLoaded &&
-      store.targetsCache !== null
-    ) {
-      return
-    }
+    if (store.hydratedFromCache) return
     const tasks = []
     if (!store.overviewLoaded) tasks.push(store.refreshOverview())
     if (!store.jobsLoaded || Date.now() - store.jobsLoadedAt > 3000) {
@@ -609,9 +608,6 @@ onActivated(async () => {
     if (tasks.length > 0) {
       await Promise.all(tasks)
       nextTick(updateQuickScrollState)
-    }
-    if (store.overview && typeof store.overview.uploader_enabled === 'boolean') {
-      form.auto_upload = store.overview.uploader_enabled
     }
     return
   }

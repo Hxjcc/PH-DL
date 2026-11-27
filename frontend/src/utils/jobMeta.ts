@@ -120,6 +120,15 @@ function normalizeSiteKey(site: string | undefined): SiteKey | '' {
   return ''
 }
 
+export function resolveManualUrlSite(urls: readonly string[], site?: SiteKey): SiteKey | '' {
+  const fallback = normalizeSiteKey(site)
+  const links = urls.filter(Boolean)
+  if (links.length === 0) return fallback
+  if (links.every(isXhamsterUrlText)) return 'xhamster'
+  if (!links.some(isXhamsterUrlText)) return 'pornhub'
+  return fallback
+}
+
 function buildTargetLookup(targetsList: readonly VisualTarget[] = []): TargetLookup {
   if (!Array.isArray(targetsList) || targetsList.length === 0) {
     return EMPTY_TARGET_LOOKUP
@@ -353,13 +362,8 @@ export function resolveJobVisual(job: VisualJob | null | undefined, targetsList:
     }
   } else if (kind === 'manual_urls') {
     const urls = Array.isArray(params.urls) ? params.urls.filter(Boolean) : []
-    const urlCount = urls.length
-    if (urlCount > 0) {
-      const hasXh = urls.some((u) => isXhamsterUrlText(u))
-      const hasPh = urls.some((u) => !isXhamsterUrlText(u))
-      if (hasXh && !hasPh) site = 'xhamster'
-      else if (hasPh && !hasXh) site = 'pornhub'
-    }
+    const urlCount = urls.length || Number(params.url_count || 0)
+    site = resolveManualUrlSite(urls, params.site)
     title = params.group_by_uploader === false && params.batch_name
       ? params.batch_name
       : '直链批量队列'

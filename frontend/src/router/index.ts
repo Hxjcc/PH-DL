@@ -52,19 +52,18 @@ async function resolveAsyncGuard(
 
 router.beforeEach((to) => {
   const store = useAppStore()
-  // Fast synchronous path on same-tab reload when sessionStorage has valid route cache:
-  // mounts #app BEFORE window.load fires so Chrome Paint Holding transitions with zero white flash,
-  // while revalidating auth & silently refreshing data in the background.
-  if (
-    store.hydratedFromCache &&
-    !store.authChecked &&
-    !to.meta.public &&
-    store.hasRouteCache(to.name)
-  ) {
-    store.revalidateSession(to.name).then((ok) => {
-      if (!ok && router.currentRoute.value.name !== 'login') {
-        router.replace({ name: 'login', query: { next: to.fullPath } })
+  // A same-tab reload can paint cached data or the route's loading state while auth is checked.
+  if (store.hydratedFromCache && !store.authChecked && !to.meta.public) {
+    void store.revalidateSession(to.name).then((ok) => {
+      const current = router.currentRoute.value
+      if (!ok && current.name !== 'login') {
+        return router.replace({ name: 'login', query: { next: current.name ? current.fullPath : to.fullPath } })
       }
+      if (ok && current.name && current.name !== to.name && !current.meta.public) {
+        return store.ensureRouteData(current.name)
+      }
+    }).catch(() => {
+      // Route components can retry their data requests after an interrupted navigation.
     })
     return true
   }
