@@ -37,6 +37,7 @@ import {
   buildItemStatusPills,
   computeJobLiveMetrics,
   filterJobItemsByStatus,
+  jobItemErrorClass,
   resolveItemUploaderLabel,
   resolveJobVisual,
 } from '../utils/jobMeta'
@@ -108,9 +109,10 @@ const itemListScrollRef = ref<HTMLElement | null>(null)
 const brokenAvatars = ref(new Set<string>())
 
 const isActive = computed(() => ['queued', 'scanning', 'running'].includes(props.job.status))
-const tracksLiveProgress = computed(() => props.routeActive && ['scanning', 'running'].includes(props.job.status))
+const isCancelling = computed(() => isActive.value && store.isJobCancelling(props.job.id))
+const tracksLiveProgress = computed(() => props.routeActive && !isCancelling.value && ['scanning', 'running'].includes(props.job.status))
 const items = computed(() => store.jobItems[props.job.id] || [])
-const statusMeta = computed(() => jobStatusMeta(props.job.status))
+const statusMeta = computed(() => jobStatusMeta(isCancelling.value ? 'cancelling' : props.job.status))
 
 const visual = computed(() => resolveJobVisual(props.job, store.targetsCache || []))
 const categoryIcon = computed(() => CATEGORY_ICONS[visual.value.category.icon] || DownloadIcon)
@@ -433,11 +435,14 @@ watch(
 )
 
 async function handleCancel() {
+  if (busyAction.value || isCancelling.value) return
+  const jobId = props.job.id
   busyAction.value = true
+  store.markJobCancelling(jobId)
   try {
-    await api.cancelJob(props.job.id)
-    store.notify(`已发送停止信号给任务 #${props.job.id}`, 'warning')
+    await api.cancelJob(jobId)
   } catch (err: unknown) {
+    store.clearJobCancelling(jobId)
     store.notify(getErrorMessage(err), 'error')
   } finally {
     busyAction.value = false
@@ -717,11 +722,12 @@ function downloadExportTxt() {
               variant="outline"
               size="xs"
               class="text-red-600 dark:text-red-400 hover:text-red-600 hover:bg-red-500/10 border-red-500/30"
-              :disabled="busyAction"
+              :disabled="busyAction || isCancelling"
               @click="handleCancel"
             >
-              <Square class="w-3 h-3" />
-              停止
+              <Loader2 v-if="isCancelling" class="w-3 h-3 animate-spin" />
+              <Square v-else class="w-3 h-3" />
+              {{ isCancelling ? '停止中...' : '停止' }}
             </Button>
 
             <Button
@@ -790,11 +796,11 @@ function downloadExportTxt() {
         class="mt-3 sm:mt-3.5 rounded-xl border border-border/75 bg-surface-subtle/80 dark:bg-surface-subtle/45 px-3 sm:px-3.5 py-2 sm:py-2.5 space-y-1.5"
       >
         <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] tabular-nums">
-          <span class="inline-flex items-center gap-1.5 text-muted-foreground">
-            <Loader2 class="w-3 h-3 animate-spin text-brand shrink-0 will-change-transform" />
-            <span>{{ liveMetrics.phaseText }}</span>
+          <span class="inline-flex items-center gap-1.5 text-muted-foreground" aria-live="polite">
+            <Loader2 :class="['w-3 h-3 animate-spin shrink-0 will-change-transform', isCancelling ? 'text-amber-500' : 'text-brand']" />
+            <span>{{ isCancelling ? '正在安全停止任务并保留断点与本地文件...' : liveMetrics.phaseText }}</span>
           </span>
-          <div class="flex flex-wrap items-center gap-1.5 ml-auto">
+          <div v-if="!isCancelling" class="flex flex-wrap items-center gap-1.5 ml-auto">
             <span
               v-if="schedulerChip"
               :class="[
@@ -829,8 +835,8 @@ function downloadExportTxt() {
         </div>
         <div class="relative h-1.5 w-full overflow-hidden rounded-full bg-secondary">
           <div
-            v-if="liveMetrics.indeterminate"
-            class="h-full w-full bg-primary/80 animate-pulse"
+            v-if="isCancelling || liveMetrics.indeterminate"
+            :class="['h-full w-full animate-pulse', isCancelling ? 'bg-amber-500/55' : 'bg-primary/80']"
           />
           <div
             v-else
@@ -977,7 +983,7 @@ function downloadExportTxt() {
                     {{ item.quality }}
                   </span>
 
-                  <template v-if="item.status === 'downloading'">
+                  <template v-if="!isCancelling && item.status === 'downloading'">
                     <template v-if="transferProgressMap[item.id]?.phase === 'remuxing'">
                       <span
                         v-if="transferProgressMap[item.id]?.totalText || transferProgressMap[item.id]?.doneText"
@@ -1011,7 +1017,7 @@ function downloadExportTxt() {
                       </span>
                     </template>
                   </template>
-                  <template v-else-if="item.status === 'uploading'">
+                  <template v-else-if="!isCancelling && item.status === 'uploading'">
                     <span
                       v-if="transferProgressMap[item.id]?.hasProgress && transferProgressMap[item.id]?.totalText"
                       class="text-muted-foreground font-mono text-[10px] sm:text-[11px]"
@@ -1079,7 +1085,7 @@ function downloadExportTxt() {
               </div>
 
               <div
-                v-if="item.status === 'downloading' || item.status === 'uploading'"
+                v-if="!isCancelling && (item.status === 'downloading' || item.status === 'uploading')"
                 class="relative h-1 w-full overflow-hidden rounded-full bg-secondary"
               >
                 <div
@@ -1101,7 +1107,7 @@ function downloadExportTxt() {
                 />
               </div>
 
-              <div v-if="visibleItemError(item)" class="text-[11px] text-red-600 dark:text-red-400 pl-6 sm:pl-[26px]">
+              <div v-if="visibleItemError(item)" class="text-[11px] pl-6 sm:pl-[26px]" :class="jobItemErrorClass(item)">
                 {{ visibleItemError(item) }}
               </div>
             </div>

@@ -1208,9 +1208,9 @@ async def _download_hls_aiohttp(
                         last_manifest_seg = completed_segments
                         last_manifest_at = now
 
-            stop_watcher = asyncio.create_task(_watch_stop())
-            writer_task = asyncio.create_task(_writer())
             fetcher_tasks = [asyncio.create_task(_fetcher()) for _ in range(workers)]
+            writer_task = asyncio.create_task(_writer())
+            stop_watcher = asyncio.create_task(_watch_stop())
             try:
                 await writer_task
                 if abort_event.is_set() or stop.is_set():
@@ -1219,13 +1219,11 @@ async def _download_hls_aiohttp(
                             ft.cancel()
                 await asyncio.gather(*fetcher_tasks, return_exceptions=True)
             finally:
-                stop_watcher.cancel()
-                with contextlib.suppress(BaseException):
-                    await stop_watcher
-                for ft in fetcher_tasks:
-                    if not ft.done():
-                        ft.cancel()
-                await asyncio.gather(*fetcher_tasks, return_exceptions=True)
+                tasks = [stop_watcher, writer_task, *fetcher_tasks]
+                for task in tasks:
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             await _write_in_thread(fh.flush)
             _write_hls_manifest_atomic(hls_dir, _build_meta())

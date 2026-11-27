@@ -5,10 +5,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Callable, Sequence
+from typing import TypeVar
 
 _PIPE_CHUNK = 16 * 1024
 _STDERR_LIMIT = 64 * 1024
 _STDOUT_LIMIT = 8 * 1024 * 1024
+_CANCEL_TERMINATE_GRACE = 0.4
+_CANCEL_KILL_GRACE = 1.0
+_TIMEOUT_GRACE = 2.0
+_T = TypeVar("_T")
+
+
+async def _wait_for_cleanup(task: asyncio.Task[_T]) -> _T:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 async def _read_stdout(stream: asyncio.StreamReader) -> tuple[bytes, bool]:
@@ -74,7 +88,7 @@ async def run_bounded_process(
         # Creation can finish after the caller has been cancelled.
         spawn_cancelled = True
         try:
-            proc = await spawn
+            proc = await _wait_for_cleanup(spawn)
         except OSError:
             raise asyncio.CancelledError from None
 
@@ -87,18 +101,22 @@ async def run_bounded_process(
     wait_task = asyncio.gather(*tasks)
     signal = asyncio.create_task(cancel_event.wait()) if cancel_event is not None else None
 
-    async def stop_and_drain() -> None:
+    async def stop_and_drain(*, cancelled: bool) -> None:
+        term_grace = _CANCEL_TERMINATE_GRACE if cancelled else _TIMEOUT_GRACE
+        kill_grace = _CANCEL_KILL_GRACE if cancelled else _TIMEOUT_GRACE
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
-        _, pending = await asyncio.wait(tasks, timeout=2)
+        _, pending = await asyncio.wait(tasks, timeout=term_grace)
         if pending:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            _, pending = await asyncio.wait(pending, timeout=2)
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            _, pending = await asyncio.wait(pending, timeout=kill_grace)
         if pending:
             # A descendant may still hold a pipe even after the direct child exited.
             proc._transport.close()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     try:
         if spawn_cancelled:
@@ -112,11 +130,12 @@ async def run_bounded_process(
             if overflow:
                 return proc.returncode or 1, "", f"{stderr}\n子进程标准输出超过 {_STDOUT_LIMIT // 1024**2} MiB".strip()
             return proc.returncode or 0, stdout.decode(errors="replace"), stderr
-        await stop_and_drain()
+        cancelled = signal in done
+        await stop_and_drain(cancelled=cancelled)
         stderr = stderr_task.result() if stderr_task.done() and not stderr_task.cancelled() else ""
-        return (130 if signal in done else 124), "", stderr
+        return (130 if cancelled else 124), "", stderr
     except BaseException:
-        await stop_and_drain()
+        await _wait_for_cleanup(asyncio.create_task(stop_and_drain(cancelled=True)))
         raise
     finally:
         pending_cleanup = [wait_task, *tasks]

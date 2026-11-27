@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { getErrorMessage } from '../utils/errors'
-import { computed, onActivated, onDeactivated, ref, watch } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
 import { useRoute, useRouter, type LocationQuery } from 'vue-router'
 import {
   Save,
@@ -151,8 +151,19 @@ const LOGIN_POLL_TIMEOUT_MS = 15 * 60 * 1000
 const LOGIN_POLL_MAX_ERRORS = 5
 let loginPoll: AbortController | null = null
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted()
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    function abort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', abort, { once: true })
+  })
 }
 
 async function waitForLoginResult(
@@ -162,7 +173,7 @@ async function waitForLoginResult(
   const deadline = Date.now() + LOGIN_POLL_TIMEOUT_MS
   let consecutiveErrors = 0
   while (Date.now() < deadline) {
-    await sleep(LOGIN_POLL_INTERVAL_MS)
+    await sleep(LOGIN_POLL_INTERVAL_MS, signal)
     signal.throwIfAborted()
     let status = null
     try {
@@ -545,6 +556,8 @@ onDeactivated(() => {
     Object.assign(form.value, redactedSettingsFields(store.settingsCache))
   }
 })
+
+onBeforeUnmount(() => loginPoll?.abort())
 
 async function saveAll() {
   if (!form.value) return

@@ -401,3 +401,103 @@ test('late WebSocket events from a disconnected client cannot change the next co
     client.disconnect()
   }
 })
+
+test('optimistic, snapshot and live cancellation clear telemetry until the terminal event', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const storage = mockSessionStorage('/jobs')
+  vi.stubGlobal('WebSocket', class {
+    get [Symbol.toStringTag]() { return 'WebSocket' }
+    close() {}
+  })
+  const store = useAppStore(createPinia())
+  const running = job(1, 'running', 1)
+  const other = job(2, 'running', 1)
+  const scan = { job_id: 1, mode: 'pages', page: 1 } as const
+  const scheduler = { job_id: 1, level: 'green', free_bytes: 1024 } as const
+  const progress = { job_id: 1, item_id: 4, bytes_downloaded: 16, bytes_total: 64, speed_bps: 32, phase: 'downloading' }
+  const otherProgress = { ...progress, job_id: 2, item_id: 8 }
+  const readOverview = vi.spyOn(api, 'overview').mockResolvedValue(overview)
+  vi.spyOn(api, 'listTempFiles').mockResolvedValue({ items: [] })
+  vi.spyOn(api, 'getJob').mockResolvedValue({ job: running, items: [makeJobItem(4, 1, { status: 'downloading', speed_bps: 32 })] })
+  try {
+    store.authenticated = true
+    store.overview = { ...overview, running: true, current_job: running }
+    store.jobs = [running, other]
+    store.startRealtime()
+    const socket = (store._wsClient as EventStreamClient).ws!
+    const send = (msg: WsMessage) => socket.onmessage?.(new MessageEvent('message', { data: JSON.stringify(msg) }))
+    send({ type: 'snapshot', data: {
+      logs: [], live_progress: { 4: progress, 8: otherProgress },
+      scan_status: { 1: scan }, scheduler_status: { 1: scheduler },
+    } })
+    send({ type: 'item_progress', ts: '', data: progress })
+    store.markJobCancelling(1)
+    assert.equal(store.isJobCancelling(1), true)
+    assert.equal(store.overview.cancelling_job_id, undefined, 'only server-confirmed cancellation is eligible for caching')
+    storage.pagehide()
+    assert.equal(useAppStore(createPinia()).isJobCancelling(1), false)
+    assert.deepEqual(Object.values(store.liveProgress), [otherProgress])
+    assert.deepEqual(store.schedulerStatus, {})
+    assert.deepEqual(store.scanStatus, {})
+
+    send({ type: 'snapshot', data: {
+      logs: [], cancelling_jobs: [2], live_progress: { 4: progress, 8: otherProgress },
+      scan_status: { 1: scan }, scheduler_status: { 1: scheduler },
+    } })
+    assert.equal(store.isJobCancelling(1), true)
+    assert.equal(store.isJobCancelling(2), true)
+    send({ type: 'job_cancelling', ts: '', data: { job_id: 1, cancelling: true } })
+    assert.equal(store.overview.cancelling_job_id, 1)
+    send({ type: 'item_progress', ts: '', data: progress })
+    send({ type: 'job_scan', ts: '', data: scan })
+    send({ type: 'job_scheduler', ts: '', data: scheduler })
+    await store.loadJobDetail(1)
+    await vi.advanceTimersByTimeAsync(150)
+    assert.deepEqual(store.liveProgress, {})
+    assert.deepEqual(store.schedulerStatus, {})
+    assert.deepEqual(store.scanStatus, {})
+
+    send({ type: 'job_cancelling', ts: '', data: { job_id: 1, cancelling: false } })
+    assert.equal(store.isJobCancelling(1), true)
+    send({ type: 'job_updated', ts: '', data: job(1, 'cancelled', 2) })
+    assert.equal(store.jobs.find((row) => row.id === 1)?.status, 'cancelled')
+    assert.equal(store.isJobCancelling(1), false)
+    assert.equal(store.isJobCancelling(2), true)
+    assert.equal(store.overview.running, false)
+    assert.equal(store.overview.current_job, null)
+    assert.equal(store.overview.cancelling_job_id, null)
+    await Promise.resolve()
+    assert.equal(readOverview.mock.calls.length, 1, 'overview refresh starts without a timer')
+    await vi.advanceTimersByTimeAsync(360)
+    assert.equal(readOverview.mock.calls.length, 1, 'terminal update clears the pending overview timer')
+  } finally {
+    store.stopRealtime()
+    store._resetSessionState()
+  }
+})
+
+test('overview restores stopping state on reload and deleting a job cleans runtime metadata', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const storage = mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const running = job(21, 'running', 1)
+  const fetchOverview = vi.spyOn(api, 'overview').mockResolvedValue({ ...overview, running: true, current_job: running, cancelling_job_id: 21 })
+  try {
+    await store.refreshOverview()
+    assert.equal(store.isJobCancelling(21), true)
+    fetchOverview.mockResolvedValueOnce({ ...overview, running: true, current_job: running, cancelling_job_id: null })
+    await store.refreshOverview()
+    assert.equal(store.overview?.cancelling_job_id, 21)
+    storage.pagehide()
+    const hydrated = useAppStore(createPinia())
+    assert.equal(hydrated.isJobCancelling(21), true)
+    store.scanStatus[21] = { job_id: 21, mode: 'pages', page: 1 }
+    store.schedulerStatus[21] = { job_id: 21, level: 'green', free_bytes: 1024 }
+    store.removeJobs([21])
+    assert.equal(store.scanStatus[21], undefined)
+    assert.equal(store.schedulerStatus[21], undefined)
+    assert.equal(store.isJobCancelling(21), false)
+  } finally {
+    store._resetSessionState()
+  }
+})

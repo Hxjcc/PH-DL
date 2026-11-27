@@ -64,6 +64,7 @@ interface AppState {
   liveProgress: Partial<Record<string, LiveProgressEntry>>
   schedulerStatus: Partial<Record<number, SchedulerStatus>>
   scanStatus: Partial<Record<number, ScanStatusEntry>>
+  cancellingJobIds: Partial<Record<number, true>>
   logs: LogEntry[]
   logsLoaded: boolean
   _wsClient: Pick<EventStreamClient, 'connect' | 'disconnect'> | null
@@ -447,6 +448,7 @@ export const useAppStore = defineStore('app', {
       liveProgress: {},
       schedulerStatus: {},
       scanStatus: {},
+      cancellingJobIds: cached?.overview?.cancelling_job_id ? { [cached.overview.cancelling_job_id]: true } : {},
       logs: hasCache && Array.isArray(cached.logs) ? cached.logs : [],
       logsLoaded: Boolean(hasCache && Array.isArray(cached.logs)),
       _wsClient: null,
@@ -457,6 +459,9 @@ export const useAppStore = defineStore('app', {
   },
 
   getters: {
+    isJobCancelling: (state) => (jobId?: number | null): boolean =>
+      jobId != null && state.cancellingJobIds[jobId] === true,
+
     accountUsername(state): string {
       return String(
         state.settingsCache?.ph_logged_in_username ||
@@ -658,6 +663,7 @@ export const useAppStore = defineStore('app', {
       this.liveProgress = {}
       this.schedulerStatus = {}
       this.scanStatus = {}
+      this.cancellingJobIds = {}
       this.logs = []
       this.logsLoaded = false
     },
@@ -685,6 +691,58 @@ export const useAppStore = defineStore('app', {
         this._overviewTimer = null
         if (this.authenticated) this.refreshOverview()
       }, delayMs)
+    },
+
+    _clearJobTelemetry(jobId: number) {
+      clearLiveProgressForJob(this, jobId)
+      delete this.schedulerStatus[jobId]
+      delete this.scanStatus[jobId]
+    },
+
+    markJobCancelling(jobId: number, confirmed = false) {
+      this.cancellingJobIds[jobId] = true
+      this._clearJobTelemetry(jobId)
+      // A reload should restore the server's state even if the original request failed in flight.
+      if (confirmed && this.overview?.current_job?.id === jobId && this.overview.cancelling_job_id !== jobId) {
+        this.overview = { ...this.overview, cancelling_job_id: jobId }
+        this.persistCache()
+      }
+    },
+
+    clearJobCancelling(jobId: number) {
+      delete this.cancellingJobIds[jobId]
+      if (this.overview?.cancelling_job_id === jobId) {
+        this.overview = { ...this.overview, cancelling_job_id: null }
+        this.persistCache()
+      }
+    },
+
+    _applyOverview(data: OverviewResponse) {
+      const previousJobId = this.overview?.current_job?.id
+      if (data.cancelling_job_id != null) {
+        this.markJobCancelling(data.cancelling_job_id, true)
+      }
+      const jobId = data.current_job?.id
+      this.overview = data.running && jobId != null && this.overview?.cancelling_job_id === jobId
+        ? { ...data, cancelling_job_id: jobId }
+        : data
+      this.overviewLoaded = true
+      this.persistCache()
+      if (previousJobId !== jobId && this.isJobCancelling(previousJobId)) void this.refreshJobs()
+    },
+
+    _clearFinishedJobState(jobId: number) {
+      this._clearJobTelemetry(jobId)
+      this.clearJobCancelling(jobId)
+      if (this.overview?.current_job?.id !== jobId) return false
+      this.overview = { ...this.overview, running: false, current_job: null, cancelling_job_id: null }
+      this.persistCache()
+      if (this._overviewTimer !== null) {
+        clearTimeout(this._overviewTimer)
+        this._overviewTimer = null
+      }
+      void this.refreshOverview()
+      return true
     },
 
     getCachedSubscriptions(username = '', site: SiteKey = 'pornhub'): SubscriptionsCacheEntry | null {
@@ -753,9 +811,7 @@ export const useAppStore = defineStore('app', {
         try {
           const data = await api.overview()
           if (isLatest()) {
-            this.overview = data
-            this.overviewLoaded = true
-            this.persistCache()
+            this._applyOverview(data)
           }
           return data
         } catch {
@@ -773,9 +829,7 @@ export const useAppStore = defineStore('app', {
         try {
           const data = await api.overview()
           if (isLatest()) {
-            this.overview = data
-            this.overviewLoaded = true
-            this.persistCache()
+            this._applyOverview(data)
           }
         } catch {
           if (isLatest()) {
@@ -807,7 +861,12 @@ export const useAppStore = defineStore('app', {
               if (!merged.has(job.id) && before.get(job.id) !== job) merged.set(job.id, job)
             }
             this.jobs = [...merged.values()].sort(compareJobListOrder).slice(0, limit)
-            for (const job of this.jobs) updateCachedJobStatus(this, job, current.get(job.id))
+            for (const job of this.jobs) {
+              updateCachedJobStatus(this, job, current.get(job.id))
+              if (!isActiveJobStatus(job.status) && (this.isJobCancelling(job.id) || this.overview?.current_job?.id === job.id)) {
+                this._clearFinishedJobState(job.id)
+              }
+            }
             trimJobItemsCache(this)
             this.jobsLoaded = true
             this.jobsLoadedAt = Date.now()
@@ -1146,7 +1205,8 @@ export const useAppStore = defineStore('app', {
       for (const jid of idSet) {
         evictJobItems(this, jid)
         inflight.delete(`jobDetail:${jid}`)
-        delete this.schedulerStatus[jid]
+        this._clearJobTelemetry(jid)
+        this.clearJobCancelling(jid)
       }
       this.persistCache()
     },
@@ -1173,7 +1233,9 @@ export const useAppStore = defineStore('app', {
           scheduleJobItemsReload(this, jid)
           return res
         }
-        if (res?.job) this._upsertJob(res.job)
+        if (res?.job && this._upsertJob(res.job) !== false && !isActiveJobStatus(res.job.status) && this.isJobCancelling(jid)) {
+          this._clearFinishedJobState(jid)
+        }
         if (Array.isArray(res?.items)) {
           pendingItemUpdates?.delete(jid)
           const rows = new Map(res.items.map((item) => [item.id, item]))
@@ -1185,7 +1247,7 @@ export const useAppStore = defineStore('app', {
           indexJobItems(jid, items)
           const status = this.jobs.find((job) => job.id === jid)?.status || res.job?.status
           touchJobItems(jid, status)
-          for (const it of isActiveJobStatus(status) ? items : []) {
+          for (const it of isActiveJobStatus(status) && !this.isJobCancelling(jid) ? items : []) {
             if (!it.speed_bps && it.status !== 'downloading' && it.status !== 'uploading') continue
             const isUploading = it.status === 'uploading' || it.progress_phase === 'uploading' || it.progress_phase === 'verifying'
             this.liveProgress[it.id] = {
@@ -1295,9 +1357,9 @@ export const useAppStore = defineStore('app', {
           const reconnected = ok && this._wsOpenedOnce && !this.wsConnected
           if (ok) this._wsOpenedOnce = true
           this.wsConnected = ok
-          if (reconnected && this.authenticated) {
+          if ((reconnected || (ok && Object.keys(this.cancellingJobIds).length > 0)) && this.authenticated) {
             this.refreshOverview()
-            if (this.jobsLoaded) this.refreshJobs()
+            if (this.jobsLoaded || Object.keys(this.cancellingJobIds).length > 0) this.refreshJobs()
             for (const [jid, status] of jobItemAccessOrder) {
               if (isActiveJobStatus(status) || jobItemPins.has(jid)) scheduleJobItemsReload(this, jid)
             }
@@ -1316,6 +1378,8 @@ export const useAppStore = defineStore('app', {
             this.liveProgress = msg.data?.live_progress || {}
             this.schedulerStatus = msg.data?.scheduler_status || {}
             this.scanStatus = msg.data?.scan_status || {}
+            for (const jobId of msg.data?.cancelling_jobs || []) this.markJobCancelling(jobId, true)
+            for (const jobId of Object.keys(this.cancellingJobIds)) this._clearJobTelemetry(Number(jobId))
           } else if (msg.type === 'log') {
             const entry = msg.data
             const nextLogs = appendLiveLog(this.logs, entry, 500)
@@ -1326,12 +1390,11 @@ export const useAppStore = defineStore('app', {
             this.persistCache()
           } else if (msg.type === 'job_updated') {
             if (this._upsertJob(msg.data) === false) return
-            this._scheduleOverviewRefresh()
-            if (['completed', 'cancelled', 'failed', 'partial_failed'].includes(msg.data?.status)) {
+            if (isActiveJobStatus(msg.data.status)) {
+              this._scheduleOverviewRefresh()
+            } else {
               flushPendingItemUpdates(this)
-              clearLiveProgressForJob(this, msg.data.id)
-              delete this.schedulerStatus[msg.data.id]
-              delete this.scanStatus[msg.data.id]
+              if (!this._clearFinishedJobState(msg.data.id)) this._scheduleOverviewRefresh()
               this.refreshTempFiles()
               this.targetsLoadedAt = 0
               if (this.targetsCache !== null) {
@@ -1342,18 +1405,27 @@ export const useAppStore = defineStore('app', {
                 this.refreshHistory().catch(() => {})
               }
             }
+          } else if (msg.type === 'job_cancelling') {
+            const { job_id, cancelling } = msg.data
+            if (cancelling) {
+              this.markJobCancelling(job_id, true)
+            } else if (this.isJobCancelling(job_id)) {
+              // The server clears its runtime flag immediately before the terminal job update.
+              // Keep the stopping UI latched until that update, avoiding a frame of running state.
+              this._scheduleOverviewRefresh()
+            }
           } else if (msg.type === 'item_updated') {
             this._upsertItem(msg.data)
           } else if (msg.type === 'job_items_changed') {
             scheduleJobItemsReload(this, msg.data?.job_id)
           } else if (msg.type === 'item_progress') {
-            queueLiveProgress(this, msg.data)
+            if (!this.isJobCancelling(msg.data.job_id)) queueLiveProgress(this, msg.data)
           } else if (msg.type === 'job_scheduler') {
             const jid = Number(msg.data?.job_id)
             if (jid > 0) {
               if (msg.data?.cleared) {
                 delete this.schedulerStatus[jid]
-              } else {
+              } else if (!this.isJobCancelling(jid)) {
                 this.schedulerStatus[jid] = msg.data
               }
             }
@@ -1362,7 +1434,7 @@ export const useAppStore = defineStore('app', {
             if (jid > 0) {
               if (msg.data?.cleared) {
                 delete this.scanStatus[jid]
-              } else {
+              } else if (!this.isJobCancelling(jid)) {
                 this.scanStatus[jid] = msg.data
               }
             }

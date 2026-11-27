@@ -51,6 +51,8 @@ async def list_videos(
     include_meta: bool = Query(default=True),
     container: AppContainer = Depends(require_auth),
 ):
+    stats = await container.repo.get_video_stats(site=site) if include_meta else None
+    unfiltered = not any((search.strip(), uploader.strip(), status.strip(), quality.strip(), time_range.strip()))
     items, total = await container.repo.query_videos(
         site=site,
         search=search,
@@ -61,9 +63,9 @@ async def list_videos(
         sort_by=sort_by,
         page=page,
         page_size=page_size,
+        known_total=stats["total"] if (stats is not None and unfiltered) else None,
     )
     facets = await container.repo.get_video_filter_facets(site=site) if include_meta else None
-    stats = await container.repo.get_video_stats(site=site) if include_meta else None
     return {
         "items": items,
         "total": total,

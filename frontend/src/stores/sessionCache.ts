@@ -139,7 +139,7 @@ function cachedOverview(overview: OverviewResponse): OverviewResponse {
   const account = overview.account
   return {
     ...pick(overview, [
-      'running', 'queued_count', 'uploader_enabled', 'targets_total', 'targets_enabled', 'temp_files_count',
+      'running', 'cancelling_job_id', 'queued_count', 'uploader_enabled', 'targets_total', 'targets_enabled', 'temp_files_count',
     ]),
     current_job: overview.current_job ? cachedJobSummary(overview.current_job) : null,
     account: {

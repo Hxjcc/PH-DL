@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { getErrorMessage } from '../utils/errors'
-import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import {
   Download,
   Play,
@@ -30,6 +30,7 @@ import {
   Info,
 } from 'lucide-vue-next'
 import { useAppStore } from '../stores/app'
+import { useQuickScrollReady } from '../composables/useQuickScrollReady'
 import { api } from '../api/client'
 import type { CreateJobRequest, SiteKey, SubscriptionItem, TargetRecord, TargetType, TargetTypeInput } from '../types/api'
 import { avatarGradient, formatDateTime, formatSpeed, jobStatusMeta } from '../utils/format'
@@ -305,6 +306,9 @@ const activeFilterCount = computed(() => {
 const showTempBanner = computed(
   () => !store.overview?.running && store.tempFiles.length > 0
 )
+const engineCancelling = computed(() => Boolean(
+  store.overview?.running && store.isJobCancelling(store.overview.current_job?.id ?? store.overview.cancelling_job_id)
+))
 const legacyTempCount = computed(() => store.tempFiles.filter((file) => !file.verified_checkpoint).length)
 
 const recentJobs = computed(() => store.jobs.slice(0, 6))
@@ -338,17 +342,21 @@ const recentJobCards = computed(() => {
   return recentJobs.value.map((job) => {
     const visual = resolveJobVisual(job, store.targetsCache || [])
     const isActive = ['queued', 'scanning', 'running'].includes(job.status)
+    const isCancelling = isActive && store.isJobCancelling(job.id)
+    const showLive = trackLive && isActive && !isCancelling
     const metrics = computeJobLiveMetrics(
       job,
-      trackLive && isActive ? store.liveProgress : null,
-      store.jobItems[job.id],
-      trackLive && isActive ? store.scanStatus : null
+      showLive ? store.liveProgress : null,
+      isCancelling ? null : store.jobItems[job.id],
+      showLive ? store.scanStatus : null
     )
     return {
       job,
       visual,
       metrics,
       isActive,
+      isCancelling,
+      status: jobStatusMeta(isCancelling ? 'cancelling' : job.status),
       icon: RECENT_CATEGORY_ICONS[visual.category.icon] || Download,
     }
   })
@@ -466,6 +474,8 @@ function updateQuickScrollState() {
   }
 }
 
+const { quickScrollReady, measureQuickScroll, resetQuickScrollReady } = useQuickScrollReady(quickRailRef, updateQuickScrollState)
+
 function stopQuickGlide({ immediate = false } = {}) {
   quickHoverDir.value = 0
   if (immediate) {
@@ -555,16 +565,16 @@ const quickRailMaskClass = computed(() => {
 
 watch(
   () => quickTargets.value.length,
-  async () => {
-    await nextTick()
-    updateQuickScrollState()
-  }
+  () => { if (isRouteActive.value) updateQuickScrollState() },
+  { flush: 'post' },
 )
 
 onMounted(() => {
-  updateQuickScrollState()
+  measureQuickScroll()
   if (typeof ResizeObserver !== 'undefined') {
-    quickResizeObserver = new ResizeObserver(() => updateQuickScrollState())
+    quickResizeObserver = new ResizeObserver(() => {
+      if (isRouteActive.value) updateQuickScrollState()
+    })
     if (quickRailRef.value) quickResizeObserver.observe(quickRailRef.value)
   }
 })
@@ -572,15 +582,17 @@ onMounted(() => {
 watch(quickRailRef, (el, prev) => {
   if (prev && quickResizeObserver) quickResizeObserver.unobserve(prev)
   if (el && quickResizeObserver) quickResizeObserver.observe(el)
-  nextTick(updateQuickScrollState)
-})
+  if (isRouteActive.value) measureQuickScroll()
+}, { flush: 'post' })
 
 onDeactivated(() => {
   isRouteActive.value = false
+  resetQuickScrollReady()
   stopQuickGlide({ immediate: true })
 })
 
 onBeforeUnmount(() => {
+  resetQuickScrollReady()
   stopQuickGlide({ immediate: true })
   quickResizeObserver?.disconnect()
   quickResizeObserver = null
@@ -590,7 +602,7 @@ let activatedOnce = false
 
 onActivated(async () => {
   isRouteActive.value = true
-  nextTick(updateQuickScrollState)
+  measureQuickScroll()
   if (!activatedOnce) {
     activatedOnce = true
     if (store.hydratedFromCache) return
@@ -607,7 +619,6 @@ onActivated(async () => {
     }
     if (tasks.length > 0) {
       await Promise.all(tasks)
-      nextTick(updateQuickScrollState)
     }
     return
   }
@@ -792,9 +803,9 @@ async function handleClearTemp() {
             class="overview-icon"
             :class="[
               'w-8 h-8 rounded-full flex items-center justify-center shrink-0',
-              store.overview?.running
-                ? 'bg-brand/12 text-brand'
-                : 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400',
+              engineCancelling ? 'bg-amber-500/12 text-amber-600 dark:text-amber-400'
+                : store.overview?.running ? 'bg-brand/12 text-brand'
+                  : 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400',
             ]"
           >
             <Activity class="w-4 h-4" />
@@ -804,13 +815,13 @@ async function handleClearTemp() {
           <span
             :class="[
               'w-2.5 h-2.5 rounded-full shrink-0',
-              store.overview?.running
-                ? 'bg-brand status-dot-glow-brand animate-pulse'
-                : 'bg-emerald-500 status-dot-glow-emerald',
+              engineCancelling ? 'bg-amber-500 status-dot-glow-amber animate-pulse'
+                : store.overview?.running ? 'bg-brand status-dot-glow-brand animate-pulse'
+                  : 'bg-emerald-500 status-dot-glow-emerald',
             ]"
           />
           <span class="overview-number font-bold tracking-tight text-foreground">
-            {{ store.overview?.running ? '运行中' : '空闲就绪' }}
+            {{ engineCancelling ? '停止中' : store.overview?.running ? '运行中' : '空闲就绪' }}
           </span>
           <Badge
             v-if="store.overview?.queued_count"
@@ -821,7 +832,7 @@ async function handleClearTemp() {
           </Badge>
         </div>
         <p class="text-xs text-muted-foreground mt-1.5">
-          {{ store.overview?.running ? '当前有任务正在后台高速执行' : '引擎健康，随时可接收新任务' }}
+          {{ engineCancelling ? '正在安全停止当前任务并保留断点' : store.overview?.running ? '当前有任务正在后台高速执行' : '引擎健康，随时可接收新任务' }}
         </p>
       </Card>
 
@@ -1011,6 +1022,7 @@ async function handleClearTemp() {
                       type="button"
                       :class="[
                         'quick-edge-trigger quick-edge-left',
+                        { 'quick-edge-animated': quickScrollReady },
                         quickCanScrollLeft ? 'quick-edge-visible' : 'quick-edge-hidden',
                         quickHoverDir === -1 ? 'quick-edge-gliding' : '',
                       ]"
@@ -1030,6 +1042,7 @@ async function handleClearTemp() {
                       type="button"
                       :class="[
                         'quick-edge-trigger quick-edge-right',
+                        { 'quick-edge-animated': quickScrollReady },
                         quickCanScrollRight ? 'quick-edge-visible' : 'quick-edge-hidden',
                         quickHoverDir === 1 ? 'quick-edge-gliding' : '',
                       ]"
@@ -1348,19 +1361,19 @@ async function handleClearTemp() {
                   </div>
 
                   <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground tabular-nums">
-                    <Badge :variant="jobStatusMeta(entry.job.status).variant" :dot="jobStatusMeta(entry.job.status).dot" class="text-[10px] px-1.5 py-0 shrink-0">
-                      {{ jobStatusMeta(entry.job.status).label }}
+                    <Badge :variant="entry.status.variant" :dot="entry.status.dot" class="text-[10px] px-1.5 py-0 shrink-0">
+                      {{ entry.status.label }}
                     </Badge>
                     <span class="font-mono">#{{ entry.job.id }}</span>
                     <span>{{ entry.metrics.done }}/{{ entry.metrics.total }}</span>
                     <span
-                      v-if="entry.isActive && entry.metrics.speedBps > 0"
+                      v-if="entry.isActive && !entry.isCancelling && entry.metrics.speedBps > 0"
                       class="ml-auto font-mono font-semibold text-emerald-600 dark:text-emerald-400"
                     >
                       {{ formatSpeed(entry.metrics.speedBps) }}
                     </span>
                     <span
-                      v-else-if="entry.isActive && entry.metrics.remuxingCount > 0"
+                      v-else-if="entry.isActive && !entry.isCancelling && entry.metrics.remuxingCount > 0"
                       class="ml-auto font-medium text-violet-600 dark:text-violet-400"
                     >
                       封装 MP4
@@ -1373,7 +1386,7 @@ async function handleClearTemp() {
                   <Progress
                     v-if="entry.isActive"
                     :model-value="entry.metrics.percent"
-                    :indeterminate="entry.metrics.indeterminate"
+                    :indeterminate="entry.isCancelling || entry.metrics.indeterminate"
                     class="mt-2 h-1"
                   />
                 </RouterLink>
@@ -1608,6 +1621,9 @@ async function handleClearTemp() {
   border: 0;
   background: transparent;
   cursor: pointer;
+}
+
+.quick-edge-trigger.quick-edge-animated {
   transition: opacity 200ms cubic-bezier(0.22, 1, 0.36, 1), transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 

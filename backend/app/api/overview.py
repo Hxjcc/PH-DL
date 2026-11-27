@@ -35,13 +35,14 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
     except OSError:
         pass
 
-    current_job = None
-    if container.tasks.current_job_id is not None:
-        current_job = await container.repo.get_job(container.tasks.current_job_id)
+    job_id = container.tasks.current_job_id
+    current_job = await container.repo.get_job(job_id) if job_id is not None else None
+    running = job_id is not None and job_id == container.tasks.current_job_id
 
     return {
-        "running": container.tasks.current_job_id is not None,
-        "current_job": current_job,
+        "running": running,
+        "current_job": current_job if running else None,
+        "cancelling_job_id": job_id if running and container.tasks.cancelling_job_id == job_id else None,
         "queued_count": container.tasks.queued_count,
         "account": {
             "username": (settings.ph_logged_in_username or settings.ph_username or "").strip(),

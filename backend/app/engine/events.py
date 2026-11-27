@@ -24,6 +24,7 @@ class EventBus:
         self._live_progress: Dict[int, Dict[str, Any]] = {}
         self._scheduler_status: Dict[int, Dict[str, Any]] = {}
         self._scan_status: Dict[int, Dict[str, Any]] = {}
+        self._cancelling_jobs: Set[int] = set()
 
     def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
         q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=500)
@@ -34,6 +35,12 @@ class EventBus:
         self._subscribers.discard(q)
 
     def broadcast(self, event_type: str, data: Any) -> None:
+        if self._cancelling_jobs and isinstance(data, dict):
+            if event_type == "job_updated" and data.get("id") in self._cancelling_jobs:
+                if data.get("status") in {"queued", "scanning", "running"}:
+                    return
+            if event_type in {"item_updated", "job_items_changed"} and data.get("job_id") in self._cancelling_jobs:
+                return
         packet = {
             "type": event_type,
             "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -81,6 +88,8 @@ class EventBus:
         *,
         estimated_total: bool = False,
     ) -> None:
+        if job_id in self._cancelling_jobs:
+            return
         payload: Dict[str, Any] = {
             "job_id": job_id,
             "item_id": item_id,
@@ -98,6 +107,8 @@ class EventBus:
         self._live_progress.pop(item_id, None)
 
     def emit_scheduler_status(self, job_id: int, status: Dict[str, Any]) -> None:
+        if job_id in self._cancelling_jobs:
+            return
         payload = {"job_id": int(job_id), **status}
         self._scheduler_status[int(job_id)] = payload
         self.broadcast("job_scheduler", payload)
@@ -107,6 +118,8 @@ class EventBus:
             self.broadcast("job_scheduler", {"job_id": int(job_id), "cleared": True})
 
     def emit_scan_status(self, job_id: int, status: Dict[str, Any]) -> None:
+        if job_id in self._cancelling_jobs:
+            return
         payload = {"job_id": int(job_id), **status}
         self._scan_status[int(job_id)] = payload
         self.broadcast("job_scan", payload)
@@ -120,6 +133,21 @@ class EventBus:
             self._live_progress.pop(k, None)
         self.clear_scheduler_status(job_id)
         self.clear_scan_status(job_id)
+
+    def set_job_cancelling(self, job_id: int) -> None:
+        jid = int(job_id)
+        if jid not in self._cancelling_jobs:
+            self._cancelling_jobs.add(jid)
+            self.broadcast("job_cancelling", {"job_id": jid, "cancelling": True})
+
+    def clear_job_cancelling(self, job_id: int) -> None:
+        jid = int(job_id)
+        if jid in self._cancelling_jobs:
+            self._cancelling_jobs.remove(jid)
+            self.broadcast("job_cancelling", {"job_id": jid, "cancelling": False})
+
+    def cancelling_jobs_snapshot(self) -> List[int]:
+        return sorted(self._cancelling_jobs)
 
     def recent_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
         if limit <= 0:

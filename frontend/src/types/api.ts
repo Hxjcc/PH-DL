@@ -350,6 +350,7 @@ export interface SettingsResponse {
 export interface OverviewResponse {
   running: boolean
   current_job: JobRecord | null
+  cancelling_job_id?: number | null
   queued_count: number
   account: { username: string; avatar_url: string }
   cookie: CookieStatus & { configured: boolean; username: string }
@@ -431,11 +432,13 @@ interface WsSnapshot {
   live_progress: Record<number, LiveProgressEntry>
   scheduler_status: Record<number, SchedulerStatus>
   scan_status: Record<number, ScanStatusEntry>
+  cancelling_jobs?: number[]
 }
 
 interface WsEventData {
   log: LogEntry
   job_updated: JobRecord
+  job_cancelling: { job_id: number; cancelling: boolean }
   item_updated: JobItemRecord
   job_items_changed: { job_id: number }
   item_progress: LiveProgressEntry

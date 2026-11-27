@@ -106,6 +106,9 @@ class Repository:
         self.db = db
         self._diagnostic_secrets: tuple[str, ...] = ()
         self._previous_diagnostic_secrets: tuple[str, ...] = ()
+        self._display_map_cache: Optional[Tuple[int, Dict[Tuple[str, str], str]]] = None
+        self._facets_cache: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+        self._stats_cache: Dict[str, Tuple[int, str, Dict[str, int]]] = {}
 
     def redact_diagnostic(self, message: str) -> str:
         return redact_diagnostic(message, (*self._diagnostic_secrets, *self._previous_diagnostic_secrets))
@@ -1196,14 +1199,21 @@ class Repository:
             )
         return deleted
 
-    async def _get_target_display_map(self) -> Dict[Tuple[str, str], str]:
+    async def _get_target_display_map(
+        self, *, conn: Optional[aiosqlite.Connection] = None,
+    ) -> Dict[Tuple[str, str], str]:
+        version = self.db.video_meta_version
+        cached = self._display_map_cache
+        if conn is None and cached is not None and cached[0] == version:
+            return cached[1]
         rows = await self.db.fetch_all(
             """
             SELECT LOWER(site) AS site_low, LOWER(username) AS uname, display_name
             FROM targets
             WHERE display_name != ''
             ORDER BY id ASC
-            """
+            """,
+            conn=conn,
         )
         mapping: Dict[Tuple[str, str], str] = {}
         for r in rows:
@@ -1211,6 +1221,8 @@ class Repository:
             uname = r["uname"]
             if uname and (s_low, uname) not in mapping:
                 mapping[(s_low, uname)] = r["display_name"]
+        if conn is None and version == self.db.video_meta_version:
+            self._display_map_cache = (version, mapping)
         return mapping
 
     async def query_videos(
@@ -1225,6 +1237,7 @@ class Repository:
         sort_by: str = "activity",
         page: int = 1,
         page_size: int = 30,
+        known_total: Optional[int] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         clauses = []
         params: List[Any] = []
@@ -1278,12 +1291,6 @@ class Repository:
             params.append(activity_cutoff)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        total_row = await self.db.fetch_one(
-            f"SELECT COUNT(*) AS cnt FROM videos v {where_sql}",
-            params,
-        )
-        total = int(total_row["cnt"]) if total_row else 0
-
         if (sort_by or "").strip().lower() == "published":
             order_sql = (
                 "(v.published_at = '') ASC, "
@@ -1298,16 +1305,27 @@ class Repository:
             )
 
         offset = max(0, (page - 1) * page_size)
-        rows = await self.db.fetch_all(
-            f"""
-            SELECT v.*
-            FROM videos v
-            {where_sql}
-            ORDER BY {order_sql}
-            LIMIT ? OFFSET ?
-            """,
-            [*params, page_size, offset],
-        )
+        async with self.db.read() as conn:
+            if known_total is not None:
+                total = int(known_total)
+            else:
+                total_row = await self.db.fetch_one(
+                    f"SELECT COUNT(*) AS cnt FROM videos v {where_sql}",
+                    params,
+                    conn=conn,
+                )
+                total = int(total_row["cnt"]) if total_row else 0
+            rows = await self.db.fetch_all(
+                f"""
+                SELECT v.*
+                FROM videos v
+                {where_sql}
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_size, offset],
+                conn=conn,
+            )
         display_map = await self._get_target_display_map() if rows else {}
         for row in rows:
             s_low = normalize_site(row.get("site"))
@@ -1325,35 +1343,54 @@ class Repository:
 
     async def get_video_filter_facets(self, site: str = "") -> Dict[str, Any]:
         site_filter = normalize_site(site) if (site or "").strip() else ""
+        version = self.db.video_meta_version
+        cached = self._facets_cache.get(site_filter)
+        if cached is not None and cached[0] == version:
+            data = cached[1]
+            return {
+                "sites": list(data["sites"]),
+                "uploaders": list(data["uploaders"]),
+                "uploader_labels": dict(data["uploader_labels"]),
+                "qualities": list(data["qualities"]),
+            }
+
         where_site = " AND site = ?" if site_filter else ""
         site_params = (site_filter,) if site_filter else ()
-        uploader_rows = await self.db.fetch_all(
-            f"""
-            SELECT uploader, site,
-                   MAX(CASE WHEN uploader_display_name != '' THEN uploader_display_name ELSE '' END) AS video_display_name
-            FROM videos
-            WHERE uploader != ''{where_site}
-            GROUP BY LOWER(site), LOWER(uploader)
-            ORDER BY LOWER(uploader) ASC
-            """,
-            site_params,
-        )
-        has_liked_row = await self.db.fetch_one(
-            f"SELECT 1 AS hit FROM videos WHERE LOWER(target_type) = 'liked'{where_site} LIMIT 1",
-            site_params,
-        )
+        async with self.db.read() as conn:
+            uploader_rows = await self.db.fetch_all(
+                f"""
+                SELECT COALESCE(MIN(CASE WHEN uploader != LOWER(uploader) THEN uploader END), MIN(uploader)) AS uploader,
+                       site,
+                       MAX(CASE WHEN uploader_display_name != '' THEN uploader_display_name ELSE '' END) AS video_display_name
+                FROM videos
+                WHERE uploader != ''{where_site}
+                GROUP BY LOWER(site), LOWER(uploader)
+                ORDER BY LOWER(uploader) ASC
+                """,
+                site_params,
+                conn=conn,
+            )
+            has_liked_row = await self.db.fetch_one(
+                f"SELECT 1 AS hit FROM videos WHERE LOWER(target_type) = 'liked'{where_site} LIMIT 1",
+                site_params,
+                conn=conn,
+            )
+            qualities = await self.db.fetch_all(
+                f"""
+                SELECT DISTINCT quality FROM videos
+                WHERE quality != ''{where_site}
+                ORDER BY CAST(REPLACE(REPLACE(LOWER(quality), 'p', ''), 'k', '') AS INTEGER) DESC,
+                         quality DESC
+                """,
+                site_params,
+                conn=conn,
+            )
+            site_rows = await self.db.fetch_all(
+                "SELECT DISTINCT site FROM videos WHERE site != '' ORDER BY site ASC",
+                conn=conn,
+            )
         display_map = await self._get_target_display_map()
         video_display_map: Dict[Tuple[str, str], str] = {}
-        qualities = await self.db.fetch_all(
-            f"""
-            SELECT DISTINCT quality FROM videos
-            WHERE quality != ''{where_site}
-            ORDER BY CAST(REPLACE(REPLACE(LOWER(quality), 'p', ''), 'k', '') AS INTEGER) DESC,
-                     quality DESC
-            """,
-            site_params,
-        )
-        site_rows = await self.db.fetch_all("SELECT DISTINCT site FROM videos WHERE site != '' ORDER BY site ASC")
         uploaders: List[str] = []
         seen_up: Dict[str, int] = {}
         uploader_sites: Dict[str, str] = {}
@@ -1398,35 +1435,61 @@ class Repository:
                     or video_display_map.get(("xhamster", low))
                     or u
                 )
-        return {
+        result = {
             "sites": [normalize_site(r["site"]) for r in site_rows],
             "uploaders": uploaders,
             "uploader_labels": uploader_labels,
             "qualities": [r["quality"] for r in qualities],
         }
+        if version == self.db.video_meta_version:
+            if len(self._facets_cache) >= 4:
+                self._facets_cache.clear()
+            self._facets_cache[site_filter] = (version, result)
+        return {
+            "sites": list(result["sites"]),
+            "uploaders": list(result["uploaders"]),
+            "uploader_labels": dict(result["uploader_labels"]),
+            "qualities": list(result["qualities"]),
+        }
 
     async def get_video_stats(self, site: str = "") -> Dict[str, int]:
         site_filter = normalize_site(site) if (site or "").strip() else ""
+        version = self.db.video_meta_version
+        today_key = local_today_date()
+        cached = self._stats_cache.get(site_filter)
+        if cached is not None and cached[0] == version and cached[1] == today_key:
+            return dict(cached[2])
+
         where_site = " WHERE LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
-        and_site = " AND LOWER(COALESCE(site, 'pornhub')) = ?" if site_filter else ""
-        site_params: Tuple[Any, ...] = (site_filter,) if site_filter else ()
-        rows = await self.db.fetch_all(
-            f"SELECT status, COUNT(*) AS cnt FROM videos{where_site} GROUP BY status",
-            site_params,
+        cutoff_7d = local_date_days_ago(7)
+        params: Tuple[Any, ...] = (cutoff_7d, site_filter) if site_filter else (cutoff_7d,)
+        row = await self.db.fetch_one(
+            f"""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status = 'uploaded' THEN 1 ELSE 0 END), 0) AS uploaded,
+                COALESCE(SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END), 0) AS downloaded,
+                COALESCE(SUM(CASE WHEN status = 'baseline' THEN 1 ELSE 0 END), 0) AS baseline,
+                COALESCE(SUM(CASE WHEN published_at != '' AND published_at >= ? THEN 1 ELSE 0 END), 0) AS published_7d,
+                COALESCE(SUM(CASE WHEN {_BASELINE_METADATA_FILTER} THEN 1 ELSE 0 END), 0) AS baseline_missing_metadata
+            FROM videos
+            {where_site}
+            """,
+            params,
         )
-        counts = {"total": 0, "uploaded": 0, "downloaded": 0, "baseline": 0}
-        for r in rows:
-            c = int(r["cnt"])
-            counts["total"] += c
-            if r["status"] in counts:
-                counts[r["status"]] = c
-        recent_row = await self.db.fetch_one(
-            f"SELECT COUNT(*) AS cnt FROM videos WHERE published_at != '' AND published_at >= ?{and_site}",
-            (local_date_days_ago(7), *site_params),
-        )
-        counts["published_7d"] = int(recent_row["cnt"]) if recent_row else 0
-        counts["baseline_missing_metadata"] = await self.count_baseline_metadata_candidates(site=site_filter)
-        return counts
+        counts = {
+            "total": int(row["total"]) if row else 0,
+            "uploaded": int(row["uploaded"]) if row else 0,
+            "downloaded": int(row["downloaded"]) if row else 0,
+            "baseline": int(row["baseline"]) if row else 0,
+            "published_7d": int(row["published_7d"]) if row else 0,
+            "baseline_missing_metadata": int(row["baseline_missing_metadata"]) if row else 0,
+        }
+        if version == self.db.video_meta_version:
+            if len(self._stats_cache) >= 4:
+                self._stats_cache.clear()
+            self._stats_cache[site_filter] = (version, today_key, counts)
+        return dict(counts)
 
     # ------------------------------------------------------------------
     # Jobs & JobItems
@@ -1587,7 +1650,7 @@ class Repository:
         return await self.get_job(job_id)
 
     async def merge_job_params(self, job_id: int, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        async with self.db.transaction() as conn:
+        async with self.db.transaction(touches_video_meta=False) as conn:
             job = await self.get_job(job_id, conn=conn)
             if not job:
                 return None
@@ -1675,7 +1738,7 @@ class Repository:
         """
         for start in range(0, len(items), step):
             batch = items[start : start + step]
-            async with self.db.transaction() as conn:
+            async with self.db.transaction(touches_video_meta=False) as conn:
                 for spec in batch:
                     up_req = spec.get("upload_requested")
                     page_url = spec.get("page_url", "")
@@ -1838,6 +1901,18 @@ class Repository:
         params.append(item_id)
         await self.db.execute(f"UPDATE job_items SET {', '.join(sets)} WHERE id = ?", params)
         return await self.get_job_item(item_id)
+
+    async def cancel_job_uploads(self, job_id: int, item_ids: Iterable[int], message: str) -> None:
+        reason, now = self.redact_diagnostic(message), utc_now_iso()
+        params = [(reason, now, job_id, item_id) for item_id in item_ids]
+        if params:
+            await self.db.executemany(
+                """
+                UPDATE job_items SET status = 'cancelled', error_message = ?, updated_at = ?
+                WHERE job_id = ? AND id = ? AND status IN ('downloaded', 'uploading')
+                """,
+                params,
+            )
 
     async def bulk_cancel_pending_job_items(
         self,

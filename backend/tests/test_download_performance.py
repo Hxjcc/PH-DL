@@ -555,3 +555,144 @@ async def test_secondary_mp4_range_cannot_follow_disallowed_redirects(tmp_path, 
     assert fetched == ["/media", "/media"]
     assert result.file_size == RANGE_BYTES
     assert downloader.read_download_checkpoint(result.temp_path).completed_ranges == [[0, RANGE_BYTES]]
+
+
+async def test_mp4_multi_range_and_resume_work_with_last_modified_validator_only(tmp_path, monkeypatch):
+    """CDNs like PornHub omit strong ETags and send Last-Modified as the RFC 9110 If-Range validator."""
+    media = large_mp4(14 * MIB)
+    last_modified = "Tue, 29 Oct 2026 12:34:56 GMT"
+    release_hole = asyncio.Event()
+    stop = asyncio.Event()
+    initial_requests = []
+    resumed_requests = []
+    resumed = False
+    state = tmp_path / "temp"
+
+    async def handler(request):
+        start, end = range_bounds(request.headers["Range"], len(media))
+        if start > 0:
+            assert request.headers.get("If-Range") == last_modified
+        (resumed_requests if resumed else initial_requests).append((start, end))
+        if start == RANGE_BYTES and not resumed:
+            await release_hole.wait()
+        return web.Response(
+            status=206,
+            body=media[start:end],
+            headers={
+                "Last-Modified": last_modified,
+                "Content-Range": f"bytes {start}-{end - 1}/{len(media)}",
+                "Content-Encoding": "identity",
+            },
+        )
+
+    checkpoint_with_hole = [[0, RANGE_BYTES], [2 * RANGE_BYTES, len(media)]]
+
+    def has_hole_checkpoint():
+        for part in state.glob("*.mp4.tmp"):
+            cp = downloader.read_download_checkpoint(part)
+            if cp and cp.etag == last_modified and cp.completed_ranges == checkpoint_with_hole:
+                return True
+        return False
+
+    monkeypatch.setattr(downloader, "_CHECKPOINT_WRITE_INTERVAL", 0)
+    async with media_server(handler) as url, aiohttp.ClientSession() as session:
+        args = media_args(
+            tmp_path, session, url, cancel_event=stop, range_connections=4,
+            min_multi_range_bytes=8 * MIB, max_attempts=1,
+        )
+        task = asyncio.create_task(downloader.download_mp4_with_resume(**args))
+        try:
+            await wait_for(has_hole_checkpoint)
+            stop.set()
+            stopped = await asyncio.wait_for(task, 5)
+            assert stopped.cancelled and stopped.file_size == len(media) - RANGE_BYTES
+            resumed = True
+            release_hole.set()
+            result = await downloader.download_mp4_with_resume(**(args | {
+                "cancel_event": asyncio.Event(), "partial_path": stopped.temp_path,
+            }))
+            assert result.success and result.local_path.read_bytes() == media
+        finally:
+            release_hole.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    assert initial_requests[0] == (0, RANGE_BYTES)
+    assert resumed_requests == [(RANGE_BYTES, 2 * RANGE_BYTES)]
+    assert not list(state.iterdir())
+
+
+async def test_mp4_multi_range_works_without_etag_or_last_modified_but_does_not_resume_unvalidated(tmp_path):
+    """Signed immutable CDN URLs with neither ETag nor Last-Modified still get live multi-range speed."""
+    media = large_mp4(12 * MIB)
+    active = peak = 0
+    both_running = asyncio.Event()
+    requests = []
+
+    async def handler(request):
+        nonlocal active, peak
+        start, end = range_bounds(request.headers["Range"], len(media))
+        assert "If-Range" not in request.headers
+        requests.append((start, end))
+        if start > 0:
+            active += 1
+            peak = max(peak, active)
+            try:
+                if active >= 2:
+                    both_running.set()
+                await asyncio.wait_for(both_running.wait(), 5)
+            finally:
+                active -= 1
+        return web.Response(
+            status=206,
+            body=media[start:end],
+            headers={
+                "Content-Range": f"bytes {start}-{end - 1}/{len(media)}",
+                "Content-Encoding": "identity",
+            },
+        )
+
+    async with media_server(handler) as url, aiohttp.ClientSession() as session:
+        result = await downloader.download_mp4_with_resume(**media_args(
+            tmp_path, session, url, range_connections=4, min_multi_range_bytes=8 * MIB,
+        ))
+    assert result.success and result.local_path.read_bytes() == media
+    assert peak >= 2 and sorted(requests) == list(downloader._missing_ranges(len(media), []))
+    assert not list((tmp_path / "temp").iterdir())
+
+
+async def test_wal_read_connection_does_not_block_on_write_lock_and_meta_cache_invalidates(tmp_path):
+    from app.db.database import Database
+    from app.db.repo import Repository
+
+    db = Database(tmp_path / "wal_test.db")
+    await db.connect()
+    try:
+        repo = Repository(db)
+        await repo.upsert_video(
+            "vk1", site="pornhub", title="Demo", uploader="alice", uploader_display_name="Alice",
+            quality="1080p", status="uploaded",
+        )
+        stats1 = await repo.get_video_stats()
+        facets1 = await repo.get_video_filter_facets()
+        assert stats1["total"] == 1 and stats1["uploaded"] == 1
+        assert facets1["uploaders"] == ["alice"]
+        assert facets1["uploader_labels"]["alice"] == "Alice"
+
+        # Hold the write transaction open and verify reads on the dedicated WAL read connection complete immediately.
+        async with db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO videos (viewkey, site, title, uploader, status, created_at) "
+                "VALUES ('vk2', 'xhamster', 'Second', 'bob', 'downloaded', '2026-11-27T00:00:00+00:00')"
+            )
+            items, total = await asyncio.wait_for(repo.query_videos(), timeout=1.0)
+            assert total == 1 and [item["viewkey"] for item in items] == ["vk1"]
+
+        # Once committed, cached stats/facets must invalidate automatically.
+        stats2 = await repo.get_video_stats()
+        facets2 = await repo.get_video_filter_facets()
+        assert stats2["total"] == 2 and stats2["downloaded"] == 1
+        assert set(facets2["uploaders"]) == {"alice", "bob"}
+    finally:
+        await db.close()

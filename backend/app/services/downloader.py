@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import hashlib
 import json
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Set, TypeVar
 from urllib.parse import unquote_plus, urlsplit
@@ -41,7 +43,7 @@ _T = TypeVar("_T")
 _MIB = 1024 * 1024
 _RANGE_BYTES = 4 * _MIB
 _RANGE_READ_BYTES = 512 * 1024
-_RANGE_READ_BUFSIZE = 256 * 1024
+_RANGE_READ_BUFSIZE = 512 * 1024
 _MAX_CHECKPOINT_BYTES = 16_384
 _MAX_CHECKPOINT_RANGES = 128
 _MAX_FILE_BYTES = (1 << 63) - 1
@@ -229,6 +231,39 @@ def _strong_etag(value: str) -> str:
     return candidate if re.fullmatch(r'"[^"\x00-\x20\x7f]*"', candidate) else ""
 
 
+def _http_date_validator(value: str) -> str:
+    candidate = value.strip()
+    if not candidate or len(candidate) > 64 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in candidate):
+        return ""
+    try:
+        dt = parsedate_to_datetime(candidate)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return ""
+    return candidate if dt is not None else ""
+
+
+def _valid_validator(value: str) -> str:
+    """Validate an RFC 9110 ``If-Range`` entity validator (strong ETag or HTTP-date)."""
+    return _strong_etag(value) or _http_date_validator(value)
+
+
+def _response_validator(response) -> tuple[str, bool]:
+    """Return ``(validator, rejected_weak_etag)`` for Range / ``If-Range`` verification.
+
+    Prefers a strong ETag, falls back to ``Last-Modified`` (valid RFC 9110 ``If-Range``
+    HTTP-date used by CDNs such as PornHub's). Only flags ``rejected_weak_etag=True`` when
+    an explicit weak/malformed ETag is returned without a valid ``Last-Modified`` fallback.
+    """
+    raw_etag = response.headers.get("ETag", "").strip()
+    strong = _strong_etag(raw_etag)
+    if strong:
+        return strong, False
+    last_modified = _http_date_validator(response.headers.get("Last-Modified", ""))
+    if last_modified:
+        return last_modified, False
+    return "", bool(raw_etag)
+
+
 def _checkpoint_path(path: Path) -> Path:
     return path.with_name(path.name + ".json")
 
@@ -295,11 +330,20 @@ def _size(path: Path) -> int:
         return 0
 
 
+def _range_chunk_size(total: int) -> int:
+    if total >= 256 * _MIB:
+        return 12 * _MIB
+    if total >= 64 * _MIB:
+        return 8 * _MIB
+    return _RANGE_BYTES
+
+
 def _missing_ranges(total: int, completed: list[list[int]]) -> Iterator[tuple[int, int]]:
+    chunk = _range_chunk_size(total)
     start = 0
     for left, right in [*completed, [total, total]]:
-        for offset in range(start, left, _RANGE_BYTES):
-            yield offset, min(offset + _RANGE_BYTES, left)
+        for offset in range(start, left, chunk):
+            yield offset, min(offset + chunk, left)
         start = right
 
 
@@ -339,19 +383,35 @@ def _response_range(response) -> tuple[int, int, int]:
 
 
 def _progress_tracker(callback: Optional[ProgressCallback], downloaded: int, total: int):
-    last_tick, since_tick = time.monotonic(), 0
+    window: collections.deque[tuple[float, int]] = collections.deque()
+    window_bytes = 0
+    last_tick = 0.0
     if callback:
         callback(downloaded, total, 0.0)
 
     def advance(count: int) -> None:
-        nonlocal downloaded, last_tick, since_tick
+        nonlocal downloaded, window_bytes, last_tick
         downloaded += count
-        if callback:
-            since_tick += count
-            now = time.monotonic()
-            if now - last_tick >= 0.35:
-                callback(downloaded, total, since_tick / (now - last_tick))
-                last_tick, since_tick = now, 0
+        if not callback:
+            return
+        now = time.monotonic()
+        if count > 0:
+            if window and now - window[-1][0] < 0.1:
+                tick, acc = window[-1]
+                window[-1] = (tick, acc + count)
+            else:
+                window.append((now, count))
+            window_bytes += count
+        cutoff = now - 2.0
+        while window and window[0][0] < cutoff:
+            _, old = window.popleft()
+            window_bytes -= old
+        if last_tick > 0.0 and (now - last_tick) < 0.25:
+            return
+        span = max(0.25, now - window[0][0]) if window else 0.25
+        speed = max(0.0, window_bytes / span) if window else 0.0
+        last_tick = now
+        callback(downloaded, total, speed)
 
     return advance
 
@@ -365,17 +425,18 @@ async def _stream_mp4_body(
     stop: asyncio.Event,
     *,
     overlap: bool,
+    chunk_size: Optional[int] = None,
 ) -> int:
     received = 0
     pending: Optional[asyncio.Task[None]] = None
-    chunk_size = _MIB if overlap else _RANGE_READ_BYTES
+    read_size = chunk_size if chunk_size is not None else (_MIB if overlap else _RANGE_READ_BYTES)
 
     async def write_chunk(chunk: bytes) -> None:
         await asyncio.to_thread(_write_media_chunk, fp, chunk, prepare_write)
         advance(len(chunk))
 
     try:
-        async for chunk in response.content.iter_chunked(chunk_size):
+        async for chunk in response.content.iter_chunked(read_size):
             if pending is not None:
                 previous, pending = pending, None
                 await _await_file_io(previous)
@@ -618,16 +679,21 @@ async def download_mp4_with_resume(
                             if response.status not in {200, 206, 412, 416}:
                                 response.raise_for_status()
                             try:
+                                resp_validator, resp_weak = _response_validator(response)
                                 if (
                                     response.status != 206
                                     or not _identity_encoding(response)
-                                    or _strong_etag(response.headers.get("ETag", "")) != checkpoint.etag
+                                    or resp_weak
+                                    or resp_validator != checkpoint.etag
                                     or _fingerprint(str(getattr(response, "url", url))) != checkpoint.response_fingerprint
                                     or _response_range(response) != (start, end, checkpoint.total)
                                 ):
                                     raise _RangeMismatch("并行下载的 HTTP 字节区间或校验标记已变化")
                                 fp.seek(start)
-                                await _stream_mp4_body(response, fp, end - start, prepare_write, advance, stop, overlap=False)
+                                await _stream_mp4_body(
+                                    response, fp, end - start, prepare_write, advance, stop,
+                                    overlap=True, chunk_size=_RANGE_READ_BYTES,
+                                )
                             except _RangeMismatch as err:
                                 raise _RetrySingleStream(str(err)) from err
                     _add_completed_range(completed, start, end)
@@ -665,7 +731,7 @@ async def download_mp4_with_resume(
             checkpoint and checkpoint.viewkey == viewkey
             and normalized_quality(checkpoint.quality) == normalized_quality(current_quality)
             and (checkpoint.request_fingerprint == request_fingerprint or renewed)
-            and _strong_etag(checkpoint.etag) and 0 < offset <= checkpoint.total
+            and _valid_validator(checkpoint.etag) and 0 < offset <= checkpoint.total
             and (not checkpoint.completed_ranges or checkpoint.completed_ranges[-1][1] <= offset)
         ):
             checkpoint = None
@@ -693,10 +759,10 @@ async def download_mp4_with_resume(
                         response.raise_for_status()
                         raise _RangeMismatch(f"意外的下载响应 HTTP {response.status}")
 
-                    etag = _strong_etag(response.headers.get("ETag", ""))
+                    etag, rejected_weak_etag = _response_validator(response)
                     response_url = str(getattr(response, "url", url))
                     resolved = _fingerprint(response_url)
-                    same_entity = bool(checkpoint and etag == checkpoint.etag and (
+                    same_entity = bool(checkpoint and etag and etag == checkpoint.etag and (
                         resolved == checkpoint.response_fingerprint
                         or (renewed and renewed_from and _media_resource(renewed_from[1]) == _media_resource(response_url))
                     ))
@@ -726,8 +792,9 @@ async def download_mp4_with_resume(
                             checkpoint and (not same_entity or total != checkpoint.total)
                         ) or (end is not None and write_end != min(end, total)):
                             raise mismatch("HTTP 206 返回的字节区间或校验标记与断点不符")
-                        if write_end < total and not etag:
-                            # A weak/missing validator can only be used if this response contains the entire file.
+                        if write_end < total and (rejected_weak_etag or (not etag and total < min_multi_range_bytes)):
+                            # A weak/invalid ETag without Last-Modified cannot be trusted across Range requests,
+                            # and small validator-less files should switch straight to one sequential GET.
                             raise mismatch("HTTP 206 缺少可用于续接的原文件校验标记")
                         expected = write_end - write_from
                         if sparse or (bounded and write_end < total and total >= min_multi_range_bytes):

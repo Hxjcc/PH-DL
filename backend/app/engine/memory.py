@@ -25,5 +25,9 @@ async def reclaim_memory(db: Optional[Database] = None) -> None:
     await asyncio.to_thread(gc.collect)
     if db is not None:
         with contextlib.suppress(Exception):
-            await db.execute("PRAGMA shrink_memory")
+            shrink = getattr(db, "shrink_memory", None)
+            if shrink is not None:
+                await shrink()
+            else:
+                await db.execute("PRAGMA shrink_memory")
     await asyncio.to_thread(trim_process_memory)

@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -234,6 +234,17 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                    ''
                )
                WHERE uploader_display_name = '' AND uploader != '';""",
+        ],
+    ),
+    (
+        13,
+        [
+            "CREATE INDEX IF NOT EXISTS idx_videos_facets_uploader "
+            "ON videos(LOWER(site), LOWER(uploader), uploader, uploader_display_name);",
+            "CREATE INDEX IF NOT EXISTS idx_videos_site_quality "
+            "ON videos(site, quality);",
+            "CREATE INDEX IF NOT EXISTS idx_videos_target_type_lower "
+            "ON videos(LOWER(target_type), site);",
         ],
     ),
 ]

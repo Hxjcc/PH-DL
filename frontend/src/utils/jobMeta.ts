@@ -15,6 +15,17 @@ type JobMetricInput = Partial<Pick<JobRecord, 'id' | 'kind' | 'status' | 'total_
 type ItemMetricInput = Pick<JobItemRecord, 'id' | 'status' | 'progress_phase'>
 type ProgressMetricInput = Pick<LiveProgressEntry, 'job_id'> & Partial<LiveProgressEntry>
 
+export function jobItemErrorClass(item: Pick<JobItemRecord, 'status' | 'error_message'>) {
+  const message = item.error_message.trim()
+  if (item.status === 'cancelled') {
+    if (/^(?:已取消(?:（断点已保留）)?|上传已取消，保留本地文件|用户取消排队任务)$/.test(message)) {
+      return 'text-muted-foreground'
+    }
+    if (/限额|配额|磁盘/.test(message)) return 'text-amber-700 dark:text-amber-400'
+  }
+  return 'text-red-600 dark:text-red-400'
+}
+
 const CATEGORY_MAP = {
   target_download: {
     key: 'target_download',

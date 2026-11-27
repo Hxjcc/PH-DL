@@ -189,6 +189,7 @@ class TaskManager:
         self._stopping = False
         self._current_job_id: Optional[int] = None
         self._current_cancel_event: Optional[asyncio.Event] = None
+        self._cancelling_job_id: Optional[int] = None
         self._current_halt_reason: str = ""
         self._last_cookie_valid: Optional[bool] = None
         self._last_cookie_message: str = "未检测"
@@ -338,6 +339,10 @@ class TaskManager:
         return self._current_job_id
 
     @property
+    def cancelling_job_id(self) -> Optional[int]:
+        return self._cancelling_job_id
+
+    @property
     def queued_count(self) -> int:
         return len(self._pending_tokens)
 
@@ -353,6 +358,7 @@ class TaskManager:
     def reset_cookie_status(self) -> None:
         self._last_cookie_valid = None
         self._last_cookie_message = "未检测"
+        self.events.broadcast("overview_changed", {})
 
     @property
     def xh_cookie_status(self) -> Dict[str, Any]:
@@ -361,6 +367,7 @@ class TaskManager:
     def set_xh_cookie_status(self, valid: Optional[bool], message: str) -> None:
         self._last_xh_cookie_valid = valid
         self._last_xh_cookie_message = self.repo.redact_diagnostic(message)
+        self.events.broadcast("overview_changed", {})
 
     def reset_xh_cookie_status(self) -> None:
         self._last_xh_cookie_valid = None
@@ -410,12 +417,11 @@ class TaskManager:
 
     async def cancel_job(self, job_id: int) -> bool:
         async with self._queue_lock:
-            job = await self.repo.get_job(job_id)
-            if not job or job["status"] not in {"queued", "scanning", "running"}:
-                return False
             if self._current_job_id == job_id and self._current_cancel_event is not None:
-                self._current_cancel_event.set()
-                self.events.emit_log("WARNING", "收到停止指令，正在安全中止当前任务...", job_id=job_id)
+                if not self._current_cancel_event.is_set():
+                    self._begin_cancelling_job(job_id, self._current_cancel_event)
+                    self.events.emit_log("INFO", "收到停止指令，正在安全中止当前任务...", job_id=job_id)
+                    self.events.broadcast("overview_changed", {})
                 return True
             updated = await self.repo.cancel_queued_job(job_id)
             if updated:
@@ -428,6 +434,13 @@ class TaskManager:
             self.events.emit_log("WARNING", "已取消排队中的任务", job_id=job_id)
             return True
         return False
+
+    def _begin_cancelling_job(self, job_id: int, cancel_event: asyncio.Event) -> None:
+        cancel_event.set()
+        if self._current_job_id == job_id:
+            self._cancelling_job_id = job_id
+            self.events.set_job_cancelling(job_id)
+            self.events.clear_job_progress(job_id)
 
     def _discard_stale_tokens(self) -> None:
         if self._queue.qsize() <= len(self._pending_tokens) + 64:
@@ -503,19 +516,12 @@ class TaskManager:
                 try:
                     await self._run_job(job_id)
                 except Exception as err:
-                    failed = await self._fail_job(job_id, err)
-                    if failed:
-                        self.events.broadcast("job_updated", failed)
+                    self._publish_job_finished(job_id, await self._fail_job(job_id, err))
                 finally:
-                    self._current_job_id = None
-                    self._current_cancel_event = None
-                    self._current_halt_reason = ""
-                    self.events.clear_job_progress(job_id)
                     with contextlib.suppress(Exception):
                         await self.repo.prune_old_jobs(200)
                     with contextlib.suppress(Exception):
                         await reclaim_memory(self.repo.db)
-                    self.events.broadcast("overview_changed", {})
             except asyncio.CancelledError:
                 if self._pending_tokens.get(job_id) == token:
                     self._queue.put_nowait((job_id, token))
@@ -796,6 +802,20 @@ class TaskManager:
         self.events.emit_log("ERROR", f"[xHamster Cookie] 准备失败: {err_msg}", job_id=job_id)
         return None
 
+    def _publish_job_finished(self, job_id: int, finished: Optional[Dict[str, Any]]) -> None:
+        if self._current_job_id == job_id:
+            self._current_job_id = None
+            self._current_cancel_event = None
+            self._cancelling_job_id = None
+            self._current_halt_reason = ""
+        self.events.clear_job_progress(job_id)
+        self.events.clear_job_cancelling(job_id)
+        if finished:
+            if finished["status"] != "completed":
+                self.events.broadcast("job_items_changed", {"job_id": job_id})
+            self.events.broadcast("job_updated", finished)
+        self.events.broadcast("overview_changed", {})
+
     async def _run_job(self, job_id: int) -> None:
         cancel_event = asyncio.Event()
         self._pending_tokens.pop(job_id, None)
@@ -804,38 +824,39 @@ class TaskManager:
         self._current_halt_reason = ""
         self._current_xh_ctx = None
 
+        finished = None
         try:
             started = await self.repo.claim_queued_job(job_id)
             if not started:
                 return
-            self.events.broadcast("job_updated", started)
-            self.events.broadcast("overview_changed", {})
             try:
+                if cancel_event.is_set():
+                    raise StopRequested
+                self.events.broadcast("job_updated", started)
+                self.events.broadcast("overview_changed", {})
                 finished = await self._execute_job(job_id, started, cancel_event)
             except StopRequested:
                 finished = await self._cancel_active_job(job_id, "已取消")
             except Exception as err:
-                finished = await self._fail_job(job_id, err)
-            if finished:
-                if finished["status"] != "completed":
-                    self.events.broadcast("job_items_changed", {"job_id": job_id})
-                self.events.broadcast("job_updated", finished)
-                self.events.emit_log(
-                    "INFO",
-                    f"任务结束 [{finished['status']}]: 总计 {finished['total_items']}，"
-                    f"完成 {finished['done_items']}，已上传 {finished['uploaded_items']}，"
-                    f"跳过 {finished['skipped_items']}，失败 {finished['failed_items']}",
-                    job_id=job_id,
-                )
+                if self._cancelling_job_id == job_id and not self._current_halt_reason:
+                    finished = await self._cancel_active_job(job_id, "已取消")
+                else:
+                    finished = await self._fail_job(job_id, err)
         except asyncio.CancelledError:
+            cancel_event.set()
             finished = await self._cancel_active_job(job_id, "服务停止，可点击续传或重试")
-            if finished:
-                self.events.broadcast("job_updated", finished)
             raise
         finally:
-            self._current_job_id = None
-            self._current_cancel_event = None
-            self._current_halt_reason = ""
+            self._publish_job_finished(job_id, finished)
+
+        if finished:
+            self.events.emit_log(
+                "INFO",
+                f"任务结束 [{finished['status']}]: 总计 {finished['total_items']}，"
+                f"完成 {finished['done_items']}，已上传 {finished['uploaded_items']}，"
+                f"跳过 {finished['skipped_items']}，失败 {finished['failed_items']}",
+                job_id=job_id,
+            )
 
     async def _execute_job(
         self, job_id: int, job: Dict[str, Any], cancel_event: asyncio.Event,
@@ -952,7 +973,7 @@ class TaskManager:
 
         final_job = (
             await self.repo.recalculate_job_counts(job_id)
-            if job_uses_item_counts(job)
+            if not cancel_event.is_set() and job_uses_item_counts(job)
             else await self.repo.get_job(job_id)
         )
         if final_job is None:
@@ -1021,17 +1042,17 @@ class TaskManager:
                 return item_preferred_qualities[iid]
             return preferred_qualities
 
-        if not item_ids:
+        if not item_ids or ctx.cancel_event.is_set():
             return dict(uploaded_by_uploader), dict(failed_urls_by_uploader)
 
         running_job = await self.repo.update_job(job_id, status="running")
-        if running_job:
+        if running_job and not ctx.cancel_event.is_set():
             self.events.broadcast("job_updated", running_job)
 
         disk_budget = DownloadDiskBudget(self.env.temp_dir, int(settings.min_free_disk_gb * 1024 ** 3))
         dl_slots = max(1, int(settings.max_concurrent_downloads))
         total_hls_slots = min(32, max(16, dl_slots * 6))
-        total_mp4_range_slots = min(16, max(4, dl_slots * 3))
+        total_mp4_range_slots = min(20, max(4, dl_slots * 4))
         hls_segment_semaphore = asyncio.Semaphore(total_hls_slots)
         mp4_range_semaphore = asyncio.Semaphore(total_mp4_range_slots)
         hls_memory_budget = HlsMemoryBudget(HLS_JOB_BUFFER_BYTES, http_slots=total_hls_slots, writers=dl_slots)
@@ -1048,7 +1069,7 @@ class TaskManager:
             min_free_disk_gb=settings.min_free_disk_gb,
             max_pending_upload_files=settings.max_pending_upload_files,
             disk_usage_fn=lambda p: shutil.disk_usage(p),
-            on_status=lambda snap: self.events.emit_scheduler_status(job_id, snap),
+            on_status=lambda snap: None if ctx.cancel_event.is_set() else self.events.emit_scheduler_status(job_id, snap),
         )
         upload_pool = SmartUploadPool(
             scheduler,
@@ -1070,40 +1091,33 @@ class TaskManager:
                 )
         scheduler.emit_status(force=True)
 
+        def _emit_item_updated(item: Optional[Dict[str, Any]]) -> None:
+            if item and not ctx.cancel_event.is_set():
+                self.events.broadcast("item_updated", item)
+
+        async def _wake_cancelled_pipeline() -> None:
+            await ctx.cancel_event.wait()
+            self.events.clear_job_progress(job_id)
+            await asyncio.gather(upload_pool.notify_cancel(), scheduler.notify_changed())
+
         async def _mark_entries_cancelled(entries: List[UploadQueuedItem]) -> None:
             if not entries:
                 return
+            halted = bool(self._current_halt_reason)
             cancel_reason = (
                 "因触发网盘限额已暂停，保留本地文件"
-                if self._current_halt_reason
+                if halted
                 else "上传已取消，保留本地文件"
             )
+            await self.repo.cancel_job_uploads(job_id, (entry.item_id for entry in entries), cancel_reason)
+            level, label = ("WARNING", "上传暂停") if halted else ("INFO", "上传已取消")
             for entry in entries:
                 self.events.clear_item_progress(entry.item_id)
-                it = await self.repo.update_job_item(
-                    entry.item_id,
-                    status="cancelled",
-                    error_message=cancel_reason,
-                )
-                if it:
-                    self.events.broadcast("item_updated", it)
-                self.events.emit_log(
-                    "WARNING",
-                    f"[上传失败] {entry.local_path.name}: {cancel_reason}",
-                    job_id=job_id,
-                )
-            await scheduler.on_upload_discarded(len(entries), sum(e.file_size for e in entries))
-            refreshed = await self.repo.recalculate_job_counts(job_id)
-            if refreshed:
-                self.events.broadcast("job_updated", refreshed)
+                self.events.emit_log(level, f"[{label}] {entry.local_path.name}: {cancel_reason}", job_id=job_id)
 
         async def _upload_chunk(chunk: List[UploadQueuedItem]) -> None:
             if not chunk:
                 return
-            if ctx.cancel_event.is_set():
-                await _mark_entries_cancelled(chunk)
-                return
-
             uploader_folder = chunk[0].uploader_folder
             download_dir = chunk[0].download_dir
             chunk_site = normalize_site(chunk[0].site)
@@ -1113,9 +1127,14 @@ class TaskManager:
             remote_chain = configured_remote_chain or self._effective_rclone_chain(settings)
 
             for entry in chunk:
+                if ctx.cancel_event.is_set():
+                    await _mark_entries_cancelled(chunk)
+                    await scheduler.on_upload_discarded(len(chunk), chunk_bytes)
+                    return
                 it = await self.repo.update_job_item(entry.item_id, status="uploading")
-                if it:
-                    self.events.broadcast("item_updated", it)
+                if ctx.cancel_event.is_set():
+                    continue
+                _emit_item_updated(it)
                 self.events.emit_item_progress(
                     job_id,
                     entry.item_id,
@@ -1132,6 +1151,8 @@ class TaskManager:
                     remote_names_map[entry.viewkey] = dated_name
 
             def _on_upload_progress(vk: str, sent: int, total: int, speed: float, phase: str) -> None:
+                if ctx.cancel_event.is_set():
+                    return
                 entry = vk_to_entry.get(vk)
                 if entry is not None:
                     self.events.emit_item_progress(
@@ -1143,7 +1164,7 @@ class TaskManager:
                         phase=phase,
                     )
 
-            async def _halt_for_all_remotes_exhausted(fatal_limit: str) -> None:
+            def _halt_for_all_remotes_exhausted(fatal_limit: str) -> None:
                 if ctx.cancel_event.is_set():
                     return
                 if not self._current_halt_reason:
@@ -1158,8 +1179,8 @@ class TaskManager:
                         f"检测到网盘上传硬性限制（{halt_msg}），已自动暂停当前任务剩余下载与上传，本地已下载文件均已保留。",
                         job_id=job_id,
                     )
-                ctx.cancel_event.set()
-                await upload_pool.notify_cancel()
+                self._begin_cancelling_job(job_id, ctx.cancel_event)
+                self.events.broadcast("overview_changed", {})
 
             await scheduler.on_upload_started()
             try:
@@ -1178,7 +1199,7 @@ class TaskManager:
                             ),
                             "已达到网盘上传或空间限额",
                         )
-                        await _halt_for_all_remotes_exhausted(fallback_reason)
+                        _halt_for_all_remotes_exhausted(fallback_reason)
                         break
 
                     tried_remotes.add(active_remote.lower())
@@ -1224,6 +1245,8 @@ class TaskManager:
                         remote_names_by_viewkey=batch_remote_names or None,
                         site=chunk_site,
                     )
+                    if ctx.cancel_event.is_set():
+                        break
                     elapsed = max(0.0, time.monotonic() - upload_started)
                     uploaded_set = set(up_res.uploaded_viewkeys)
                     next_remaining: List[UploadQueuedItem] = []
@@ -1273,8 +1296,7 @@ class TaskManager:
                                 await self.repo.update_job_item(entry.item_id, local_path="")
                                 if removed_local else await self.repo.get_job_item(entry.item_id)
                             )
-                            if it:
-                                self.events.broadcast("item_updated", it)
+                            _emit_item_updated(it)
                             uploaded_by_uploader[uploader_folder] += 1
                             cleanup_note = "，已删除本地文件" if removed_local else "，保留本地副本"
                             speed_note = ""
@@ -1293,6 +1315,10 @@ class TaskManager:
 
                     if not next_remaining:
                         remaining_entries = []
+                        break
+
+                    if ctx.cancel_event.is_set():
+                        remaining_entries = next_remaining
                         break
 
                     fatal_limit = str(getattr(up_res, "fatal_limit_error", "") or "").strip()
@@ -1334,61 +1360,39 @@ class TaskManager:
                             remaining_entries = next_remaining
                             continue
 
-                    # No failover target left (or non-quota failure / user cancellation)
-                    cancelled = ctx.cancel_event.is_set()
-                    err_txt = (
-                        ("因触发网盘限额已暂停，保留本地文件" if self._current_halt_reason else "上传已取消，保留本地文件")
-                        if cancelled
-                        else up_res.error or "未能确认上传结果"
-                    )
-                    for entry in next_remaining:
+                    err_txt = up_res.error or "未能确认上传结果"
+                    remaining_entries = []
+                    for idx, entry in enumerate(next_remaining):
+                        if ctx.cancel_event.is_set():
+                            remaining_entries = next_remaining[idx:]
+                            break
                         it = await self.repo.update_job_item(
                             entry.item_id,
-                            status="cancelled" if cancelled else "failed",
-                            error_message=err_txt if cancelled else f"上传失败: {err_txt}",
+                            status="failed",
+                            error_message=f"上传失败: {err_txt}",
                         )
-                        if it:
-                            self.events.broadcast("item_updated", it)
-                        if not cancelled:
-                            _record_failed_url(uploader_folder, entry.page_url)
+                        _emit_item_updated(it)
+                        _record_failed_url(uploader_folder, entry.page_url)
                         self.events.emit_log(
                             "WARNING",
-                            f"[上传失败] {entry.local_path.name}: {err_txt}",
+                            f"[{'上传暂停' if fatal_limit else '上传失败'}] {entry.local_path.name}: {err_txt}",
                             job_id=job_id,
                         )
-                    remaining_entries = []
                     if fatal_limit and not ctx.cancel_event.is_set():
-                        await _halt_for_all_remotes_exhausted(fatal_limit)
+                        _halt_for_all_remotes_exhausted(fatal_limit)
                     break
 
-                if remaining_entries:
-                    cancel_reason = (
-                        "因触发网盘限额已暂停，保留本地文件"
-                        if self._current_halt_reason
-                        else "上传已取消，保留本地文件"
-                    )
-                    for entry in remaining_entries:
-                        it = await self.repo.update_job_item(
-                            entry.item_id,
-                            status="cancelled",
-                            error_message=cancel_reason,
-                        )
-                        if it:
-                            self.events.broadcast("item_updated", it)
-                        self.events.emit_log(
-                            "WARNING",
-                            f"[上传失败] {entry.local_path.name}: {cancel_reason}",
-                            job_id=job_id,
-                        )
+                await _mark_entries_cancelled(remaining_entries)
             finally:
                 for entry in chunk:
                     self.events.clear_item_progress(entry.item_id)
                 # Release disk backpressure immediately once local files are deleted.
                 await scheduler.on_upload_finished(len(chunk), chunk_bytes)
 
-            refreshed = await self.repo.recalculate_job_counts(job_id)
-            if refreshed:
-                self.events.broadcast("job_updated", refreshed)
+            if not ctx.cancel_event.is_set():
+                refreshed = await self.repo.recalculate_job_counts(job_id)
+                if refreshed and not ctx.cancel_event.is_set():
+                    self.events.broadcast("job_updated", refreshed)
 
         async def _upload_worker() -> None:
             try:
@@ -1399,7 +1403,6 @@ class TaskManager:
                     await _upload_chunk(chunk)
             except Exception:
                 ctx.cancel_event.set()
-                await upload_pool.notify_cancel()
                 raise
 
         async def _enqueue_for_upload(
@@ -1418,20 +1421,23 @@ class TaskManager:
             if size <= 0:
                 with contextlib.suppress(OSError):
                     size = local_path.stat().st_size
-            await scheduler.on_upload_queued(size)
-            await upload_pool.put(
-                UploadQueuedItem(
-                    item_id=item_id,
-                    viewkey=viewkey,
-                    uploader_folder=uploader_folder,
-                    download_dir=download_dir,
-                    local_path=local_path,
-                    page_url=page_url,
-                    file_size=size,
-                    published_at=(published_at or "").strip(),
-                    site=normalize_site(site),
-                )
+            entry = UploadQueuedItem(
+                item_id=item_id,
+                viewkey=viewkey,
+                uploader_folder=uploader_folder,
+                download_dir=download_dir,
+                local_path=local_path,
+                page_url=page_url,
+                file_size=size,
+                published_at=(published_at or "").strip(),
+                site=normalize_site(site),
             )
+            if not ctx.cancel_event.is_set():
+                await scheduler.on_upload_queued(size)
+                if await upload_pool.put(entry, cancel_event=ctx.cancel_event):
+                    return
+                await scheduler.on_upload_discarded(1, size)
+            await _mark_entries_cancelled([entry])
 
         upload_tasks: List[asyncio.Task] = []
         if auto_upload:
@@ -1448,18 +1454,24 @@ class TaskManager:
             pass_parse_specs: Optional[Dict[int, _PendingParseSpec]] = None,
         ) -> List[int]:
             pass_failed: List[int] = []
+            if ctx.cancel_event.is_set():
+                return pass_failed
             refresh_lock = asyncio.Lock()
             last_refresh_at = 0.0
 
             async def _refresh_job_progress(force: bool = False) -> None:
                 nonlocal last_refresh_at
+                if ctx.cancel_event.is_set():
+                    return
                 async with refresh_lock:
+                    if ctx.cancel_event.is_set():
+                        return
                     now = time.monotonic()
                     if not force and (now - last_refresh_at) < 0.25:
                         return
                     last_refresh_at = now
                     refreshed = await self.repo.recalculate_job_counts(job_id)
-                    if refreshed:
+                    if refreshed and not ctx.cancel_event.is_set():
                         self.events.broadcast("job_updated", refreshed)
 
             timeout = aiohttp.ClientTimeout(total=None, connect=20.0, sock_connect=20.0, sock_read=45.0)
@@ -1484,7 +1496,7 @@ class TaskManager:
                         return
 
                     item = await self.repo.get_job_item(item_id)
-                    if not item:
+                    if not item or ctx.cancel_event.is_set():
                         return
 
                     vkey = item["viewkey"]
@@ -1509,13 +1521,14 @@ class TaskManager:
                         partial_path = None
                     if not is_within_directory(dl_dir, self.env.downloads_dir) or not is_within_directory(tmp_dir, self.env.temp_dir):
                         it = await self.repo.update_job_item(item_id, status="failed", error_message="文件目录超出允许范围")
-                        if it:
-                            self.events.broadcast("item_updated", it)
+                        _emit_item_updated(it)
                         await _refresh_job_progress()
                         return
                     will_upload = auto_upload and item.get("upload_requested") != 0
                     requested = _resolve_item_qualities(item_id)
                     ledger = await self.repo.get_video(vkey) if vkey and not redownload else None
+                    if ctx.cancel_event.is_set():
+                        return
                     quality = normalized_quality(item["quality"])
                     saved_quality = normalized_quality(ledger["quality"]) if ledger else ""
                     quality_matches = (
@@ -1540,8 +1553,7 @@ class TaskManager:
                             temp_path="" if cleaned_stale else item.get("temp_path") or "",
                             error_message="已在云端上传记录中，跳过（已清理残留临时文件）" if cleaned_stale else "已在云端上传记录中，跳过",
                         )
-                        if it:
-                            self.events.broadcast("item_updated", it)
+                        _emit_item_updated(it)
                         if cleaned_stale:
                             self.events.emit_log(
                                 "INFO",
@@ -1567,6 +1579,8 @@ class TaskManager:
                         )
                         local_quality = ledger["quality"]
 
+                    if ctx.cancel_event.is_set():
+                        return
                     if local_file is not None:
                         existing_local, existing_size = local_file
                         pub_date = str(item.get("published_at") or (ledger or {}).get("published_at") or "").strip()
@@ -1602,8 +1616,7 @@ class TaskManager:
                             upload_requested=int(will_upload),
                             error_message="" if completed_here else "本地已有符合画质的完整文件，跳过",
                         )
-                        if it:
-                            self.events.broadcast("item_updated", it)
+                        _emit_item_updated(it)
                         if will_upload:
                             await _enqueue_for_upload(
                                 item_id=item_id,
@@ -1624,6 +1637,7 @@ class TaskManager:
                     max_disk_wait_rounds = 60
                     outcome = None
 
+                    handoff_slot_to_upload = False
                     while True:
                         ok_slot, slot_err = await scheduler.acquire_download_slot(
                             will_upload=will_upload,
@@ -1633,22 +1647,23 @@ class TaskManager:
                             on_request_flush=upload_pool.request_flush_nowait if auto_upload else None,
                         )
                         if not ok_slot:
-                            cancelled = ctx.cancel_event.is_set()
+                            if ctx.cancel_event.is_set():
+                                return
                             it = await self.repo.update_job_item(
                                 item_id,
-                                status="cancelled" if cancelled else "failed",
-                                error_message="已取消" if cancelled else (slot_err or "磁盘空间不足"),
+                                status="failed",
+                                error_message=slot_err or "磁盘空间不足",
                             )
-                            if it:
-                                self.events.broadcast("item_updated", it)
-                            if not cancelled:
-                                if slot_err:
-                                    self.events.emit_log("ERROR", slot_err, job_id=job_id)
-                                _record_failed_url(uploader_folder, item["page_url"])
+                            _emit_item_updated(it)
+                            if slot_err:
+                                self.events.emit_log("ERROR", slot_err, job_id=job_id)
+                            _record_failed_url(uploader_folder, item["page_url"])
                             await _refresh_job_progress()
                             return
 
                         try:
+                            if ctx.cancel_event.is_set():
+                                return
                             it = await self.repo.update_job_item(
                                 item_id,
                                 status="downloading",
@@ -1656,8 +1671,9 @@ class TaskManager:
                                 upload_requested=int(will_upload),
                                 error_message="",
                             )
-                            if it:
-                                self.events.broadcast("item_updated", it)
+                            if ctx.cancel_event.is_set():
+                                return
+                            _emit_item_updated(it)
 
                             use_hls = is_hls_url(item["download_url"]) or (
                                 partial_path is not None and partial_path.name.endswith(".hls")
@@ -1669,6 +1685,8 @@ class TaskManager:
                                 speed_bps: float,
                                 phase: str = "downloading",
                             ) -> None:
+                                if ctx.cancel_event.is_set():
+                                    return
                                 norm_phase = (phase or "downloading").strip().lower()
                                 self.events.emit_item_progress(
                                     job_id,
@@ -1749,7 +1767,10 @@ class TaskManager:
                                 )
                         finally:
                             self.events.clear_item_progress(item_id)
-                            await scheduler.release_download_slot()
+                            if outcome is not None and outcome.success and outcome.local_path is not None and will_upload:
+                                handoff_slot_to_upload = True
+                            else:
+                                await scheduler.release_download_slot()
 
                         if (
                             outcome is not None
@@ -1772,8 +1793,7 @@ class TaskManager:
                                 download_url=outcome.download_url or item["download_url"],
                                 error_message="",
                             )
-                            if it:
-                                self.events.broadcast("item_updated", it)
+                            _emit_item_updated(it)
                             if auto_upload:
                                 await upload_pool.request_flush()
                             refreshed_item = await self.repo.get_job_item(item_id)
@@ -1787,7 +1807,10 @@ class TaskManager:
                     if outcome is None:
                         return
 
-                    if outcome.cancelled:
+                    if outcome.cancelled or (ctx.cancel_event.is_set() and not outcome.success):
+                        reason = "因触发网盘限额已暂停" if self._current_halt_reason else "已取消"
+                        if outcome.temp_path:
+                            reason += "（断点已保留）"
                         it = await self.repo.update_job_item(
                             item_id,
                             status="cancelled",
@@ -1795,10 +1818,9 @@ class TaskManager:
                             bytes_downloaded=outcome.file_size,
                             quality=outcome.quality or item["quality"],
                             download_url=outcome.download_url or item["download_url"],
-                            error_message="已取消（断点已保留）" if outcome.temp_path else "已取消",
+                            error_message=reason,
                         )
-                        if it:
-                            self.events.broadcast("item_updated", it)
+                        _emit_item_updated(it)
                         return
 
                     if not outcome.success or outcome.local_path is None:
@@ -1811,8 +1833,7 @@ class TaskManager:
                             download_url=outcome.download_url or item["download_url"],
                             error_message=outcome.error or "下载失败",
                         )
-                        if it:
-                            self.events.broadcast("item_updated", it)
+                        _emit_item_updated(it)
                         if not (outcome.error or "").startswith(("磁盘", "写入", "单文件")):
                             pass_failed.append(item_id)
                         else:
@@ -1821,66 +1842,70 @@ class TaskManager:
                         await _refresh_job_progress()
                         return
 
-                    scheduler.record_video_size(outcome.file_size)
-                    pub_date = str(item.get("published_at") or "").strip()
-                    dur_sec = int(item.get("duration_seconds") or 0)
-                    if not pub_date or dur_sec <= 0:
-                        existing_video = ledger or (await self.repo.get_video(vkey) if vkey else None)
-                        if existing_video:
-                            pub_date = pub_date or str(existing_video.get("published_at") or "").strip()
-                            if dur_sec <= 0:
-                                dur_sec = int(existing_video.get("duration_seconds") or 0)
-                    await self.repo.upsert_video(
-                        vkey,
-                        site=item_site,
-                        title=item["title"],
-                        uploader=item["uploader"],
-                        uploader_display_name=_resolve_item_display_name(item_id, item["uploader"]),
-                        target_type=item["target_type"],
-                        quality=outcome.quality or item["quality"],
-                        video_page_url=item["page_url"],
-                        status="downloaded",
-                        local_path=str(outcome.local_path),
-                        file_size=outcome.file_size,
-                        downloaded_at=utc_now_iso(),
-                        force_status=True,
-                        upload_requested=will_upload,
-                        published_at=pub_date,
-                        duration_seconds=dur_sec,
-                    )
-                    it = await self.repo.update_job_item(
-                        item_id,
-                        status="downloaded",
-                        quality=outcome.quality or item["quality"],
-                        download_url=outcome.download_url or item["download_url"],
-                        local_path=str(outcome.local_path),
-                        temp_path="",
-                        bytes_downloaded=outcome.file_size,
-                        bytes_total=outcome.file_size,
-                        error_message="",
-                    )
-                    if it:
-                        self.events.broadcast("item_updated", it)
-
-                    self.events.emit_log(
-                        "INFO",
-                        f"下载成功: {item['title']} ({outcome.quality or item['quality']}, "
-                        f"{outcome.file_size / (1024 * 1024):.1f} MB)",
-                        job_id=job_id,
-                    )
-
-                    if will_upload:
-                        await _enqueue_for_upload(
-                            item_id=item_id,
-                            viewkey=vkey,
-                            uploader_folder=uploader_folder,
-                            download_dir=dl_dir,
-                            local_path=outcome.local_path,
-                            page_url=item["page_url"],
-                            file_size=outcome.file_size,
-                            published_at=pub_date,
+                    try:
+                        scheduler.record_video_size(outcome.file_size)
+                        pub_date = str(item.get("published_at") or "").strip()
+                        dur_sec = int(item.get("duration_seconds") or 0)
+                        if not pub_date or dur_sec <= 0:
+                            existing_video = ledger or (await self.repo.get_video(vkey) if vkey else None)
+                            if existing_video:
+                                pub_date = pub_date or str(existing_video.get("published_at") or "").strip()
+                                if dur_sec <= 0:
+                                    dur_sec = int(existing_video.get("duration_seconds") or 0)
+                        await self.repo.upsert_video(
+                            vkey,
                             site=item_site,
+                            title=item["title"],
+                            uploader=item["uploader"],
+                            uploader_display_name=_resolve_item_display_name(item_id, item["uploader"]),
+                            target_type=item["target_type"],
+                            quality=outcome.quality or item["quality"],
+                            video_page_url=item["page_url"],
+                            status="downloaded",
+                            local_path=str(outcome.local_path),
+                            file_size=outcome.file_size,
+                            downloaded_at=utc_now_iso(),
+                            force_status=True,
+                            upload_requested=will_upload,
+                            published_at=pub_date,
+                            duration_seconds=dur_sec,
                         )
+                        it = await self.repo.update_job_item(
+                            item_id,
+                            status="downloaded",
+                            quality=outcome.quality or item["quality"],
+                            download_url=outcome.download_url or item["download_url"],
+                            local_path=str(outcome.local_path),
+                            temp_path="",
+                            bytes_downloaded=outcome.file_size,
+                            bytes_total=outcome.file_size,
+                            error_message="",
+                        )
+                        _emit_item_updated(it)
+
+                        self.events.emit_log(
+                            "INFO",
+                            f"下载成功: {item['title']} ({outcome.quality or item['quality']}, "
+                            f"{outcome.file_size / (1024 * 1024):.1f} MB)",
+                            job_id=job_id,
+                        )
+
+                        if will_upload:
+                            await _enqueue_for_upload(
+                                item_id=item_id,
+                                viewkey=vkey,
+                                uploader_folder=uploader_folder,
+                                download_dir=dl_dir,
+                                local_path=outcome.local_path,
+                                page_url=item["page_url"],
+                                file_size=outcome.file_size,
+                                published_at=pub_date,
+                                site=item_site,
+                            )
+                    finally:
+                        if handoff_slot_to_upload:
+                            handoff_slot_to_upload = False
+                            await scheduler.release_download_slot()
 
                     await _refresh_job_progress()
 
@@ -1910,12 +1935,11 @@ class TaskManager:
                                     try:
                                         if iid is None:
                                             return
+                                        if ctx.cancel_event.is_set():
+                                            continue
                                         spec = pass_parse_specs.get(iid)
                                         if spec is None:
-                                            await ready_queue.put(iid)
-                                            continue
-
-                                        if ctx.cancel_event.is_set():
+                                            ready_queue.put_nowait(iid)
                                             continue
 
                                         try:
@@ -1948,10 +1972,11 @@ class TaskManager:
                                                 error="未解析到视频详情",
                                             )
 
-                                            if ctx.cancel_event.is_set() or detail.error == "操作已取消":
+                                            if ctx.cancel_event.is_set():
+                                                continue
+                                            if detail.error == "操作已取消":
                                                 it = await self.repo.update_job_item(iid, status="cancelled", error_message="已取消")
-                                                if it:
-                                                    self.events.broadcast("item_updated", it)
+                                                _emit_item_updated(it)
                                                 continue
 
                                             if on_detail_parsed is not None and (not detail.error or detail.filtered_out):
@@ -1964,14 +1989,16 @@ class TaskManager:
                                                         job_id=job_id,
                                                     )
 
+                                            if ctx.cancel_event.is_set():
+                                                continue
+
                                             if detail.filtered_out:
                                                 it = await self.repo.update_job_item(
                                                     iid,
                                                     status="skipped",
                                                     error_message="不符合画质或关键词筛选，跳过",
                                                 )
-                                                if it:
-                                                    self.events.broadcast("item_updated", it)
+                                                _emit_item_updated(it)
                                                 await _refresh_job_progress()
                                                 continue
 
@@ -1986,8 +2013,7 @@ class TaskManager:
                                                     status="failed",
                                                     error_message=err_msg,
                                                 )
-                                                if it:
-                                                    self.events.broadcast("item_updated", it)
+                                                _emit_item_updated(it)
                                                 self.events.emit_log(
                                                     "WARNING",
                                                     f"视频解析失败 [{detail.viewkey or spec.page_url}]: {err_msg}",
@@ -2030,11 +2056,12 @@ class TaskManager:
                                             if detail.duration_seconds > 0:
                                                 patch["duration_seconds"] = detail.duration_seconds
                                             it = await self.repo.update_job_item(iid, **patch)
-                                            if it:
-                                                self.events.broadcast("item_updated", it)
+                                            if ctx.cancel_event.is_set():
+                                                continue
+                                            _emit_item_updated(it)
 
                                             in_window_ids.add(iid)
-                                            await ready_queue.put(iid)
+                                            ready_queue.put_nowait(iid)
                                             handed_off = True
                                         finally:
                                             if not handed_off:
@@ -2045,14 +2072,15 @@ class TaskManager:
                             pworkers = [asyncio.create_task(_parse_worker()) for _ in range(parse_concurrency)]
                             try:
                                 await asyncio.gather(*pworkers)
-                                await self._release_idle_http_sessions(ctx)
+                                if not ctx.cancel_event.is_set():
+                                    await self._release_idle_http_sessions(ctx)
                             finally:
                                 for pw in pworkers:
                                     if not pw.done():
                                         pw.cancel()
                                 await asyncio.gather(*pworkers, return_exceptions=True)
                                 for _ in range(worker_count):
-                                    await ready_queue.put(None)
+                                    ready_queue.put_nowait(None)
 
                         producer_task = asyncio.create_task(_preparse_producer(), name=f"phdl-preparse-{job_id}")
                     else:
@@ -2065,7 +2093,7 @@ class TaskManager:
                         while True:
                             iid = await ready_queue.get()
                             try:
-                                if iid is None:
+                                if iid is None or ctx.cancel_event.is_set():
                                     return
                                 if window_sem is not None and iid in in_window_ids:
                                     in_window_ids.discard(iid)
@@ -2088,14 +2116,11 @@ class TaskManager:
                         tasks_to_wait = [*workers, *([producer_task] if producer_task is not None else [])]
                         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
                         raise
-                if ctx.cancel_event.is_set():
-                    pending_cancel_msg = "因触发网盘限额已暂停" if self._current_halt_reason else "已取消"
-                    await self.repo.bulk_cancel_pending_job_items(job_id, error_message=pending_cancel_msg)
-                    self.events.broadcast("job_items_changed", {"job_id": job_id})
                 await _refresh_job_progress(force=True)
 
             return pass_failed
 
+        cancel_watcher = asyncio.create_task(_wake_cancelled_pipeline(), name=f"phdl-cancel-pipeline-{job_id}")
         try:
             failed_item_ids_pass1 = await _download_items_pass(item_ids, pass_num=1, pass_parse_specs=parse_specs)
 
@@ -2109,6 +2134,8 @@ class TaskManager:
                 )
                 retry_candidates: List[Tuple[int, str, str]] = []
                 for fid in failed_item_ids_pass1:
+                    if ctx.cancel_event.is_set():
+                        break
                     row = await self.repo.get_job_item(fid)
                     if row and row.get("page_url"):
                         r_site = normalize_site(
@@ -2125,6 +2152,8 @@ class TaskManager:
 
                     by_url: Dict[str, VideoDetail] = {}
                     for (grp_site, q_key), group_rows in grouped_candidates.items():
+                        if ctx.cancel_event.is_set():
+                            break
                         reparsed = await fetch_video_details_batch(
                             self._ctx_for_site(ctx, grp_site),
                             [(u, 0, idx + 1) for idx, (_, u) in enumerate(group_rows)],
@@ -2140,6 +2169,8 @@ class TaskManager:
                     ready_for_pass2: List[int] = []
                     unresolved_ids: List[int] = []
                     for fid, purl, _ in retry_candidates:
+                        if ctx.cancel_event.is_set():
+                            break
                         d = by_url.get(purl)
                         if d and d.download_url:
                             patch: Dict[str, Any] = {
@@ -2160,6 +2191,8 @@ class TaskManager:
                     final_failed_ids = unresolved_ids + pass2_failed
 
             for fid in final_failed_ids:
+                if ctx.cancel_event.is_set():
+                    break
                 row = await self.repo.get_job_item(fid)
                 if row and row.get("page_url"):
                     row_site = normalize_site(
@@ -2176,17 +2209,22 @@ class TaskManager:
             raise
         finally:
             upload_results = []
-            if upload_tasks:
-                with contextlib.suppress(Exception):
-                    await self._release_idle_http_sessions(ctx)
-                await upload_pool.mark_downloads_done()
-                if ctx.cancel_event.is_set():
-                    await upload_pool.notify_cancel()
-                upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
-                leftovers = await upload_pool.drain_all()
-                if leftovers:
-                    await _mark_entries_cancelled(leftovers)
-            self.events.clear_scheduler_status(job_id)
+            try:
+                if upload_tasks:
+                    await upload_pool.mark_downloads_done()
+                    if not ctx.cancel_event.is_set():
+                        with contextlib.suppress(Exception):
+                            await self._release_idle_http_sessions(ctx)
+                    upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+                    leftovers = await upload_pool.drain_all()
+                    if leftovers:
+                        await _mark_entries_cancelled(leftovers)
+                        await scheduler.on_upload_discarded(len(leftovers), sum(entry.file_size for entry in leftovers))
+            finally:
+                if not ctx.cancel_event.is_set():
+                    cancel_watcher.cancel()
+                await asyncio.gather(cancel_watcher, return_exceptions=True)
+                self.events.clear_scheduler_status(job_id)
 
         for result in upload_results:
             if isinstance(result, Exception):
@@ -3630,18 +3668,18 @@ class TaskManager:
                             job_id=job_id,
                         )
                     title, body = build_auto_update_report(new_by_target, uploaded_by, failed_urls_by)
-                    ok, msg = await send_serverchan(title, body, settings)
+                    ok, msg = await until_stopped(send_serverchan(title, body, settings), ctx.cancel_event)
                     if settings.serverchan_enabled:
                         self.events.emit_log("INFO" if ok else "WARNING", f"ServerChan 通知: {msg}", job_id=job_id)
             else:
                 if target_error_count == 0:
                     self.events.emit_log("INFO", "本次自动追更未发现新视频。", job_id=job_id)
                 if settings.notify_if_no_updates and target_error_count == 0:
-                    await send_serverchan(
+                    await until_stopped(send_serverchan(
                         "PH-DL 自动追更：无新内容",
                         f"本次共检查 {len(targets)} 个目标，均无更新。",
                         settings,
-                    )
+                    ), ctx.cancel_event)
         else:
             total_found = sum(new_by_target.values())
             await self.repo.update_job(job_id, total_items=total_found, done_items=total_found)
@@ -3658,13 +3696,15 @@ class TaskManager:
                     job_id=job_id,
                 )
             if check_notes:
-                await send_serverchan("PH-DL 更新检查汇总", "\n\n---\n\n".join(check_notes), settings)
+                await until_stopped(
+                    send_serverchan("PH-DL 更新检查汇总", "\n\n---\n\n".join(check_notes), settings), ctx.cancel_event,
+                )
             elif settings.notify_if_no_updates and target_error_count == 0:
-                await send_serverchan(
+                await until_stopped(send_serverchan(
                     "PH-DL 更新检查：无新内容",
                     f"本次共检查 {len(targets)} 个目标，均无更新。",
                     settings,
-                )
+                ), ctx.cancel_event)
 
     async def _exec_baseline_sync(
         self,
@@ -3991,15 +4031,13 @@ class TaskManager:
                     break
 
                 refreshed = await self.repo.recalculate_job_counts(job_id)
-                if refreshed:
+                if refreshed and not ctx.cancel_event.is_set():
                     self.events.broadcast("job_updated", refreshed)
-                self.events.broadcast("job_items_changed", {"job_id": job_id})
+                    self.events.broadcast("job_items_changed", {"job_id": job_id})
 
         if ctx.cancel_event.is_set():
-            await self.repo.bulk_cancel_pending_job_items(job_id, error_message="已取消")
-            self.events.broadcast("job_items_changed", {"job_id": job_id})
             self.events.emit_log(
-                "WARNING",
+                "INFO",
                 f"元数据补全已取消：已完成 {completed_count} 条，其余条目已批量取消。",
                 job_id=job_id,
             )

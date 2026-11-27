@@ -70,6 +70,7 @@ export function jobStatusMeta(status: string): StatusMeta & { variant: 'outline'
     queued: { label: '排队中', dot: 'bg-amber-400', variant: 'outline' },
     scanning: { label: '扫描解析中', dot: 'bg-brand status-dot-glow-brand animate-pulse', variant: 'secondary' },
     running: { label: '执行中', dot: 'bg-brand status-dot-glow-brand animate-pulse', variant: 'secondary' },
+    cancelling: { label: '停止中', dot: 'bg-amber-500 status-dot-glow-amber animate-pulse', variant: 'outline' },
     completed: { label: '已完成', dot: 'bg-emerald-500', variant: 'outline' },
     partial_failed: { label: '部分失败', dot: 'bg-amber-500', variant: 'outline' },
     cancelled: { label: '已取消', dot: 'bg-zinc-400', variant: 'outline' },

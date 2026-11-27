@@ -354,12 +354,15 @@ class SmartUploadPool:
         self._downloads_done = False
         self._flush_requested = False
 
-    async def put(self, item: UploadQueuedItem) -> None:
+    async def put(self, item: UploadQueuedItem, *, cancel_event: Optional[asyncio.Event] = None) -> bool:
         async with self._cond:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             self._seq += 1
             item.enqueued_seq = self._seq
             self._items.append(item)
             self._cond.notify_all()
+            return True
 
     async def request_flush(self) -> None:
         async with self._cond:
@@ -445,15 +448,12 @@ class SmartUploadPool:
                 cond_wait = asyncio.create_task(self._cond.wait())
                 cancel_wait = asyncio.create_task(cancel_event.wait())
                 try:
-                    _, pending = await asyncio.wait(
+                    await asyncio.wait(
                         {cond_wait, cancel_wait},
                         timeout=1.0,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                except BaseException:
+                finally:
                     cond_wait.cancel()
                     cancel_wait.cancel()
-                    raise
+                    await asyncio.gather(cond_wait, cancel_wait, return_exceptions=True)
