@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -216,6 +216,24 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                     UPDATE job_items SET revision = OLD.revision + 1 WHERE id = OLD.id;
                 END;""",
             "CREATE INDEX IF NOT EXISTS idx_job_items_job_viewkey ON job_items(job_id, viewkey, status);",
+        ],
+    ),
+    (
+        12,
+        [
+            "ALTER TABLE videos ADD COLUMN uploader_display_name TEXT NOT NULL DEFAULT '';",
+            """UPDATE videos
+               SET uploader_display_name = COALESCE(
+                   (SELECT t.display_name
+                    FROM targets t
+                    WHERE LOWER(t.site) = LOWER(videos.site)
+                      AND LOWER(t.username) = LOWER(videos.uploader)
+                      AND t.display_name != ''
+                    ORDER BY t.id ASC
+                    LIMIT 1),
+                   ''
+               )
+               WHERE uploader_display_name = '' AND uploader != '';""",
         ],
     ),
 ]

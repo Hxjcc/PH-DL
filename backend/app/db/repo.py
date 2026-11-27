@@ -875,10 +875,10 @@ class Repository:
 
     _UPSERT_VIDEO_SQL = """
         INSERT INTO videos (
-            viewkey, site, title, uploader, target_type, quality, video_page_url,
+            viewkey, site, title, uploader, uploader_display_name, target_type, quality, video_page_url,
             status, local_path, remote_path, file_size, downloaded_at, uploaded_at, created_at,
             upload_requested, published_at, duration_seconds
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(viewkey) DO UPDATE SET
             site = CASE WHEN ? != '' THEN ? ELSE videos.site END,
             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE videos.title END,
@@ -888,6 +888,13 @@ class Repository:
                 WHEN ? IN ('favorites', 'liked') AND videos.target_type NOT IN ('favorites', 'liked') THEN videos.uploader
                 WHEN ? = 0 AND excluded.status = 'baseline' AND videos.status IN ('downloaded', 'uploaded') THEN videos.uploader
                 ELSE excluded.uploader
+            END,
+            uploader_display_name = CASE
+                WHEN excluded.uploader_display_name = '' THEN videos.uploader_display_name
+                WHEN videos.uploader_display_name = '' THEN excluded.uploader_display_name
+                WHEN ? IN ('favorites', 'liked') AND videos.target_type NOT IN ('favorites', 'liked') THEN videos.uploader_display_name
+                WHEN ? = 0 AND excluded.status = 'baseline' AND videos.status IN ('downloaded', 'uploaded') THEN videos.uploader_display_name
+                ELSE excluded.uploader_display_name
             END,
             target_type = CASE
                 WHEN ? = '' THEN videos.target_type
@@ -940,6 +947,7 @@ class Repository:
         site: str = "",
         title: str = "",
         uploader: str = "",
+        uploader_display_name: str = "",
         target_type: str = "",
         quality: str = "",
         video_page_url: str = "",
@@ -973,6 +981,7 @@ class Repository:
             insert_site,
             title or "",
             uploader or "",
+            (uploader_display_name or "").strip(),
             insert_type,
             quality or "",
             insert_url,
@@ -988,6 +997,8 @@ class Repository:
             max(0, int(duration_seconds or 0)),
             explicit_site,
             explicit_site,
+            explicit_type,
+            force_flag,
             explicit_type,
             force_flag,
             explicit_type,
@@ -1010,6 +1021,7 @@ class Repository:
         site: str = "",
         title: str = "",
         uploader: str = "",
+        uploader_display_name: str = "",
         target_type: str = "",
         quality: str = "",
         video_page_url: str = "",
@@ -1031,6 +1043,7 @@ class Repository:
             site=site,
             title=title,
             uploader=uploader,
+            uploader_display_name=uploader_display_name,
             target_type=target_type,
             quality=quality,
             video_page_url=video_page_url,
@@ -1067,6 +1080,7 @@ class Repository:
                     site=str(rec.get("site") or ""),
                     title=rec.get("title", ""),
                     uploader=rec.get("uploader", ""),
+                    uploader_display_name=str(rec.get("uploader_display_name") or ""),
                     target_type=rec.get("target_type", ""),
                     quality=rec.get("quality", ""),
                     video_page_url=rec.get("video_page_url", ""),
@@ -1089,6 +1103,25 @@ class Repository:
         for start in range(0, len(param_rows), step):
             await self.db.executemany(self._UPSERT_VIDEO_SQL, param_rows[start : start + step])
         return len(param_rows)
+
+    async def update_videos_uploader_display_name(
+        self,
+        site: str,
+        uploader: str,
+        display_name: str,
+    ) -> None:
+        clean_u = (uploader or "").strip()
+        clean_name = (display_name or "").strip()
+        if not clean_u or not clean_name:
+            return
+        await self.db.execute(
+            """
+            UPDATE videos
+            SET uploader_display_name = ?
+            WHERE LOWER(site) = ? AND LOWER(uploader) = LOWER(?) AND uploader_display_name = ''
+            """,
+            (clean_name, normalize_site(site), clean_u),
+        )
 
     async def mark_video_uploaded(self, viewkey: str, remote_path: str = "") -> None:
         if not viewkey:
@@ -1209,12 +1242,12 @@ class Repository:
             if matched_unames:
                 placeholders = ",".join("?" for _ in matched_unames)
                 clauses.append(
-                    f"(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR LOWER(v.uploader) IN ({placeholders}))"
+                    f"(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR v.uploader_display_name LIKE ? OR LOWER(v.uploader) IN ({placeholders}))"
                 )
-                params.extend([like, like, like, *matched_unames])
+                params.extend([like, like, like, like, *matched_unames])
             else:
-                clauses.append("(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ?)")
-                params.extend([like, like, like])
+                clauses.append("(v.title LIKE ? OR v.viewkey LIKE ? OR v.uploader LIKE ? OR v.uploader_display_name LIKE ?)")
+                params.extend([like, like, like, like])
         if uploader.strip():
             u_clean = uploader.strip()
             if u_clean.lower() == "my_liked":
@@ -1281,12 +1314,13 @@ class Repository:
             row["site"] = s_low
             uname = str(row.get("uploader") or "").strip().lower()
             t_low = str(row.get("target_type") or "").strip().lower()
+            stored_dn = str(row.get("uploader_display_name") or "").strip()
             if uname == "my_liked" or (not uname and t_low == "liked"):
                 row["uploader_display_name"] = "Liked Videos"
             elif s_low == "xhamster" and (uname == "my_favorites" or (not uname and t_low == "favorites")):
                 row["uploader_display_name"] = "xHamster Favorites"
             else:
-                row["uploader_display_name"] = display_map.get((s_low, uname), "")
+                row["uploader_display_name"] = display_map.get((s_low, uname)) or stored_dn
         return rows, total
 
     async def get_video_filter_facets(self, site: str = "") -> Dict[str, Any]:
@@ -1295,9 +1329,11 @@ class Repository:
         site_params = (site_filter,) if site_filter else ()
         uploader_rows = await self.db.fetch_all(
             f"""
-            SELECT DISTINCT uploader, site
+            SELECT uploader, site,
+                   MAX(CASE WHEN uploader_display_name != '' THEN uploader_display_name ELSE '' END) AS video_display_name
             FROM videos
             WHERE uploader != ''{where_site}
+            GROUP BY LOWER(site), LOWER(uploader)
             ORDER BY LOWER(uploader) ASC
             """,
             site_params,
@@ -1307,6 +1343,7 @@ class Repository:
             site_params,
         )
         display_map = await self._get_target_display_map()
+        video_display_map: Dict[Tuple[str, str], str] = {}
         qualities = await self.db.fetch_all(
             f"""
             SELECT DISTINCT quality FROM videos
@@ -1325,11 +1362,15 @@ class Repository:
             if not u:
                 continue
             low = u.lower()
+            s_low = normalize_site(r.get("site"))
+            vdn = str(r.get("video_display_name") or "").strip()
+            if vdn and (s_low, low) not in video_display_map:
+                video_display_map[(s_low, low)] = vdn
             idx = seen_up.get(low)
             if idx is None:
                 seen_up[low] = len(uploaders)
                 uploaders.append(u)
-                uploader_sites[low] = normalize_site(r.get("site"))
+                uploader_sites[low] = s_low
             else:
                 # Prefer a mixed-case spelling over an all-lowercase duplicate when both exist.
                 prev = uploaders[idx]
@@ -1350,8 +1391,11 @@ class Repository:
                 s_low = site_filter or uploader_sites.get(low, "pornhub")
                 uploader_labels[u] = (
                     display_map.get((s_low, low))
+                    or video_display_map.get((s_low, low))
                     or display_map.get(("pornhub", low))
+                    or video_display_map.get(("pornhub", low))
                     or display_map.get(("xhamster", low))
+                    or video_display_map.get(("xhamster", low))
                     or u
                 )
         return {

@@ -138,6 +138,27 @@ function buildTargetLookup(targetsList = []) {
   return lookup
 }
 
+function lookupProfileField(map, ...keys) {
+  if (!map || typeof map !== 'object') return ''
+  for (const rawKey of keys) {
+    const key = String(rawKey || '').trim()
+    if (!key) continue
+    if (map[key]) return String(map[key]).trim()
+  }
+  const wanted = new Set(
+    keys
+      .map((k) => String(k || '').trim().toLowerCase())
+      .filter(Boolean)
+  )
+  if (wanted.size === 0) return ''
+  for (const [k, v] of Object.entries(map)) {
+    if (v && wanted.has(String(k).trim().toLowerCase())) {
+      return String(v).trim()
+    }
+  }
+  return ''
+}
+
 function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames = {}, hint = {}) {
   if (target) {
     const site = normalizeSiteKey(target.site || hint.site) || 'pornhub'
@@ -148,9 +169,18 @@ function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames
       ? '我的点赞'
       : isFavorites
         ? String(target.display_name || '').trim() || '我的收藏'
-        : String(target.display_name || profileNames[target.username] || target.username || fallbackName || '').trim()
+        : String(
+            target.display_name ||
+              lookupProfileField(profileNames, target.username, fallbackName) ||
+              target.username ||
+              fallbackName ||
+              ''
+          ).trim()
     const username = isLiked || isFavorites ? '' : String(target.username || '').trim()
-    const avatarUrl = isLiked || isFavorites ? '' : String(target.avatar_url || profileAvatars[target.username] || '').trim()
+    const avatarUrl =
+      isLiked || isFavorites
+        ? ''
+        : String(target.avatar_url || lookupProfileField(profileAvatars, target.username, fallbackName) || '').trim()
     return {
       key: `target-${target.id || `${site}:${username || name}`}`,
       name: name || username || '未知目标',
@@ -171,8 +201,8 @@ function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames
     ? '我的点赞'
     : isFavorites
       ? '我的收藏'
-      : String(profileNames[raw] || raw).trim()
-  const avatarUrl = isLiked || isFavorites ? '' : String(profileAvatars[raw] || '').trim()
+      : String(lookupProfileField(profileNames, raw) || raw).trim()
+  const avatarUrl = isLiked || isFavorites ? '' : String(lookupProfileField(profileAvatars, raw) || '').trim()
   return {
     key: `raw-${site || 'any'}-${raw}`,
     name: displayName || '未知目标',
@@ -183,6 +213,24 @@ function makeAvatarEntry(target, fallbackName, profileAvatars = {}, profileNames
     isLiked,
     isFavorites,
   }
+}
+
+export function resolveItemUploaderLabel(item, targetsList = [], profileNames = {}) {
+  const raw = String(item?.uploader || '').trim()
+  if (!raw) return { label: '', isHandle: false }
+  const low = raw.toLowerCase()
+  if (low === 'my_liked') return { label: '我的点赞', isHandle: false }
+  if (low === 'my_favorites') return { label: '我的收藏', isHandle: false }
+  const { byName, bySiteName } = buildTargetLookup(targetsList)
+  const site = normalizeSiteKey(item?.site)
+  const matched = (site && bySiteName.get(`${site}:${low}`)) || byName.get(low) || null
+  const displayName = String(
+    matched?.display_name || lookupProfileField(profileNames, raw, matched?.username) || ''
+  ).trim()
+  if (displayName) {
+    return { label: displayName, isHandle: false }
+  }
+  return { label: raw, isHandle: true }
 }
 
 export function resolveJobCategory(job) {

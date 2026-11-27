@@ -661,7 +661,20 @@ def _timestamp_to_ymd(raw: Any) -> str:
 
 
 def _normalize_thumb_url(raw: Any) -> str:
-    url = str(raw or "").strip()
+    if isinstance(raw, dict):
+        for key in ("url", "src", "thumbURL", "thumbUrl", "avatarURL", "avatarUrl", "image", "default", "large", "medium"):
+            cand = _normalize_thumb_url(raw.get(key))
+            if cand:
+                return cand
+        for value in raw.values():
+            if isinstance(value, str):
+                cand = _normalize_thumb_url(value)
+                if cand:
+                    return cand
+        return ""
+    if not isinstance(raw, str):
+        return ""
+    url = raw.strip()
     if not url or url.startswith("data:"):
         return ""
     if url.startswith("//"):
@@ -686,7 +699,7 @@ def _extract_profile_meta_from_initials(
         if not isinstance(d, dict):
             return
         if not display_name:
-            for key in ("name", "displayName", "title", "pageTitle", "channelName", "pornstarName"):
+            for key in ("name", "displayName", "title", "pageTitle", "channelName", "pornstarName", "userName"):
                 val = str(d.get(key) or "").strip()
                 if val and val.lower() not in {"xhamster", "videos", "favorites"}:
                     display_name = html_lib.unescape(val)
@@ -696,13 +709,19 @@ def _extract_profile_meta_from_initials(
                 "imageUserAvatarUrl",
                 "avatarURL",
                 "avatarUrl",
+                "avatarThumbUrl",
                 "avatar",
                 "siteLogoURL",
                 "thumbURL",
                 "thumbUrl",
                 "imageThumbUrl",
                 "logoThumbUrl",
+                "imageURL",
+                "imageUrl",
+                "image",
                 "logo",
+                "photo",
+                "picture",
                 "icon",
             ):
                 cand = _normalize_thumb_url(d.get(key))
@@ -724,17 +743,29 @@ def _extract_profile_meta_from_initials(
     )
     candidates = [
         initials.get("profile"),
+        initials.get("userProfile"),
+        initials.get("profileModel"),
         info_comp.get("pornstarTop"),
-        info_comp,
         info_comp.get("displayUserModel"),
         info_comp.get("pornstar"),
+        info_comp.get("creator"),
         info_comp.get("channel"),
+        info_comp.get("channelModel"),
+        info_comp.get("user"),
+        info_comp.get("model"),
         info_comp.get("entity"),
+        info_comp,
         channel_landing.get("sponsorChannel"),
         channel_landing,
         layout_page.get("channel"),
         layout_page.get("pornstar"),
         layout_page.get("creator"),
+        layout_page.get("user"),
+        layout_page.get("entity"),
+        initials.get("creator"),
+        initials.get("pornstar"),
+        initials.get("channel"),
+        initials.get("user"),
         initials.get("entity"),
     ]
     for cand in candidates:
@@ -1485,12 +1516,38 @@ def _extract_xhamster_uploader_profile(video_model: Dict[str, Any]) -> Tuple[str
                 name = html_lib.unescape(val)
                 break
         avatar = ""
-        for k in ("logo", "siteLogoURL", "imageUserAvatarUrl", "avatarURL", "avatarUrl", "thumbURL", "thumbUrl", "logoThumbUrl"):
+        for k in (
+            "logo",
+            "siteLogoURL",
+            "imageUserAvatarUrl",
+            "avatarURL",
+            "avatarUrl",
+            "avatarThumbUrl",
+            "avatar",
+            "thumbURL",
+            "thumbUrl",
+            "logoThumbUrl",
+            "imageURL",
+            "imageUrl",
+            "image",
+        ):
             cand = _normalize_thumb_url(node.get(k))
             if cand:
                 avatar = cand
                 break
         return name, avatar
+
+    best_name = ""
+    best_avatar = ""
+
+    def _merge(node: Any) -> bool:
+        nonlocal best_name, best_avatar
+        name, avatar = _pick(node)
+        if name and not best_name:
+            best_name = name
+        if avatar and not best_avatar:
+            best_avatar = avatar
+        return bool(best_name and best_avatar)
 
     landing = video_model.get("landing")
     landing_user_meta: Tuple[str, str] = ("", "")
@@ -1500,30 +1557,31 @@ def _extract_xhamster_uploader_profile(video_model: Dict[str, Any]) -> Tuple[str
         )
         name, avatar = _pick(landing)
         if parsed_landing and parsed_landing[0] in {"creator", "pornstar", "channel"}:
-            return name, avatar
-        landing_user_meta = (name, avatar)
+            best_name, best_avatar = name, avatar
+            if best_name and best_avatar:
+                return best_name, best_avatar
+        else:
+            landing_user_meta = (name, avatar)
 
-    channel_model = video_model.get("channelModel")
-    if isinstance(channel_model, dict):
-        name, avatar = _pick(channel_model)
-        if name or avatar:
-            return name, avatar
+    if _merge(video_model.get("channelModel")):
+        return best_name, best_avatar
 
-    if landing_user_meta[0] or landing_user_meta[1]:
-        return landing_user_meta
+    if landing_user_meta[0] and not best_name:
+        best_name = landing_user_meta[0]
+    if landing_user_meta[1] and not best_avatar:
+        best_avatar = landing_user_meta[1]
+    if best_name and best_avatar:
+        return best_name, best_avatar
 
     for key in ("creator", "pornstar", "author"):
-        name, avatar = _pick(video_model.get(key))
-        if name or avatar:
-            return name, avatar
+        if _merge(video_model.get(key)):
+            return best_name, best_avatar
 
     channels = video_model.get("channels")
     if isinstance(channels, list) and channels:
-        name, avatar = _pick(channels[0])
-        if name or avatar:
-            return name, avatar
+        _merge(channels[0])
 
-    return "", ""
+    return best_name, best_avatar
 
 
 async def fetch_xhamster_video_detail(

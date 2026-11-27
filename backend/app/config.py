@@ -16,6 +16,24 @@ from .redaction import redact_diagnostic
 
 REDACTED_PLACEHOLDER = "********"
 _SECRET_FLAGS = re.compile(r"--[\w-]*(?:password|pass|token|header|secret|credential|(?:^|-)key)[\w-]*", re.I)
+_AUTH_COOKIE_NAME_RE = re.compile(r"(?:^|[_-])(sess|session|sid|token|auth|key|secret|hash|login|uid|ss|il|at|rt|jwt|csrf|xsrf|prs|bs|ua)(?:$|[_-])", re.I)
+_NON_SECRET_COOKIE_VAL_RE = re.compile(r"^[\d._:/-]+$")
+_BENIGN_COOKIE_VALUES = frozenset(
+    {
+        "true",
+        "false",
+        "accepted",
+        "rejected",
+        "disabled",
+        "enabled",
+        "desktop",
+        "mobile",
+        "straight",
+        "default",
+        "english",
+        "chinese",
+    }
+)
 
 SENSITIVE_RUNTIME_FIELDS = frozenset(
     {
@@ -27,6 +45,22 @@ SENSITIVE_RUNTIME_FIELDS = frozenset(
         "yescaptcha_client_key",
     }
 )
+
+
+def _is_redactable_cookie_value(name: str, value: str) -> bool:
+    """Only treat high-entropy / auth-like cookie values as substring redaction targets.
+
+    Short flag cookies such as ``accessAgeDisclaimerPH=1`` or ``lang=en`` must never
+    be added as global substring replacements, otherwise ordinary log numbers and
+    timestamps get corrupted into ``***``.
+    """
+    if len(value) < 8:
+        return False
+    if value.lower() in _BENIGN_COOKIE_VALUES:
+        return False
+    if _NON_SECRET_COOKIE_VAL_RE.fullmatch(value) and len(value) < 16:
+        return False
+    return len(value) >= 12 or bool(_AUTH_COOKIE_NAME_RE.search(name))
 
 
 def default_data_dir() -> Path:
@@ -328,14 +362,29 @@ class RuntimeSettings(BaseModel):
         return data
 
     def diagnostic_secrets(self) -> tuple[str, ...]:
-        values = {getattr(self, field).strip() for field in SENSITIVE_RUNTIME_FIELDS}
+        values: set[str] = set()
+        for field in ("ph_password", "xh_password", "serverchan_send_key", "yescaptcha_client_key"):
+            val = getattr(self, field).strip()
+            if len(val) >= 4:
+                values.add(val)
         for cookie in (self.ph_cookie, self.xh_cookie):
-            values.update(pair.partition("=")[2].strip().strip('"') for pair in cookie.split(";"))
+            raw_cookie = cookie.strip()
+            if len(raw_cookie) >= 8:
+                values.add(raw_cookie)
+            for pair in raw_cookie.split(";"):
+                name, sep, raw_val = pair.partition("=")
+                if not sep:
+                    continue
+                val = raw_val.strip().strip('"')
+                if _is_redactable_cookie_value(name.strip(), val):
+                    values.add(val)
         for url in (self.proxy_url, self.serverchan_api_url):
             try:
                 password = urlsplit(url).password
                 if password:
-                    values.update((password, unquote(password)))
+                    for cand in (password, unquote(password)):
+                        if len(cand) >= 4:
+                            values.add(cand)
             except ValueError:
                 pass
         return tuple(sorted(values - {""}, key=len, reverse=True))

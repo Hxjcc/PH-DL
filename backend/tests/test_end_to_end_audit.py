@@ -392,3 +392,196 @@ def test_file_and_remote_names_fit_filesystem_and_reject_unsafe_paths(tmp_path):
     part = tmp_path / "fixture.mp4.tmp"
     part.with_suffix(".tmp.json").write_bytes(b" " * 20_000)
     assert read_download_checkpoint(part) is None
+
+
+def test_diagnostic_redaction_preserves_short_cookie_flags_and_numbers():
+    settings = RuntimeSettings(
+        ph_password="my-real-password",
+        ph_cookie="accessAgeDisclaimerPH=1; hasVisited=1; cookieBannerState=1; lang=en; date=2025-02-24; ts=1732681234; PHPSESSID=fixture_session_token_987654",
+        xh_cookie="hasVisited=1; lang=en; prs=fixture_xh_token_abcdef123",
+    )
+    sample_logs = [
+        "[上传] 开始上传至 gd:xHamster/yourselena: 2025-02-24_18 Y.O Needs A Big Cock! [xhSInkk].mp4 (102.8 MB)",
+        "[上传成功] 2024-10-10_Title [xhdMQJM].mp4 -> gd:xHamster/yourselena (耗时 11.0s, 27.5 MB/s, 已删除本地文件)",
+        "任务结束 [completed]: 总计 12, 完成 12, 已上传 12, 跳过 0, 失败 0",
+    ]
+    for line in sample_logs:
+        assert settings.redact_diagnostic(line) == line
+
+    leaked = "err my-real-password fixture_session_token_987654 fixture_xh_token_abcdef123"
+    cleaned = settings.redact_diagnostic(leaked)
+    assert "my-real-password" not in cleaned
+    assert "fixture_session_token_987654" not in cleaned
+    assert "fixture_xh_token_abcdef123" not in cleaned
+
+
+async def test_manual_target_persists_profile_metadata_and_video_display_name(tmp_path, monkeypatch):
+    from app.engine import task_manager as tm_mod
+    from app.engine.events import EventBus
+    from app.parsers.list_scanner import ListedVideo
+    from app.parsers.video import VideoDetail
+    from app.parsers.xhamster import _extract_profile_meta_from_initials, _extract_xhamster_uploader_profile
+    from app.services.downloader import DownloadOutcome
+
+    av_nested, dn_nested = _extract_profile_meta_from_initials(
+        {"creator": {"name": "Your Selena", "avatar": {"url": "https://ic-tt-nss.xhcdn.com/a/selena/avatar.jpg"}}},
+        target_type="creator",
+    )
+    assert dn_nested == "Your Selena"
+    assert av_nested == "https://ic-tt-nss.xhcdn.com/a/selena/avatar.jpg"
+
+    merged_dn, merged_av = _extract_xhamster_uploader_profile(
+        {
+            "landing": {"link": "https://xhamster.com/creators/yourselena", "name": "Your Selena"},
+            "channelModel": {"logo": "https://ic-tt-nss.xhcdn.com/a/selena/logo.jpg"},
+        }
+    )
+    assert merged_dn == "Your Selena"
+    assert merged_av == "https://ic-tt-nss.xhcdn.com/a/selena/logo.jpg"
+
+    env = EnvSettings(data_dir=tmp_path)
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    try:
+        repo = Repository(db)
+        await repo.save_settings(RuntimeSettings(uploader_enabled=False))
+        events = EventBus()
+        manager = tm_mod.TaskManager(env, repo, events)
+
+        async def fake_resolve(_ctx, username, timeout=15.0):
+            return ("creator", "yourselena", "Your Selena", "https://ic-tt-nss.xhcdn.com/a/yourselena/avatar.jpg")
+
+        async def fake_scan(_ctx, _url, _selectors, **kwargs):
+            # Emits the exact same avatar & display_name that resolve_xhamster_target_with_profile returned
+            if kwargs.get("on_profile"):
+                await kwargs["on_profile"]("https://ic-tt-nss.xhcdn.com/a/yourselena/avatar.jpg", "Your Selena")
+            return [
+                ListedVideo(
+                    viewkey="xhNmusf",
+                    title="Sample Clip",
+                    url="https://xhamster.com/videos/sample-xhNmusf",
+                    page_num=1,
+                    item_num=1,
+                    total_on_page=1,
+                )
+            ]
+
+        async def fake_details(_ctx, items, _selectors, **_kwargs):
+            return [
+                VideoDetail(
+                    viewkey="xhNmusf",
+                    title="Sample Clip",
+                    page_url=items[0][0],
+                    referer_url=items[0][0],
+                    download_url="https://cdn.xhcdn.com/sample.mp4",
+                    quality="1080p",
+                    uploader_username="yourselena",
+                    uploader_type="creator",
+                    uploader_display_name="Your Selena",
+                    uploader_avatar_url="https://ic-tt-nss.xhcdn.com/a/yourselena/avatar.jpg",
+                )
+            ]
+
+        async def fake_download(**kwargs):
+            out = kwargs["download_dir"] / "sample.mp4"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"0" * 32768)
+            return DownloadOutcome(
+                success=True,
+                local_path=out,
+                file_size=32768,
+                quality="1080p",
+                download_url=kwargs["download_url"],
+            )
+
+        monkeypatch.setattr(tm_mod, "resolve_xhamster_target_with_profile", fake_resolve)
+        monkeypatch.setattr(tm_mod, "scan_list_pages", fake_scan)
+        monkeypatch.setattr(tm_mod, "fetch_video_details_batch", fake_details)
+        monkeypatch.setattr(tm_mod, "download_mp4_with_resume", fake_download)
+
+        job = await repo.create_job(
+            "manual_target",
+            "[xHamster] 下载目标: yourselena",
+            {
+                "site": "xhamster",
+                "usernames": ["yourselena"],
+                "target_type": "auto",
+                "auto_upload": False,
+                "add_to_auto_track": False,
+            },
+        )
+        await manager._run_job(job["id"])
+        final_job = await repo.get_job(job["id"])
+        assert final_job is not None and final_job["status"] == "completed"
+        assert final_job["params"]["profile_names"]["yourselena"] == "Your Selena"
+        assert final_job["params"]["profile_avatars"]["yourselena"] == "https://ic-tt-nss.xhcdn.com/a/yourselena/avatar.jpg"
+
+        # Untracked creator still renders display name in history, search, and filter dropdown
+        videos, total = await repo.query_videos(site="xhamster")
+        assert total == 1
+        assert videos[0]["uploader"] == "yourselena"
+        assert videos[0]["uploader_display_name"] == "Your Selena"
+
+        searched, search_total = await repo.query_videos(site="xhamster", search="Your Selena")
+        assert search_total == 1 and searched[0]["viewkey"] == "xhNmusf"
+
+        facets = await repo.get_video_filter_facets(site="xhamster")
+        assert facets["uploader_labels"]["yourselena"] == "Your Selena"
+
+        # Also verify detail-page backfill when list/resolve returned no profile metadata
+        async def empty_resolve(_ctx, username, timeout=15.0):
+            return ("creator", username, "", "")
+
+        async def empty_scan(_ctx, _url, _selectors, **kwargs):
+            return [
+                ListedVideo(
+                    viewkey="xhBackfill",
+                    title="Backfill Clip",
+                    url="https://xhamster.com/videos/backfill-xhBackfill",
+                    page_num=1,
+                    item_num=1,
+                    total_on_page=1,
+                )
+            ]
+
+        async def detail_with_profile(_ctx, items, _selectors, **_kwargs):
+            return [
+                VideoDetail(
+                    viewkey="xhBackfill",
+                    title="Backfill Clip",
+                    page_url=items[0][0],
+                    referer_url=items[0][0],
+                    download_url="https://cdn.xhcdn.com/backfill.mp4",
+                    quality="1080p",
+                    uploader_username="backfilluser",
+                    uploader_type="creator",
+                    uploader_display_name="Backfill Creator",
+                    uploader_avatar_url="https://ic-tt-nss.xhcdn.com/a/backfill/avatar.jpg",
+                )
+            ]
+
+        monkeypatch.setattr(tm_mod, "resolve_xhamster_target_with_profile", empty_resolve)
+        monkeypatch.setattr(tm_mod, "scan_list_pages", empty_scan)
+        monkeypatch.setattr(tm_mod, "fetch_video_details_batch", detail_with_profile)
+
+        job2 = await repo.create_job(
+            "manual_target",
+            "[xHamster] 下载目标: backfilluser",
+            {
+                "site": "xhamster",
+                "usernames": ["backfilluser"],
+                "target_type": "auto",
+                "auto_upload": False,
+                "add_to_auto_track": False,
+            },
+        )
+        await manager._run_job(job2["id"])
+        final_job2 = await repo.get_job(job2["id"])
+        assert final_job2 is not None and final_job2["status"] == "completed"
+        assert final_job2["params"]["profile_names"]["backfilluser"] == "Backfill Creator"
+        assert final_job2["params"]["profile_avatars"]["backfilluser"] == "https://ic-tt-nss.xhcdn.com/a/backfill/avatar.jpg"
+        v_backfill, _ = await repo.query_videos(site="xhamster", uploader="backfilluser")
+        assert v_backfill[0]["uploader_display_name"] == "Backfill Creator"
+    finally:
+        await db.close()

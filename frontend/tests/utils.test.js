@@ -12,6 +12,7 @@ import {
   buildItemStatusPills,
   computeJobLiveMetrics,
   filterJobItemsByStatus,
+  resolveItemUploaderLabel,
   resolveJobVisual,
 } from '../src/utils/jobMeta.js'
 import { appendLiveLog, mergeLogsSnapshot } from '../src/utils/logBuffer.js'
@@ -655,4 +656,32 @@ test('computeJobLiveMetrics handles HLS remuxing phase without stalling overall 
   assert.equal(lastMetrics.indeterminate, true)
   assert.equal(lastMetrics.remuxingCount, 1)
   assert.equal(lastMetrics.phaseText, '正在封装 MP4 (1 个视频)...')
+})
+
+test('resolveJobVisual and resolveItemUploaderLabel resolve profile names and avatars case-insensitively', () => {
+  const job = {
+    id: 96,
+    kind: 'manual_target',
+    label: '[xHamster] 下载目标: yourselena',
+    params: {
+      site: 'xhamster',
+      usernames: ['yourselena'],
+      target_type: 'auto',
+      profile_names: { YourSelena: 'Your Selena' },
+      profile_avatars: { YourSelena: 'https://ic-tt-nss.xhcdn.com/a/yourselena/avatar.jpg' },
+    },
+  }
+  const visual = resolveJobVisual(job, [])
+  assert.equal(visual.title, 'Your Selena')
+  assert.equal(visual.avatars.length, 1)
+  assert.equal(visual.avatars[0].avatarUrl, 'https://ic-tt-nss.xhcdn.com/a/yourselena/avatar.jpg')
+
+  assert.deepEqual(
+    resolveItemUploaderLabel({ site: 'xhamster', uploader: 'yourselena' }, [], job.params.profile_names),
+    { label: 'Your Selena', isHandle: false }
+  )
+  assert.deepEqual(
+    resolveItemUploaderLabel({ site: 'xhamster', uploader: 'unknown_user' }, [], job.params.profile_names),
+    { label: 'unknown_user', isHandle: true }
+  )
 })

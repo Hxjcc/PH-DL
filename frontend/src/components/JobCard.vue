@@ -35,6 +35,7 @@ import {
   buildItemStatusPills,
   computeJobLiveMetrics,
   filterJobItemsByStatus,
+  resolveItemUploaderLabel,
   resolveJobVisual,
 } from '../utils/jobMeta'
 import { buildExportFilename } from '../utils/exportFilename'
@@ -105,6 +106,10 @@ const showItemUploader = computed(() => {
   if (!singleUser) return true
   return items.value.some((it) => it.uploader && it.uploader.toLowerCase() !== singleUser)
 })
+
+function itemUploaderMeta(item) {
+  return resolveItemUploaderLabel(item, store.targetsCache || [], props.job.params?.profile_names || {})
+}
 
 function isAvatarValid(entry) {
   return Boolean(entry?.avatarUrl) && !brokenAvatars.value.has(entry.avatarUrl)
@@ -931,11 +936,11 @@ function downloadExportTxt() {
                 <div class="flex flex-wrap items-center sm:justify-end gap-1.5 shrink-0 text-[11px] tabular-nums pl-5 sm:pl-0">
                   <span
                     v-if="showItemUploader && item.uploader"
-                    class="hidden md:inline-flex h-[21px] items-center rounded-full border border-border/80 bg-surface-subtle px-2.5 text-[11px] leading-none text-muted-foreground max-w-32"
-                    :title="item.uploader"
+                    class="hidden md:inline-flex h-[21px] items-center rounded-full border border-border/80 bg-surface-subtle px-2.5 text-[11px] leading-none text-muted-foreground max-w-36"
+                    :title="itemUploaderMeta(item).label"
                   >
-                    <span class="opacity-65 mr-[1px] shrink-0">@</span>
-                    <span class="truncate">{{ item.uploader }}</span>
+                    <span v-if="itemUploaderMeta(item).isHandle" class="opacity-65 mr-[1px] shrink-0">@</span>
+                    <span class="truncate">{{ itemUploaderMeta(item).label }}</span>
                   </span>
 
                   <span

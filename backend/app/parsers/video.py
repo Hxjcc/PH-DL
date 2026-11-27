@@ -334,6 +334,45 @@ def _extract_uploader(tree: HTMLParser, video_data: Optional[Dict[str, Any]], se
     return _extract_uploader_from_video_data(video_data)
 
 
+def _extract_uploader_profile(
+    tree: Optional[HTMLParser],
+    video_data: Optional[Dict[str, Any]],
+    selectors: SelectorSettings,
+    base_url: str,
+) -> Tuple[str, str]:
+    display_name = ""
+    avatar_url = ""
+    if tree is not None:
+        container = select_one(tree, selectors.split_list("detail_page_uploader_container"))
+        if container:
+            link = select_one(container, selectors.split_list("detail_page_uploader_link_in_container"))
+            if link is not None:
+                text = " ".join((link.text() or "").split()).strip()
+                if text and text.lower() not in {"pornhub", "avatar", "profile"}:
+                    display_name = html_lib.unescape(text)
+            for img in container.css("img"):
+                attrs = getattr(img, "attributes", {}) or {}
+                src = (attrs.get("src") or attrs.get("data-src") or "").strip()
+                if not src or src.startswith("data:"):
+                    continue
+                resolved = urllib.parse.urljoin(base_url, src)
+                if "/pics/users/default/" in resolved:
+                    continue
+                avatar_url = resolved
+                if not display_name:
+                    alt = (attrs.get("alt") or "").strip()
+                    if alt and alt.lower() not in {"pornhub", "avatar", "profile", "user avatar"}:
+                        display_name = html_lib.unescape(alt)
+                break
+    if not display_name and isinstance(video_data, dict):
+        for key in ("author", "uploader"):
+            val = str(video_data.get(key) or "").strip()
+            if val:
+                display_name = html_lib.unescape(val)
+                break
+    return display_name, avatar_url
+
+
 def is_mp4_media_option(option: Dict[str, Any]) -> bool:
     video_url = option.get("videoUrl")
     if not isinstance(video_url, str) or not video_url.strip():
@@ -422,7 +461,7 @@ def _parse_video_html_fields(
     selectors: SelectorSettings,
     uploader_hint: Optional[Tuple[str, str]],
     skip_dom: bool,
-) -> Tuple[Optional[Dict[str, Any]], str, str, str, str, int, Optional[SubscribeAction]]:
+) -> Tuple[Optional[Dict[str, Any]], str, str, str, str, str, str, int, Optional[SubscribeAction]]:
     vdata = extract_flashvars(html, final_url, vkey)
     published_at, duration_seconds = extract_detail_published_and_duration(html, vdata)
     subscribe_action = extract_subscribe_action(html)
@@ -433,15 +472,27 @@ def _parse_video_html_fields(
     else:
         uploader_name, uploader_type = _extract_uploader_from_video_data(vdata)
 
+    tree: Optional[HTMLParser] = None
     if not skip_dom and (not title or not uploader_name):
         tree = HTMLParser(html)
         if not title:
             title = _extract_title(tree, js_title, vkey, final_url, selectors)
         if not uploader_name:
             uploader_name, uploader_type = _extract_uploader(tree, vdata, selectors)
+    uploader_display_name, uploader_avatar_url = _extract_uploader_profile(tree, vdata, selectors, final_url)
     if not title:
         title = f"未知标题_{vkey or os.path.basename(final_url)}"
-    return vdata, title, uploader_name, uploader_type, published_at, duration_seconds, subscribe_action
+    return (
+        vdata,
+        title,
+        uploader_name,
+        uploader_type,
+        uploader_display_name,
+        uploader_avatar_url,
+        published_at,
+        duration_seconds,
+        subscribe_action,
+    )
 
 
 async def fetch_single_video_detail(
@@ -508,7 +559,17 @@ async def fetch_single_video_detail(
             return VideoDetail(viewkey=vkey, title="", page_url=page_url, referer_url=final_url, error="操作已取消")
 
         if len(html) >= _OFFLOAD_HTML_THRESHOLD:
-            vdata, title, uploader_name, uploader_type, published_at, duration_seconds, subscribe_action = await asyncio.to_thread(
+            (
+                vdata,
+                title,
+                uploader_name,
+                uploader_type,
+                uploader_display_name,
+                uploader_avatar_url,
+                published_at,
+                duration_seconds,
+                subscribe_action,
+            ) = await asyncio.to_thread(
                 _parse_video_html_fields,
                 html,
                 final_url,
@@ -518,7 +579,17 @@ async def fetch_single_video_detail(
                 skip_dom,
             )
         else:
-            vdata, title, uploader_name, uploader_type, published_at, duration_seconds, subscribe_action = _parse_video_html_fields(
+            (
+                vdata,
+                title,
+                uploader_name,
+                uploader_type,
+                uploader_display_name,
+                uploader_avatar_url,
+                published_at,
+                duration_seconds,
+                subscribe_action,
+            ) = _parse_video_html_fields(
                 html,
                 final_url,
                 vkey,
@@ -536,6 +607,8 @@ async def fetch_single_video_detail(
                 referer_url=final_url,
                 uploader_username=uploader_name,
                 uploader_type=uploader_type,
+                uploader_display_name=uploader_display_name,
+                uploader_avatar_url=uploader_avatar_url,
                 page_num=page_num,
                 item_num=item_num,
                 error=kw_reason,
@@ -651,6 +724,8 @@ async def fetch_single_video_detail(
             video_format="mp4",
             uploader_username=uploader_name,
             uploader_type=uploader_type,
+            uploader_display_name=uploader_display_name,
+            uploader_avatar_url=uploader_avatar_url,
             page_num=page_num,
             item_num=item_num,
             mp4_sources=_describe_media_sources(mp4_options) if include_mp4_sources else (),

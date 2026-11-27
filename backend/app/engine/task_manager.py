@@ -992,10 +992,25 @@ class TaskManager:
         include_keywords: Optional[Set[str]] = None,
         exclude_keywords: Optional[Set[str]] = None,
         on_detail_parsed: Optional[Callable[[VideoDetail], Awaitable[None]]] = None,
+        uploader_display_names: Optional[Dict[str, str]] = None,
     ) -> Tuple[Dict[str, int], Dict[str, List[str]]]:
         """Stream pre-parse, byte-adaptive downloads, and multi-worker zero-wait uploads."""
         uploaded_by_uploader: Dict[str, int] = defaultdict(int)
         failed_urls_by_uploader: Dict[str, List[str]] = defaultdict(list)
+        item_display_names: Dict[int, str] = {}
+        known_display_names: Dict[str, str] = {}
+        for raw_k, raw_v in (uploader_display_names or {}).items():
+            ck = str(raw_k or "").strip().lower()
+            cv = str(raw_v or "").strip()
+            if ck and cv:
+                known_display_names[ck] = cv
+
+        def _resolve_item_display_name(iid: int, uploader_name: str) -> str:
+            return (
+                item_display_names.get(iid)
+                or known_display_names.get(str(uploader_name or "").strip().lower())
+                or ""
+            )
 
         def _record_failed_url(folder: str, page_url: str) -> None:
             if page_url and page_url not in failed_urls_by_uploader[folder]:
@@ -1556,8 +1571,12 @@ class TaskManager:
                         pub_date = str(item.get("published_at") or (ledger or {}).get("published_at") or "").strip()
                         dur_sec = int(item.get("duration_seconds") or (ledger or {}).get("duration_seconds") or 0)
                         local_metadata = {
-                            "title": item["title"], "uploader": item["uploader"], "target_type": item["target_type"],
-                            "quality": local_quality, "video_page_url": item["page_url"],
+                            "title": item["title"],
+                            "uploader": item["uploader"],
+                            "uploader_display_name": _resolve_item_display_name(item_id, item["uploader"]),
+                            "target_type": item["target_type"],
+                            "quality": local_quality,
+                            "video_page_url": item["page_url"],
                         } if own_local_file else {}
                         await self.repo.upsert_video(
                             vkey,
@@ -1809,6 +1828,7 @@ class TaskManager:
                         site=item_site,
                         title=item["title"],
                         uploader=item["uploader"],
+                        uploader_display_name=_resolve_item_display_name(item_id, item["uploader"]),
                         target_type=item["target_type"],
                         quality=outcome.quality or item["quality"],
                         video_page_url=item["page_url"],
@@ -1981,6 +2001,13 @@ class TaskManager:
                                                 if spec.group_by_uploader
                                                 else spec.default_type
                                             )
+                                            detail_dn = (detail.uploader_display_name or "").strip()
+                                            if detail_dn:
+                                                item_display_names[iid] = detail_dn
+                                                for alias in (resolved_uploader, detail.uploader_username):
+                                                    alias_key = str(alias or "").strip().lower()
+                                                    if alias_key and alias_key not in known_display_names:
+                                                        known_display_names[alias_key] = detail_dn
                                             patch: Dict[str, Any] = {
                                                 "viewkey": detail.viewkey,
                                                 "uploader": resolved_uploader,
@@ -2508,6 +2535,7 @@ class TaskManager:
         existing_keys = {_item_key(item["viewkey"], item["page_url"]) for item in historical_items}
 
         targets: List[Tuple[str, str]] = []
+        target_aliases: Dict[str, List[str]] = {}
         resolved_profile_names: Dict[str, str] = {}
         resolved_profile_avatars: Dict[str, str] = {}
         if raw_type == "liked":
@@ -2536,10 +2564,11 @@ class TaskManager:
                     )
                     if detected:
                         resolved, resolved_uname, det_name, det_avatar = detected
-                        if det_name:
-                            resolved_profile_names[resolved_uname] = det_name
-                        if det_avatar:
-                            resolved_profile_avatars[resolved_uname] = det_avatar
+                        for key in dict.fromkeys((resolved_uname, uname)):
+                            if det_name:
+                                resolved_profile_names[key] = det_name
+                            if det_avatar:
+                                resolved_profile_avatars[key] = det_avatar
                     else:
                         resolved, resolved_uname = "creator", uname
                     if resolved_uname.casefold() != uname.casefold():
@@ -2558,6 +2587,10 @@ class TaskManager:
                     resolved = detected or "model"
                     resolved_uname = uname
                     self.events.emit_log("INFO", f"自动识别目标 '{uname}' 类型为 '{resolved}'。", job_id=job_id)
+                aliases = target_aliases.setdefault(resolved_uname.casefold(), [])
+                for cand_alias in (resolved_uname, uname):
+                    if cand_alias and cand_alias not in aliases:
+                        aliases.append(cand_alias)
                 if not any(t_u.casefold() == resolved_uname.casefold() and t_t == resolved for t_u, t_t in targets):
                     targets.append((resolved_uname, resolved))
 
@@ -2575,8 +2608,66 @@ class TaskManager:
         all_details: List[VideoDetail] = []
         scoped_listed: Dict[str, Tuple[ListedVideo, str, str]] = {}
         scan_errors: List[str] = []
-        profile_avatars: Dict[str, str] = {**resolved_profile_avatars, **(params.get("profile_avatars") or {})}
-        profile_names: Dict[str, str] = {**resolved_profile_names, **(params.get("profile_names") or {})}
+        persisted_avatars: Dict[str, str] = dict(params.get("profile_avatars") or {})
+        persisted_names: Dict[str, str] = dict(params.get("profile_names") or {})
+        profile_avatars: Dict[str, str] = {**persisted_avatars, **resolved_profile_avatars}
+        profile_names: Dict[str, str] = {**persisted_names, **resolved_profile_names}
+        profile_lock = asyncio.Lock()
+
+        async def _persist_manual_profile(
+            keys: Iterable[str],
+            target_type: str,
+            url: str,
+            display_name: str,
+        ) -> None:
+            clean_url = (url or "").strip()
+            clean_name = (display_name or "").strip()
+            if not clean_url and not clean_name:
+                return
+            unique_keys = [k for k in dict.fromkeys(str(x or "").strip() for x in keys) if k and k != "_currentUser_"]
+            if not unique_keys:
+                return
+            async with profile_lock:
+                for key in unique_keys:
+                    await self.repo.update_target_profile_by_username(
+                        key,
+                        target_type,
+                        avatar_url=clean_url,
+                        display_name=clean_name,
+                        site=site,
+                    )
+                    if clean_name:
+                        await self.repo.update_videos_uploader_display_name(site, key, clean_name)
+                changed = False
+                for key in unique_keys:
+                    if clean_url and persisted_avatars.get(key) != clean_url:
+                        profile_avatars[key] = clean_url
+                        persisted_avatars[key] = clean_url
+                        changed = True
+                    if clean_name and persisted_names.get(key) != clean_name:
+                        profile_names[key] = clean_name
+                        persisted_names[key] = clean_name
+                        changed = True
+                if changed:
+                    updated_job = await self.repo.merge_job_params(
+                        job_id,
+                        {"profile_avatars": dict(profile_avatars), "profile_names": dict(profile_names)},
+                    )
+                    if updated_job:
+                        self.events.broadcast("job_updated", updated_job)
+
+        if profile_avatars != persisted_avatars or profile_names != persisted_names:
+            for t_uname, t_utype in targets:
+                if t_uname == "_currentUser_":
+                    continue
+                t_keys = target_aliases.get(t_uname.casefold(), [t_uname])
+                await _persist_manual_profile(
+                    t_keys,
+                    t_utype,
+                    profile_avatars.get(t_uname) or "",
+                    profile_names.get(t_uname) or "",
+                )
+
         tracked_keys: Set[Tuple[str, str]] = set()
         subscribed_keys: Set[str] = set()
 
@@ -2627,30 +2718,17 @@ class TaskManager:
             ) -> None:
                 target_user = active_uname
                 target_type = active_utype
-                await self.repo.update_target_profile_by_username(
-                    target_user,
-                    target_type,
-                    avatar_url=url,
-                    display_name=display_name,
-                    site=site,
-                )
                 if target_user == "_currentUser_":
-                    return
-                changed = False
-                for key in dict.fromkeys((target_user, uname)):
-                    if url and profile_avatars.get(key) != url:
-                        profile_avatars[key] = url
-                        changed = True
-                    if display_name and profile_names.get(key) != display_name:
-                        profile_names[key] = display_name
-                        changed = True
-                if changed:
-                    updated_job = await self.repo.merge_job_params(
-                        job_id,
-                        {"profile_avatars": profile_avatars, "profile_names": profile_names},
+                    await self.repo.update_target_profile_by_username(
+                        target_user,
+                        target_type,
+                        avatar_url=url,
+                        display_name=display_name,
+                        site=site,
                     )
-                    if updated_job:
-                        self.events.broadcast("job_updated", updated_job)
+                    return
+                keys = [target_user, uname, *target_aliases.get(uname.casefold(), ())]
+                await _persist_manual_profile(keys, target_type, url, display_name)
 
             can_link_creator = (
                 utype in ({"creator", "pornstar", "users", "channel"} if site == "xhamster" else {"model", "pornstar"})
@@ -2694,6 +2772,11 @@ class TaskManager:
                     profile_avatars[canon_user] = profile_avatars[prev_uname]
                 if prev_uname in profile_names and canon_user not in profile_names:
                     profile_names[canon_user] = profile_names[prev_uname]
+                aliases = target_aliases.setdefault(canon_user.casefold(), [])
+                for cand_alias in (canon_user, prev_uname, *target_aliases.get(prev_uname.casefold(), ())):
+                    if cand_alias and cand_alias not in aliases:
+                        aliases.append(cand_alias)
+                target_aliases[prev_uname.casefold()] = aliases
                 self.events.emit_log(
                     "INFO",
                     f"目标 '{prev_uname}' ({prev_utype}) 重定向至新标识 '{canon_user}' ({canon_type})。",
@@ -2870,6 +2953,36 @@ class TaskManager:
             self.events.clear_scan_status(job_id)
             await self._release_idle_http_sessions(ctx)
             await reclaim_memory(self.repo.db)
+
+            async def _backfill_target_profile_from_detail(detail: VideoDetail) -> None:
+                det_name = (detail.uploader_display_name or "").strip()
+                det_avatar = (detail.uploader_avatar_url or "").strip()
+                if not det_name and not det_avatar:
+                    return
+                det_user = (detail.uploader_username or "").strip()
+                matched_keys: List[str] = []
+                matched_type = (detail.uploader_type or ("creator" if site == "xhamster" else "model")).strip().lower()
+                for t_uname, t_utype in targets:
+                    if t_uname == "_currentUser_":
+                        continue
+                    aliases = target_aliases.get(t_uname.casefold(), [t_uname])
+                    if not det_user or any(a.casefold() == det_user.casefold() for a in aliases) or len(targets) == 1:
+                        matched_keys.extend(aliases)
+                        matched_type = t_utype
+                        break
+                if det_user:
+                    matched_keys.append(det_user)
+                if matched_keys:
+                    # Only fill missing fields from video detail pages so profile-page metadata stays authoritative.
+                    existing_avatar = any(persisted_avatars.get(k) for k in matched_keys)
+                    existing_name = any(persisted_names.get(k) for k in matched_keys)
+                    await _persist_manual_profile(
+                        matched_keys,
+                        matched_type,
+                        "" if existing_avatar else det_avatar,
+                        "" if existing_name else det_name,
+                    )
+
             await self._run_download_upload_pipeline(
                 job_id,
                 all_item_ids,
@@ -2882,6 +2995,8 @@ class TaskManager:
                 parse_specs=parse_specs,
                 include_keywords=include_kw,
                 exclude_keywords=exclude_kw,
+                on_detail_parsed=_backfill_target_profile_from_detail,
+                uploader_display_names=profile_names,
             )
 
     def _url_creator_linkage_handler(
@@ -3050,6 +3165,37 @@ class TaskManager:
             f"已入队 {len(item_ids)} 条链接，启动流式按需解析、动态下载与实时上传...",
             job_id=job_id,
         )
+        url_profile_avatars: Dict[str, str] = dict(params.get("profile_avatars") or {})
+        url_profile_names: Dict[str, str] = dict(params.get("profile_names") or {})
+        url_profile_lock = asyncio.Lock()
+
+        async def _handle_url_detail_parsed(detail: VideoDetail) -> None:
+            if on_detail_parsed is not None:
+                await on_detail_parsed(detail)
+            uname = (detail.uploader_username or "").strip()
+            dname = (detail.uploader_display_name or "").strip()
+            avatar = (detail.uploader_avatar_url or "").strip()
+            if not uname or (not dname and not avatar):
+                return
+            detail_site = detect_site_from_url(detail.page_url)
+            async with url_profile_lock:
+                if dname:
+                    await self.repo.update_videos_uploader_display_name(detail_site, uname, dname)
+                changed = False
+                if dname and url_profile_names.get(uname) != dname:
+                    url_profile_names[uname] = dname
+                    changed = True
+                if avatar and url_profile_avatars.get(uname) != avatar:
+                    url_profile_avatars[uname] = avatar
+                    changed = True
+                if changed:
+                    updated_job = await self.repo.merge_job_params(
+                        job_id,
+                        {"profile_avatars": dict(url_profile_avatars), "profile_names": dict(url_profile_names)},
+                    )
+                    if updated_job:
+                        self.events.broadcast("job_updated", updated_job)
+
         if item_ids and not ctx.cancel_event.is_set():
             await self._run_download_upload_pipeline(
                 job_id,
@@ -3063,7 +3209,8 @@ class TaskManager:
                 parse_specs=parse_specs,
                 include_keywords=include_kw,
                 exclude_keywords=exclude_kw,
-                on_detail_parsed=on_detail_parsed,
+                on_detail_parsed=_handle_url_detail_parsed,
+                uploader_display_names=url_profile_names,
             )
 
     async def _exec_update_check(
@@ -3451,6 +3598,11 @@ class TaskManager:
                 self.events.clear_scan_status(job_id)
                 await self._release_idle_http_sessions(ctx)
                 await reclaim_memory(self.repo.db)
+                auto_display_names = {
+                    str(t.get("username") or "").strip(): str(t.get("display_name") or "").strip()
+                    for t in targets
+                    if str(t.get("username") or "").strip() and str(t.get("display_name") or "").strip()
+                }
                 uploaded_by, failed_urls_by = await self._run_download_upload_pipeline(
                     job_id,
                     pipeline_item_ids,
@@ -3461,6 +3613,7 @@ class TaskManager:
                     preferred_qualities=_quality_set(settings.preferred_quality),
                     item_preferred_qualities=item_qual_map,
                     parse_specs=parse_specs or None,
+                    uploader_display_names=auto_display_names,
                 )
                 if not ctx.cancel_event.is_set():
                     if pending_upload_ids and not new_item_ids:
@@ -3529,7 +3682,12 @@ class TaskManager:
         pages_spec = (params.get("pages") or "").strip() or None
         list_url = build_target_list_url(uname if uname != "_currentUser_" else None, utype, site=tsite)
 
+        target_display_name = (target.get("display_name") or "").strip()
+
         async def _save_profile(url: str, display_name: str) -> None:
+            nonlocal target_display_name
+            if (display_name or "").strip():
+                target_display_name = display_name.strip()
             await self.repo.update_target_profile(
                 int(target["id"]),
                 avatar_url=url,
@@ -3616,6 +3774,7 @@ class TaskManager:
                     "viewkey": lv.viewkey,
                     "title": lv.title,
                     "uploader": default_uploader if is_self_col else uname,
+                    "uploader_display_name": "" if is_self_col else target_display_name,
                     "target_type": utype,
                     "video_page_url": lv.url,
                     "status": "baseline",
