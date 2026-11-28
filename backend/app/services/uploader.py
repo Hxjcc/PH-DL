@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,15 @@ from .subprocesses import run_bounded_process
 
 FileSnapshot = Tuple[int, int, int, int, int]
 UploadProgressCallback = Callable[[str, int, int, float, str], None]  # (viewkey, bytes_sent, total, speed_bps, phase)
+
+
+_UPLOAD_SPEED_WINDOW_SECONDS = 5.0
+_UPLOAD_SPEED_MIN_SPAN_SECONDS = 2.5
+_UPLOAD_BURST_DAMP_BYTES = 1024 * 1024
+
+
+def _positive_float(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else 0.0
 
 
 @dataclass
@@ -839,6 +849,39 @@ async def upload_file_batch(
             if len(subset) == 1
             else None
         )
+        copy_started = time.monotonic()
+        active_totals: Dict[str, int] = {}
+        speed_windows: Dict[str, deque[Tuple[float, int]]] = {}
+
+        def _smoothed_upload_speed(
+            vk_key: str,
+            sent_bytes: int,
+            raw_speed: Any,
+            avg_speed: Any,
+            per_item_fallback: float,
+        ) -> float:
+            reported = _positive_float(avg_speed) or _positive_float(raw_speed) or max(0.0, per_item_fallback)
+            if sent_bytes < _UPLOAD_BURST_DAMP_BYTES:
+                return reported
+            now = time.monotonic()
+            win = speed_windows.get(vk_key)
+            if win is None:
+                start_ts = copy_started if sole_entry is not None else now
+                win = deque([(start_ts, 0)])
+                speed_windows[vk_key] = win
+            if sent_bytes >= win[-1][1]:
+                if len(win) > 1 and (now - win[-1][0]) < 0.15:
+                    win[-1] = (now, sent_bytes)
+                else:
+                    win.append((now, sent_bytes))
+            cutoff = now - _UPLOAD_SPEED_WINDOW_SECONDS
+            while len(win) > 2 and win[1][0] <= cutoff:
+                win.popleft()
+            oldest_ts, oldest_bytes = win[0]
+            delta_bytes = max(0, sent_bytes - oldest_bytes)
+            span = max(_UPLOAD_SPEED_MIN_SPAN_SECONDS, now - oldest_ts)
+            window_speed = delta_bytes / span
+            return min(reported, window_speed) if reported > 0 else window_speed
 
         def _on_stderr_line(line: str) -> None:
             parsed = parse_rclone_json_line(line)
@@ -856,6 +899,10 @@ async def upload_file_batch(
                     matched = by_name.get(name) or by_name.get(Path(name).name)
                 if matched is not None and parsed.get("size", matched[1]) == matched[1]:
                     transferred.add(matched[0])
+                    if on_progress is not None and matched[0] in active_totals:
+                        done_total = active_totals.pop(matched[0])
+                        speed_windows.pop(matched[0], None)
+                        on_progress(matched[0], done_total, done_total, 0.0, "uploading")
             if lvl in {"error", "critical", "fatal", "warning"}:
                 err_field = str(parsed.get("error") or "").strip()
                 if message:
@@ -869,7 +916,9 @@ async def upload_file_batch(
                 return
             transferring = stats.get("transferring")
             if isinstance(transferring, list) and transferring:
-                fallback_speed = float(stats.get("speed") or 0.0)
+                fallback_speed = _positive_float(stats.get("speed"))
+                per_item_fallback = fallback_speed / max(1, len(transferring))
+                seen_vks: Set[str] = set()
                 for item in transferring:
                     if not isinstance(item, dict):
                         continue
@@ -878,30 +927,38 @@ async def upload_file_batch(
                     if matched is None:
                         continue
                     vk_m, local_total = matched
+                    seen_vks.add(vk_m)
                     raw_total = item.get("size")
                     total = int(raw_total) if isinstance(raw_total, (int, float)) and raw_total > 0 else local_total
                     raw_bytes = item.get("bytes")
                     sent = int(raw_bytes) if isinstance(raw_bytes, (int, float)) and raw_bytes >= 0 else 0
                     if total > 0:
                         sent = min(sent, total)
-                    raw_speed = item.get("speed")
-                    if isinstance(raw_speed, (int, float)) and raw_speed > 0:
-                        speed = float(raw_speed)
-                    else:
-                        avg_speed = item.get("speedAvg")
-                        speed = (
-                            float(avg_speed)
-                            if isinstance(avg_speed, (int, float)) and avg_speed > 0
-                            else max(0.0, fallback_speed)
-                        )
+                    speed = _smoothed_upload_speed(
+                        vk_m, sent, item.get("speed"), item.get("speedAvg"), per_item_fallback,
+                    )
+                    active_totals[vk_m] = total
                     on_progress(vk_m, sent, total, speed, "uploading")
+                for finished_vk in list(active_totals):
+                    if finished_vk not in seen_vks:
+                        done_total = active_totals.pop(finished_vk)
+                        speed_windows.pop(finished_vk, None)
+                        on_progress(finished_vk, done_total, done_total, 0.0, "uploading")
             elif sole_entry is not None:
                 vk_m, local_total = sole_entry
                 raw_bytes = stats.get("bytes")
                 if isinstance(raw_bytes, (int, float)) and raw_bytes > 0:
                     sent = min(int(raw_bytes), local_total) if local_total > 0 else int(raw_bytes)
-                    speed = float(stats.get("speed") or 0.0)
-                    on_progress(vk_m, sent, local_total, max(0.0, speed), "uploading")
+                    speed = _smoothed_upload_speed(
+                        vk_m, sent, stats.get("speed"), None, 0.0,
+                    )
+                    active_totals[vk_m] = local_total
+                    on_progress(vk_m, sent, local_total, speed, "uploading")
+            elif active_totals:
+                for finished_vk in list(active_totals):
+                    done_total = active_totals.pop(finished_vk)
+                    speed_windows.pop(finished_vk, None)
+                    on_progress(finished_vk, done_total, done_total, 0.0, "uploading")
 
         return _on_stderr_line
 

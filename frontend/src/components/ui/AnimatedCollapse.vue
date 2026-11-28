@@ -17,8 +17,7 @@ const wrapper = ref<HTMLElement | null>(null)
 const content = ref<HTMLElement | null>(null)
 
 let fallbackTimer: ReturnType<typeof setTimeout> | null = null
-let rafId1: number | null = null
-let rafId2: number | null = null
+let rafId: number | null = null
 let animToken = 0
 let activePhase: Phase | null = null
 
@@ -35,17 +34,12 @@ function clearFallback() {
 
 function clearRafs() {
   if (typeof cancelAnimationFrame === 'function') {
-    if (rafId1 !== null) {
-      cancelAnimationFrame(rafId1)
-      rafId1 = null
-    }
-    if (rafId2 !== null) {
-      cancelAnimationFrame(rafId2)
-      rafId2 = null
+    if (rafId !== null) {
+      cancelAnimationFrame(rafId)
+      rafId = null
     }
   } else {
-    rafId1 = null
-    rafId2 = null
+    rafId = null
   }
 }
 
@@ -114,22 +108,18 @@ function animateHeight(fromPx: number, toPx: number, phase: Phase, fromOpacity: 
     wrapper.value.style.height = `${toPx}px`
     wrapper.value.style.opacity = String(toOpacity)
     clearFallback()
-    fallbackTimer = setTimeout(() => finishTransition(token, phase), 320)
+    fallbackTimer = setTimeout(() => finishTransition(token, phase), 260)
   }
 
-  // Wait for two VSync frames so heavy slot mounting commits cleanly before frame 0 of the transition begins.
+  // Commit the initial fixed height cleanly, then start the transition on the next VSync frame.
+  void el.offsetHeight
   if (typeof requestAnimationFrame === 'function') {
-    fallbackTimer = setTimeout(() => finishTransition(token, phase), 420)
-    rafId1 = requestAnimationFrame(() => {
-      rafId1 = null
-      if (token !== animToken) return
-      rafId2 = requestAnimationFrame(() => {
-        rafId2 = null
-        startTransition()
-      })
+    fallbackTimer = setTimeout(() => finishTransition(token, phase), 320)
+    rafId = requestAnimationFrame(() => {
+      rafId = null
+      startTransition()
     })
   } else {
-    void el.offsetHeight
     startTransition()
   }
 }
@@ -210,10 +200,10 @@ onBeforeUnmount(() => {
   height: 0;
   opacity: 0;
   overflow: hidden;
-  contain: layout paint;
+  contain: layout style paint;
   transition:
-    height 250ms cubic-bezier(0.22, 1, 0.36, 1),
-    opacity 190ms cubic-bezier(0.22, 1, 0.36, 1);
+    height 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 160ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .collapse-content {

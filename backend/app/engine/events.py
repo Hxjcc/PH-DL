@@ -17,7 +17,11 @@ _TELEMETRY_EVENTS = frozenset({"item_progress", "job_scheduler", "job_scan", "lo
 
 
 def public_job_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    is_hls = is_hls_url(item.get("download_url")) or str(item.get("temp_path") or "").lower().endswith(".hls")
+    temp_path = item.get("temp_path") or ""
+    is_hls = (
+        (isinstance(temp_path, str) and temp_path.lower().endswith(".hls"))
+        or is_hls_url(item.get("download_url"))
+    )
     return {**item, "download_url": "", "is_hls": is_hls}
 
 

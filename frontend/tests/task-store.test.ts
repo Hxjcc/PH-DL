@@ -649,3 +649,92 @@ test('overview restores stopping state on reload and deleting a job cleans runti
     store._resetSessionState()
   }
 })
+
+test('paginated job details dedupe matching prefetch, drop stale page switches, hydrate off-page progress, and keep WS updates scoped', async () => {
+  vi.useFakeTimers()
+  mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const running = job(30, 'running', 1)
+  store.jobs = [running]
+
+  let resolvePage1!: (res: JobDetailResponse) => void
+  let resolveFailed!: (res: JobDetailResponse) => void
+  const getJob = vi.spyOn(api, 'getJob')
+    .mockImplementationOnce(() => new Promise((resolve) => { resolvePage1 = resolve }))
+    .mockImplementationOnce(() => new Promise((resolve) => { resolveFailed = resolve }))
+    .mockResolvedValueOnce({
+      job: running,
+      items: [makeJobItem(2, 30, { status: 'failed', revision: 2 })],
+      total: 1,
+      total_all: 120,
+      page: 1,
+      page_size: 50,
+      status: 'failed',
+      status_counts: { done: 118, failed: 1, downloading: 1 },
+      paginated: true,
+    })
+
+  const send = startTestEventStream(store)
+  const unpin = store.pinJobDetail(30)
+  try {
+    // 1. Concurrent prefetch + expand with identical query reuses a single HTTP request.
+    const prefetch = store.prefetchJobDetail(30, { page: 1, page_size: 50, status: 'all' })
+    const expand = store.loadJobDetail(30, { page: 1, page_size: 50, status: 'all' })
+    await Promise.resolve()
+    assert.equal(getJob.mock.calls.length, 1)
+
+    // 2. Switching filter while page 1 is still in flight issues a fresh request and ignores late page 1.
+    const switchFilter = store.loadJobDetail(30, { page: 1, page_size: 50, status: 'failed' })
+    await Promise.resolve()
+    assert.equal(getJob.mock.calls.length, 2)
+    assert.deepEqual(getJob.mock.calls[1], [30, { page: 1, page_size: 50, status: 'failed' }])
+
+    resolveFailed({
+      job: running,
+      items: [makeJobItem(2, 30, { status: 'failed', revision: 1 })],
+      total: 1,
+      total_all: 120,
+      page: 1,
+      page_size: 50,
+      status: 'failed',
+      status_counts: { done: 118, failed: 1, downloading: 1 },
+      paginated: true,
+      live_progress: {
+        95: { job_id: 30, item_id: 95, bytes_downloaded: 400, bytes_total: 1000, speed_bps: 500, phase: 'downloading' },
+      },
+    })
+    await switchFilter
+    assert.equal(store.jobItemMeta[30]?.status, 'failed')
+    assert.equal(store.liveProgress[95]?.bytes_downloaded, 400, 'hydrates off-page active item progress')
+
+    // Late page 1 response must NOT overwrite the newer failed-filter view.
+    resolvePage1({
+      job: running,
+      items: [makeJobItem(1, 30, { status: 'done', revision: 1 })],
+      total: 120,
+      total_all: 120,
+      page: 1,
+      page_size: 50,
+      status: 'all',
+      status_counts: { done: 118, failed: 1, downloading: 1 },
+      paginated: true,
+    })
+    await Promise.all([prefetch, expand])
+    assert.equal(store.jobItemMeta[30]?.status, 'failed')
+    assert.deepEqual(store.jobItems[30]?.map((it) => it.id), [2])
+
+    // 3. Off-page WS item_updated must NOT pollute the paginated slice, and job_items_changed reloads the active filter query.
+    send({ type: 'item_updated', ts: '', data: makeJobItem(99, 30, { status: 'done', revision: 2 }) })
+    await vi.advanceTimersByTimeAsync(150)
+    assert.deepEqual(store.jobItems[30]?.map((it) => it.id), [2])
+
+    send({ type: 'job_items_changed', ts: '', data: { job_id: 30 } })
+    await vi.advanceTimersByTimeAsync(300)
+    assert.equal(getJob.mock.calls.length, 3)
+    assert.deepEqual(getJob.mock.calls[2], [30, { page: 1, page_size: 50, status: 'failed' }])
+  } finally {
+    unpin()
+    store.stopRealtime()
+    store._resetSessionState()
+  }
+})

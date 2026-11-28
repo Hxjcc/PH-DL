@@ -347,7 +347,7 @@ const recentJobCards = computed(() => {
     const metrics = computeJobLiveMetrics(
       job,
       showLive ? store.liveProgress : null,
-      isCancelling ? null : store.jobItems[job.id],
+      isCancelling ? null : (store.jobItemMeta[job.id]?.status_counts ?? store.jobItems[job.id]),
       showLive ? store.scanStatus : null
     )
     return {

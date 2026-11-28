@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { getErrorMessage } from '../utils/errors'
 import { safeExternalVideoUrl } from '../utils/videoLinks'
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   ChevronDown,
   ChevronLeft,
@@ -36,6 +36,7 @@ import {
 } from '../utils/format'
 import {
   buildItemStatusPills,
+  buildItemStatusPillsFromCounts,
   computeJobLiveMetrics,
   filterJobItemsByStatus,
   jobItemErrorClass,
@@ -113,6 +114,9 @@ const isActive = computed(() => ['queued', 'scanning', 'running'].includes(props
 const isCancelling = computed(() => isActive.value && store.isJobCancelling(props.job.id))
 const tracksLiveProgress = computed(() => props.routeActive && !isCancelling.value && ['scanning', 'running'].includes(props.job.status))
 const items = computed(() => store.jobItems[props.job.id] || [])
+const itemMeta = computed(() => store.jobItemMeta[props.job.id] || null)
+const isPaginated = computed(() => Boolean(itemMeta.value?.paginated))
+const totalAllItems = computed(() => (itemMeta.value ? itemMeta.value.total_all : items.value.length))
 const statusMeta = computed(() => jobStatusMeta(isCancelling.value ? 'cancelling' : props.job.status))
 
 const visual = computed(() => resolveJobVisual(props.job, store.targetsCache || []))
@@ -121,7 +125,7 @@ const liveMetrics = computed(() =>
   computeJobLiveMetrics(
     props.job,
     tracksLiveProgress.value ? store.liveProgress : null,
-    isActive.value ? store.jobItems[props.job.id] : null,
+    isActive.value ? (itemMeta.value?.status_counts ?? store.jobItems[props.job.id]) : null,
     tracksLiveProgress.value ? store.scanStatus : null
   )
 )
@@ -130,12 +134,21 @@ const showItemUploader = computed(() => {
   if (visual.value.avatars.length !== 1) return true
   const singleUser = (visual.value.avatars[0]?.username || '').toLowerCase()
   if (!singleUser) return true
-  return items.value.some((it) => it.uploader && it.uploader.toLowerCase() !== singleUser)
+  return visibleItems.value.some((it) => it.uploader && it.uploader.toLowerCase() !== singleUser)
 })
 
-function itemUploaderMeta(item: JobItemRecord) {
-  return resolveItemUploaderLabel(item, store.targetsCache || [], props.job.params?.profile_names || {})
-}
+const visibleItemUploaderMap = computed(() => {
+  const map: Partial<Record<number, { label: string; isHandle: boolean }>> = Object.create(null)
+  if (!showItemUploader.value) return map
+  const targets = store.targetsCache || []
+  const profileNames = props.job.params?.profile_names || {}
+  for (const item of visibleItems.value) {
+    if (item.uploader) {
+      map[item.id] = resolveItemUploaderLabel(item, targets, profileNames)
+    }
+  }
+  return map
+})
 
 function isAvatarValid(entry: JobVisual['avatars'][number] | undefined) {
   return Boolean(entry?.avatarUrl && !brokenAvatars.value.has(entry.avatarUrl))
@@ -184,11 +197,11 @@ const hasNoJobItems = computed(
 )
 const detailsOpen = computed(() => expanded.value)
 const detailsContentKey = computed(() => {
-  if (loadingItems.value && items.value.length === 0) return 'loading'
-  if (itemsLoadError.value && items.value.length === 0) return 'error'
-  if (items.value.length === 0) return 'empty'
+  if (loadingItems.value && totalAllItems.value === 0 && items.value.length === 0) return 'loading'
+  if (itemsLoadError.value && totalAllItems.value === 0 && items.value.length === 0) return 'error'
+  if (totalAllItems.value === 0) return 'empty'
   const heightBucket = visibleItems.value.length >= 9 ? '9+' : String(visibleItems.value.length)
-  return `ready:${itemStatusFilter.value}:${heightBucket}:${totalItemPages.value > 1 ? 1 : 0}`
+  return `ready:${heightBucket}:${totalItemPages.value > 1 ? 1 : 0}`
 })
 
 function statusPillClass(variant: ReturnType<typeof jobStatusMeta>['variant']) {
@@ -228,18 +241,35 @@ const retryButtonTitle = computed(() => {
 })
 
 const itemFilterPills = computed(() =>
-  buildItemStatusPills(items.value, {
-    isMetadataJob: isMetadataJob.value,
-    activeFilter: itemStatusFilter.value,
-  })
+  itemMeta.value
+    ? buildItemStatusPillsFromCounts(itemMeta.value.status_counts, itemMeta.value.total_all, {
+        isMetadataJob: isMetadataJob.value,
+        activeFilter: itemStatusFilter.value,
+      })
+    : buildItemStatusPills(items.value, {
+        isMetadataJob: isMetadataJob.value,
+        activeFilter: itemStatusFilter.value,
+      })
 )
 
-const filteredItems = computed(() => filterJobItemsByStatus(items.value, itemStatusFilter.value))
-const totalItemPages = computed(() => Math.max(1, Math.ceil(filteredItems.value.length / ITEMS_PER_PAGE)))
+const filteredItems = computed(() =>
+  isPaginated.value ? items.value : filterJobItemsByStatus(items.value, itemStatusFilter.value)
+)
+const filteredTotal = computed(() =>
+  isPaginated.value ? Number(itemMeta.value?.total ?? 0) : filteredItems.value.length
+)
+const totalItemPages = computed(() => Math.max(1, Math.ceil(filteredTotal.value / ITEMS_PER_PAGE)))
 const safeItemPage = computed(() => Math.min(Math.max(1, itemPage.value), totalItemPages.value))
-const itemPageStart = computed(() => (safeItemPage.value - 1) * ITEMS_PER_PAGE)
+const itemPageStart = computed(() => {
+  const displayedPage = isPaginated.value
+    ? Math.min(Math.max(1, Number(itemMeta.value?.page || safeItemPage.value)), totalItemPages.value)
+    : safeItemPage.value
+  return (displayedPage - 1) * ITEMS_PER_PAGE
+})
 const visibleItems = computed(() =>
-  filteredItems.value.slice(itemPageStart.value, itemPageStart.value + ITEMS_PER_PAGE)
+  isPaginated.value
+    ? items.value
+    : filteredItems.value.slice(itemPageStart.value, itemPageStart.value + ITEMS_PER_PAGE)
 )
 const itemIndexWidthClass = computed(() => {
   const maxIndex = itemPageStart.value + visibleItems.value.length
@@ -333,6 +363,9 @@ function selectItemFilter(val: string) {
   itemStatusFilter.value = val
   itemPage.value = 1
   if (itemListScrollRef.value) itemListScrollRef.value.scrollTop = 0
+  if (expanded.value && (isPaginated.value || !itemMeta.value)) {
+    void ensureItemsLoaded(true)
+  }
 }
 
 function goItemPage(nextPage: number) {
@@ -340,6 +373,9 @@ function goItemPage(nextPage: number) {
   if (clamped === itemPage.value) return
   itemPage.value = clamped
   if (itemListScrollRef.value) itemListScrollRef.value.scrollTop = 0
+  if (expanded.value && isPaginated.value) {
+    void ensureItemsLoaded(true)
+  }
 }
 
 const exportFilename = computed(() => buildExportFilename(props.job))
@@ -364,27 +400,85 @@ function visibleItemError(item: JobItemRecord) {
   return msg
 }
 
-async function ensureItemsLoaded(force = false) {
-  if (loadingItems.value || hasNoJobItems.value) return
-  const expectedTotal = Number(props.job.total_items || 0)
+let itemsLoadSeq = 0
+let prefetchTimer: ReturnType<typeof setTimeout> | null = null
+
+function currentItemQuery() {
+  return {
+    page: itemPage.value,
+    page_size: ITEMS_PER_PAGE,
+    status: itemStatusFilter.value,
+  }
+}
+
+function hasMatchingItemsCache() {
   const cached = store.jobItems[props.job.id]
-  if (!force && cached && (expectedTotal <= 0 || cached.length >= expectedTotal || (!isActive.value && itemsLoaded.value))) {
+  if (!Array.isArray(cached)) return false
+  const expectedTotal = Number(props.job.total_items || 0)
+  const meta = itemMeta.value
+  if (meta?.paginated) {
+    const sameQuery =
+      meta.status === itemStatusFilter.value &&
+      meta.page === itemPage.value &&
+      meta.page_size === ITEMS_PER_PAGE
+    if (!sameQuery) return false
+    return expectedTotal <= 0 || meta.total_all >= expectedTotal || (!isActive.value && itemsLoaded.value)
+  }
+  return expectedTotal <= 0 || cached.length >= expectedTotal || (!isActive.value && itemsLoaded.value)
+}
+
+function cancelPrefetchItems() {
+  if (prefetchTimer !== null) {
+    clearTimeout(prefetchTimer)
+    prefetchTimer = null
+  }
+}
+
+function schedulePrefetchItems() {
+  if (expanded.value || hasNoJobItems.value || loadingItems.value || !store.authenticated || hasMatchingItemsCache()) {
+    return
+  }
+  cancelPrefetchItems()
+  prefetchTimer = setTimeout(() => {
+    prefetchTimer = null
+    if (expanded.value || hasNoJobItems.value || !store.authenticated || hasMatchingItemsCache()) return
+    void store.prefetchJobDetail(props.job.id, currentItemQuery())
+  }, 80)
+}
+
+onBeforeUnmount(() => {
+  cancelPrefetchItems()
+})
+
+async function ensureItemsLoaded(force = false) {
+  if (hasNoJobItems.value) return
+  if (!force && loadingItems.value) return
+  if (!force && hasMatchingItemsCache()) {
     store.touchJobDetail(props.job.id)
     return
   }
+  const seq = ++itemsLoadSeq
   loadingItems.value = true
   itemsLoadError.value = ''
   try {
-    const detail = await store.loadJobDetail(props.job.id)
+    const detail = await store.loadJobDetail(props.job.id, currentItemQuery())
+    if (seq !== itemsLoadSeq) return
+    if (detail?.paginated && typeof detail.page === 'number' && detail.page !== itemPage.value) {
+      itemPage.value = detail.page
+    }
     itemsLoaded.value = !['queued', 'scanning', 'running'].includes(detail?.job?.status || props.job.status)
   } catch (err: unknown) {
+    if (seq !== itemsLoadSeq) return
     itemsLoadError.value = getErrorMessage(err, '读取视频明细失败，请重试。')
   } finally {
-    loadingItems.value = false
+    if (seq === itemsLoadSeq) {
+      loadingItems.value = false
+    }
   }
 }
 
 async function toggleExpand() {
+  cancelPrefetchItems()
   expanded.value = !expanded.value
   emit('activate', props.job.id, expanded.value)
   if (expanded.value) {
@@ -419,7 +513,7 @@ watch(
 watch(
   [() => props.job.total_items, () => props.job.status],
   async ([total]) => {
-    if (props.routeActive && expanded.value && Number(total || 0) > items.value.length) {
+    if (props.routeActive && expanded.value && Number(total || 0) > totalAllItems.value) {
       await ensureItemsLoaded(true)
     }
   }
@@ -461,7 +555,7 @@ async function handleRetry() {
     store._upsertJob(res.job)
     const reloadItems = expanded.value || Array.isArray(store.jobItems[jobId])
     await Promise.all([
-      reloadItems ? store.loadJobDetail(jobId).catch(() => {}) : null,
+      reloadItems ? store.loadJobDetail(jobId, currentItemQuery()).catch(() => {}) : null,
       store.refreshJobs(),
     ])
   } catch (err: unknown) {
@@ -512,7 +606,12 @@ function downloadExportTxt() {
     ]"
   >
     <!-- Job Header -->
-    <div class="px-3.5 sm:px-5 py-3.5 sm:py-4 cursor-pointer select-none" @click="toggleExpand">
+    <div
+      class="px-3.5 sm:px-5 py-3.5 sm:py-4 cursor-pointer select-none"
+      @pointerenter="schedulePrefetchItems"
+      @pointerleave="cancelPrefetchItems"
+      @click="toggleExpand"
+    >
       <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5 sm:gap-3.5">
         <!-- Left: Checkbox + Avatar/Icon + Title & Capsules -->
         <div class="min-w-0 w-full sm:w-auto sm:flex-1 flex items-start sm:items-center gap-2.5 sm:gap-3.5">
@@ -867,17 +966,17 @@ function downloadExportTxt() {
         class="job-details border-t border-border bg-surface-subtle/50 dark:bg-surface-subtle/25 px-3 sm:px-5 py-3 sm:py-3.5"
         @click="!focused && emit('activate', job.id, true)"
       >
-        <div v-if="loadingItems && items.length === 0" class="py-5 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
+        <div v-if="loadingItems && totalAllItems === 0 && items.length === 0" class="py-5 flex items-center justify-center gap-2 text-xs text-muted-foreground leading-none">
           <Loader2 class="w-3.5 h-3.5 animate-spin shrink-0 text-brand" />
           <span>加载视频明细...</span>
         </div>
 
-        <div v-else-if="itemsLoadError && items.length === 0" class="py-4 flex flex-wrap items-center justify-center gap-2 text-xs text-muted-foreground">
+        <div v-else-if="itemsLoadError && totalAllItems === 0 && items.length === 0" class="py-4 flex flex-wrap items-center justify-center gap-2 text-xs text-muted-foreground">
           <span>{{ itemsLoadError }}</span>
           <Button variant="outline" size="xs" @click="ensureItemsLoaded(true)">重试加载</Button>
         </div>
 
-        <div v-else-if="items.length === 0" class="py-4 text-center text-xs text-muted-foreground">
+        <div v-else-if="totalAllItems === 0" class="py-4 text-center text-xs text-muted-foreground">
           <template v-if="isExportJob">
             {{ job.export_text ? '页面链接导出任务（点击右上角“导出 TXT”下载）' : isActive ? '正在筛选并整理页面链接...' : '没有可导出的符合条件的视频页面链接。' }}
           </template>
@@ -925,16 +1024,31 @@ function downloadExportTxt() {
                 <span class="font-mono text-[10px] opacity-80">{{ pill.count }}</span>
               </button>
             </div>
-            <span v-if="filteredItems.length > ITEMS_PER_PAGE" class="text-[11px] text-muted-foreground tabular-nums">
-              第 {{ itemPageStart + 1 }}–{{ itemPageStart + visibleItems.length }} / 共 {{ filteredItems.length }} 项
+            <span v-if="filteredTotal > ITEMS_PER_PAGE || loadingItems" class="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground tabular-nums">
+              <Loader2 v-if="loadingItems" class="w-3 h-3 animate-spin shrink-0 text-brand" />
+              <template v-if="filteredTotal > ITEMS_PER_PAGE">
+                第 {{ itemPageStart + 1 }}–{{ itemPageStart + visibleItems.length }} / 共 {{ filteredTotal }} 项
+              </template>
             </span>
           </div>
 
-          <div v-if="visibleItems.length === 0" class="py-4 text-center text-xs text-muted-foreground">
+          <div v-if="itemsLoadError" class="py-2 flex flex-wrap items-center justify-center gap-2 text-xs text-muted-foreground">
+            <span>{{ itemsLoadError }}</span>
+            <Button variant="outline" size="xs" @click="ensureItemsLoaded(true)">重试加载</Button>
+          </div>
+
+          <div v-if="visibleItems.length === 0 && !loadingItems" class="py-4 text-center text-xs text-muted-foreground">
             当前筛选下没有条目
           </div>
 
-          <div v-else ref="itemListScrollRef" class="space-y-1.5 max-h-96 overflow-y-auto pr-0.5 sm:pr-1">
+          <div
+            v-else-if="visibleItems.length > 0"
+            ref="itemListScrollRef"
+            :class="[
+              'job-items-scroll space-y-1.5 max-h-96 overflow-y-auto pr-0.5 sm:pr-1 transition-opacity duration-150',
+              loadingItems && 'opacity-60',
+            ]"
+          >
             <div
               v-for="(item, idx) in visibleItems"
               :key="item.id"
@@ -966,12 +1080,12 @@ function downloadExportTxt() {
                 <!-- Right: Capsules (Uploader, Quality, Size / Live Speed, Source Link) -->
                 <div class="flex flex-wrap items-center sm:justify-end gap-1.5 shrink-0 text-[11px] tabular-nums pl-5 sm:pl-0">
                   <span
-                    v-if="showItemUploader && item.uploader"
+                    v-if="showItemUploader && item.uploader && visibleItemUploaderMap[item.id]"
                     class="hidden md:inline-flex h-[21px] items-center rounded-full border border-border/80 bg-surface-subtle px-2.5 text-[11px] leading-none text-muted-foreground max-w-36"
-                    :title="itemUploaderMeta(item).label"
+                    :title="visibleItemUploaderMap[item.id]?.label"
                   >
-                    <span v-if="itemUploaderMeta(item).isHandle" class="opacity-65 mr-[1px] shrink-0">@</span>
-                    <span class="truncate">{{ itemUploaderMeta(item).label }}</span>
+                    <span v-if="visibleItemUploaderMap[item.id]?.isHandle" class="opacity-65 mr-[1px] shrink-0">@</span>
+                    <span class="truncate">{{ visibleItemUploaderMap[item.id]?.label }}</span>
                   </span>
 
                   <span
@@ -1152,5 +1266,9 @@ function downloadExportTxt() {
 
 .job-details {
   contain: layout paint;
+}
+
+.job-items-scroll {
+  contain: layout style paint;
 }
 </style>

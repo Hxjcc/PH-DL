@@ -1949,8 +1949,78 @@ class Repository:
                 "SELECT * FROM job_items WHERE job_id = ? ORDER BY id ASC", (job_id,), conn=conn,
             ) if job else []
             for item in items:
-                item["error_message"] = self.redact_diagnostic(item["error_message"])
+                err = item.get("error_message")
+                if err:
+                    item["error_message"] = self.redact_diagnostic(err)
             return job, items
+
+    async def get_job_detail_page(
+        self,
+        job_id: int,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        status: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        status_filter = (status or "").strip()
+        if status_filter == "all":
+            status_filter = ""
+        safe_page_size = max(1, min(int(page_size or 50), 200))
+        req_page = max(1, int(page or 1))
+
+        async with self.db.read() as conn:
+            job = await self.get_job(job_id, conn=conn)
+            if not job:
+                return None
+            count_rows = await self.db.fetch_all(
+                "SELECT status, COUNT(*) AS cnt FROM job_items WHERE job_id = ? GROUP BY status",
+                (job_id,),
+                conn=conn,
+            )
+            status_counts: Dict[str, int] = {}
+            total_all = 0
+            for row in count_rows:
+                st = str(row.get("status") or "").strip()
+                cnt = int(row.get("cnt") or 0)
+                if st and cnt > 0:
+                    status_counts[st] = cnt
+                total_all += cnt
+
+            filtered_total = status_counts.get(status_filter, 0) if status_filter else total_all
+            max_page = max(1, (filtered_total + safe_page_size - 1) // safe_page_size)
+            safe_page = min(req_page, max_page)
+            offset = (safe_page - 1) * safe_page_size
+
+            if filtered_total == 0:
+                items: List[Dict[str, Any]] = []
+            elif status_filter:
+                items = await self.db.fetch_all(
+                    "SELECT * FROM job_items WHERE job_id = ? AND status = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+                    (job_id, status_filter, safe_page_size, offset),
+                    conn=conn,
+                )
+            else:
+                items = await self.db.fetch_all(
+                    "SELECT * FROM job_items WHERE job_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+                    (job_id, safe_page_size, offset),
+                    conn=conn,
+                )
+
+            for item in items:
+                err = item.get("error_message")
+                if err:
+                    item["error_message"] = self.redact_diagnostic(err)
+
+            return {
+                "job": job,
+                "items": items,
+                "total": filtered_total,
+                "total_all": total_all,
+                "page": safe_page,
+                "page_size": safe_page_size,
+                "status": status_filter or "all",
+                "status_counts": status_counts,
+            }
 
     async def find_temp_job_item(self, viewkey: str, temp_path: str) -> Optional[Dict[str, Any]]:
         return await self.db.fetch_one(

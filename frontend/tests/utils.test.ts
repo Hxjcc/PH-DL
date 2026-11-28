@@ -12,6 +12,7 @@ import { formatBytes, formatPublishedDate, formatSpeed, formatVideoDuration, sit
 import { parseSpecificVideoDraft, serializeSpecificVideoSpecs } from '../src/utils/specificVideos'
 import {
   buildItemStatusPills,
+  buildItemStatusPillsFromCounts,
   computeJobLiveMetrics,
   filterJobItemsByStatus,
   resolveItemUploaderLabel,
@@ -761,4 +762,44 @@ test('resolveJobVisual and resolveItemUploaderLabel resolve profile names and av
     resolveItemUploaderLabel({ site: 'xhamster', uploader: 'unknown_user' }, [], job.params.profile_names),
     { label: 'unknown_user', isHandle: true }
   )
+})
+
+test('paginated job helpers build pills from status_counts, compute O(1) live metrics, and serialize api.getJob queries', async () => {
+  const pills = buildItemStatusPillsFromCounts(
+    { done: 66, downloading: 7, uploading: 5, pending: 2898 },
+    2976,
+    { activeFilter: 'failed' },
+  )
+  assert.deepEqual(
+    pills.map((p) => [p.value, p.count]),
+    [['all', 2976], ['downloading', 7], ['uploading', 5], ['pending', 2898], ['done', 66], ['failed', 0]],
+  )
+
+  const multiJob = { id: 101, kind: 'manual_target', status: 'running', total_items: 2976, done_items: 66 } satisfies Partial<JobRecord>
+  const multiLive = {
+    601: { job_id: 101, item_id: 601, bytes_downloaded: 50, bytes_total: 100, speed_bps: 80_000_000, phase: 'uploading' },
+    602: { job_id: 101, item_id: 602, bytes_downloaded: 100, bytes_total: 100, speed_bps: 0, phase: 'remuxing' },
+    603: { job_id: 101, item_id: 603, bytes_downloaded: 50, bytes_total: 100, speed_bps: 20_000_000, phase: 'downloading' },
+  }
+  const metrics = computeJobLiveMetrics(
+    multiJob,
+    multiLive,
+    { done: 66, uploading: 1, downloading: 2, pending: 2907 },
+  )
+  assert.equal(metrics.total, 2976)
+  assert.equal(metrics.downloadingCount, 1)
+  assert.equal(metrics.remuxingCount, 1)
+  assert.equal(metrics.uploadingCount, 1)
+  assert.equal(metrics.downloadSpeedBps, 20_000_000)
+  assert.equal(metrics.uploadSpeedBps, 80_000_000)
+
+  const fetchMock = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(Response.json({ job: makeJob(5, 'completed', {}), items: [] }))
+    .mockResolvedValueOnce(Response.json({ job: makeJob(5, 'completed', {}), items: [], paginated: true }))
+  vi.stubGlobal('fetch', fetchMock)
+
+  await api.getJob(5)
+  await api.getJob(5, { page: 2, page_size: 50, status: 'failed' })
+  assert.equal(fetchMock.mock.calls[0][0], '/api/jobs/5')
+  assert.equal(fetchMock.mock.calls[1][0], '/api/jobs/5?page=2&page_size=50&status=failed')
 })

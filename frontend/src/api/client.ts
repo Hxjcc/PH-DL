@@ -3,6 +3,7 @@ import type {
   CookieCheckResult,
   CreateJobRequest,
   CreateTargetRequest,
+  JobDetailQuery,
   JobDetailResponse,
   JobRecord,
   LoginOpStatus,
@@ -131,7 +132,17 @@ export const api = {
   // Jobs
   listJobs: (limit = 30): Promise<ItemsResponse<JobRecord>> => request(`/api/jobs?limit=${limit}`),
   createJob: (payload: CreateJobRequest): Promise<JobResponse> => request('/api/jobs', { method: 'POST', body: payload }),
-  getJob: (id: number): Promise<JobDetailResponse> => request(`/api/jobs/${id}`),
+  getJob: (id: number, params?: JobDetailQuery): Promise<JobDetailResponse> => {
+    if (!params || (params.page == null && params.page_size == null && (!params.status || params.status === 'all'))) {
+      return request(`/api/jobs/${id}`)
+    }
+    const sp = new URLSearchParams()
+    if (params.page != null) sp.set('page', String(params.page))
+    if (params.page_size != null) sp.set('page_size', String(params.page_size))
+    if (params.status && params.status !== 'all') sp.set('status', params.status)
+    const qs = sp.toString()
+    return request(`/api/jobs/${id}${qs ? `?${qs}` : ''}`)
+  },
   cancelJob: (id: number): Promise<{ cancelled: true }> => request(`/api/jobs/${id}/cancel`, { method: 'POST' }),
   retryFailedJob: (id: number): Promise<JobResponse> => request(`/api/jobs/${id}/retry-failed`, { method: 'POST' }),
   deleteJob: (id: number): Promise<{ deleted: true; id: number }> => request(`/api/jobs/${id}`, { method: 'DELETE' }),

@@ -5,10 +5,13 @@ import type { RouteRecordName } from 'vue-router'
 import { api } from '../api/client'
 import { EventStreamClient } from '../api/ws'
 import type {
+  JobDetailQuery,
   JobDetailResponse,
+  JobItemPageMeta,
   JobItemRecord,
   JobRecord,
   JobStatus,
+  JobStatusCounts,
   LiveProgressEntry,
   LogEntry,
   OverviewResponse,
@@ -65,6 +68,7 @@ interface AppState {
   historyLoadedAt: number
   historyPageSize: number
   jobItems: Partial<Record<number, JobItemRecord[]>>
+  jobItemMeta: Partial<Record<number, JobItemPageMeta>>
   liveProgress: Partial<Record<string, LiveProgressEntry>>
   schedulerStatus: Partial<Record<number, SchedulerStatus>>
   scanStatus: Partial<Record<number, ScanStatusEntry>>
@@ -92,8 +96,8 @@ interface RequestResults {
 }
 
 type RequestHandler<T> = (context: { isLatest: () => boolean }) => Promise<T>
-type JobDetailCache = Pick<AppState, 'jobItems' | 'liveProgress' | 'authenticated'> & {
-  loadJobDetail: (jobId: number) => Promise<JobDetailResponse>
+type JobDetailCache = Pick<AppState, 'jobItems' | 'jobItemMeta' | 'liveProgress' | 'authenticated'> & {
+  loadJobDetail: (jobId: number, query?: JobDetailQuery) => Promise<JobDetailResponse>
 }
 
 export const DEFAULT_HISTORY_FILTERS = Object.freeze<VideoFilters>({
@@ -113,7 +117,9 @@ const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
 const LIVE_PROGRESS_FLUSH_MS = 140
 const ITEM_UPDATE_FLUSH_MS = 120
 const JOB_ITEMS_RELOAD_DEBOUNCE_MS = 240
+const JOB_ITEMS_SOFT_RELOAD_DEBOUNCE_MS = 900
 const JOB_DETAILS_HISTORY_LIMIT = 8
+const DEFAULT_JOB_ITEMS_PAGE_SIZE = 50
 const JOB_RUN_ORDER: Partial<Record<JobStatus, number>> = { queued: 0, scanning: 1, running: 2 }
 
 const inflight = new Map<keyof RequestResults, Promise<RequestResults[keyof RequestResults]>>()
@@ -128,6 +134,9 @@ let pendingItemUpdates: ItemUpdates | null = null
 let itemUpdateFlushTimer: Timer | null = null
 const jobItemIndexMap = new Map<number, Map<number, number>>()
 const jobItemsReloadTimers = new Map<number, Timer>()
+const jobItemsReloadDeadlines = new Map<number, number>()
+const jobDetailQueries = new Map<number, Required<JobDetailQuery>>()
+const jobDetailInflightQuery = new Map<number, string>()
 const jobItemAccessOrder = new Map<number, JobStatus | undefined>()
 const jobItemPins = new Map<number, number>()
 const detailUpdates: ItemUpdates = new Map()
@@ -135,6 +144,43 @@ const detailProgressVersions = new Map<number, Map<number, number>>()
 const deletedJobVersions = new Map<number, number>()
 let progressVersion = 0
 let deletionVersion = 0
+
+function normalizeJobDetailQuery(query?: JobDetailQuery): Required<JobDetailQuery> | undefined {
+  if (!query) return undefined
+  const rawStatus = String(query.status || '').trim()
+  const hasExplicitPagination = query.page != null || query.page_size != null || (Boolean(rawStatus) && rawStatus !== 'all')
+  if (!hasExplicitPagination) return undefined
+  return {
+    page: Math.max(1, Number(query.page || 1)),
+    page_size: Math.max(1, Math.min(200, Number(query.page_size || DEFAULT_JOB_ITEMS_PAGE_SIZE))),
+    status: rawStatus || 'all',
+  }
+}
+
+function jobDetailQuerySignature(query?: Required<JobDetailQuery>): string {
+  return query ? `${query.page}:${query.page_size}:${query.status}` : 'full'
+}
+
+function computeStatusCounts(items: JobItemRecord[]): JobStatusCounts {
+  const counts: JobStatusCounts = Object.create(null)
+  for (const item of items) {
+    const status = String(item?.status || '').trim()
+    if (!status) continue
+    counts[status] = (counts[status] ?? 0) + 1
+  }
+  return counts
+}
+
+function matchesJobDetailMeta(meta: JobItemPageMeta | undefined, query?: Required<JobDetailQuery>): boolean {
+  if (!query) return true
+  if (!meta) return false
+  if (!meta.paginated) return true
+  return (
+    meta.status === query.status &&
+    meta.page === query.page &&
+    meta.page_size === query.page_size
+  )
+}
 
 function isActiveJobStatus(status: JobStatus | undefined) {
   return status !== undefined && JOB_RUN_ORDER[status] !== undefined
@@ -188,14 +234,18 @@ function updateCachedJobStatus(store: JobDetailCache, job: JobRecord, previousJo
 
 function evictJobItems(store: JobDetailCache, jid: number) {
   delete store.jobItems[jid]
+  delete store.jobItemMeta[jid]
   jobItemAccessOrder.delete(jid)
   jobItemIndexMap.delete(jid)
+  jobDetailQueries.delete(jid)
+  jobDetailInflightQuery.delete(jid)
   detailUpdates.delete(jid)
   detailProgressVersions.delete(jid)
   inflight.delete(`jobDetail:${jid}`)
   pendingItemUpdates?.delete(jid)
   clearTimeout(jobItemsReloadTimers.get(jid))
   jobItemsReloadTimers.delete(jid)
+  jobItemsReloadDeadlines.delete(jid)
   clearLiveProgressForJob(store, jid)
 }
 
@@ -229,13 +279,15 @@ function clearPendingItemUpdates() {
   detailUpdates.clear()
   detailProgressVersions.clear()
   jobItemIndexMap.clear()
+  jobDetailInflightQuery.clear()
   for (const timer of jobItemsReloadTimers.values()) {
     clearTimeout(timer)
   }
   jobItemsReloadTimers.clear()
+  jobItemsReloadDeadlines.clear()
 }
 
-function flushPendingItemUpdates(store: Pick<AppState, 'jobItems'>) {
+function flushPendingItemUpdates(store: JobDetailCache) {
   if (itemUpdateFlushTimer !== null) {
     clearTimeout(itemUpdateFlushTimer)
     itemUpdateFlushTimer = null
@@ -251,21 +303,81 @@ function flushPendingItemUpdates(store: Pick<AppState, 'jobItems'>) {
       idxMap = indexJobItems(jid, list)
     }
     if (!idxMap) continue
+    const meta = store.jobItemMeta[jid]
+    const isPaginated = Boolean(meta?.paginated)
     const nextList = list.slice()
+    let listChanged = false
+    let nextCounts: JobStatusCounts | null = null
+    let needsFastReload = false
+    let needsSoftReload = false
+
+    const adjustStatusCount = (prevStatus: string | undefined, nextStatus: string | undefined) => {
+      if (!meta || prevStatus === nextStatus) return
+      if (!nextCounts) nextCounts = { ...meta.status_counts }
+      if (prevStatus) {
+        const dec = Math.max(0, Number(nextCounts[prevStatus] || 0) - 1)
+        if (dec > 0) nextCounts[prevStatus] = dec
+        else delete nextCounts[prevStatus]
+      }
+      if (nextStatus) {
+        nextCounts[nextStatus] = Number(nextCounts[nextStatus] || 0) + 1
+      }
+    }
+
     for (const [itemId, item] of updatesById) {
       const idx = idxMap.get(itemId)
       if (idx !== undefined && idx < nextList.length) {
-        if (!isOlderItemUpdate(item, nextList[idx])) nextList[idx] = { ...nextList[idx], ...item }
-      } else {
+        const current = nextList[idx]
+        if (!isOlderItemUpdate(item, current)) {
+          const prevStatus = current.status
+          nextList[idx] = { ...current, ...item }
+          listChanged = true
+          adjustStatusCount(prevStatus, nextList[idx].status)
+          if (isPaginated && meta && meta.status !== 'all' && nextList[idx].status !== meta.status) {
+            needsFastReload = true
+          }
+        }
+      } else if (!isPaginated) {
         idxMap.set(itemId, nextList.length)
         nextList.push(item)
+        listChanged = true
+        adjustStatusCount(undefined, item.status)
+      } else if (meta) {
+        if (
+          (meta.status !== 'all' && item.status === meta.status) ||
+          (meta.status === 'all' && meta.page === 1 && nextList.length < meta.page_size)
+        ) {
+          needsFastReload = true
+        } else if (jobItemPins.has(jid)) {
+          needsSoftReload = true
+        }
       }
     }
-    store.jobItems[jid] = markRaw(nextList)
+
+    if (listChanged) {
+      store.jobItems[jid] = markRaw(nextList)
+    }
+    if (meta && nextCounts) {
+      const counts = nextCounts as JobStatusCounts
+      const totalAll = Object.values(counts).reduce<number>((sum, n) => sum + Number(n || 0), 0)
+      store.jobItemMeta[jid] = {
+        ...meta,
+        total_all: isPaginated ? Math.max(meta.total_all, totalAll) : nextList.length,
+        total: meta.status === 'all'
+          ? (isPaginated ? Math.max(meta.total_all, totalAll) : nextList.length)
+          : Number(counts[meta.status] || 0),
+        status_counts: counts,
+      }
+    }
+    if (needsFastReload) {
+      scheduleJobItemsReload(store, jid, JOB_ITEMS_RELOAD_DEBOUNCE_MS)
+    } else if (needsSoftReload) {
+      scheduleJobItemsReload(store, jid, JOB_ITEMS_SOFT_RELOAD_DEBOUNCE_MS)
+    }
   }
 }
 
-function queueItemUpdate(store: Pick<AppState, 'jobItems' | 'liveProgress'>, item: JobItemRecord) {
+function queueItemUpdate(store: JobDetailCache, item: JobItemRecord) {
   if (!item || item.id == null || item.job_id == null) return
   if (item.status !== 'downloading' && item.status !== 'uploading') {
     pendingLiveProgress?.delete(item.id)
@@ -286,19 +398,29 @@ function queueItemUpdate(store: Pick<AppState, 'jobItems' | 'liveProgress'>, ite
   }
 }
 
-function scheduleJobItemsReload(store: JobDetailCache, jobId: number | undefined) {
+function scheduleJobItemsReload(store: JobDetailCache, jobId: number | undefined, delayMs = JOB_ITEMS_RELOAD_DEBOUNCE_MS) {
   const jid = Number(jobId)
   if (!jid || !store.authenticated || (!Array.isArray(store.jobItems[jid]) && !jobItemPins.has(jid))) return
-  if (jobItemsReloadTimers.has(jid)) return
+  const targetDeadline = Date.now() + delayMs
+  const existingDeadline = jobItemsReloadDeadlines.get(jid)
+  if (jobItemsReloadTimers.has(jid)) {
+    if (existingDeadline !== undefined && existingDeadline <= targetDeadline) return
+    clearTimeout(jobItemsReloadTimers.get(jid))
+    jobItemsReloadTimers.delete(jid)
+    jobItemsReloadDeadlines.delete(jid)
+  }
   const timer = setTimeout(async () => {
     const pending = inflight.get(`jobDetail:${jid}`)
     if (pending) await pending.catch(() => {})
     if (jobItemsReloadTimers.get(jid) !== timer) return
     jobItemsReloadTimers.delete(jid)
+    jobItemsReloadDeadlines.delete(jid)
     if (!store.authenticated || (!Array.isArray(store.jobItems[jid]) && !jobItemPins.has(jid))) return
-    store.loadJobDetail(jid).catch(() => {})
-  }, JOB_ITEMS_RELOAD_DEBOUNCE_MS)
+    const query = jobDetailQueries.get(jid)
+    ;(query ? store.loadJobDetail(jid, query) : store.loadJobDetail(jid)).catch(() => {})
+  }, delayMs)
   jobItemsReloadTimers.set(jid, timer)
+  jobItemsReloadDeadlines.set(jid, targetDeadline)
 }
 
 function clearPendingLiveProgress() {
@@ -462,6 +584,7 @@ export const useAppStore = defineStore('app', {
       historyLoadedAt: 0,
       historyPageSize: readListPreference('history', HISTORY_PAGE_SIZES),
       jobItems: {},
+      jobItemMeta: {},
       liveProgress: {},
       schedulerStatus: {},
       scanStatus: {},
@@ -627,7 +750,9 @@ export const useAppStore = defineStore('app', {
           (routeName === 'download' || routeName === 'jobs') &&
           this.overview?.current_job?.id
         ) {
-          this.loadJobDetail(this.overview.current_job.id).catch(() => {})
+          const curId = this.overview.current_job.id
+          const query = jobDetailQueries.get(curId) || { page: 1, page_size: DEFAULT_JOB_ITEMS_PAGE_SIZE, status: 'all' }
+          this.loadJobDetail(curId, query).catch(() => {})
         }
         this.persistCache()
         this.prefetchAll()
@@ -657,6 +782,8 @@ export const useAppStore = defineStore('app', {
       clearPendingItemUpdates()
       jobItemAccessOrder.clear()
       jobItemPins.clear()
+      jobDetailQueries.clear()
+      jobDetailInflightQuery.clear()
       deletedJobVersions.clear()
       clearSessionCache()
       this.hydratedFromCache = false
@@ -681,6 +808,7 @@ export const useAppStore = defineStore('app', {
       this.historyCache = null
       this.historyLoadedAt = 0
       this.jobItems = {}
+      this.jobItemMeta = {}
       this.liveProgress = {}
       this.schedulerStatus = {}
       this.scanStatus = {}
@@ -1211,7 +1339,9 @@ export const useAppStore = defineStore('app', {
         (routeName === 'download' || routeName === 'jobs') &&
         this.overview?.current_job?.id
       ) {
-        await this.ensureJobDetail(this.overview.current_job.id)
+        const curId = this.overview.current_job.id
+        const query = jobDetailQueries.get(curId) || { page: 1, page_size: DEFAULT_JOB_ITEMS_PAGE_SIZE, status: 'all' }
+        await this.ensureJobDetail(curId, query)
       }
     },
 
@@ -1245,13 +1375,19 @@ export const useAppStore = defineStore('app', {
       this.persistCache()
     },
 
-    async loadJobDetail(jobId: number): Promise<JobDetailResponse> {
+    async loadJobDetail(jobId: number, query?: JobDetailQuery): Promise<JobDetailResponse> {
       const jid = Number(jobId)
+      const normalizedQuery = normalizeJobDetailQuery(query)
+      const querySig = jobDetailQuerySignature(normalizedQuery)
       const key = `jobDetail:${jid}` as const
       const existing = getInflight(key)
-      if (existing) return existing
+      if (existing && jobDetailInflightQuery.get(jid) === querySig) return existing
       clearTimeout(jobItemsReloadTimers.get(jid))
       jobItemsReloadTimers.delete(jid)
+      jobItemsReloadDeadlines.delete(jid)
+      if (normalizedQuery) jobDetailQueries.set(jid, normalizedQuery)
+      else jobDetailQueries.delete(jid)
+      jobDetailInflightQuery.set(jid, querySig)
       return runRequest(key, async ({ isLatest }) => {
         const version = progressVersion
         const progressUpdates = new Map<number, number>()
@@ -1260,10 +1396,13 @@ export const useAppStore = defineStore('app', {
         detailProgressVersions.set(jid, progressUpdates)
         let res
         try {
-          res = await api.getJob(jid)
+          res = normalizedQuery ? await api.getJob(jid, normalizedQuery) : await api.getJob(jid)
         } finally {
           if (detailUpdates.get(jid) === updates) detailUpdates.delete(jid)
           if (detailProgressVersions.get(jid) === progressUpdates) detailProgressVersions.delete(jid)
+          if (isLatest() && jobDetailInflightQuery.get(jid) === querySig) {
+            jobDetailInflightQuery.delete(jid)
+          }
         }
         if (!isLatest()) return res
         const current = this.jobs.find((job) => job.id === jid)
@@ -1276,29 +1415,114 @@ export const useAppStore = defineStore('app', {
         }
         if (Array.isArray(res?.items)) {
           pendingItemUpdates?.delete(jid)
+          const isPaginated = Boolean(res.paginated)
           const rows = new Map(res.items.map((item) => [item.id, item]))
+          const statusCounts: JobStatusCounts = res.status_counts
+            ? { ...res.status_counts }
+            : computeStatusCounts(res.items)
+          const resStatus = String(res.status || normalizedQuery?.status || 'all').trim() || 'all'
+          const resPage = Math.max(1, Number(res.page || normalizedQuery?.page || 1))
+          const resPageSize = Math.max(1, Number(res.page_size || normalizedQuery?.page_size || res.items.length || DEFAULT_JOB_ITEMS_PAGE_SIZE))
+          let needsFollowupReload = false
+
           for (const item of updates.values()) {
-            if (!isOlderItemUpdate(item, rows.get(item.id))) rows.set(item.id, item)
+            const existingRow = rows.get(item.id)
+            if (existingRow) {
+              if (!isOlderItemUpdate(item, existingRow)) {
+                const prevStatus = existingRow.status
+                const merged = { ...existingRow, ...item }
+                rows.set(item.id, merged)
+                if (prevStatus !== merged.status) {
+                  if (prevStatus) {
+                    const dec = Math.max(0, Number(statusCounts[prevStatus] || 0) - 1)
+                    if (dec > 0) statusCounts[prevStatus] = dec
+                    else delete statusCounts[prevStatus]
+                  }
+                  if (merged.status) {
+                    statusCounts[merged.status] = Number(statusCounts[merged.status] || 0) + 1
+                  }
+                  if (isPaginated && resStatus !== 'all' && merged.status !== resStatus) {
+                    needsFollowupReload = true
+                  }
+                }
+              }
+            } else if (!isPaginated) {
+              rows.set(item.id, item)
+              if (item.status) {
+                statusCounts[item.status] = Number(statusCounts[item.status] || 0) + 1
+              }
+            } else if (
+              (resStatus !== 'all' && item.status === resStatus) ||
+              (resStatus === 'all' && resPage === 1 && rows.size < resPageSize)
+            ) {
+              needsFollowupReload = true
+            }
           }
+
           const items = [...rows.values()]
+          const totalAll = typeof res.total_all === 'number'
+            ? res.total_all
+            : isPaginated
+              ? Object.values(statusCounts).reduce<number>((sum, n) => sum + Number(n || 0), 0)
+              : items.length
+          const filteredTotal = typeof res.total === 'number'
+            ? res.total
+            : resStatus === 'all'
+              ? totalAll
+              : Number(statusCounts[resStatus] || 0)
+
           this.jobItems[jid] = markRaw(items)
+          this.jobItemMeta[jid] = {
+            paginated: isPaginated,
+            page: resPage,
+            page_size: resPageSize,
+            status: resStatus,
+            total: filteredTotal,
+            total_all: totalAll,
+            status_counts: statusCounts,
+          }
+          if (isPaginated) {
+            jobDetailQueries.set(jid, { page: resPage, page_size: resPageSize, status: resStatus })
+          }
           indexJobItems(jid, items)
           const status = this.jobs.find((job) => job.id === jid)?.status || res.job?.status
           touchJobItems(jid, status)
-          for (const it of isActiveJobStatus(status) && !this.isJobCancelling(jid) ? items : []) {
-            if (!it.speed_bps && it.status !== 'downloading' && it.status !== 'uploading') continue
-            if ((progressUpdates.get(it.id) ?? 0) > version) continue
-            const isUploading = it.status === 'uploading' || it.progress_phase === 'uploading' || it.progress_phase === 'verifying'
-            this.liveProgress[it.id] = {
-              job_id: jid,
-              item_id: it.id,
-              bytes_downloaded: isUploading ? Number(it.upload_bytes || 0) : Number(it.bytes_downloaded || 0),
-              bytes_total: Number(it.bytes_total || 0),
-              speed_bps: Number(it.speed_bps || 0),
-              phase: it.progress_phase || (isUploading ? 'uploading' : 'downloading'),
+          const canHydrateLive = isActiveJobStatus(status) && !this.isJobCancelling(jid)
+          if (canHydrateLive) {
+            if (res.live_progress && typeof res.live_progress === 'object') {
+              for (const prog of Object.values(res.live_progress)) {
+                if (!prog || Number(prog.job_id) !== jid) continue
+                const itemId = Number(prog.item_id)
+                if (!itemId || (progressUpdates.get(itemId) ?? 0) > version) continue
+                this.liveProgress[itemId] = {
+                  job_id: jid,
+                  item_id: itemId,
+                  bytes_downloaded: Number(prog.bytes_downloaded || 0),
+                  bytes_total: Number(prog.bytes_total || 0),
+                  speed_bps: Number(prog.speed_bps || 0),
+                  phase: prog.phase || 'downloading',
+                  ...(prog.estimated_total !== undefined ? { estimated_total: Boolean(prog.estimated_total) } : {}),
+                }
+              }
+            }
+            for (const it of items) {
+              if (!it.speed_bps && it.status !== 'downloading' && it.status !== 'uploading') continue
+              if ((progressUpdates.get(it.id) ?? 0) > version) continue
+              const isUploading = it.status === 'uploading' || it.progress_phase === 'uploading' || it.progress_phase === 'verifying'
+              this.liveProgress[it.id] = {
+                job_id: jid,
+                item_id: it.id,
+                bytes_downloaded: isUploading ? Number(it.upload_bytes || 0) : Number(it.bytes_downloaded || 0),
+                bytes_total: Number(it.bytes_total || 0),
+                speed_bps: Number(it.speed_bps || 0),
+                phase: it.progress_phase || (isUploading ? 'uploading' : 'downloading'),
+              }
             }
           }
           trimJobItemsCache(this)
+          if (needsFollowupReload) {
+            scheduleJobItemsReload(this, jid, JOB_ITEMS_RELOAD_DEBOUNCE_MS)
+          }
           if (jid === Number(this.overview?.current_job?.id)) this.persistCache()
         }
         return res
@@ -1322,13 +1546,22 @@ export const useAppStore = defineStore('app', {
       if (Array.isArray(this.jobItems[jid])) touchJobItems(jid)
     },
 
-    ensureJobDetail(jobId: number): Promise<JobDetailResponse | void> {
-      if (!this.authenticated || !jobId) return Promise.resolve()
-      if (Array.isArray(this.jobItems[jobId])) {
-        this.touchJobDetail(jobId)
+    ensureJobDetail(jobId: number, query?: JobDetailQuery): Promise<JobDetailResponse | void> {
+      const jid = Number(jobId)
+      if (!this.authenticated || !jid) return Promise.resolve()
+      const normalizedQuery = normalizeJobDetailQuery(query)
+      if (Array.isArray(this.jobItems[jid]) && matchesJobDetailMeta(this.jobItemMeta[jid], normalizedQuery)) {
+        this.touchJobDetail(jid)
         return Promise.resolve()
       }
-      return getInflight(`jobDetail:${jobId}`) || this.loadJobDetail(jobId).catch(() => {})
+      const querySig = jobDetailQuerySignature(normalizedQuery)
+      const existing = getInflight(`jobDetail:${jid}`)
+      if (existing && jobDetailInflightQuery.get(jid) === querySig) return existing
+      return (normalizedQuery ? this.loadJobDetail(jid, normalizedQuery) : this.loadJobDetail(jid)).catch(() => {})
+    },
+
+    prefetchJobDetail(jobId: number, query?: JobDetailQuery): Promise<JobDetailResponse | void> {
+      return this.ensureJobDetail(jobId, query)
     },
 
     _upsertJob(job: JobRecord): false | void {

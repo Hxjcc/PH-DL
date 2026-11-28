@@ -260,3 +260,80 @@ async def test_list_videos_recovers_when_write_races_cached_stats_before_snapsho
     )
     assert res["total"] == 2 and len(res["items"]) == 2
     assert res["stats"]["total"] == 2 and res["facets"]["qualities"] == ["1080p", "720p"]
+
+
+async def test_schema_v16_index_and_paginated_job_detail(repo):
+    from app.api.jobs import get_job_detail
+    from app.engine.events import EventBus
+
+    # Verify Schema v16 covering index exists and is selected by SQLite query planner.
+    plan_counts = await repo.db.fetch_all(
+        "EXPLAIN QUERY PLAN SELECT status, COUNT(*) FROM job_items WHERE job_id = ? GROUP BY status",
+        (1,),
+    )
+    assert any("idx_job_items_job_status_id" in str(r["detail"]) for r in plan_counts)
+    plan_filter = await repo.db.fetch_all(
+        "EXPLAIN QUERY PLAN SELECT * FROM job_items WHERE job_id = ? AND status = ? ORDER BY id ASC LIMIT 50 OFFSET 0",
+        (1, "failed"),
+    )
+    assert any("idx_job_items_job_status_id" in str(r["detail"]) for r in plan_filter)
+
+    job = await repo.create_job("manual_target", "Large Job", {"auto_upload": True})
+    specs = []
+    for i in range(120):
+        if i < 60:
+            st = "done"
+        elif i < 75:
+            st = "failed"
+        elif i == 95:
+            st = "downloading"
+        else:
+            st = "pending"
+        specs.append({
+            "viewkey": f"vk_{i:04d}",
+            "title": f"Video {i}",
+            "uploader": "alice",
+            "status": st,
+            "download_url": f"https://cdn.example/video_{i}.m3u8?token=secret-{i}" if i == 95 else f"https://cdn.example/video_{i}.mp4?token=secret-{i}",
+            "error_message": f"HTTP 500 at https://cdn.example/secret?token=abc{i}" if st == "failed" else "",
+        })
+    inserted = await repo.add_job_items_batch(job["id"], specs)
+    active_item = inserted[95]
+
+    events = EventBus(redact=repo.redact_diagnostic)
+    events.emit_item_progress(job["id"], active_item["id"], 12345, 50000, 1024000.0, phase="downloading")
+    container = SimpleNamespace(repo=repo, events=events)
+
+    # 1. Legacy full call (positional 2-arg signature preserved)
+    full = await get_job_detail(job["id"], container)
+    assert full["paginated"] is False
+    assert len(full["items"]) == 120
+    assert full["total"] == 120 and full["total_all"] == 120
+    assert full["status_counts"] == {"done": 60, "failed": 15, "downloading": 1, "pending": 44}
+    assert full["items"][95]["is_hls"] is True and full["items"][95]["download_url"] == ""
+    assert full["items"][0]["is_hls"] is False and full["items"][0]["download_url"] == ""
+
+    # 2. Paginated page 1 still carries live_progress for off-page active item #95
+    page1 = await get_job_detail(job["id"], container, page=1, page_size=50, status="all")
+    assert page1["paginated"] is True
+    assert len(page1["items"]) == 50
+    assert page1["page"] == 1 and page1["total"] == 120 and page1["total_all"] == 120
+    assert page1["status_counts"] == {"done": 60, "failed": 15, "downloading": 1, "pending": 44}
+    assert str(active_item["id"]) in page1["live_progress"]
+    assert page1["live_progress"][str(active_item["id"])]["bytes_downloaded"] == 12345
+
+    # 3. Paginated page 2 returns items 50..99 with live progress hydrated on #95
+    page2 = await get_job_detail(job["id"], container, page=2, page_size=50, status="all")
+    assert len(page2["items"]) == 50
+    assert page2["items"][0]["viewkey"] == "vk_0050"
+    assert page2["items"][45]["id"] == active_item["id"]
+    assert page2["items"][45]["speed_bps"] == 1024000.0
+
+    # 4. Status-filtered pagination redacts errors and clamps out-of-range pages
+    failed_p1 = await get_job_detail(job["id"], container, page=1, page_size=10, status="failed")
+    assert failed_p1["total"] == 15 and failed_p1["total_all"] == 120 and len(failed_p1["items"]) == 10
+    assert all(it["status"] == "failed" for it in failed_p1["items"])
+    assert "token=abc" not in failed_p1["items"][0]["error_message"]
+
+    failed_clamped = await get_job_detail(job["id"], container, page=99, page_size=10, status="failed")
+    assert failed_clamped["page"] == 2 and len(failed_clamped["items"]) == 5

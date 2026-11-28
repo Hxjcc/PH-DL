@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import List, Optional
+from typing import Annotated, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -208,12 +208,8 @@ async def batch_delete_jobs(
     }
 
 
-@router.get("/{job_id}")
-async def get_job_detail(job_id: int, container: AppContainer = Depends(require_auth)):
-    job, items = await container.repo.get_job_detail(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    live = container.events.live_progress_snapshot()
+def _public_job_items_with_live(items: List[dict], live: Dict[int, dict]) -> List[dict]:
+    result: List[dict] = []
     for it in items:
         prog = live.get(int(it["id"]))
         if prog:
@@ -229,7 +225,70 @@ async def get_job_detail(job_id: int, container: AppContainer = Depends(require_
                 it["bytes_total"] = prog["bytes_total"]
         else:
             it["speed_bps"] = 0.0
-    return {"job": job, "items": [public_job_item(item) for item in items]}
+        result.append(public_job_item(it))
+    return result
+
+
+@router.get("/{job_id}")
+async def get_job_detail(
+    job_id: int,
+    container: AppContainer = Depends(require_auth),
+    page: Annotated[Optional[int], Query(ge=1)] = None,
+    page_size: Annotated[Optional[int], Query(ge=1, le=200)] = None,
+    status: Annotated[str, Query()] = "",
+):
+    status_filter = (status or "").strip()
+    use_pagination = page is not None or page_size is not None or (bool(status_filter) and status_filter != "all")
+    live = container.events.live_progress_snapshot()
+    job_live_progress = {
+        str(item_id): prog
+        for item_id, prog in live.items()
+        if int(prog.get("job_id") or 0) == job_id
+    }
+
+    if use_pagination:
+        detail = await container.repo.get_job_detail_page(
+            job_id,
+            page=page or 1,
+            page_size=page_size or 50,
+            status=status_filter,
+        )
+        if not detail:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return {
+            "job": detail["job"],
+            "items": _public_job_items_with_live(detail["items"], live),
+            "total": detail["total"],
+            "total_all": detail["total_all"],
+            "page": detail["page"],
+            "page_size": detail["page_size"],
+            "status": detail["status"],
+            "status_counts": detail["status_counts"],
+            "paginated": True,
+            "live_progress": job_live_progress,
+        }
+
+    job, items = await container.repo.get_job_detail(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    status_counts: Dict[str, int] = {}
+    for it in items:
+        st = str(it.get("status") or "").strip()
+        if st:
+            status_counts[st] = status_counts.get(st, 0) + 1
+    public_items = _public_job_items_with_live(items, live)
+    return {
+        "job": job,
+        "items": public_items,
+        "total": len(public_items),
+        "total_all": len(public_items),
+        "page": 1,
+        "page_size": len(public_items),
+        "status": "all",
+        "status_counts": status_counts,
+        "paginated": False,
+        "live_progress": job_live_progress,
+    }
 
 
 @router.delete("/{job_id}")

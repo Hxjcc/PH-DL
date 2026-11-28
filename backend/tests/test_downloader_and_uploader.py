@@ -879,3 +879,91 @@ async def test_multi_remote_chain_session_cache_and_connection_test(tmp_path: Pa
     assert ok_part is False
     assert "可用 2/3" in msg_part
     assert [r["ok"] for r in res_part] == [True, True, False]
+
+
+async def test_upload_progress_smooths_chunk_bursts_splits_fallback_and_zeroes_finished_items(tmp_path: Path, monkeypatch):
+    dl_dir = tmp_path / "alice"
+    dl_dir.mkdir()
+    f1 = dl_dir / "One [vk1].mp4"
+    f2 = dl_dir / "Two [vk2].mp4"
+    f1.write_bytes(VALID_MP4)
+    f2.write_bytes(VALID_MP4)
+
+    clock = 100.0
+    monkeypatch.setattr(uploader.time, "monotonic", lambda: clock)
+    progress_events: List[tuple[str, int, int, float, str]] = []
+    mib = 1024 * 1024
+
+    async def fake_run_cmd(cmd: List[str], **kwargs):
+        nonlocal clock
+        action = cmd[1]
+        if action == "listremotes":
+            return 0, "gd: drive\n", ""
+        if action == "mkdir":
+            return 0, "", ""
+        if action == "copy":
+            cb = kwargs["on_stderr_line"]
+            # Tick 1 (t+0.3s): 64 MiB Google Drive chunk pre-read from RAM spikes rclone speed to 300 MB/s,
+            # while f2 starts with speed=0 and must share stats.speed (40 MB/s / 2 = 20 MB/s), not double-count it.
+            clock = 100.3
+            cb(json.dumps({
+                "level": "notice",
+                "stats": {
+                    "speed": 40 * mib,
+                    "transferring": [
+                        {"name": f1.name, "bytes": 64 * mib, "size": 256 * mib, "speed": 300 * mib, "speedAvg": 220 * mib},
+                        {"name": f2.name, "bytes": 512 * 1024, "size": 256 * mib, "speed": 0, "speedAvg": 0},
+                    ],
+                },
+            }))
+            # Tick 2 (t+2.0s): f1 prefers speedAvg (24 MiB/s) over spiky speed (180 MiB/s).
+            clock = 102.0
+            cb(json.dumps({
+                "level": "notice",
+                "stats": {
+                    "speed": 40 * mib,
+                    "transferring": [
+                        {"name": f1.name, "bytes": 128 * mib, "size": 256 * mib, "speed": 180 * mib, "speedAvg": 24 * mib},
+                        {"name": f2.name, "bytes": 40 * mib, "size": 256 * mib, "speed": 20 * mib, "speedAvg": 20 * mib},
+                    ],
+                },
+            }))
+            # Tick 3 (t+3.0s): f1 completes and leaves transferring while f2 keeps uploading; f1 speed must drop to 0.
+            clock = 103.0
+            cb(json.dumps({"level": "info", "msg": "Copied (new)", "object": f1.name, "size": len(VALID_MP4)}))
+            cb(json.dumps({
+                "level": "notice",
+                "stats": {
+                    "speed": 20 * mib,
+                    "transferring": [
+                        {"name": f2.name, "bytes": 60 * mib, "size": 256 * mib, "speed": 20 * mib, "speedAvg": 20 * mib},
+                    ],
+                },
+            }))
+            cb(json.dumps({"level": "info", "msg": "Copied (new)", "object": f2.name, "size": len(VALID_MP4)}))
+            return 0, "", ""
+        if action == "lsjson":
+            return 0, json.dumps({"Size": len(VALID_MP4), "IsDir": False}), ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(uploader, "_run_cmd", fake_run_cmd)
+    settings = RuntimeSettings(rclone_remote="gd", rclone_remote_base_dir="Pornhub", min_file_size_bytes=64)
+    res = await uploader.upload_file_batch(
+        dl_dir,
+        "alice",
+        {"vk1": f1, "vk2": f2},
+        settings,
+        on_progress=lambda vk, sent, total, speed, phase: progress_events.append((vk, sent, total, speed, phase)),
+    )
+    assert set(res.uploaded_viewkeys) == {"vk1", "vk2"}
+
+    vk1_up = [ev for ev in progress_events if ev[0] == "vk1" and ev[4] == "uploading"]
+    vk2_up = [ev for ev in progress_events if ev[0] == "vk2" and ev[4] == "uploading"]
+    # First 64 MiB chunk pre-read is damped to 64 MiB / 2.5s = 25.6 MiB/s instead of 220-300 MiB/s.
+    assert vk1_up[0][3] == pytest.approx((64 * mib) / 2.5)
+    # Second tick respects smoothed speedAvg (24 MiB/s) instead of spiky instantaneous speed (180 MiB/s).
+    assert vk1_up[1][3] == pytest.approx(24 * mib)
+    # Once vk1 completes while vk2 is still uploading, vk1 emits speed=0 so totals do not double-count.
+    assert vk1_up[-1][3] == 0.0
+    # Startup fallback speed is split evenly across active transfers (40 MiB/s / 2 = 20 MiB/s).
+    assert vk2_up[0][3] == pytest.approx(20 * mib)

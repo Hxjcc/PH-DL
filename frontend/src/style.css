@@ -245,6 +245,15 @@
   contain-intrinsic-size: auto none auto 28px;
 }
 
+@supports not (content-visibility: auto) {
+  .cv-deferred-job-item,
+  .cv-deferred-history-card,
+  .cv-deferred-target-card,
+  .cv-deferred-log-row {
+    contain: layout style paint;
+  }
+}
+
 .no-scrollbar {
   scrollbar-width: none;
   -ms-overflow-style: none;

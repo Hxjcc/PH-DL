@@ -91,9 +91,35 @@ export interface JobItemRecord {
   speed_bps?: number
 }
 
+export type JobStatusCounts = Partial<Record<string, number>>
+
+export interface JobDetailQuery {
+  page?: number
+  page_size?: number
+  status?: string
+}
+
+export interface JobItemPageMeta {
+  paginated: boolean
+  page: number
+  page_size: number
+  status: string
+  total: number
+  total_all: number
+  status_counts: JobStatusCounts
+}
+
 export interface JobDetailResponse {
   job: JobRecord
   items: JobItemRecord[]
+  total?: number
+  total_all?: number
+  page?: number
+  page_size?: number
+  status?: string
+  status_counts?: JobStatusCounts
+  paginated?: boolean
+  live_progress?: Partial<Record<string, LiveProgressEntry>>
 }
 
 export interface LiveProgressEntry {

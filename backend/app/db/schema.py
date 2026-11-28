@@ -1,6 +1,6 @@
 """Unified SQLite database schema and versioned migrations."""
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 TARGET_IDENTITY_TYPE = """
     CASE
@@ -323,6 +323,13 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "COALESCE(downloaded_at, uploaded_at, created_at) DESC, viewkey DESC);",
             "CREATE INDEX IF NOT EXISTS idx_videos_stats_cover "
             "ON videos(site, status, published_at, quality, file_size, (video_page_url != ''));",
+        ],
+    ),
+    (
+        16,
+        [
+            "CREATE INDEX IF NOT EXISTS idx_job_items_job_status_id "
+            "ON job_items(job_id, status, id);",
         ],
     ),
 ]

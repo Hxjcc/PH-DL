@@ -81,7 +81,7 @@ def _playlist_resource(url: str) -> str:
 
 def is_hls_url(url: Optional[str]) -> bool:
     raw = (url or "").strip()
-    if not raw:
+    if not raw or ".m3u8" not in raw.lower():
         return False
     try:
         path = urllib.parse.urlparse(raw).path.lower()

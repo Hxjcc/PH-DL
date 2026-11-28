@@ -1,6 +1,6 @@
 import { targetTypeMeta } from './format'
 import { isXhamsterUrlText } from './targetInput'
-import type { JobItemRecord, JobRecord, LiveProgressEntry, ScanProgress, SiteKey, TargetRecord } from '../types/api'
+import type { JobItemRecord, JobRecord, JobStatusCounts, LiveProgressEntry, ScanProgress, SiteKey, TargetRecord } from '../types/api'
 
 type VisualJob = Partial<Pick<JobRecord, 'id' | 'kind' | 'params' | 'export_text' | 'label' | 'trigger'>>
 type VisualTarget = Partial<Pick<TargetRecord, 'id' | 'username' | 'site' | 'target_type' | 'display_name' | 'avatar_url' | 'enabled'>>
@@ -511,7 +511,7 @@ export function formatDurationCompact(startedAt: string | null | undefined, fini
 export function computeJobLiveMetrics(
   job: JobMetricInput | null | undefined,
   liveProgressMap: Partial<Record<number, ProgressMetricInput>> | null = {},
-  jobItemsList: ItemMetricInput[] | null | undefined = null,
+  jobItemsOrCounts: ItemMetricInput[] | JobStatusCounts | null | undefined = null,
   scanStatusMap: Partial<Record<number, ScanProgress>> | null = null,
 ) {
   let total = Number(job?.total_items || 0)
@@ -522,38 +522,6 @@ export function computeJobLiveMetrics(
   let downloadingCount = 0
   let remuxingCount = 0
   let uploadingCount = 0
-
-  if (Array.isArray(jobItemsList) && jobItemsList.length > 0) {
-    let iDone = 0
-    let iUploaded = 0
-    let iSkipped = 0
-    let iFailed = 0
-    for (const it of jobItemsList) {
-      if (it.status === 'done') {
-        iDone += 1
-        if (job?.kind !== 'enrich_metadata') iUploaded += 1
-      } else if (it.status === 'downloaded' || it.status === 'uploading') {
-        iDone += 1
-        if (it.status === 'uploading') uploadingCount += 1
-      } else if (it.status === 'downloading') {
-        const livePhase = String(liveProgressMap?.[it.id]?.phase || it.progress_phase || 'downloading').toLowerCase()
-        if (livePhase === 'remuxing') {
-          remuxingCount += 1
-        } else {
-          downloadingCount += 1
-        }
-      } else if (it.status === 'skipped') {
-        iSkipped += 1
-      } else if (it.status === 'failed') {
-        iFailed += 1
-      }
-    }
-    total = Math.max(total, jobItemsList.length)
-    done = Math.max(done, iDone)
-    uploaded = Math.max(uploaded, iUploaded)
-    skipped = Math.max(skipped, iSkipped)
-    failed = Math.max(failed, iFailed)
-  }
 
   let downloadSpeedBps = 0
   let uploadSpeedBps = 0
@@ -590,6 +558,59 @@ export function computeJobLiveMetrics(
       }
     }
   }
+
+  if (Array.isArray(jobItemsOrCounts) && jobItemsOrCounts.length > 0) {
+    let iDone = 0
+    let iUploaded = 0
+    let iSkipped = 0
+    let iFailed = 0
+    for (const it of jobItemsOrCounts) {
+      if (it.status === 'done') {
+        iDone += 1
+        if (job?.kind !== 'enrich_metadata') iUploaded += 1
+      } else if (it.status === 'downloaded' || it.status === 'uploading') {
+        iDone += 1
+        if (it.status === 'uploading') uploadingCount += 1
+      } else if (it.status === 'downloading') {
+        const livePhase = String(liveProgressMap?.[it.id]?.phase || it.progress_phase || 'downloading').toLowerCase()
+        if (livePhase === 'remuxing') {
+          remuxingCount += 1
+        } else {
+          downloadingCount += 1
+        }
+      } else if (it.status === 'skipped') {
+        iSkipped += 1
+      } else if (it.status === 'failed') {
+        iFailed += 1
+      }
+    }
+    total = Math.max(total, jobItemsOrCounts.length)
+    done = Math.max(done, iDone)
+    uploaded = Math.max(uploaded, iUploaded)
+    skipped = Math.max(skipped, iSkipped)
+    failed = Math.max(failed, iFailed)
+  } else if (jobItemsOrCounts && !Array.isArray(jobItemsOrCounts) && typeof jobItemsOrCounts === 'object') {
+    let countSum = 0
+    for (const val of Object.values(jobItemsOrCounts)) {
+      countSum += Math.max(0, Number(val || 0))
+    }
+    if (countSum > 0) {
+      const cDone = Math.max(0, Number(jobItemsOrCounts.done || 0))
+      const cDownloaded = Math.max(0, Number(jobItemsOrCounts.downloaded || 0))
+      const cUploading = Math.max(0, Number(jobItemsOrCounts.uploading || 0))
+      const cDownloading = Math.max(0, Number(jobItemsOrCounts.downloading || 0))
+      const cSkipped = Math.max(0, Number(jobItemsOrCounts.skipped || 0))
+      const cFailed = Math.max(0, Number(jobItemsOrCounts.failed || 0))
+      total = Math.max(total, countSum)
+      done = Math.max(done, cDone + cDownloaded + cUploading)
+      uploaded = Math.max(uploaded, job?.kind !== 'enrich_metadata' ? cDone : 0)
+      skipped = Math.max(skipped, cSkipped)
+      failed = Math.max(failed, cFailed)
+      uploadingCount = cUploading
+      downloadingCount = Math.max(0, cDownloading - liveRemuxCount)
+    }
+  }
+
   downloadingCount = Math.max(downloadingCount, liveDlCount)
   remuxingCount = Math.max(remuxingCount, liveRemuxCount)
   uploadingCount = Math.max(uploadingCount, liveUpCount)
@@ -757,28 +778,28 @@ function getItemStatusPillMeta(status: string, isMetadataJob = false) {
   return base
 }
 
-export function buildItemStatusPills(
-  items: Pick<JobItemRecord, 'status'>[] = [],
+export function buildItemStatusPillsFromCounts(
+  counts: JobStatusCounts = {},
+  totalAll?: number,
   { isMetadataJob = false, activeFilter = 'all' } = {},
 ) {
-  const list = Array.isArray(items) ? items : []
-  const counts: Partial<Record<string, number>> = Object.create(null)
+  const safeCounts: Partial<Record<string, number>> = Object.create(null)
   const extraStatuses: string[] = []
+  let sum = 0
 
-  for (const it of list) {
-    const status = String(it?.status || '').trim()
-    if (!status) continue
-    const count = counts[status]
-    if (count == null) {
-      counts[status] = 0
-      if (!ITEM_STATUS_ORDER.includes(status)) {
-        extraStatuses.push(status)
-      }
+  for (const [rawStatus, rawCount] of Object.entries(counts || {})) {
+    const status = String(rawStatus || '').trim()
+    const count = Math.max(0, Number(rawCount || 0))
+    if (!status || count <= 0) continue
+    safeCounts[status] = count
+    sum += count
+    if (!ITEM_STATUS_ORDER.includes(status)) {
+      extraStatuses.push(status)
     }
-    counts[status] = (count ?? 0) + 1
   }
 
-  const pills = [{ value: 'all', label: '全部', count: list.length, dot: '' }]
+  const allCount = typeof totalAll === 'number' && Number.isFinite(totalAll) ? Math.max(0, totalAll) : sum
+  const pills = [{ value: 'all', label: '全部', count: allCount, dot: '' }]
   const orderedStatuses = [...ITEM_STATUS_ORDER, ...extraStatuses]
 
   if (activeFilter && activeFilter !== 'all' && !orderedStatuses.includes(activeFilter)) {
@@ -786,7 +807,7 @@ export function buildItemStatusPills(
   }
 
   for (const status of orderedStatuses) {
-    const count = counts[status] || 0
+    const count = safeCounts[status] || 0
     if (count > 0 || activeFilter === status) {
       const meta = getItemStatusPillMeta(status, isMetadataJob)
       pills.push({
@@ -799,6 +820,22 @@ export function buildItemStatusPills(
   }
 
   return pills
+}
+
+export function buildItemStatusPills(
+  items: Pick<JobItemRecord, 'status'>[] = [],
+  { isMetadataJob = false, activeFilter = 'all' } = {},
+) {
+  const list = Array.isArray(items) ? items : []
+  const counts: JobStatusCounts = Object.create(null)
+
+  for (const it of list) {
+    const status = String(it?.status || '').trim()
+    if (!status) continue
+    counts[status] = (counts[status] ?? 0) + 1
+  }
+
+  return buildItemStatusPillsFromCounts(counts, list.length, { isMetadataJob, activeFilter })
 }
 
 export function filterJobItemsByStatus<T extends Pick<JobItemRecord, 'status'>>(items: T[] = [], filter = 'all'): T[] {
