@@ -101,12 +101,14 @@ const loadingItems = ref(false)
 const showSwitchLoading = ref(false)
 const busyAction = ref(false)
 const detailsMounted = ref(props.defaultExpanded)
+const renderFullPage = ref(props.defaultExpanded)
 const itemsLoaded = ref(false)
 const itemsLoadError = ref('')
 const deletePopoverMounted = ref(false)
 const deletePopoverDefaultOpen = ref(false)
 const itemStatusFilter = ref('all')
 const ITEMS_PER_PAGE = 50
+const INITIAL_RENDER_ITEMS = 12
 const itemPage = ref(1)
 const itemListScrollRef = ref<HTMLElement | null>(null)
 const brokenAvatars = ref(new Set<string>())
@@ -144,7 +146,7 @@ const visibleItemUploaderMap = computed(() => {
   if (!showItemUploader.value) return map
   const targets = store.targetsCache || []
   const profileNames = props.job.params?.profile_names || {}
-  for (const item of visibleItems.value) {
+  for (const item of renderedItems.value) {
     if (item.uploader) {
       map[item.id] = resolveItemUploaderLabel(item, targets, profileNames)
     }
@@ -273,6 +275,11 @@ const visibleItems = computed(() =>
     ? items.value
     : filteredItems.value.slice(itemPageStart.value, itemPageStart.value + ITEMS_PER_PAGE)
 )
+const renderedItems = computed(() =>
+  renderFullPage.value || visibleItems.value.length <= INITIAL_RENDER_ITEMS
+    ? visibleItems.value
+    : visibleItems.value.slice(0, INITIAL_RENDER_ITEMS)
+)
 const itemIndexWidthClass = computed(() => {
   const maxIndex = itemPageStart.value + visibleItems.value.length
   if (maxIndex >= 1000) return 'w-7 sm:w-8 text-right'
@@ -289,7 +296,7 @@ watch(totalItemPages, (maxPage) => {
 const transferProgressMap = computed<Partial<Record<number, TransferProgress>>>(() => {
   if (!detailsMounted.value || !tracksLiveProgress.value) return {}
   const map: Partial<Record<number, TransferProgress>> = Object.create(null)
-  for (const item of visibleItems.value) {
+  for (const item of renderedItems.value) {
     if (item.status !== 'downloading' && item.status !== 'uploading') continue
     const live = store.liveProgress[item.id]
     const isUploading = item.status === 'uploading'
@@ -578,9 +585,22 @@ async function toggleExpand() {
   }
 }
 
+function ensureFullPageRendered() {
+  if (!renderFullPage.value) {
+    renderFullPage.value = true
+  }
+}
+
+function handleDetailsSettled() {
+  if (expanded.value && visibleItems.value.length > 0) {
+    renderFullPage.value = true
+  }
+}
+
 function handleDetailsAfterLeave() {
   if (!expanded.value) {
     detailsMounted.value = false
+    renderFullPage.value = false
     itemPage.value = 1
   }
 }
@@ -975,7 +995,7 @@ function downloadExportTxt() {
               :aria-busy="loadingItems"
               @click="toggleExpand"
             >
-              <ChevronDown :class="['w-4 h-4 transition-transform duration-[260ms] ease-[cubic-bezier(0.22,1,0.36,1)]', expanded ? 'rotate-180' : '']" />
+              <ChevronDown :class="['w-4 h-4 transition-transform duration-[280ms] ease-[cubic-bezier(0.28,0.12,0.2,1)]', expanded ? 'rotate-180' : '']" />
             </button>
           </div>
         </div>
@@ -1050,6 +1070,8 @@ function downloadExportTxt() {
       :id="`job-details-${job.id}`"
       :open="detailsOpen"
       :content-key="detailsContentKey"
+      @after-enter="handleDetailsSettled"
+      @after-resize="handleDetailsSettled"
       @after-leave="handleDetailsAfterLeave"
     >
       <div
@@ -1140,9 +1162,10 @@ function downloadExportTxt() {
               'job-items-scroll space-y-1.5 max-h-96 overflow-y-auto pr-0.5 sm:pr-1 transition-opacity duration-150',
               showSwitchLoading && 'opacity-65',
             ]"
+            @scroll.passive="ensureFullPageRendered"
           >
             <div
-              v-for="(item, idx) in visibleItems"
+              v-for="(item, idx) in renderedItems"
               :key="item.id"
               :class="[
                 'job-item-row rounded-lg border border-border/80 bg-card px-3 sm:px-3.5 py-2 sm:py-2.5 space-y-1.5 sm:space-y-2 transition-colors hover:border-foreground/20',

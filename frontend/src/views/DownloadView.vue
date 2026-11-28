@@ -1777,7 +1777,9 @@ async function handleClearTemp() {
 .advanced-filters {
   display: grid;
   grid-template-rows: 1fr;
-  transition: grid-template-rows 180ms, opacity 180ms;
+  transition:
+    grid-template-rows 260ms cubic-bezier(0.28, 0.12, 0.2, 1),
+    opacity 220ms cubic-bezier(0.28, 0.12, 0.2, 1);
 }
 
 .advanced-filters-collapsed {
@@ -1886,7 +1888,10 @@ async function handleClearTemp() {
   display: grid;
   grid-template-rows: 1fr;
   opacity: 1;
-  transition: grid-template-rows 180ms, opacity 180ms, margin-top 180ms;
+  transition:
+    grid-template-rows 260ms cubic-bezier(0.28, 0.12, 0.2, 1),
+    opacity 220ms cubic-bezier(0.28, 0.12, 0.2, 1),
+    margin-top 260ms cubic-bezier(0.28, 0.12, 0.2, 1);
 }
 
 .recent-extra-slot-collapsed {
