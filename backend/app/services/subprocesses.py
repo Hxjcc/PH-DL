@@ -14,6 +14,11 @@ _CANCEL_TERMINATE_GRACE = 0.4
 _CANCEL_KILL_GRACE = 1.0
 _TIMEOUT_GRACE = 2.0
 _T = TypeVar("_T")
+_active_real_upload_processes = 0
+
+
+def has_active_real_upload_processes() -> bool:
+    return _active_real_upload_processes > 0
 
 
 async def _wait_for_cleanup(task: asyncio.Task[_T]) -> _T:
@@ -70,7 +75,9 @@ async def run_bounded_process(
     env: dict[str, str] | None = None,
     capture_stdout: bool = True,
     filter_stderr: Callable[[str], str | None] | None = None,
+    track_upload_net: bool = False,
 ) -> tuple[int, str, str]:
+    global _active_real_upload_processes
     if cancel_event is not None and cancel_event.is_set():
         return 130, "", ""
 
@@ -118,6 +125,8 @@ async def run_bounded_process(
             proc._transport.close()
             await asyncio.gather(*pending, return_exceptions=True)
 
+    if track_upload_net:
+        _active_real_upload_processes += 1
     try:
         if spawn_cancelled:
             raise asyncio.CancelledError
@@ -138,6 +147,8 @@ async def run_bounded_process(
         await _wait_for_cleanup(asyncio.create_task(stop_and_drain(cancelled=True)))
         raise
     finally:
+        if track_upload_net:
+            _active_real_upload_processes = max(0, _active_real_upload_processes - 1)
         pending_cleanup = [wait_task, *tasks]
         if signal is not None:
             pending_cleanup.append(signal)

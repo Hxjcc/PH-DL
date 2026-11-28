@@ -693,7 +693,10 @@ async def test_uploader_streams_json_progress_and_caches_remote_session(tmp_path
     assert cmd_actions.count("listremotes") == 1
     assert cmd_actions.count("mkdir") == 1
     assert cmd_actions.count("copy") == 2
-    assert any(vk == "vk1" and phase == "uploading" and speed == 125_000_000 for vk, _, _, speed, phase in progress_events)
+    assert any(
+        vk == "vk1" and phase == "uploading" and 0 < speed <= (len(VALID_MP4) // 2)
+        for vk, _, _, speed, phase in progress_events
+    )
     assert any(vk == "vk1" and phase == "verifying" and sent == len(VALID_MP4) for vk, sent, _, _, phase in progress_events)
     assert any(vk == "vk2" and phase == "uploading" for vk, _, _, _, phase in progress_events)
 
@@ -959,11 +962,74 @@ async def test_upload_progress_smooths_chunk_bursts_splits_fallback_and_zeroes_f
 
     vk1_up = [ev for ev in progress_events if ev[0] == "vk1" and ev[4] == "uploading"]
     vk2_up = [ev for ev in progress_events if ev[0] == "vk2" and ev[4] == "uploading"]
-    # First 64 MiB chunk pre-read is damped to 64 MiB / 2.5s = 25.6 MiB/s instead of 220-300 MiB/s.
-    assert vk1_up[0][3] == pytest.approx((64 * mib) / 2.5)
-    # Second tick respects smoothed speedAvg (24 MiB/s) instead of spiky instantaneous speed (180 MiB/s).
-    assert vk1_up[1][3] == pytest.approx(24 * mib)
+    # First 64 MiB chunk pre-read is damped to 64 MiB / 4.0s = 16 MiB/s instead of 220-300 MiB/s.
+    assert vk1_up[0][3] == pytest.approx((64 * mib) / 4.0)
+    # Second tick uses speedAvg (24 MiB/s) smoothed via rise-limited EWMA instead of spiky instantaneous speed (180 MiB/s).
+    assert vk1_up[1][3] == pytest.approx(0.35 * (24 * mib) + 0.65 * (16 * mib))
     # Once vk1 completes while vk2 is still uploading, vk1 emits speed=0 so totals do not double-count.
     assert vk1_up[-1][3] == 0.0
-    # Startup fallback speed is split evenly across active transfers (40 MiB/s / 2 = 20 MiB/s).
-    assert vk2_up[0][3] == pytest.approx(20 * mib)
+    # Startup sub-1MiB bytes (512 KiB) must also be damped instead of emitting raw 20 MiB/s fallback spikes.
+    assert vk2_up[0][3] == pytest.approx((512 * 1024) / 4.0)
+
+
+def test_event_bus_caps_concurrent_upload_speeds_to_linux_nic_tx_ceiling(tmp_path: Path):
+    from app.engine.events import EventBus, NetTxRateMeter, read_linux_net_bytes
+
+    # 1. Verify /proc/net/dev parser ignores loopback and sums external NIC counters.
+    proc_file = tmp_path / "net_dev"
+    proc_file.write_text(
+        "Inter-|   Receive                                                |  Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
+        "    lo: 9000000    100    0    0    0     0          0         0  9000000    100    0    0    0     0       0          0\n"
+        "  eth0: 100000000  50000  0    0    0     0          0         0  50000000  25000  0    0    0     0       0          0\n",
+        encoding="ascii",
+    )
+    assert read_linux_net_bytes(str(proc_file)) == (100_000_000, 50_000_000)
+
+    # 2. Verify EventBus proportionally scales concurrent upload speeds to real NIC TX minus download ACK overhead.
+    mib = 1024 * 1024
+    clock = 10.0
+    rx_bytes = 0
+    tx_bytes = 0
+    meter = NetTxRateMeter(
+        reader=lambda: (rx_bytes, tx_bytes),
+        clock=lambda: clock,
+        window_seconds=2.0,
+        min_span_seconds=0.5,
+        sample_interval=0.2,
+    )
+    bus = EventBus(net_tx_meter=meter, net_ceiling_active=lambda: True)
+    sub = bus.subscribe()
+
+    # Prime baseline during active download (t=10.0 -> t=11.0: 80 MiB/s RX, 61.6 MiB/s TX = 60 MiB/s upload + 1.6 MiB/s ACKs)
+    bus.emit_item_progress(1, 10, 10 * mib, 100 * mib, 80 * mib, phase="downloading")
+    clock = 11.0
+    rx_bytes += 80 * mib
+    tx_bytes += int(61.6 * mib)
+
+    # Three concurrent rclone workers report 80 MiB/s each (240 MiB/s total from chunk pre-reads / instant dedup).
+    bus.emit_item_progress(1, 101, 64 * mib, 256 * mib, 80 * mib, phase="uploading")
+    bus.emit_item_progress(1, 102, 64 * mib, 256 * mib, 80 * mib, phase="uploading")
+    bus.emit_item_progress(1, 103, 64 * mib, 256 * mib, 80 * mib, phase="uploading")
+
+    snap = bus.live_progress_snapshot()
+    total_reported = sum(snap[iid]["speed_bps"] for iid in (101, 102, 103))
+    assert total_reported == pytest.approx(60 * mib, rel=0.01)
+    assert all(snap[iid]["speed_bps"] == pytest.approx(20 * mib, rel=0.01) for iid in (101, 102, 103))
+
+    # Subscribers must have received rescaled speeds for earlier items too (so frontend sum stays <= ceiling).
+    latest_by_item = {}
+    while not sub.empty():
+        ev = sub.get_nowait()
+        if ev["type"] == "item_progress":
+            latest_by_item[ev["data"]["item_id"]] = ev["data"]["speed_bps"]
+    assert sum(latest_by_item[iid] for iid in (101, 102, 103)) == pytest.approx(60 * mib, rel=0.01)
+
+    # When real NIC TX is higher than reported sum (e.g., 100 MiB/s ceiling vs 45 MiB/s reported), no artificial cap occurs.
+    clock = 12.0
+    tx_bytes += 140 * mib  # 2-second avg TX = (61.6 + 140)/2 = 100.8 MiB/s, RX avg = 40 MiB/s -> ceiling = 100 MiB/s
+    bus.emit_item_progress(1, 101, 100 * mib, 256 * mib, 15 * mib, phase="uploading")
+    bus.emit_item_progress(1, 102, 100 * mib, 256 * mib, 15 * mib, phase="uploading")
+    bus.emit_item_progress(1, 103, 100 * mib, 256 * mib, 15 * mib, phase="uploading")
+    snap2 = bus.live_progress_snapshot()
+    assert sum(snap2[iid]["speed_bps"] for iid in (101, 102, 103)) == pytest.approx(45 * mib, rel=0.01)

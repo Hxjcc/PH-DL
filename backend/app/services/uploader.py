@@ -25,9 +25,8 @@ FileSnapshot = Tuple[int, int, int, int, int]
 UploadProgressCallback = Callable[[str, int, int, float, str], None]  # (viewkey, bytes_sent, total, speed_bps, phase)
 
 
-_UPLOAD_SPEED_WINDOW_SECONDS = 5.0
-_UPLOAD_SPEED_MIN_SPAN_SECONDS = 2.5
-_UPLOAD_BURST_DAMP_BYTES = 1024 * 1024
+_UPLOAD_SPEED_WINDOW_SECONDS = 8.0
+_UPLOAD_SPEED_MIN_SPAN_SECONDS = 4.0
 
 
 def _positive_float(value: Any) -> float:
@@ -205,11 +204,13 @@ async def _run_cmd(
             return str(parsed.get("msg") or "").strip()
         return None
 
+    is_upload_transfer = len(cmd) >= 2 and cmd[1] in {"copy", "copyto"}
     try:
         rc, out, err = await run_bounded_process(
             cmd, timeout=timeout, cancel_event=cancel_event, env=env,
             capture_stdout=len(cmd) < 2 or cmd[1] not in {"copy", "copyto", "mkdir"},
             filter_stderr=filter_line if on_stderr_line is not None else None,
+            track_upload_net=is_upload_transfer,
         )
     except FileNotFoundError as err:
         return 127, "", f"找不到可执行文件: {err}"
@@ -852,6 +853,7 @@ async def upload_file_batch(
         copy_started = time.monotonic()
         active_totals: Dict[str, int] = {}
         speed_windows: Dict[str, deque[Tuple[float, int]]] = {}
+        last_speeds: Dict[str, float] = {}
 
         def _smoothed_upload_speed(
             vk_key: str,
@@ -860,9 +862,10 @@ async def upload_file_batch(
             avg_speed: Any,
             per_item_fallback: float,
         ) -> float:
+            if sent_bytes <= 0:
+                last_speeds[vk_key] = 0.0
+                return 0.0
             reported = _positive_float(avg_speed) or _positive_float(raw_speed) or max(0.0, per_item_fallback)
-            if sent_bytes < _UPLOAD_BURST_DAMP_BYTES:
-                return reported
             now = time.monotonic()
             win = speed_windows.get(vk_key)
             if win is None:
@@ -881,7 +884,13 @@ async def upload_file_batch(
             delta_bytes = max(0, sent_bytes - oldest_bytes)
             span = max(_UPLOAD_SPEED_MIN_SPAN_SECONDS, now - oldest_ts)
             window_speed = delta_bytes / span
-            return min(reported, window_speed) if reported > 0 else window_speed
+            candidate = min(reported, window_speed) if reported > 0 else window_speed
+            prev = last_speeds.get(vk_key)
+            if prev is not None and prev > 0:
+                alpha = 0.35 if candidate > prev else 0.6
+                candidate = alpha * candidate + (1.0 - alpha) * prev
+            last_speeds[vk_key] = candidate
+            return candidate
 
         def _on_stderr_line(line: str) -> None:
             parsed = parse_rclone_json_line(line)
@@ -902,6 +911,7 @@ async def upload_file_batch(
                     if on_progress is not None and matched[0] in active_totals:
                         done_total = active_totals.pop(matched[0])
                         speed_windows.pop(matched[0], None)
+                        last_speeds.pop(matched[0], None)
                         on_progress(matched[0], done_total, done_total, 0.0, "uploading")
             if lvl in {"error", "critical", "fatal", "warning"}:
                 err_field = str(parsed.get("error") or "").strip()
@@ -943,6 +953,7 @@ async def upload_file_batch(
                     if finished_vk not in seen_vks:
                         done_total = active_totals.pop(finished_vk)
                         speed_windows.pop(finished_vk, None)
+                        last_speeds.pop(finished_vk, None)
                         on_progress(finished_vk, done_total, done_total, 0.0, "uploading")
             elif sole_entry is not None:
                 vk_m, local_total = sole_entry
@@ -958,6 +969,7 @@ async def upload_file_batch(
                 for finished_vk in list(active_totals):
                     done_total = active_totals.pop(finished_vk)
                     speed_windows.pop(finished_vk, None)
+                    last_speeds.pop(finished_vk, None)
                     on_progress(finished_vk, done_total, done_total, 0.0, "uploading")
 
         return _on_stderr_line
