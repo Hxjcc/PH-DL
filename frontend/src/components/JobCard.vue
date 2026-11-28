@@ -23,7 +23,7 @@ import {
   Clock,
   CloudUpload,
 } from 'lucide-vue-next'
-import { useAppStore } from '../stores/app'
+import { JOB_PAGINATION_THRESHOLD, useAppStore } from '../stores/app'
 import { api } from '../api/client'
 import type { JobItemRecord, JobItemStatus, JobRecord } from '../types/api'
 import {
@@ -98,6 +98,7 @@ interface TransferProgress {
 const store = useAppStore()
 const expanded = ref(props.defaultExpanded)
 const loadingItems = ref(false)
+const showSwitchLoading = ref(false)
 const busyAction = ref(false)
 const detailsMounted = ref(props.defaultExpanded)
 const itemsLoaded = ref(false)
@@ -115,6 +116,7 @@ const isCancelling = computed(() => isActive.value && store.isJobCancelling(prop
 const tracksLiveProgress = computed(() => props.routeActive && !isCancelling.value && ['scanning', 'running'].includes(props.job.status))
 const items = computed(() => store.jobItems[props.job.id] || [])
 const itemMeta = computed(() => store.jobItemMeta[props.job.id] || null)
+const shouldPaginate = computed(() => Number(props.job.total_items || 0) > JOB_PAGINATION_THRESHOLD)
 const isPaginated = computed(() => Boolean(itemMeta.value?.paginated))
 const totalAllItems = computed(() => (itemMeta.value ? itemMeta.value.total_all : items.value.length))
 const statusMeta = computed(() => jobStatusMeta(isCancelling.value ? 'cancelling' : props.job.status))
@@ -363,9 +365,18 @@ function selectItemFilter(val: string) {
   itemStatusFilter.value = val
   itemPage.value = 1
   if (itemListScrollRef.value) itemListScrollRef.value.scrollTop = 0
-  if (expanded.value && (isPaginated.value || !itemMeta.value)) {
-    void ensureItemsLoaded(true)
+  if (!expanded.value || (!isPaginated.value && !shouldPaginate.value)) return
+  const query = currentItemQuery()
+  if (!query) return
+  const cached = store.activateJobDetailSlice(props.job.id, query)
+  if (cached.hit) {
+    itemsLoadError.value = ''
+    if (!cached.fresh) {
+      void store.loadJobDetail(props.job.id, query).catch(() => {})
+    }
+    return
   }
+  void ensureItemsLoaded(true)
 }
 
 function goItemPage(nextPage: number) {
@@ -373,8 +384,54 @@ function goItemPage(nextPage: number) {
   if (clamped === itemPage.value) return
   itemPage.value = clamped
   if (itemListScrollRef.value) itemListScrollRef.value.scrollTop = 0
-  if (expanded.value && isPaginated.value) {
-    void ensureItemsLoaded(true)
+  if (!expanded.value || !isPaginated.value) return
+  const query = currentItemQuery()
+  if (!query) return
+  const cached = store.activateJobDetailSlice(props.job.id, query)
+  if (cached.hit) {
+    itemsLoadError.value = ''
+    if (!cached.fresh) {
+      void store.loadJobDetail(props.job.id, query).catch(() => {})
+    }
+    return
+  }
+  void ensureItemsLoaded(true)
+}
+
+function prefetchFilterPill(val: string) {
+  if (!expanded.value || !isPaginated.value || val === itemStatusFilter.value || !store.authenticated) return
+  void store.prefetchJobDetailSlice(props.job.id, {
+    page: 1,
+    page_size: ITEMS_PER_PAGE,
+    status: val,
+  })
+}
+
+function prefetchItemPage(targetPage: number) {
+  if (!expanded.value || !isPaginated.value || !store.authenticated) return
+  const clamped = Math.min(Math.max(1, targetPage), totalItemPages.value)
+  if (clamped === itemPage.value) return
+  void store.prefetchJobDetailSlice(props.job.id, {
+    page: clamped,
+    page_size: ITEMS_PER_PAGE,
+    status: itemStatusFilter.value,
+  })
+}
+
+function warmHotFilterSlices() {
+  if (!expanded.value || !isPaginated.value || !store.authenticated) return
+  const counts = itemMeta.value?.status_counts
+  if (!counts) return
+  const candidates = ['downloading', 'uploading', 'failed']
+  for (const st of candidates) {
+    if (st === itemStatusFilter.value) continue
+    if (Number(counts[st] || 0) > 0) {
+      void store.prefetchJobDetailSlice(props.job.id, {
+        page: 1,
+        page_size: ITEMS_PER_PAGE,
+        status: st,
+      })
+    }
   }
 }
 
@@ -402,8 +459,18 @@ function visibleItemError(item: JobItemRecord) {
 
 let itemsLoadSeq = 0
 let prefetchTimer: ReturnType<typeof setTimeout> | null = null
+let switchLoadingTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearSwitchLoadingTimer() {
+  if (switchLoadingTimer !== null) {
+    clearTimeout(switchLoadingTimer)
+    switchLoadingTimer = null
+  }
+  showSwitchLoading.value = false
+}
 
 function currentItemQuery() {
+  if (!shouldPaginate.value) return undefined
   return {
     page: itemPage.value,
     page_size: ITEMS_PER_PAGE,
@@ -416,7 +483,8 @@ function hasMatchingItemsCache() {
   if (!Array.isArray(cached)) return false
   const expectedTotal = Number(props.job.total_items || 0)
   const meta = itemMeta.value
-  if (meta?.paginated) {
+  if (shouldPaginate.value) {
+    if (!meta?.paginated) return expectedTotal <= 0 || cached.length >= expectedTotal
     const sameQuery =
       meta.status === itemStatusFilter.value &&
       meta.page === itemPage.value &&
@@ -424,6 +492,7 @@ function hasMatchingItemsCache() {
     if (!sameQuery) return false
     return expectedTotal <= 0 || meta.total_all >= expectedTotal || (!isActive.value && itemsLoaded.value)
   }
+  if (meta?.paginated) return false
   return expectedTotal <= 0 || cached.length >= expectedTotal || (!isActive.value && itemsLoaded.value)
 }
 
@@ -448,6 +517,7 @@ function schedulePrefetchItems() {
 
 onBeforeUnmount(() => {
   cancelPrefetchItems()
+  clearSwitchLoadingTimer()
 })
 
 async function ensureItemsLoaded(force = false) {
@@ -455,11 +525,22 @@ async function ensureItemsLoaded(force = false) {
   if (!force && loadingItems.value) return
   if (!force && hasMatchingItemsCache()) {
     store.touchJobDetail(props.job.id)
+    warmHotFilterSlices()
     return
   }
   const seq = ++itemsLoadSeq
+  const isSwitch = totalAllItems.value > 0
   loadingItems.value = true
   itemsLoadError.value = ''
+  clearSwitchLoadingTimer()
+  if (isSwitch) {
+    switchLoadingTimer = setTimeout(() => {
+      switchLoadingTimer = null
+      if (loadingItems.value && seq === itemsLoadSeq) {
+        showSwitchLoading.value = true
+      }
+    }, 180)
+  }
   try {
     const detail = await store.loadJobDetail(props.job.id, currentItemQuery())
     if (seq !== itemsLoadSeq) return
@@ -467,12 +548,16 @@ async function ensureItemsLoaded(force = false) {
       itemPage.value = detail.page
     }
     itemsLoaded.value = !['queued', 'scanning', 'running'].includes(detail?.job?.status || props.job.status)
+    if (detail?.paginated) {
+      warmHotFilterSlices()
+    }
   } catch (err: unknown) {
     if (seq !== itemsLoadSeq) return
     itemsLoadError.value = getErrorMessage(err, '读取视频明细失败，请重试。')
   } finally {
     if (seq === itemsLoadSeq) {
       loadingItems.value = false
+      clearSwitchLoadingTimer()
     }
   }
 }
@@ -1017,6 +1102,7 @@ function downloadExportTxt() {
                     ? 'border-brand/35 bg-brand/10 dark:bg-brand/15 text-brand'
                     : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-foreground/20',
                 ]"
+                @pointerenter="prefetchFilterPill(pill.value)"
                 @click="selectItemFilter(pill.value)"
               >
                 <span v-if="pill.dot" :class="['w-1.5 h-1.5 rounded-full shrink-0', pill.dot]" />
@@ -1024,8 +1110,8 @@ function downloadExportTxt() {
                 <span class="font-mono text-[10px] opacity-80">{{ pill.count }}</span>
               </button>
             </div>
-            <span v-if="filteredTotal > ITEMS_PER_PAGE || loadingItems" class="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground tabular-nums">
-              <Loader2 v-if="loadingItems" class="w-3 h-3 animate-spin shrink-0 text-brand" />
+            <span v-if="filteredTotal > ITEMS_PER_PAGE || showSwitchLoading" class="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground tabular-nums">
+              <Loader2 v-if="showSwitchLoading" class="w-3 h-3 animate-spin shrink-0 text-brand" />
               <template v-if="filteredTotal > ITEMS_PER_PAGE">
                 第 {{ itemPageStart + 1 }}–{{ itemPageStart + visibleItems.length }} / 共 {{ filteredTotal }} 项
               </template>
@@ -1046,7 +1132,7 @@ function downloadExportTxt() {
             ref="itemListScrollRef"
             :class="[
               'job-items-scroll space-y-1.5 max-h-96 overflow-y-auto pr-0.5 sm:pr-1 transition-opacity duration-150',
-              loadingItems && 'opacity-60',
+              showSwitchLoading && 'opacity-65',
             ]"
           >
             <div
@@ -1236,18 +1322,18 @@ function downloadExportTxt() {
               每页 {{ ITEMS_PER_PAGE }} 项 · 第 {{ safeItemPage }} / {{ totalItemPages }} 页
             </span>
             <div class="flex items-center gap-1">
-              <Button variant="outline" size="xs" :disabled="safeItemPage <= 1" @click="goItemPage(1)">
+              <Button variant="outline" size="xs" :disabled="safeItemPage <= 1" @pointerenter="prefetchItemPage(1)" @click="goItemPage(1)">
                 首页
               </Button>
-              <Button variant="outline" size="xs" :disabled="safeItemPage <= 1" @click="goItemPage(safeItemPage - 1)">
+              <Button variant="outline" size="xs" :disabled="safeItemPage <= 1" @pointerenter="prefetchItemPage(safeItemPage - 1)" @click="goItemPage(safeItemPage - 1)">
                 <ChevronLeft class="w-3.5 h-3.5" />
                 上一页
               </Button>
-              <Button variant="outline" size="xs" :disabled="safeItemPage >= totalItemPages" @click="goItemPage(safeItemPage + 1)">
+              <Button variant="outline" size="xs" :disabled="safeItemPage >= totalItemPages" @pointerenter="prefetchItemPage(safeItemPage + 1)" @click="goItemPage(safeItemPage + 1)">
                 下一页
                 <ChevronRight class="w-3.5 h-3.5" />
               </Button>
-              <Button variant="outline" size="xs" :disabled="safeItemPage >= totalItemPages" @click="goItemPage(totalItemPages)">
+              <Button variant="outline" size="xs" :disabled="safeItemPage >= totalItemPages" @pointerenter="prefetchItemPage(totalItemPages)" @click="goItemPage(totalItemPages)">
                 末页
               </Button>
             </div>

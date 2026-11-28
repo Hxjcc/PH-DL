@@ -120,7 +120,16 @@ const JOB_ITEMS_RELOAD_DEBOUNCE_MS = 240
 const JOB_ITEMS_SOFT_RELOAD_DEBOUNCE_MS = 900
 const JOB_DETAILS_HISTORY_LIMIT = 8
 const DEFAULT_JOB_ITEMS_PAGE_SIZE = 50
+export const JOB_PAGINATION_THRESHOLD = 500
+const JOB_PAGE_CACHE_MAX_SLICES = 16
+const ACTIVE_SLICE_FRESH_MS = 2000
 const JOB_RUN_ORDER: Partial<Record<JobStatus, number>> = { queued: 0, scanning: 1, running: 2 }
+
+interface CachedJobItemPage {
+  items: JobItemRecord[]
+  meta: JobItemPageMeta
+  fetchedAt: number
+}
 
 const inflight = new Map<keyof RequestResults, Promise<RequestResults[keyof RequestResults]>>()
 let sessionEpoch = 0
@@ -137,6 +146,8 @@ const jobItemsReloadTimers = new Map<number, Timer>()
 const jobItemsReloadDeadlines = new Map<number, number>()
 const jobDetailQueries = new Map<number, Required<JobDetailQuery>>()
 const jobDetailInflightQuery = new Map<number, string>()
+const jobItemPageCache = new Map<number, Map<string, CachedJobItemPage>>()
+const jobItemSlicePrefetches = new Map<string, Promise<JobDetailResponse>>()
 const jobItemAccessOrder = new Map<number, JobStatus | undefined>()
 const jobItemPins = new Map<number, number>()
 const detailUpdates: ItemUpdates = new Map()
@@ -144,6 +155,48 @@ const detailProgressVersions = new Map<number, Map<number, number>>()
 const deletedJobVersions = new Map<number, number>()
 let progressVersion = 0
 let deletionVersion = 0
+
+function defaultJobDetailQueryFor(job: Pick<JobRecord, 'total_items'> | null | undefined): Required<JobDetailQuery> | undefined {
+  if (Number(job?.total_items || 0) > JOB_PAGINATION_THRESHOLD) {
+    return { page: 1, page_size: DEFAULT_JOB_ITEMS_PAGE_SIZE, status: 'all' }
+  }
+  return undefined
+}
+
+function saveJobItemPageSlice(jid: number, sig: string, items: JobItemRecord[], meta: JobItemPageMeta) {
+  if (!meta.paginated) return
+  let slices = jobItemPageCache.get(jid)
+  if (!slices) {
+    slices = new Map()
+    jobItemPageCache.set(jid, slices)
+  }
+  slices.delete(sig)
+  slices.set(sig, {
+    items: markRaw(items),
+    meta: { ...meta, status_counts: { ...meta.status_counts } },
+    fetchedAt: Date.now(),
+  })
+  while (slices.size > JOB_PAGE_CACHE_MAX_SLICES) {
+    const oldest = slices.keys().next().value
+    if (oldest === undefined) break
+    slices.delete(oldest)
+  }
+}
+
+function invalidateJobItemPageSlices(jid: number, affectedStatuses?: Set<string>) {
+  if (!affectedStatuses) {
+    jobItemPageCache.delete(jid)
+    return
+  }
+  const slices = jobItemPageCache.get(jid)
+  if (!slices || slices.size === 0) return
+  for (const [sig, entry] of slices) {
+    if (entry.meta.status === 'all' || affectedStatuses.has(entry.meta.status)) {
+      slices.delete(sig)
+    }
+  }
+  if (slices.size === 0) jobItemPageCache.delete(jid)
+}
 
 function normalizeJobDetailQuery(query?: JobDetailQuery): Required<JobDetailQuery> | undefined {
   if (!query) return undefined
@@ -226,6 +279,7 @@ function updateCachedJobStatus(store: JobDetailCache, job: JobRecord, previousJo
   jobItemAccessOrder.set(jid, job.status)
   if (Number(job.params?.resume_count || 0) > Number(previousJob?.params?.resume_count || 0) ||
       (!isActiveJobStatus(previous) && isActiveJobStatus(job.status))) {
+    invalidateJobItemPageSlices(jid)
     pendingItemUpdates?.delete(jid)
     clearLiveProgressForJob(store, jid)
     scheduleJobItemsReload(store, jid)
@@ -239,6 +293,10 @@ function evictJobItems(store: JobDetailCache, jid: number) {
   jobItemIndexMap.delete(jid)
   jobDetailQueries.delete(jid)
   jobDetailInflightQuery.delete(jid)
+  jobItemPageCache.delete(jid)
+  for (const key of jobItemSlicePrefetches.keys()) {
+    if (key.startsWith(`${jid}:`)) jobItemSlicePrefetches.delete(key)
+  }
   detailUpdates.delete(jid)
   detailProgressVersions.delete(jid)
   inflight.delete(`jobDetail:${jid}`)
@@ -280,6 +338,7 @@ function clearPendingItemUpdates() {
   detailProgressVersions.clear()
   jobItemIndexMap.clear()
   jobDetailInflightQuery.clear()
+  jobItemSlicePrefetches.clear()
   for (const timer of jobItemsReloadTimers.values()) {
     clearTimeout(timer)
   }
@@ -310,6 +369,7 @@ function flushPendingItemUpdates(store: JobDetailCache) {
     let nextCounts: JobStatusCounts | null = null
     let needsFastReload = false
     let needsSoftReload = false
+    const affectedStatuses = isPaginated ? new Set<string>() : null
 
     const adjustStatusCount = (prevStatus: string | undefined, nextStatus: string | undefined) => {
       if (!meta || prevStatus === nextStatus) return
@@ -333,6 +393,10 @@ function flushPendingItemUpdates(store: JobDetailCache) {
           nextList[idx] = { ...current, ...item }
           listChanged = true
           adjustStatusCount(prevStatus, nextList[idx].status)
+          if (affectedStatuses) {
+            if (prevStatus) affectedStatuses.add(prevStatus)
+            if (nextList[idx].status) affectedStatuses.add(nextList[idx].status)
+          }
           if (isPaginated && meta && meta.status !== 'all' && nextList[idx].status !== meta.status) {
             needsFastReload = true
           }
@@ -343,6 +407,7 @@ function flushPendingItemUpdates(store: JobDetailCache) {
         listChanged = true
         adjustStatusCount(undefined, item.status)
       } else if (meta) {
+        if (affectedStatuses && item.status) affectedStatuses.add(item.status)
         if (
           (meta.status !== 'all' && item.status === meta.status) ||
           (meta.status === 'all' && meta.page === 1 && nextList.length < meta.page_size)
@@ -357,6 +422,9 @@ function flushPendingItemUpdates(store: JobDetailCache) {
     if (listChanged) {
       store.jobItems[jid] = markRaw(nextList)
     }
+    if (affectedStatuses && affectedStatuses.size > 0) {
+      invalidateJobItemPageSlices(jid, affectedStatuses)
+    }
     if (meta && nextCounts) {
       const counts = nextCounts as JobStatusCounts
       const totalAll = Object.values(counts).reduce<number>((sum, n) => sum + Number(n || 0), 0)
@@ -368,6 +436,15 @@ function flushPendingItemUpdates(store: JobDetailCache) {
           : Number(counts[meta.status] || 0),
         status_counts: counts,
       }
+    }
+    if (isPaginated && store.jobItemMeta[jid] && listChanged) {
+      const updatedMeta = store.jobItemMeta[jid]!
+      const activeSig = jobDetailQuerySignature({
+        page: updatedMeta.page,
+        page_size: updatedMeta.page_size,
+        status: updatedMeta.status,
+      })
+      saveJobItemPageSlice(jid, activeSig, store.jobItems[jid] || nextList, updatedMeta)
     }
     if (needsFastReload) {
       scheduleJobItemsReload(store, jid, JOB_ITEMS_RELOAD_DEBOUNCE_MS)
@@ -750,9 +827,9 @@ export const useAppStore = defineStore('app', {
           (routeName === 'download' || routeName === 'jobs') &&
           this.overview?.current_job?.id
         ) {
-          const curId = this.overview.current_job.id
-          const query = jobDetailQueries.get(curId) || { page: 1, page_size: DEFAULT_JOB_ITEMS_PAGE_SIZE, status: 'all' }
-          this.loadJobDetail(curId, query).catch(() => {})
+          const curJob = this.overview.current_job
+          const query = jobDetailQueries.get(curJob.id) ?? defaultJobDetailQueryFor(curJob)
+          ;(query ? this.loadJobDetail(curJob.id, query) : this.loadJobDetail(curJob.id)).catch(() => {})
         }
         this.persistCache()
         this.prefetchAll()
@@ -784,6 +861,8 @@ export const useAppStore = defineStore('app', {
       jobItemPins.clear()
       jobDetailQueries.clear()
       jobDetailInflightQuery.clear()
+      jobItemPageCache.clear()
+      jobItemSlicePrefetches.clear()
       deletedJobVersions.clear()
       clearSessionCache()
       this.hydratedFromCache = false
@@ -1339,9 +1418,9 @@ export const useAppStore = defineStore('app', {
         (routeName === 'download' || routeName === 'jobs') &&
         this.overview?.current_job?.id
       ) {
-        const curId = this.overview.current_job.id
-        const query = jobDetailQueries.get(curId) || { page: 1, page_size: DEFAULT_JOB_ITEMS_PAGE_SIZE, status: 'all' }
-        await this.ensureJobDetail(curId, query)
+        const curJob = this.overview.current_job
+        const query = jobDetailQueries.get(curJob.id) ?? defaultJobDetailQueryFor(curJob)
+        await this.ensureJobDetail(curJob.id, query)
       }
     },
 
@@ -1396,7 +1475,11 @@ export const useAppStore = defineStore('app', {
         detailProgressVersions.set(jid, progressUpdates)
         let res
         try {
-          res = normalizedQuery ? await api.getJob(jid, normalizedQuery) : await api.getJob(jid)
+          const prefetchKey = normalizedQuery ? `${jid}:${querySig}` : ''
+          const pendingSlice = prefetchKey ? jobItemSlicePrefetches.get(prefetchKey) : undefined
+          res = pendingSlice
+            ? await pendingSlice
+            : (normalizedQuery ? await api.getJob(jid, normalizedQuery) : await api.getJob(jid))
         } finally {
           if (detailUpdates.get(jid) === updates) detailUpdates.delete(jid)
           if (detailProgressVersions.get(jid) === progressUpdates) detailProgressVersions.delete(jid)
@@ -1471,8 +1554,7 @@ export const useAppStore = defineStore('app', {
               ? totalAll
               : Number(statusCounts[resStatus] || 0)
 
-          this.jobItems[jid] = markRaw(items)
-          this.jobItemMeta[jid] = {
+          const pageMeta: JobItemPageMeta = {
             paginated: isPaginated,
             page: resPage,
             page_size: resPageSize,
@@ -1481,8 +1563,14 @@ export const useAppStore = defineStore('app', {
             total_all: totalAll,
             status_counts: statusCounts,
           }
+          this.jobItems[jid] = markRaw(items)
+          this.jobItemMeta[jid] = pageMeta
           if (isPaginated) {
-            jobDetailQueries.set(jid, { page: resPage, page_size: resPageSize, status: resStatus })
+            const actualQuery = { page: resPage, page_size: resPageSize, status: resStatus }
+            jobDetailQueries.set(jid, actualQuery)
+            saveJobItemPageSlice(jid, jobDetailQuerySignature(actualQuery), items, pageMeta)
+          } else {
+            jobItemPageCache.delete(jid)
           }
           indexJobItems(jid, items)
           const status = this.jobs.find((job) => job.id === jid)?.status || res.job?.status
@@ -1562,6 +1650,97 @@ export const useAppStore = defineStore('app', {
 
     prefetchJobDetail(jobId: number, query?: JobDetailQuery): Promise<JobDetailResponse | void> {
       return this.ensureJobDetail(jobId, query)
+    },
+
+    activateJobDetailSlice(jobId: number, query?: JobDetailQuery): { hit: boolean; fresh: boolean; page?: number } {
+      const jid = Number(jobId)
+      const normalizedQuery = normalizeJobDetailQuery(query)
+      if (!jid || !normalizedQuery) return { hit: false, fresh: false }
+      const sig = jobDetailQuerySignature(normalizedQuery)
+      const cached = jobItemPageCache.get(jid)?.get(sig)
+      if (!cached) return { hit: false, fresh: false }
+      const currentMeta = this.jobItemMeta[jid]
+      const statusCounts = currentMeta?.status_counts
+        ? { ...currentMeta.status_counts }
+        : { ...cached.meta.status_counts }
+      const totalAll = currentMeta ? Math.max(currentMeta.total_all, cached.meta.total_all) : cached.meta.total_all
+      const nextMeta: JobItemPageMeta = {
+        ...cached.meta,
+        total_all: totalAll,
+        total: cached.meta.status === 'all' ? totalAll : Number(statusCounts[cached.meta.status] ?? cached.meta.total),
+        status_counts: statusCounts,
+      }
+      this.jobItems[jid] = markRaw(cached.items)
+      this.jobItemMeta[jid] = nextMeta
+      jobDetailQueries.set(jid, { page: nextMeta.page, page_size: nextMeta.page_size, status: nextMeta.status })
+      indexJobItems(jid, cached.items)
+      const status = this.jobs.find((job) => job.id === jid)?.status
+      touchJobItems(jid, status)
+      const fresh = !isActiveJobStatus(status) || (Date.now() - cached.fetchedAt) < ACTIVE_SLICE_FRESH_MS
+      return { hit: true, fresh, page: nextMeta.page }
+    },
+
+    prefetchJobDetailSlice(jobId: number, query: JobDetailQuery): Promise<JobDetailResponse | void> {
+      const jid = Number(jobId)
+      const normalizedQuery = normalizeJobDetailQuery(query)
+      if (!this.authenticated || !jid || !normalizedQuery) return Promise.resolve()
+      const sig = jobDetailQuerySignature(normalizedQuery)
+      const currentMeta = this.jobItemMeta[jid]
+      if (currentMeta && !currentMeta.paginated) return Promise.resolve()
+      const status = this.jobs.find((job) => job.id === jid)?.status
+      const existingCached = jobItemPageCache.get(jid)?.get(sig)
+      if (existingCached && (!isActiveJobStatus(status) || (Date.now() - existingCached.fetchedAt) < ACTIVE_SLICE_FRESH_MS)) {
+        return Promise.resolve()
+      }
+      const prefetchKey = `${jid}:${sig}`
+      const existingInflight = jobItemSlicePrefetches.get(prefetchKey)
+      if (existingInflight) return existingInflight.catch(() => {})
+      if (getInflight(`jobDetail:${jid}`) && jobDetailInflightQuery.get(jid) === sig) {
+        return Promise.resolve()
+      }
+      const epoch = sessionEpoch
+      const req = api.getJob(jid, normalizedQuery)
+        .then((res) => {
+          if (epoch !== sessionEpoch || !this.authenticated || deletedJobVersions.has(jid)) return res
+          if (Array.isArray(res?.items) && res.paginated) {
+            const statusCounts: JobStatusCounts = res.status_counts
+              ? { ...res.status_counts }
+              : computeStatusCounts(res.items)
+            const resStatus = String(res.status || normalizedQuery.status || 'all').trim() || 'all'
+            const resPage = Math.max(1, Number(res.page || normalizedQuery.page || 1))
+            const resPageSize = Math.max(1, Number(res.page_size || normalizedQuery.page_size || DEFAULT_JOB_ITEMS_PAGE_SIZE))
+            const totalAll = typeof res.total_all === 'number'
+              ? res.total_all
+              : Object.values(statusCounts).reduce<number>((sum, n) => sum + Number(n || 0), 0)
+            const filteredTotal = typeof res.total === 'number'
+              ? res.total
+              : resStatus === 'all'
+                ? totalAll
+                : Number(statusCounts[resStatus] || 0)
+            const sliceMeta: JobItemPageMeta = {
+              paginated: true,
+              page: resPage,
+              page_size: resPageSize,
+              status: resStatus,
+              total: filteredTotal,
+              total_all: totalAll,
+              status_counts: statusCounts,
+            }
+            const actualSig = jobDetailQuerySignature({ page: resPage, page_size: resPageSize, status: resStatus })
+            saveJobItemPageSlice(jid, actualSig, res.items, sliceMeta)
+            if (actualSig !== sig) {
+              saveJobItemPageSlice(jid, sig, res.items, sliceMeta)
+            }
+          }
+          return res
+        })
+        .finally(() => {
+          if (jobItemSlicePrefetches.get(prefetchKey) === req) {
+            jobItemSlicePrefetches.delete(prefetchKey)
+          }
+        })
+      jobItemSlicePrefetches.set(prefetchKey, req)
+      return req.catch(() => {})
     },
 
     _upsertJob(job: JobRecord): false | void {
@@ -1667,6 +1846,7 @@ export const useAppStore = defineStore('app', {
               this._scheduleOverviewRefresh()
             } else {
               flushPendingItemUpdates(this)
+              invalidateJobItemPageSlices(msg.data.id)
               if (!this._clearFinishedJobState(msg.data.id)) this._scheduleOverviewRefresh()
               this.refreshTempFiles()
               this.targetsLoadedAt = 0
@@ -1690,6 +1870,7 @@ export const useAppStore = defineStore('app', {
           } else if (msg.type === 'item_updated') {
             this._upsertItem(msg.data)
           } else if (msg.type === 'job_items_changed') {
+            if (msg.data?.job_id) invalidateJobItemPageSlices(Number(msg.data.job_id))
             scheduleJobItemsReload(this, msg.data?.job_id)
           } else if (msg.type === 'jobs_deleted') {
             this.removeJobs(msg.data.job_ids)
@@ -1702,6 +1883,7 @@ export const useAppStore = defineStore('app', {
               }
             })
             for (const jid of new Set([...jobItemPins.keys(), ...jobItemAccessOrder.keys()])) {
+              invalidateJobItemPageSlices(jid)
               scheduleJobItemsReload(this, jid)
             }
           } else if (msg.type === 'item_progress') {

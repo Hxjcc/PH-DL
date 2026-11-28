@@ -738,3 +738,61 @@ test('paginated job details dedupe matching prefetch, drop stale page switches, 
     store._resetSessionState()
   }
 })
+
+test('slice prefetch warms tabs without overwriting the visible page and enables instant tab switching', async () => {
+  mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const finished = { ...job(31, 'completed', 1), total_items: 1200 }
+  store.jobs = [finished]
+
+  const getJob = vi.spyOn(api, 'getJob')
+    .mockResolvedValueOnce({
+      job: finished,
+      items: [makeJobItem(1, 31, { status: 'done' })],
+      total: 1200,
+      total_all: 1200,
+      page: 1,
+      page_size: 50,
+      status: 'all',
+      status_counts: { done: 1190, failed: 10 },
+      paginated: true,
+    })
+    .mockResolvedValueOnce({
+      job: finished,
+      items: [makeJobItem(501, 31, { status: 'failed' })],
+      total: 10,
+      total_all: 1200,
+      page: 1,
+      page_size: 50,
+      status: 'failed',
+      status_counts: { done: 1190, failed: 10 },
+      paginated: true,
+    })
+
+  try {
+    await store.loadJobDetail(31, { page: 1, page_size: 50, status: 'all' })
+    assert.deepEqual(store.jobItems[31]?.map((it) => it.id), [1])
+
+    // Hovering / warming the failed pill caches the slice WITHOUT altering the visible 'all' page.
+    await store.prefetchJobDetailSlice(31, { page: 1, page_size: 50, status: 'failed' })
+    assert.equal(getJob.mock.calls.length, 2)
+    assert.equal(store.jobItemMeta[31]?.status, 'all')
+    assert.deepEqual(store.jobItems[31]?.map((it) => it.id), [1])
+
+    // Switching to failed activates synchronously from cache with zero additional HTTP calls.
+    const activated = store.activateJobDetailSlice(31, { page: 1, page_size: 50, status: 'failed' })
+    assert.equal(activated.hit, true)
+    assert.equal(activated.fresh, true)
+    assert.equal(store.jobItemMeta[31]?.status, 'failed')
+    assert.deepEqual(store.jobItems[31]?.map((it) => it.id), [501])
+
+    // Switching back to 'all' also hits cache synchronously.
+    const back = store.activateJobDetailSlice(31, { page: 1, page_size: 50, status: 'all' })
+    assert.equal(back.hit, true)
+    assert.equal(store.jobItemMeta[31]?.status, 'all')
+    assert.deepEqual(store.jobItems[31]?.map((it) => it.id), [1])
+    assert.equal(getJob.mock.calls.length, 2)
+  } finally {
+    store._resetSessionState()
+  }
+})
