@@ -886,3 +886,48 @@ test('live item_updated patches cached slices instead of evicting them and slice
     store._resetSessionState()
   }
 })
+
+test('job_scheduler coalesces brief slot handoff dips without delaying initial chip or clear', async () => {
+  vi.useFakeTimers()
+  mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const send = startTestEventStream(store)
+  const makeStatus = (activeDownloads: number) => ({
+    job_id: 41,
+    level: 'green' as const,
+    free_bytes: 30 * 1024 ** 3,
+    active_downloads: activeDownloads,
+    allowed_downloads: 8,
+    max_downloads: 8,
+    waiting_for_space: 0,
+  })
+
+  try {
+    // First scheduler event renders immediately.
+    send({ type: 'job_scheduler', ts: '', data: makeStatus(8) })
+    assert.equal(store.schedulerStatus[41]?.active_downloads, 8)
+
+    // Brief 8 -> 7 -> 8 slot handoff within the coalesce window never flashes 7/8.
+    send({ type: 'job_scheduler', ts: '', data: makeStatus(7) })
+    assert.equal(store.schedulerStatus[41]?.active_downloads, 8)
+    await vi.advanceTimersByTimeAsync(40)
+    send({ type: 'job_scheduler', ts: '', data: makeStatus(8) })
+    await vi.advanceTimersByTimeAsync(200)
+    assert.equal(store.schedulerStatus[41]?.active_downloads, 8)
+
+    // Sustained drop to 6/8 flushes after the window.
+    send({ type: 'job_scheduler', ts: '', data: makeStatus(6) })
+    await vi.advanceTimersByTimeAsync(200)
+    assert.equal(store.schedulerStatus[41]?.active_downloads, 6)
+
+    // Cleared cancels any queued update and deletes immediately.
+    send({ type: 'job_scheduler', ts: '', data: makeStatus(5) })
+    send({ type: 'job_scheduler', ts: '', data: { job_id: 41, cleared: true } })
+    assert.equal(store.schedulerStatus[41], undefined)
+    await vi.advanceTimersByTimeAsync(250)
+    assert.equal(store.schedulerStatus[41], undefined)
+  } finally {
+    store.stopRealtime()
+    store._resetSessionState()
+  }
+})

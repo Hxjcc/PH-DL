@@ -65,6 +65,17 @@ const selectedLabel = computed(() =>
   normalizedOptions.value.find((option) => option.encoded === encodedValue.value)?.label ?? props.placeholder
 )
 
+const triggerClass = computed(() =>
+  cn(
+    'group relative flex h-9 w-full overflow-hidden select-none items-center justify-between gap-2 whitespace-nowrap rounded-lg border border-input bg-card px-3 py-1 text-sm text-foreground shadow-xs transition-[border-color,box-shadow,background-color] duration-150 hover:border-foreground/20 focus-visible:outline-none focus-visible:border-foreground/35 focus-visible:ring-[3px] focus-visible:ring-foreground/10 disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer data-[state=open]:border-brand/35 data-[state=open]:ring-[3px] data-[state=open]:ring-brand/10',
+    props.class
+  )
+)
+
+const isCompact = computed(() =>
+  /(?:^|\s)text-(?:xs|\[(?:10|11|12)px\])(?:\s|$)/.test(triggerClass.value)
+)
+
 function handleUpdate(value: AcceptableValue) {
   // Reka receives only the encoded values above, including for numeric options.
   const next = (value === EMPTY_SENTINEL ? '' : value) as EncodedValue
@@ -82,12 +93,7 @@ function handleUpdate(value: AcceptableValue) {
     <SelectTrigger
       v-bind="$attrs"
       @pointerdown="handlePointerDown"
-      :class="
-        cn(
-          'group relative flex h-9 w-full overflow-hidden select-none items-center justify-between gap-2 whitespace-nowrap rounded-lg border border-input bg-card px-3 py-1 text-sm text-foreground shadow-xs transition-[border-color,box-shadow,background-color] duration-150 hover:border-foreground/20 focus-visible:outline-none focus-visible:border-foreground/35 focus-visible:ring-[3px] focus-visible:ring-foreground/10 disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer data-[state=open]:border-brand/35 data-[state=open]:ring-[3px] data-[state=open]:ring-brand/10',
-          props.class
-        )
-      "
+      :class="triggerClass"
     >
       <span
         v-for="r in ripples"
@@ -104,24 +110,37 @@ function handleUpdate(value: AcceptableValue) {
     <SelectPortal>
       <SelectContent
         position="popper"
+        align="start"
         :body-lock="false"
         :side-offset="5"
         :collision-padding="8"
-        class="select-content z-[60] max-h-72 min-w-[var(--reka-select-trigger-width)] overflow-hidden rounded-xl border border-border bg-popover p-1.5 text-popover-foreground shadow-lg outline-none data-[state=open]:animate-select-in data-[state=closed]:animate-select-out"
+        class="select-content z-[60] max-h-72 min-w-[var(--reka-select-trigger-width)] max-w-[var(--reka-select-content-available-width)] overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg outline-none data-[state=open]:animate-select-in data-[state=closed]:animate-select-out"
       >
         <SelectViewport>
           <SelectItem
             v-for="option in normalizedOptions"
             :key="option.encoded"
             :value="option.encoded"
-            class="relative flex w-full cursor-pointer select-none items-center rounded-lg py-2 pl-8 pr-3 text-sm outline-none transition-colors duration-100 data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[state=checked]:bg-brand/10 data-[state=checked]:font-medium data-[state=checked]:text-brand"
+            :class="
+              cn(
+                'relative flex w-full cursor-pointer select-none items-center rounded-sm outline-none transition-colors duration-100 data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[state=checked]:bg-brand/10 data-[state=checked]:font-medium data-[state=checked]:text-brand',
+                isCompact ? 'py-1.5 pl-2 pr-6 text-xs' : 'py-1.5 pl-2.5 pr-7 text-sm'
+              )
+            "
           >
-            <span class="absolute left-2.5 flex h-4 w-4 items-center justify-center">
+            <SelectItemText class="min-w-0 truncate">{{ option.label }}</SelectItemText>
+            <span
+              :class="
+                cn(
+                  'absolute flex h-3.5 w-3.5 items-center justify-center',
+                  isCompact ? 'right-1.5' : 'right-2'
+                )
+              "
+            >
               <SelectItemIndicator>
-                <Check class="h-3.5 w-3.5 animate-check-in text-brand" />
+                <Check :class="cn('animate-check-in text-brand', isCompact ? 'h-3 w-3' : 'h-3.5 w-3.5')" />
               </SelectItemIndicator>
             </span>
-            <SelectItemText class="truncate">{{ option.label }}</SelectItemText>
           </SelectItem>
         </SelectViewport>
       </SelectContent>

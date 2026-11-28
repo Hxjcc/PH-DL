@@ -116,6 +116,7 @@ const SESSION_PERSIST_MS = 300
 const SUBSCRIPTIONS_CACHE_TTL_MS = 30 * 60 * 1000
 const LIVE_PROGRESS_FLUSH_MS = 140
 const ITEM_UPDATE_FLUSH_MS = 120
+const SCHEDULER_STATUS_FLUSH_MS = 180
 const JOB_ITEMS_RELOAD_DEBOUNCE_MS = 240
 const JOB_ITEMS_SOFT_RELOAD_DEBOUNCE_MS = 900
 const JOB_DETAILS_HISTORY_LIMIT = 8
@@ -140,6 +141,8 @@ let persistWindow: Window | undefined
 let lastSnapshot: string | null = null
 let pendingLiveProgress: Map<number, LiveProgressEntry> | null = null
 let liveProgressFlushTimer: Timer | null = null
+let pendingSchedulerStatus: Map<number, SchedulerStatus> | null = null
+let schedulerStatusFlushTimer: Timer | null = null
 let pendingItemUpdates: ItemUpdates | null = null
 let itemUpdateFlushTimer: Timer | null = null
 const jobItemIndexMap = new Map<number, Map<number, number>>()
@@ -557,6 +560,51 @@ function clearPendingLiveProgress() {
   pendingLiveProgress = null
 }
 
+function clearPendingSchedulerStatus(jobId?: number) {
+  if (jobId !== undefined) {
+    pendingSchedulerStatus?.delete(jobId)
+    if (pendingSchedulerStatus && pendingSchedulerStatus.size === 0) {
+      pendingSchedulerStatus = null
+      if (schedulerStatusFlushTimer !== null) {
+        clearTimeout(schedulerStatusFlushTimer)
+        schedulerStatusFlushTimer = null
+      }
+    }
+    return
+  }
+  if (schedulerStatusFlushTimer !== null) {
+    clearTimeout(schedulerStatusFlushTimer)
+    schedulerStatusFlushTimer = null
+  }
+  pendingSchedulerStatus = null
+}
+
+function flushPendingSchedulerStatus(store: Pick<AppState, 'schedulerStatus'>) {
+  if (schedulerStatusFlushTimer !== null) {
+    clearTimeout(schedulerStatusFlushTimer)
+    schedulerStatusFlushTimer = null
+  }
+  if (!pendingSchedulerStatus) return
+  const batch = pendingSchedulerStatus
+  pendingSchedulerStatus = null
+  for (const [jid, payload] of batch) {
+    store.schedulerStatus[jid] = payload
+  }
+}
+
+function queueSchedulerStatus(store: Pick<AppState, 'schedulerStatus'>, jid: number, payload: SchedulerStatus) {
+  if (!store.schedulerStatus[jid]) {
+    clearPendingSchedulerStatus(jid)
+    store.schedulerStatus[jid] = payload
+    return
+  }
+  if (!pendingSchedulerStatus) pendingSchedulerStatus = new Map()
+  pendingSchedulerStatus.set(jid, payload)
+  if (schedulerStatusFlushTimer === null) {
+    schedulerStatusFlushTimer = setTimeout(() => flushPendingSchedulerStatus(store), SCHEDULER_STATUS_FLUSH_MS)
+  }
+}
+
 function clearLiveProgressForJob(store: Pick<AppState, 'liveProgress'>, jobId: number) {
   const jid = Number(jobId)
   if (!jid) return
@@ -905,6 +953,7 @@ export const useAppStore = defineStore('app', {
         this._overviewTimer = null
       }
       clearPendingLiveProgress()
+      clearPendingSchedulerStatus()
       clearPendingItemUpdates()
       jobItemAccessOrder.clear()
       jobItemPins.clear()
@@ -978,6 +1027,7 @@ export const useAppStore = defineStore('app', {
 
     _clearJobTelemetry(jobId: number) {
       clearLiveProgressForJob(this, jobId)
+      clearPendingSchedulerStatus(jobId)
       delete this.schedulerStatus[jobId]
       delete this.scanStatus[jobId]
     },
@@ -1878,6 +1928,7 @@ export const useAppStore = defineStore('app', {
         onEvent: (msg) => {
           if (msg.type === 'snapshot') {
             clearPendingLiveProgress()
+            clearPendingSchedulerStatus()
             this._applyLogsSnapshot(msg.data?.logs || [])
             this.liveProgress = msg.data?.live_progress || {}
             this.schedulerStatus = msg.data?.scheduler_status || {}
@@ -1944,9 +1995,10 @@ export const useAppStore = defineStore('app', {
             const jid = Number(msg.data?.job_id)
             if (jid > 0) {
               if (msg.data?.cleared) {
+                clearPendingSchedulerStatus(jid)
                 delete this.schedulerStatus[jid]
               } else if (!this.isJobCancelling(jid)) {
-                this.schedulerStatus[jid] = msg.data
+                queueSchedulerStatus(this, jid, msg.data)
               }
             }
           } else if (msg.type === 'job_scan') {
@@ -1974,6 +2026,7 @@ export const useAppStore = defineStore('app', {
 
     stopRealtime() {
       clearPendingLiveProgress()
+      clearPendingSchedulerStatus()
       clearPendingItemUpdates()
       if (this._wsGraceTimer) {
         clearTimeout(this._wsGraceTimer)

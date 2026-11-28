@@ -38,6 +38,7 @@ class AdaptiveDiskScheduler:
     DEFAULT_EST_VIDEO_BYTES = 1 * GIB
     GREEN_MIN_BYTES = 8 * GIB
     YELLOW_MIN_BYTES = 3 * GIB
+    HYSTERESIS_BYTES = 512 * MIB
 
     def __init__(
         self,
@@ -68,6 +69,7 @@ class AdaptiveDiskScheduler:
         self.pending_upload_bytes = 0
         self.avg_video_bytes = self.DEFAULT_EST_VIDEO_BYTES
         self._waiting_large: List[int] = []
+        self._waterline_level: str = "green"
         self._last_emit_at = 0.0
         self._last_signature: Optional[Tuple[Any, ...]] = None
 
@@ -87,20 +89,31 @@ class AdaptiveDiskScheduler:
         """Return (level, allowed_downloads, free_bytes, effective_headroom_bytes)."""
         free = self.free_bytes()
         if self.keep_free_bytes <= 0:
+            self._waterline_level = "green"
             return "green", self.max_downloads, free, free
 
         headroom = free - self.keep_free_bytes - self.disk_budget.reserved_bytes
         green_threshold = max(self.GREEN_MIN_BYTES, int(3.5 * self.avg_video_bytes))
         yellow_threshold = max(self.YELLOW_MIN_BYTES, int(1.8 * self.avg_video_bytes))
+        prev = self._waterline_level
+        hyst = self.HYSTERESIS_BYTES
 
-        if headroom <= 0:
-            return "red", 0, free, headroom
-        if headroom < yellow_threshold:
-            return "orange", 1, free, headroom
-        if headroom < green_threshold:
+        if headroom <= 0 or (prev == "red" and headroom < hyst):
+            level, allowed = "red", 0
+        elif headroom < yellow_threshold or (
+            prev in {"red", "orange"} and headroom < yellow_threshold + hyst
+        ):
+            level, allowed = "orange", 1
+        elif headroom < green_threshold or (
+            prev in {"red", "orange", "yellow"} and headroom < green_threshold + hyst
+        ):
+            level = "yellow"
             allowed = min(self.max_downloads, max(2, self.max_downloads // 2))
-            return "yellow", allowed, free, headroom
-        return "green", self.max_downloads, free, headroom
+        else:
+            level, allowed = "green", self.max_downloads
+
+        self._waterline_level = level
+        return level, allowed, free, headroom
 
     @property
     def prefer_largest_upload(self) -> bool:
@@ -117,6 +130,11 @@ class AdaptiveDiskScheduler:
 
     def snapshot(self) -> Dict[str, Any]:
         level, allowed, free, headroom = self.compute_waterline()
+        waiting_for_space = (
+            sum(1 for req in self._waiting_large if headroom < req)
+            if self.keep_free_bytes > 0
+            else 0
+        )
         return {
             "level": level,
             "active_downloads": self.active_downloads,
@@ -129,7 +147,7 @@ class AdaptiveDiskScheduler:
             "free_bytes": free,
             "headroom_bytes": max(0, headroom),
             "reserved_bytes": self.disk_budget.reserved_bytes,
-            "waiting_for_space": len(self._waiting_large),
+            "waiting_for_space": waiting_for_space,
             "prefer_largest_upload": bool(self._waiting_large) or level != "green",
         }
 
@@ -182,20 +200,20 @@ class AdaptiveDiskScheduler:
         registered_large = False
         try:
             async with self._cond:
-                if req > 0:
-                    self._waiting_large.append(req)
-                    registered_large = True
-
                 while not cancel_event.is_set():
                     level, allowed, free, headroom = self.compute_waterline()
                     too_many_pending = self.pending_upload_count >= self.max_pending_upload_files
+                    space_blocked = req > 0 and self.keep_free_bytes > 0 and headroom < req
+                    if space_blocked and not registered_large:
+                        self._waiting_large.append(req)
+                        registered_large = True
 
                     # Large-file fairness lock: don't let new unknown-size downloads starve a waiting large file.
                     blocked_by_large_waiter = bool(self._waiting_large) and req == 0
 
                     if req > 0:
                         fits = (
-                            (self.keep_free_bytes <= 0 or headroom >= req)
+                            not space_blocked
                             and self.active_downloads < max(1, allowed)
                             and not too_many_pending
                         )
@@ -218,7 +236,7 @@ class AdaptiveDiskScheduler:
                     # True physical disk limit: nothing in flight or queued for upload can free space.
                     no_releasable_work = self.pending_upload_count == 0 and self.active_downloads == 0
                     if no_releasable_work and self.keep_free_bytes > 0:
-                        if req > 0 and headroom < req:
+                        if space_blocked:
                             return (
                                 False,
                                 f"单文件体积 ({req / GIB:.2f} GB) 超过 VPS 可用空间"
@@ -235,7 +253,7 @@ class AdaptiveDiskScheduler:
 
                     if not logged_wait:
                         logged_wait = True
-                        if req > 0:
+                        if space_blocked:
                             msg = (
                                 f"VPS 剩余空间紧凑（余量 {max(0, headroom) / GIB:.2f} GB < 需求 {req / GIB:.2f} GB），"
                                 "暂停该下载并优先上传大文件释放空间..."
@@ -244,14 +262,17 @@ class AdaptiveDiskScheduler:
                             msg = "待上传本地文件达到背压上限，正在等待上传释放队列..."
                         elif blocked_by_large_waiter:
                             msg = "正在为等待中的大视频腾出磁盘空间，暂缓开启新下载..."
-                        else:
+                        elif allowed < self.max_downloads:
                             msg = (
                                 f"VPS 磁盘水位进入 {level} 区（余量 {max(0, headroom) / GIB:.2f} GB），"
                                 f"动态调整下载并发为 {allowed}/{self.max_downloads}，等待上传释放空间..."
                             )
-                        if on_wait is not None:
+                        else:
+                            msg = ""
+                        if msg and on_wait is not None:
                             on_wait(msg)
-                        self.emit_status(force=True)
+                        if space_blocked or level != "green" or too_many_pending:
+                            self.emit_status(force=True)
 
                     await self._wait_with_cancel(cancel_event, timeout=1.0)
             return False, "已取消"

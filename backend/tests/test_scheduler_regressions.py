@@ -73,6 +73,66 @@ async def test_progress_status_probes_disk_once_per_snapshot_and_throttles_uncha
     assert len(probes) == 4 and emitted[-1]["active_downloads"] == 1
 
 
+async def test_waterline_hysteresis_and_slot_only_wait_do_not_flash_status(tmp_path):
+    import asyncio
+    from app.engine.disk_scheduler import AdaptiveDiskScheduler, GIB, MIB
+
+    free_state = {"bytes": 11 * GIB}
+    emitted = []
+    budget = DownloadDiskBudget(tmp_path, keep_free_bytes=2 * GIB)
+    sched = AdaptiveDiskScheduler(
+        tmp_path,
+        budget,
+        max_downloads=8,
+        max_uploads=2,
+        min_free_disk_gb=2.0,
+        disk_usage_fn=lambda _p: SimpleNamespace(free=free_state["bytes"]),
+        on_status=emitted.append,
+    )
+
+    # Start in green (9 GiB headroom >= 8 GiB)
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert (lvl, allowed) == ("green", 8)
+
+    # Dip just below 8 GiB -> yellow (allowed=4)
+    free_state["bytes"] = int(9.9 * GIB)
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert (lvl, allowed) == ("yellow", 4)
+
+    # Small bounce back just above 8 GiB (< 8 GiB + 512 MiB hysteresis) stays yellow without strobing
+    free_state["bytes"] = int(10.2 * GIB)
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert (lvl, allowed) == ("yellow", 4)
+
+    # Clear recovery beyond 8 GiB + 512 MiB returns to green (allowed=8)
+    free_state["bytes"] = 10 * GIB + 600 * MIB
+    lvl, allowed, _, _ = sched.compute_waterline()
+    assert (lvl, allowed) == ("green", 8)
+
+    # A required_bytes download waiting ONLY because all 8 slots are occupied (headroom is plenty)
+    # must NOT report waiting_for_space > 0 or emit a red warning chip.
+    sched.active_downloads = 8
+    cancel = asyncio.Event()
+    wait_logs = []
+    waiter = asyncio.create_task(
+        sched.acquire_download_slot(
+            will_upload=True,
+            required_bytes=1 * GIB,
+            cancel_event=cancel,
+            on_wait=wait_logs.append,
+        )
+    )
+    await asyncio.sleep(0.02)
+    snap = sched.snapshot()
+    assert snap["waiting_for_space"] == 0
+    assert wait_logs == []
+
+    await sched.release_download_slot()
+    ok, err = await waiter
+    assert ok is True and err == ""
+    assert all(item["waiting_for_space"] == 0 for item in emitted)
+
+
 async def test_scheduler_reports_overdue_run_today_with_offset_and_then_tomorrow(monkeypatch):
     class FixedDateTime(datetime):
         @classmethod
