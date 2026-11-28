@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import os
 import random
 import shutil
 import sqlite3
@@ -4390,11 +4391,98 @@ class TaskManager:
             pass
         return "pornhub"
 
+    def _iter_temp_artifacts(self) -> Tuple[List[Path], List[Path]]:
+        """Scan temp_dir for *.mp4.tmp files and *.hls dirs without descending into *.hls segment folders."""
+        mp4_tmps: List[Path] = []
+        hls_dirs: List[Path] = []
+        root = self.env.temp_dir
+        if not root.exists():
+            return mp4_tmps, hls_dirs
+        stack: List[Tuple[Path, int]] = [(root, 0)]
+        max_depth = 4
+        while stack:
+            current, depth = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        continue
+                    name = entry.name
+                    if entry.is_dir(follow_symlinks=False):
+                        if name.endswith(".hls"):
+                            hls_dirs.append(Path(entry.path))
+                        elif depth < max_depth:
+                            stack.append((Path(entry.path), depth + 1))
+                    elif name.endswith(".mp4.tmp") and entry.is_file(follow_symlinks=False):
+                        mp4_tmps.append(Path(entry.path))
+                except OSError:
+                    continue
+        mp4_tmps.sort()
+        hls_dirs.sort()
+        return mp4_tmps, hls_dirs
+
+    def _hls_dir_has_segments(self, hls_dir: Path) -> bool:
+        try:
+            with os.scandir(hls_dir) as it:
+                for entry in it:
+                    name = entry.name
+                    if (
+                        (name.startswith("seg_") and name.endswith(".tmp"))
+                        or name in {"manifest.json", "manifest.json.tmp"}
+                        or name.endswith(".ytdl")
+                    ):
+                        continue
+                    try:
+                        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                            continue
+                        if entry.stat(follow_symlinks=False).st_size > 0:
+                            return True
+                    except OSError:
+                        continue
+        except OSError:
+            return False
+        return False
+
+    def count_temp_files(self) -> int:
+        now = time.monotonic()
+        cached = getattr(self, "_temp_count_cache", None)
+        if cached is not None and (now - cached[0]) < 1.5:
+            return cached[1]
+        mp4_tmps, hls_dirs = self._iter_temp_artifacts()
+        count = 0
+        for tmp in mp4_tmps:
+            try:
+                st = tmp.stat()
+                if st.st_size <= 0:
+                    continue
+                vkey = extract_viewkey_from_url(tmp.name) or ""
+                if not vkey and "[" in tmp.stem and "]" in tmp.stem:
+                    vkey = tmp.stem.rsplit("[", 1)[1].split("]", 1)[0]
+                checkpoint = read_download_checkpoint(tmp)
+                if checkpoint and checkpoint.viewkey != vkey:
+                    checkpoint = None
+                saved_size = st.st_size
+                if checkpoint and checkpoint.completed_ranges is not None:
+                    saved_size = checkpoint.saved_bytes(saved_size)
+                    if not saved_size:
+                        continue
+                count += 1
+            except OSError:
+                continue
+        for hls_dir in hls_dirs:
+            if self._hls_dir_has_segments(hls_dir):
+                count += 1
+        self._temp_count_cache = (time.monotonic(), count)
+        return count
+
     def list_temp_files(self) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
-        if not self.env.temp_dir.exists():
-            return results
-        for tmp in sorted(self.env.temp_dir.rglob("*.mp4.tmp")):
+        mp4_tmps, hls_dirs = self._iter_temp_artifacts()
+        for tmp in mp4_tmps:
             try:
                 if tmp.is_symlink() or not tmp.is_file():
                     continue
@@ -4426,7 +4514,7 @@ class TaskManager:
                 )
             except OSError:
                 continue
-        for hls_dir in sorted(self.env.temp_dir.rglob("*.hls")):
+        for hls_dir in hls_dirs:
             try:
                 if hls_dir.is_symlink() or not hls_dir.is_dir():
                     continue
@@ -4458,22 +4546,23 @@ class TaskManager:
                 )
             except OSError:
                 continue
+        self._temp_count_cache = (time.monotonic(), len(results))
         return results
 
     def clear_temp_files(self) -> int:
-        if not self.env.temp_dir.exists():
-            return 0
+        mp4_tmps, hls_dirs = self._iter_temp_artifacts()
         removed = 0
-        for tmp in list(self.env.temp_dir.rglob("*.mp4.tmp")):
+        for tmp in mp4_tmps:
             with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
                 remove_download_checkpoint(tmp)
                 removed += 1
-        for hls_dir in list(self.env.temp_dir.rglob("*.hls")):
+        for hls_dir in hls_dirs:
             if not hls_dir.is_symlink() and hls_dir.is_dir() and not ytdlp_hls_dir_in_use(hls_dir):
                 with contextlib.suppress(OSError):
                     shutil.rmtree(hls_dir)
                     removed += 1
+        self._temp_count_cache = None
         return removed
 
     async def clear_idle_temp_files(self) -> Optional[int]:

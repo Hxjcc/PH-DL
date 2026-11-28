@@ -129,6 +129,7 @@ interface CachedJobItemPage {
   items: JobItemRecord[]
   meta: JobItemPageMeta
   fetchedAt: number
+  stale?: boolean
 }
 
 const inflight = new Map<keyof RequestResults, Promise<RequestResults[keyof RequestResults]>>()
@@ -175,6 +176,7 @@ function saveJobItemPageSlice(jid: number, sig: string, items: JobItemRecord[], 
     items: markRaw(items),
     meta: { ...meta, status_counts: { ...meta.status_counts } },
     fetchedAt: Date.now(),
+    stale: false,
   })
   while (slices.size > JOB_PAGE_CACHE_MAX_SLICES) {
     const oldest = slices.keys().next().value
@@ -183,19 +185,66 @@ function saveJobItemPageSlice(jid: number, sig: string, items: JobItemRecord[], 
   }
 }
 
-function invalidateJobItemPageSlices(jid: number, affectedStatuses?: Set<string>) {
-  if (!affectedStatuses) {
-    jobItemPageCache.delete(jid)
-    return
-  }
+function markJobItemPageSlicesStale(jid: number, affectedStatuses?: Set<string>) {
   const slices = jobItemPageCache.get(jid)
   if (!slices || slices.size === 0) return
-  for (const [sig, entry] of slices) {
-    if (entry.meta.status === 'all' || affectedStatuses.has(entry.meta.status)) {
-      slices.delete(sig)
+  for (const entry of slices.values()) {
+    if (!affectedStatuses || entry.meta.status === 'all' || affectedStatuses.has(entry.meta.status)) {
+      entry.stale = true
     }
   }
-  if (slices.size === 0) jobItemPageCache.delete(jid)
+}
+
+function syncCachedJobItemSlices(
+  jid: number,
+  updatesById: Map<number, JobItemRecord>,
+  affectedStatuses: Set<string>,
+) {
+  const slices = jobItemPageCache.get(jid)
+  if (!slices || slices.size === 0) return
+  for (const entry of slices.values()) {
+    const sliceStatus = entry.meta.status
+    const isRelevant = sliceStatus === 'all' || affectedStatuses.has(sliceStatus)
+    if (!isRelevant) continue
+    entry.stale = true
+    let nextItems: JobItemRecord[] | null = null
+    const ensureCopy = () => {
+      if (nextItems === null) nextItems = entry.items.slice()
+      return nextItems
+    }
+    for (const [itemId, item] of updatesById) {
+      const targetList = nextItems ?? entry.items
+      const idx = targetList.findIndex((row) => row.id === itemId)
+      if (idx >= 0) {
+        const current = targetList[idx]
+        if (isOlderItemUpdate(item, current)) continue
+        const merged = { ...current, ...item }
+        const list = ensureCopy()
+        if (sliceStatus !== 'all' && merged.status !== sliceStatus) {
+          list.splice(idx, 1)
+        } else {
+          list[idx] = merged
+        }
+      } else if (
+        sliceStatus !== 'all' &&
+        item.status === sliceStatus &&
+        entry.meta.page === 1 &&
+        targetList.length < entry.meta.page_size
+      ) {
+        const list = ensureCopy()
+        const insertAt = list.findIndex((row) => row.id > item.id)
+        if (insertAt >= 0) list.splice(insertAt, 0, item)
+        else list.push(item)
+      }
+    }
+    if (nextItems !== null) {
+      entry.items = markRaw(nextItems)
+    }
+  }
+}
+
+function invalidateJobItemPageSlices(jid: number) {
+  jobItemPageCache.delete(jid)
 }
 
 function normalizeJobDetailQuery(query?: JobDetailQuery): Required<JobDetailQuery> | undefined {
@@ -423,7 +472,7 @@ function flushPendingItemUpdates(store: JobDetailCache) {
       store.jobItems[jid] = markRaw(nextList)
     }
     if (affectedStatuses && affectedStatuses.size > 0) {
-      invalidateJobItemPageSlices(jid, affectedStatuses)
+      syncCachedJobItemSlices(jid, updatesById, affectedStatuses)
     }
     if (meta && nextCounts) {
       const counts = nextCounts as JobStatusCounts
@@ -1672,11 +1721,14 @@ export const useAppStore = defineStore('app', {
       }
       this.jobItems[jid] = markRaw(cached.items)
       this.jobItemMeta[jid] = nextMeta
+      // Supersede any older in-flight loadJobDetail so a late response from the previous tab cannot overwrite this slice.
+      inflight.delete(`jobDetail:${jid}`)
+      jobDetailInflightQuery.delete(jid)
       jobDetailQueries.set(jid, { page: nextMeta.page, page_size: nextMeta.page_size, status: nextMeta.status })
       indexJobItems(jid, cached.items)
       const status = this.jobs.find((job) => job.id === jid)?.status
       touchJobItems(jid, status)
-      const fresh = !isActiveJobStatus(status) || (Date.now() - cached.fetchedAt) < ACTIVE_SLICE_FRESH_MS
+      const fresh = !cached.stale && (!isActiveJobStatus(status) || (Date.now() - cached.fetchedAt) < ACTIVE_SLICE_FRESH_MS)
       return { hit: true, fresh, page: nextMeta.page }
     },
 
@@ -1689,7 +1741,7 @@ export const useAppStore = defineStore('app', {
       if (currentMeta && !currentMeta.paginated) return Promise.resolve()
       const status = this.jobs.find((job) => job.id === jid)?.status
       const existingCached = jobItemPageCache.get(jid)?.get(sig)
-      if (existingCached && (!isActiveJobStatus(status) || (Date.now() - existingCached.fetchedAt) < ACTIVE_SLICE_FRESH_MS)) {
+      if (existingCached && !existingCached.stale && (!isActiveJobStatus(status) || (Date.now() - existingCached.fetchedAt) < ACTIVE_SLICE_FRESH_MS)) {
         return Promise.resolve()
       }
       const prefetchKey = `${jid}:${sig}`
@@ -1846,7 +1898,7 @@ export const useAppStore = defineStore('app', {
               this._scheduleOverviewRefresh()
             } else {
               flushPendingItemUpdates(this)
-              invalidateJobItemPageSlices(msg.data.id)
+              markJobItemPageSlicesStale(msg.data.id)
               if (!this._clearFinishedJobState(msg.data.id)) this._scheduleOverviewRefresh()
               this.refreshTempFiles()
               this.targetsLoadedAt = 0
@@ -1870,7 +1922,7 @@ export const useAppStore = defineStore('app', {
           } else if (msg.type === 'item_updated') {
             this._upsertItem(msg.data)
           } else if (msg.type === 'job_items_changed') {
-            if (msg.data?.job_id) invalidateJobItemPageSlices(Number(msg.data.job_id))
+            if (msg.data?.job_id) markJobItemPageSlicesStale(Number(msg.data.job_id))
             scheduleJobItemsReload(this, msg.data?.job_id)
           } else if (msg.type === 'jobs_deleted') {
             this.removeJobs(msg.data.job_ids)
@@ -1883,7 +1935,7 @@ export const useAppStore = defineStore('app', {
               }
             })
             for (const jid of new Set([...jobItemPins.keys(), ...jobItemAccessOrder.keys()])) {
-              invalidateJobItemPageSlices(jid)
+              markJobItemPageSlicesStale(jid)
               scheduleJobItemsReload(this, jid)
             }
           } else if (msg.type === 'item_progress') {

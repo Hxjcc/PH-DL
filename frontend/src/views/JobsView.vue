@@ -204,8 +204,8 @@ async function handleRefreshJobs() {
     await Promise.all([
       store.refreshJobs(),
       store.refreshOverview(),
-      store.refreshTargets(),
-      new Promise((resolve) => setTimeout(resolve, 450)),
+      store.targetsCache === null ? store.ensureTargets() : Promise.resolve(),
+      new Promise((resolve) => setTimeout(resolve, 250)),
     ])
   } finally {
     refreshing.value = false

@@ -796,3 +796,93 @@ test('slice prefetch warms tabs without overwriting the visible page and enables
     store._resetSessionState()
   }
 })
+
+test('live item_updated patches cached slices instead of evicting them and slice activation supersedes stale inflight loads', async () => {
+  vi.useFakeTimers()
+  mockSessionStorage('/jobs')
+  const store = seedRouteStore()
+  const running = { ...job(32, 'running', 1), total_items: 2000 }
+  store.jobs = [running]
+
+  let resolveSlowDownloadRefresh!: (res: JobDetailResponse) => void
+  const getJob = vi.spyOn(api, 'getJob')
+    .mockResolvedValueOnce({
+      job: running,
+      items: [makeJobItem(1, 32, { status: 'done', revision: 1 })],
+      total: 2000,
+      total_all: 2000,
+      page: 1,
+      page_size: 50,
+      status: 'all',
+      status_counts: { done: 100, downloading: 1, uploading: 1, pending: 1898 },
+      paginated: true,
+    })
+    .mockResolvedValueOnce({
+      job: running,
+      items: [makeJobItem(50, 32, { status: 'downloading', revision: 1 })],
+      total: 1,
+      total_all: 2000,
+      page: 1,
+      page_size: 50,
+      status: 'downloading',
+      status_counts: { done: 100, downloading: 1, uploading: 1, pending: 1898 },
+      paginated: true,
+    })
+    .mockResolvedValueOnce({
+      job: running,
+      items: [makeJobItem(60, 32, { status: 'uploading', revision: 1 })],
+      total: 1,
+      total_all: 2000,
+      page: 1,
+      page_size: 50,
+      status: 'uploading',
+      status_counts: { done: 100, downloading: 1, uploading: 1, pending: 1898 },
+      paginated: true,
+    })
+    .mockImplementationOnce(() => new Promise((resolve) => { resolveSlowDownloadRefresh = resolve }))
+
+  const send = startTestEventStream(store)
+  try {
+    await store.loadJobDetail(32, { page: 1, page_size: 50, status: 'all' })
+    await store.prefetchJobDetailSlice(32, { page: 1, page_size: 50, status: 'downloading' })
+    await store.prefetchJobDetailSlice(32, { page: 1, page_size: 50, status: 'uploading' })
+
+    // Live WS item_updated moves #50 from downloading -> uploading and adds #51 to downloading.
+    send({ type: 'item_updated', ts: '', data: makeJobItem(50, 32, { status: 'uploading', revision: 2 }) })
+    send({ type: 'item_updated', ts: '', data: makeJobItem(51, 32, { status: 'downloading', revision: 2 }) })
+    await vi.advanceTimersByTimeAsync(150)
+
+    // Cached 'downloading' slice MUST still hit synchronously (0ms switch) with #50 removed and #51 patched in!
+    const dlAct = store.activateJobDetailSlice(32, { page: 1, page_size: 50, status: 'downloading' })
+    assert.equal(dlAct.hit, true)
+    assert.equal(dlAct.fresh, false, 'marked stale so background reconcile can run without spinner')
+    assert.deepEqual(store.jobItems[32]?.map((it) => it.id), [51])
+
+    // Start background reconcile for 'downloading', then immediately click 'uploading' before it returns.
+    const slowBg = store.loadJobDetail(32, { page: 1, page_size: 50, status: 'downloading' })
+    await Promise.resolve()
+    const upAct = store.activateJobDetailSlice(32, { page: 1, page_size: 50, status: 'uploading' })
+    assert.equal(upAct.hit, true)
+    assert.deepEqual(store.jobItems[32]?.map((it) => it.id), [50, 60])
+
+    // Late background response for 'downloading' MUST NOT overwrite the active 'uploading' tab!
+    resolveSlowDownloadRefresh({
+      job: running,
+      items: [makeJobItem(51, 32, { status: 'downloading', revision: 2 })],
+      total: 1,
+      total_all: 2000,
+      page: 1,
+      page_size: 50,
+      status: 'downloading',
+      status_counts: { done: 100, downloading: 1, uploading: 2, pending: 1897 },
+      paginated: true,
+    })
+    await slowBg
+    assert.equal(store.jobItemMeta[32]?.status, 'uploading')
+    assert.deepEqual(store.jobItems[32]?.map((it) => it.id), [50, 60])
+    assert.equal(getJob.mock.calls.length, 4)
+  } finally {
+    store.stopRealtime()
+    store._resetSessionState()
+  }
+})

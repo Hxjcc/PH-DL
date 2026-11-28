@@ -2471,3 +2471,46 @@ async def test_multi_remote_round_robin_spreads_and_fails_over(tmp_path: Path, m
     finally:
         await tm.stop()
         await db.close()
+
+
+async def test_count_and_list_temp_files_prune_hls_segment_dirs(tmp_path: Path):
+    env = EnvSettings(data_dir=tmp_path / "data")
+    env.ensure_dirs()
+    db = Database(env.db_path)
+    await db.connect()
+    repo = Repository(db)
+    events = EventBus()
+    tm = TaskManager(env=env, repo=repo, events=events)
+    try:
+        ph_dir = env.temp_dir / "alice"
+        xh_dir = env.temp_dir / "xHamster" / "bob"
+        ph_dir.mkdir(parents=True)
+        xh_dir.mkdir(parents=True)
+
+        mp4_tmp = ph_dir / "Clip [vk_mp4].mp4.tmp"
+        mp4_tmp.write_bytes(b"x" * 2048)
+
+        hls_active = xh_dir / "Stream [xh_hls].hls"
+        hls_active.mkdir()
+        (hls_active / "manifest.json").write_text('{"viewkey":"xh_hls","quality":"1080"}', encoding="utf-8")
+        (hls_active / "seg_000001.ts").write_bytes(b"y" * 4096)
+        # Decoy nested .mp4.tmp inside an .hls directory must NOT be visited or double-counted!
+        (hls_active / "nested.mp4.tmp").write_bytes(b"z" * 1024)
+
+        hls_empty = ph_dir / "Empty [vk_empty].hls"
+        hls_empty.mkdir()
+        (hls_empty / "manifest.json").write_text('{"viewkey":"vk_empty"}', encoding="utf-8")
+        (hls_empty / "seg_000001.tmp").write_bytes(b"incomplete")
+
+        assert tm.count_temp_files() == 2
+        listed = tm.list_temp_files()
+        assert len(listed) == 2
+        assert {item["viewkey"] for item in listed} == {"vk_mp4", "xh_hls"}
+        assert {item["site"] for item in listed} == {"pornhub", "xhamster"}
+
+        removed = tm.clear_temp_files()
+        assert removed == 3  # 1 mp4.tmp + 2 .hls dirs
+        assert tm.count_temp_files() == 0
+    finally:
+        await tm.stop()
+        await db.close()

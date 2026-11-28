@@ -22,17 +22,22 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
     settings = await container.repo.get_settings()
     video_stats = await container.repo.get_video_stats()
     target_count, enabled_targets = await container.repo.count_targets()
-    temp_files = await asyncio.to_thread(container.tasks.list_temp_files)
     next_run = await container.scheduler.next_run_iso()
 
-    disk_free_bytes = 0
-    disk_total_bytes = 0
-    try:
-        usage = shutil.disk_usage(container.env.resolved_data_dir)
-        disk_free_bytes = usage.free
-        disk_total_bytes = usage.total
-    except OSError:
-        pass
+    def _read_fs_overview():
+        count_fn = getattr(container.tasks, "count_temp_files", None)
+        t_count = int(count_fn()) if callable(count_fn) else len(container.tasks.list_temp_files())
+        free_b = 0
+        total_b = 0
+        try:
+            usage = shutil.disk_usage(container.env.resolved_data_dir)
+            free_b = usage.free
+            total_b = usage.total
+        except OSError:
+            pass
+        return t_count, free_b, total_b
+
+    temp_files_count, disk_free_bytes, disk_total_bytes = await asyncio.to_thread(_read_fs_overview)
 
     job_id = container.tasks.current_job_id
     current_job = await container.repo.get_job(job_id) if job_id is not None else None
@@ -72,7 +77,7 @@ async def get_overview(container: AppContainer = Depends(require_auth)):
         "targets_total": target_count,
         "targets_enabled": enabled_targets,
         "videos": video_stats,
-        "temp_files_count": len(temp_files),
+        "temp_files_count": temp_files_count,
         "disk": {
             "free_bytes": disk_free_bytes,
             "total_bytes": disk_total_bytes,

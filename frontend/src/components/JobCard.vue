@@ -422,9 +422,15 @@ function warmHotFilterSlices() {
   if (!expanded.value || !isPaginated.value || !store.authenticated) return
   const counts = itemMeta.value?.status_counts
   if (!counts) return
-  const candidates = ['downloading', 'uploading', 'failed']
-  for (const st of candidates) {
-    if (st === itemStatusFilter.value) continue
+  const priorityOrder = ['downloading', 'uploading', 'failed', 'downloaded', 'pending', 'done', 'skipped', 'cancelled']
+  const seen = new Set<string>(['all', itemStatusFilter.value])
+  const ordered = [
+    ...priorityOrder,
+    ...Object.keys(counts).filter((st) => !priorityOrder.includes(st)),
+  ]
+  for (const st of ordered) {
+    if (seen.has(st)) continue
+    seen.add(st)
     if (Number(counts[st] || 0) > 0) {
       void store.prefetchJobDetailSlice(props.job.id, {
         page: 1,

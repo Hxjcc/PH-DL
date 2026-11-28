@@ -1623,7 +1623,9 @@ class Repository:
         row = await self.db.fetch_one("SELECT * FROM jobs WHERE id = ?", (job_id,), conn=conn)
         if row:
             row["params"] = _parse_job_params(row["params_json"])
-            row["error_message"] = self.redact_diagnostic(row["error_message"])
+            err = row.get("error_message")
+            if err:
+                row["error_message"] = self.redact_diagnostic(err)
         return row
 
     async def list_jobs(self, limit: int = 30) -> List[Dict[str, Any]]:
@@ -1637,7 +1639,9 @@ class Repository:
         )
         for row in rows:
             row["params"] = _parse_job_params(row["params_json"])
-            row["error_message"] = self.redact_diagnostic(row["error_message"])
+            err = row.get("error_message")
+            if err:
+                row["error_message"] = self.redact_diagnostic(err)
         return rows
 
     async def list_queued_job_ids(self) -> List[int]:
